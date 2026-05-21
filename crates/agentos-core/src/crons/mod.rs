@@ -1,18 +1,24 @@
 use crate::memory::{MemoryCaller, MemoryManager, ReflectionReport, ReflectionRequest};
 use agentos_interfaces::memory::MemoryError;
 use agentos_proto::{ChannelId, ConversationId, Envelope, Message, MessageRole};
+use chrono::{DateTime, TimeZone, Utc};
+use croner::Cron;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
 #[derive(Debug, Error)]
 pub enum CronError {
-    #[error("cron interval must be greater than zero")]
-    InvalidInterval,
+    #[error("invalid cron expression '{expression}': {message}")]
+    InvalidExpression {
+        expression: Arc<str>,
+        message: Arc<str>,
+    },
     #[error("gateway receiver is closed")]
     GatewayClosed,
     #[error("memory maintenance failed: {0}")]
@@ -21,44 +27,55 @@ pub enum CronError {
     Storage(Arc<str>),
 }
 
+/// Absolute cron-expression schedule. The expression is the canonical source
+/// of truth — there is no mutable "next due" field. Firing decisions are made
+/// by comparing the most recent scheduled instant against `CronTask::last_fired_unix`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CronSchedule {
-    pub interval_seconds: u64,
-    pub next_due_unix: u64,
+    pub expression: Arc<str>,
 }
 
 impl CronSchedule {
-    pub fn every_hours(interval_hours: u64, next_due_unix: u64) -> Result<Self, CronError> {
-        let interval_seconds = interval_hours
-            .checked_mul(60 * 60)
-            .ok_or(CronError::InvalidInterval)?;
-        Self::every_seconds(interval_seconds, next_due_unix)
+    pub fn new(expression: impl Into<Arc<str>>) -> Result<Self, CronError> {
+        let expression = expression.into();
+        let schedule = Self { expression };
+        schedule.parse()?;
+        Ok(schedule)
     }
 
-    pub fn every_seconds(interval_seconds: u64, next_due_unix: u64) -> Result<Self, CronError> {
-        if interval_seconds == 0 {
-            return Err(CronError::InvalidInterval);
-        }
-        Ok(Self {
-            interval_seconds,
-            next_due_unix,
+    fn parse(&self) -> Result<Cron, CronError> {
+        Cron::from_str(self.expression.as_ref()).map_err(|err| CronError::InvalidExpression {
+            expression: Arc::clone(&self.expression),
+            message: Arc::from(err.to_string()),
         })
     }
 
-    fn is_due(&self, now_unix: u64) -> bool {
-        self.next_due_unix <= now_unix
-    }
-
-    fn advance_after(&mut self, now_unix: u64) {
-        while self.next_due_unix <= now_unix {
-            let next = self.next_due_unix.saturating_add(self.interval_seconds);
-            if next == self.next_due_unix {
-                self.next_due_unix = now_unix.saturating_add(self.interval_seconds);
-                break;
-            }
-            self.next_due_unix = next;
+    /// Most recent scheduled instant at or before `now`. Returns `None` if the
+    /// expression has no occurrence in the year preceding `now`.
+    pub fn previous_fire_unix(&self, now_unix: u64) -> Result<Option<u64>, CronError> {
+        let cron = self.parse()?;
+        let now = unix_to_utc(now_unix)?;
+        match cron.find_previous_occurrence(&now, true) {
+            Ok(dt) => Ok(Some(dt.timestamp().max(0) as u64)),
+            Err(_) => Ok(None),
         }
     }
+
+    /// Next scheduled instant strictly after `now`.
+    pub fn next_fire_unix(&self, now_unix: u64) -> Result<Option<u64>, CronError> {
+        let cron = self.parse()?;
+        let now = unix_to_utc(now_unix)?;
+        match cron.find_next_occurrence(&now, false) {
+            Ok(dt) => Ok(Some(dt.timestamp().max(0) as u64)),
+            Err(_) => Ok(None),
+        }
+    }
+}
+
+fn unix_to_utc(unix: u64) -> Result<DateTime<Utc>, CronError> {
+    Utc.timestamp_opt(unix as i64, 0)
+        .single()
+        .ok_or_else(|| CronError::Storage(Arc::from(format!("invalid unix timestamp {unix}"))))
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -75,6 +92,11 @@ pub struct CronTask {
     pub retry_state: CronRetryState,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// Unix timestamp of the most recent scheduled tick we have already
+    /// dispatched. The scheduler will re-fire only after the cron expression
+    /// produces a new occurrence strictly greater than this value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fired_unix: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -126,6 +148,7 @@ impl CronTask {
             retry: CronRetryPolicy::default(),
             retry_state: CronRetryState::default(),
             enabled: true,
+            last_fired_unix: None,
         }
     }
 
@@ -152,19 +175,23 @@ impl CronTask {
         }
     }
 
-    fn is_due(&self, now_unix: u64) -> bool {
-        match self.retry_state.next_retry_unix {
-            Some(next_retry) => next_retry <= now_unix,
-            None => self.schedule.is_due(now_unix),
+    fn is_due(&self, now_unix: u64) -> Result<bool, CronError> {
+        if let Some(next_retry) = self.retry_state.next_retry_unix {
+            return Ok(next_retry <= now_unix);
         }
+        let Some(previous) = self.schedule.previous_fire_unix(now_unix)? else {
+            return Ok(false);
+        };
+        Ok(previous > self.last_fired_unix.unwrap_or(0))
     }
 
-    fn mark_success(&mut self, now_unix: u64) {
+    fn mark_success(&mut self, now_unix: u64) -> Result<(), CronError> {
         self.retry_state = CronRetryState::default();
-        self.schedule.advance_after(now_unix);
+        self.last_fired_unix = Some(self.fire_tick(now_unix)?);
+        Ok(())
     }
 
-    fn mark_failure(&mut self, now_unix: u64, error: impl Into<Arc<str>>) {
+    fn mark_failure(&mut self, now_unix: u64, error: impl Into<Arc<str>>) -> Result<(), CronError> {
         self.retry_state.consecutive_failures =
             self.retry_state.consecutive_failures.saturating_add(1);
         self.retry_state.last_error = Some(error.into());
@@ -177,8 +204,16 @@ impl CronTask {
         } else {
             self.retry_state.consecutive_failures = 0;
             self.retry_state.next_retry_unix = None;
-            self.schedule.advance_after(now_unix);
+            self.last_fired_unix = Some(self.fire_tick(now_unix)?);
         }
+        Ok(())
+    }
+
+    fn fire_tick(&self, now_unix: u64) -> Result<u64, CronError> {
+        Ok(self
+            .schedule
+            .previous_fire_unix(now_unix)?
+            .unwrap_or(now_unix))
     }
 }
 
@@ -203,6 +238,8 @@ pub struct MemoryMaintenanceCron {
     pub schedule: CronSchedule,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fired_unix: Option<u64>,
 }
 
 impl MemoryMaintenanceCron {
@@ -218,6 +255,7 @@ impl MemoryMaintenanceCron {
             request,
             schedule,
             enabled: true,
+            last_fired_unix: None,
         }
     }
 
@@ -226,11 +264,17 @@ impl MemoryMaintenanceCron {
         now_unix: u64,
         manager: &MemoryManager,
     ) -> Result<Option<ReflectionReport>, CronError> {
-        if !self.enabled || !self.schedule.is_due(now_unix) {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let Some(previous) = self.schedule.previous_fire_unix(now_unix)? else {
+            return Ok(None);
+        };
+        if previous <= self.last_fired_unix.unwrap_or(0) {
             return Ok(None);
         }
         let report = manager.reflect(&self.caller, self.request.clone()).await?;
-        self.schedule.advance_after(now_unix);
+        self.last_fired_unix = Some(previous);
         Ok(Some(report))
     }
 }
@@ -259,27 +303,24 @@ impl CronScheduler {
         self.tasks.sort_by(|left, right| left.id.cmp(&right.id));
     }
 
-    pub fn due_invocations(&self, now_unix: u64) -> Vec<CronInvocation> {
-        self.tasks
-            .iter()
-            .filter(|task| task.enabled && task.is_due(now_unix))
-            .map(|task| CronInvocation {
-                task_id: Arc::clone(&task.id),
-                envelope: task.to_envelope(),
-            })
-            .collect()
+    pub fn due_invocations(&self, now_unix: u64) -> Result<Vec<CronInvocation>, CronError> {
+        let mut due = Vec::new();
+        for task in &self.tasks {
+            if !task.enabled {
+                continue;
+            }
+            if task.is_due(now_unix)? {
+                due.push(CronInvocation {
+                    task_id: Arc::clone(&task.id),
+                    envelope: task.to_envelope(),
+                });
+            }
+        }
+        Ok(due)
     }
 
     pub fn record_success(&mut self, task_id: &str, now_unix: u64) -> Result<(), CronError> {
-        let task = self
-            .tasks
-            .iter_mut()
-            .find(|task| task.id.as_ref() == task_id)
-            .ok_or_else(|| {
-                CronError::Storage(Arc::from(format!("unknown cron task '{task_id}'")))
-            })?;
-        task.mark_success(now_unix);
-        Ok(())
+        self.task_mut(task_id)?.mark_success(now_unix)
     }
 
     pub fn record_failure(
@@ -288,15 +329,14 @@ impl CronScheduler {
         now_unix: u64,
         error: impl Into<Arc<str>>,
     ) -> Result<(), CronError> {
-        let task = self
-            .tasks
+        self.task_mut(task_id)?.mark_failure(now_unix, error)
+    }
+
+    fn task_mut(&mut self, task_id: &str) -> Result<&mut CronTask, CronError> {
+        self.tasks
             .iter_mut()
             .find(|task| task.id.as_ref() == task_id)
-            .ok_or_else(|| {
-                CronError::Storage(Arc::from(format!("unknown cron task '{task_id}'")))
-            })?;
-        task.mark_failure(now_unix, error);
-        Ok(())
+            .ok_or_else(|| CronError::Storage(Arc::from(format!("unknown cron task '{task_id}'"))))
     }
 
     pub async fn enqueue_due(
@@ -306,14 +346,14 @@ impl CronScheduler {
     ) -> Result<usize, CronError> {
         let mut sent = 0;
         for task in &mut self.tasks {
-            if !task.enabled || !task.schedule.is_due(now_unix) {
+            if !task.enabled || !task.is_due(now_unix)? {
                 continue;
             }
             gateway
                 .send(task.to_envelope())
                 .await
                 .map_err(|_| CronError::GatewayClosed)?;
-            task.schedule.advance_after(now_unix);
+            task.mark_success(now_unix)?;
             sent += 1;
         }
         Ok(sent)
@@ -397,4 +437,79 @@ fn toml_de_error(err: toml::de::Error) -> CronError {
 
 fn toml_ser_error(err: toml::ser::Error) -> CronError {
     CronError::Storage(Arc::from(err.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(expression: &str) -> CronTask {
+        CronTask::new(
+            "test",
+            ChannelId::new("tui"),
+            ConversationId::new("default"),
+            "hello",
+            CronSchedule::new(expression).expect("valid expression"),
+        )
+    }
+
+    fn unix(year: i32, month: u32, day: u32, hour: u32, min: u32) -> u64 {
+        Utc.with_ymd_and_hms(year, month, day, hour, min, 0)
+            .single()
+            .expect("valid datetime")
+            .timestamp() as u64
+    }
+
+    #[test]
+    fn schedule_rejects_invalid_expression() {
+        let err = CronSchedule::new("not a cron").unwrap_err();
+        assert!(matches!(err, CronError::InvalidExpression { .. }));
+    }
+
+    #[test]
+    fn previous_and_next_fire_are_absolute() {
+        let schedule = CronSchedule::new("17 2 * * *").unwrap();
+        let now = unix(2026, 5, 20, 10, 0);
+        let prev = schedule.previous_fire_unix(now).unwrap().unwrap();
+        assert_eq!(prev, unix(2026, 5, 20, 2, 17));
+        let next = schedule.next_fire_unix(now).unwrap().unwrap();
+        assert_eq!(next, unix(2026, 5, 21, 2, 17));
+    }
+
+    #[test]
+    fn task_is_due_only_once_per_scheduled_tick() {
+        let mut t = task("17 2 * * *");
+        let now = unix(2026, 5, 20, 2, 18);
+        assert!(t.is_due(now).unwrap());
+        t.mark_success(now).unwrap();
+        assert_eq!(t.last_fired_unix, Some(unix(2026, 5, 20, 2, 17)));
+
+        // Still inside the same tick — must not refire.
+        assert!(!t.is_due(unix(2026, 5, 20, 2, 30)).unwrap());
+        assert!(!t.is_due(unix(2026, 5, 20, 23, 59)).unwrap());
+        // Next day, after 02:17 — fires again.
+        assert!(t.is_due(unix(2026, 5, 21, 2, 17)).unwrap());
+    }
+
+    #[test]
+    fn retry_backoff_overrides_schedule() {
+        let mut t = task("17 2 * * *");
+        let fire_now = unix(2026, 5, 20, 2, 18);
+        t.mark_failure(fire_now, "boom").unwrap();
+        assert!(!t.is_due(fire_now + 30).unwrap());
+        let retry_at = fire_now + t.retry.backoff_seconds;
+        assert!(t.is_due(retry_at).unwrap());
+    }
+
+    #[test]
+    fn retry_exhaustion_skips_to_next_tick() {
+        let mut t = task("17 2 * * *");
+        let fire_now = unix(2026, 5, 20, 2, 18);
+        for _ in 0..=t.retry.max_retries {
+            t.mark_failure(fire_now, "boom").unwrap();
+        }
+        assert_eq!(t.retry_state.consecutive_failures, 0);
+        assert_eq!(t.last_fired_unix, Some(unix(2026, 5, 20, 2, 17)));
+        assert!(!t.is_due(fire_now + 3600).unwrap());
+    }
 }

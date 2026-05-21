@@ -40,14 +40,11 @@ struct CronCreateArgs {
     conversation_id: String,
     /// User-side prompt the scheduler will replay each tick.
     prompt: String,
-    /// One of `interval_seconds`, `interval_hours`, or `interval_days` is
-    /// required.
-    #[serde(default)]
-    interval_seconds: Option<u64>,
-    #[serde(default)]
-    interval_hours: Option<u64>,
-    #[serde(default)]
-    interval_days: Option<u64>,
+    /// Standard 5-field cron expression (`min hour day-of-month month
+    /// day-of-week`), evaluated in UTC. The expression is the absolute source
+    /// of truth — the scheduler fires whenever wall-clock time crosses a
+    /// matching instant, with no stored "next due" cursor.
+    expression: String,
 }
 
 #[async_trait]
@@ -58,13 +55,14 @@ impl Tool for CronCreatorTool {
             description: Arc::from(
                 "Schedule a recurring AgentOS task. Persists a TOML file under \
                  workspace/crons/<id>.toml; the gateway scheduler picks it up \
-                 on its next cycle and replays the supplied prompt at the \
-                 chosen interval. Use this whenever a user asks to schedule, \
-                 automate, or repeat a chat instruction.",
+                 on its next cycle and replays the supplied prompt whenever \
+                 wall-clock time matches the cron expression. Use this \
+                 whenever a user asks to schedule, automate, or repeat a chat \
+                 instruction.",
             ),
             input_schema: json!({
                 "type": "object",
-                "required": ["id", "channel_id", "conversation_id", "prompt"],
+                "required": ["id", "channel_id", "conversation_id", "prompt", "expression"],
                 "properties": {
                     "id": {
                         "type": "string",
@@ -82,9 +80,10 @@ impl Tool for CronCreatorTool {
                         "type": "string",
                         "description": "The user-side message the scheduler replays each tick."
                     },
-                    "interval_seconds": { "type": "integer", "minimum": 1 },
-                    "interval_hours": { "type": "integer", "minimum": 1 },
-                    "interval_days": { "type": "integer", "minimum": 1 }
+                    "expression": {
+                        "type": "string",
+                        "description": "5-field cron expression in UTC: 'min hour day-of-month month day-of-week'. Example: '17 2 * * *' for 02:17 daily."
+                    }
                 }
             }),
             requires_isolation: false,
@@ -96,41 +95,7 @@ impl Tool for CronCreatorTool {
             .map_err(|err| ToolError::Failed(err.to_string().into()))?;
         let start = Instant::now();
 
-        let interval_seconds = match (
-            parsed.interval_seconds,
-            parsed.interval_hours,
-            parsed.interval_days,
-        ) {
-            (Some(s), None, None) => s,
-            (None, Some(h), None) => h.checked_mul(3_600).ok_or_else(|| {
-                ToolError::Failed(Arc::from("interval_hours overflows u64 seconds"))
-            })?,
-            (None, None, Some(d)) => d.checked_mul(86_400).ok_or_else(|| {
-                ToolError::Failed(Arc::from("interval_days overflows u64 seconds"))
-            })?,
-            (None, None, None) => {
-                return Err(ToolError::Failed(Arc::from(
-                    "one of interval_seconds, interval_hours, or interval_days is required",
-                )));
-            }
-            _ => {
-                return Err(ToolError::Failed(Arc::from(
-                    "only one of interval_seconds, interval_hours, interval_days may be set",
-                )));
-            }
-        };
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .map_err(|err| ToolError::Failed(Arc::from(err.to_string())))?;
-        // Always fire after one full interval — past timestamps would cause
-        // the scheduler to fire immediately on the next tick, which is
-        // surprising. Operators can edit the TOML by hand if they want a
-        // specific first-run wall-clock time.
-        let next_due_unix = now.saturating_add(interval_seconds);
-
-        let schedule = CronSchedule::every_seconds(interval_seconds, next_due_unix)
+        let schedule = CronSchedule::new(parsed.expression.as_str())
             .map_err(|err| ToolError::Failed(Arc::from(err.to_string())))?;
 
         let task = CronTask::new(
@@ -150,9 +115,9 @@ impl Tool for CronCreatorTool {
             .task_path(&task.id)
             .map_err(|err| ToolError::Failed(Arc::from(err.to_string())))?;
         let message = format!(
-            "created cron '{}' (every {}s, next at {next_due_unix}) at {}",
+            "created cron '{}' (schedule '{}') at {}",
             task.id,
-            interval_seconds,
+            task.schedule.expression,
             path.display()
         );
         let bytes_out = message.len() as u64;
@@ -183,8 +148,8 @@ impl Tool for CronListTool {
             name: Arc::from("cron_list"),
             description: Arc::from(
                 "Enumerate every persisted cron task (id, channel, conversation, \
-                 interval, next-due, enabled). Use this when the user asks which \
-                 crons exist or wants to confirm a previous schedule.",
+                 cron expression, next-fire, enabled). Use this when the user \
+                 asks which crons exist or wants to confirm a previous schedule.",
             ),
             input_schema: json!({
                 "type": "object",
@@ -202,17 +167,23 @@ impl Tool for CronListTool {
         let scheduler = store
             .load_scheduler()
             .map_err(|err| ToolError::Failed(Arc::from(err.to_string())))?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .map_err(|err| ToolError::Failed(Arc::from(err.to_string())))?;
         let summaries = scheduler
             .tasks()
             .iter()
             .map(|task| {
+                let next_fire_unix = task.schedule.next_fire_unix(now).ok().flatten();
                 json!({
                     "id": task.id.as_ref(),
                     "channel_id": task.channel_id.as_str(),
                     "conversation_id": task.conversation_id.as_str(),
                     "prompt": task.prompt.as_ref(),
-                    "interval_seconds": task.schedule.interval_seconds,
-                    "next_due_unix": task.schedule.next_due_unix,
+                    "expression": task.schedule.expression.as_ref(),
+                    "last_fired_unix": task.last_fired_unix,
+                    "next_fire_unix": next_fire_unix,
                     "enabled": task.enabled,
                 })
             })
@@ -303,7 +274,7 @@ mod tests {
             "channel_id": "telegram",
             "conversation_id": "5480467472",
             "prompt": "Summarize the day's notes.",
-            "interval_hours": 24,
+            "expression": "17 2 * * *",
         });
         let raw = RawValue::from_string(args.to_string()).unwrap();
         let result = CronCreatorTool
@@ -321,7 +292,8 @@ mod tests {
         assert_eq!(task.channel_id.as_str(), "telegram");
         assert_eq!(task.conversation_id.as_str(), "5480467472");
         assert_eq!(task.prompt.as_ref(), "Summarize the day's notes.");
-        assert_eq!(task.schedule.interval_seconds, 24 * 3600);
+        assert_eq!(task.schedule.expression.as_ref(), "17 2 * * *");
+        assert_eq!(task.last_fired_unix, None);
     }
 
     #[tokio::test]
@@ -332,7 +304,7 @@ mod tests {
             "channel_id": "telegram",
             "conversation_id": "1",
             "prompt": "hi",
-            "interval_seconds": 60,
+            "expression": "17 2 * * *",
             "root": "workspace",
         });
         let raw = RawValue::from_string(args.to_string()).unwrap();
@@ -345,8 +317,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cron_creator_tool_requires_an_interval() {
-        let _guard = CronDirGuard::new("cron-creator-no-interval");
+    async fn cron_creator_tool_requires_an_expression() {
+        let _guard = CronDirGuard::new("cron-creator-no-expression");
         let args = json!({
             "id": "x",
             "channel_id": "telegram",
@@ -359,19 +331,18 @@ mod tests {
             .await
             .unwrap_err();
         let ToolError::Failed(msg) = err;
-        assert!(msg.contains("interval_seconds"));
+        assert!(msg.contains("expression"));
     }
 
     #[tokio::test]
-    async fn cron_creator_tool_rejects_multiple_interval_fields() {
-        let _guard = CronDirGuard::new("cron-creator-many-intervals");
+    async fn cron_creator_tool_rejects_invalid_expression() {
+        let _guard = CronDirGuard::new("cron-creator-bad-expression");
         let args = json!({
             "id": "x",
             "channel_id": "telegram",
             "conversation_id": "1",
             "prompt": "hi",
-            "interval_hours": 1,
-            "interval_days": 1,
+            "expression": "not a cron",
         });
         let raw = RawValue::from_string(args.to_string()).unwrap();
         let err = CronCreatorTool
@@ -379,7 +350,7 @@ mod tests {
             .await
             .unwrap_err();
         let ToolError::Failed(msg) = err;
-        assert!(msg.contains("only one of"));
+        assert!(msg.contains("invalid cron expression"));
     }
 
     #[tokio::test]
@@ -390,7 +361,7 @@ mod tests {
             "channel_id": "telegram",
             "conversation_id": "1",
             "prompt": "hi",
-            "interval_seconds": 60,
+            "expression": "17 2 * * *",
         });
         let raw = RawValue::from_string(args.to_string()).unwrap();
         let err = CronCreatorTool
@@ -410,7 +381,7 @@ mod tests {
                 "channel_id": "telegram",
                 "conversation_id": "1",
                 "prompt": format!("ping-{id}"),
-                "interval_seconds": 3600,
+                "expression": "0 * * * *",
             });
             let raw = RawValue::from_string(args.to_string()).unwrap();
             CronCreatorTool
@@ -439,7 +410,7 @@ mod tests {
             "channel_id": "telegram",
             "conversation_id": "1",
             "prompt": "x",
-            "interval_seconds": 60,
+            "expression": "0 * * * *",
         });
         CronCreatorTool
             .call(

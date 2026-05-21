@@ -282,16 +282,19 @@ where
         .iter()
         .any(|task| task.id.as_ref() == task_id)
     {
+        // Wildcard expression so the smoke task is always due the moment the
+        // command runs — this is a one-shot manual verification of the
+        // cron -> envelope -> run path, not a real recurring schedule.
         scheduler.upsert_task(CronTask::new(
             task_id,
             channel.id(),
             ConversationId::new(chat_id),
             prompt,
-            CronSchedule::every_hours(24, now)?,
+            CronSchedule::new("* * * * *")?,
         ));
         store.save_scheduler(&scheduler)?;
     }
-    let Some(invocation) = scheduler.due_invocations(now).into_iter().next() else {
+    let Some(invocation) = scheduler.due_invocations(now)?.into_iter().next() else {
         return Err(format!("{run_id} did not enqueue").into());
     };
 

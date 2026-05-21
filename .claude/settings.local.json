@@ -6,7 +6,9 @@
       "Bash(cargo clippy *)",
       "Bash(cargo test *)",
       "Bash(cargo fmt *)",
-      "Bash(cargo semver-checks *)"
+      "Bash(cargo semver-checks *)",
+      "Bash(cargo info *)",
+      "Bash(python3 *)"
     ]
   }
 }

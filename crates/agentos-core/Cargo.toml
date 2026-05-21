@@ -10,6 +10,8 @@ agentos-interfaces.workspace = true
 agentos-llm.workspace = true
 agentos-proto.workspace = true
 async-trait.workspace = true
+chrono.workspace = true
+croner.workspace = true
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "http2", "json", "multipart"] }
 rusqlite.workspace = true

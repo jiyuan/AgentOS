@@ -359,15 +359,14 @@ pub fn format_crons(store: &CronStore) -> String {
     let id_width = tasks.iter().map(|task| task.id.len()).max().unwrap_or(0);
     let mut out = format!("Scheduled crons ({}):\n", tasks.len());
     for task in tasks {
-        let interval = format_duration_seconds(task.schedule.interval_seconds);
-        let next_unix = task
-            .retry_state
-            .next_retry_unix
-            .unwrap_or(task.schedule.next_due_unix);
-        let when = if next_unix <= now {
-            "due now".to_owned()
-        } else {
-            format!("in {}", format_duration_seconds(next_unix - now))
+        let next_unix = match task.retry_state.next_retry_unix {
+            Some(retry_at) => Some(retry_at),
+            None => task.schedule.next_fire_unix(now).ok().flatten(),
+        };
+        let when = match next_unix {
+            Some(next) if next <= now => "due now".to_owned(),
+            Some(next) => format!("in {}", format_duration_seconds(next - now)),
+            None => "no upcoming fire".to_owned(),
         };
         let status = if !task.enabled {
             "disabled"
@@ -377,9 +376,9 @@ pub fn format_crons(store: &CronStore) -> String {
             "enabled"
         };
         out.push_str(&format!(
-            "  {:<width$}  every {}, next {}, {}\n",
+            "  {:<width$}  cron '{}', next {}, {}\n",
             task.id.as_ref(),
-            interval,
+            task.schedule.expression.as_ref(),
             when,
             status,
             width = id_width,
