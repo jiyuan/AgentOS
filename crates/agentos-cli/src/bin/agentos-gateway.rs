@@ -21,6 +21,11 @@ const DEFAULT_PID_PATH: &str = "workspace/run/agentos-gateway.pid";
 const DEFAULT_LOG_PATH: &str = "logs/agentos-gateway.log";
 const OWNER_TOKEN_ENV: &str = "AGENTOS_GATEWAY_OWNER_TOKEN";
 
+/// How often the channel idle tick scans the cron store. Cron expressions
+/// have one-minute resolution, so a 30s scan never misses a tick while
+/// avoiding a re-read of every TOML on each one-second idle poll.
+const CRON_SCAN_INTERVAL_SECS: u64 = 30;
+
 #[cfg(unix)]
 unsafe extern "C" {
     fn setsid() -> i32;
@@ -575,6 +580,7 @@ where
     let orchestrator_handle = runtime.orchestrator.strategy_handle();
     let model_controller = runtime.model_controller.clone();
     let session_usage = SessionUsage::new();
+    let mut last_cron_scan: u64 = 0;
     log_line(config, &format!("{channel_name} gateway loop started"))?;
 
     loop {
@@ -588,6 +594,26 @@ where
             return Ok(());
         }
         let Some(mut input) = channel.receive().await else {
+            // Idle tick — nothing inbound, so this is the gateway's chance to
+            // drive the cron scheduler. Throttled to CRON_SCAN_INTERVAL_SECS
+            // since cron resolution is one minute.
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if now.saturating_sub(last_cron_scan) >= CRON_SCAN_INTERVAL_SECS {
+                last_cron_scan = now;
+                fire_due_crons(
+                    config,
+                    &channel,
+                    channel_name,
+                    &cron_store,
+                    &gateway_service,
+                    &session_usage,
+                    now,
+                )
+                .await?;
+            }
             thread::sleep(Duration::from_secs(1));
             continue;
         };
@@ -757,6 +783,113 @@ where
             }
         }
     }
+}
+
+/// Replay every cron task that is due and bound to this channel as a synthetic
+/// envelope through the normal run path, then persist the updated fire/retry
+/// bookkeeping so the task does not re-fire on the next scan.
+///
+/// Cron failures are logged and swallowed — a broken task must never take down
+/// the channel gateway loop. Each channel gateway only fires tasks whose
+/// `channel_id` matches its own, so a multi-channel deployment neither
+/// double-fires a task nor delivers it through the wrong transport. (A task
+/// bound to a channel with no running persistent gateway therefore never
+/// fires.)
+async fn fire_due_crons<C>(
+    config: &ServiceConfig,
+    channel: &C,
+    channel_name: &str,
+    cron_store: &CronStore,
+    gateway_service: &GatewayService<'_>,
+    session_usage: &SessionUsage,
+    now: u64,
+) -> Result<(), String>
+where
+    C: Channel,
+{
+    let mut scheduler = match cron_store.load_scheduler() {
+        Ok(scheduler) => scheduler,
+        Err(err) => {
+            log_line(config, &format!("{channel_name} cron load failed: {err}"))?;
+            return Ok(());
+        }
+    };
+    let due = match scheduler.due_invocations(now) {
+        Ok(due) => due,
+        Err(err) => {
+            log_line(config, &format!("{channel_name} cron scan failed: {err}"))?;
+            return Ok(());
+        }
+    };
+    for invocation in due {
+        if invocation.envelope.channel_id.as_str() != channel_name {
+            continue;
+        }
+        let task_id = invocation.task_id.clone();
+        log_line(
+            config,
+            &format!("{channel_name} cron '{task_id}' due; dispatching"),
+        )?;
+        let bookkeeping = match gateway_service
+            .run_envelope(
+                channel,
+                invocation.envelope,
+                RunId::new(format!("cron-{task_id}")),
+            )
+            .await
+        {
+            Ok(GatewayRun::Finished { state, .. }) => {
+                session_usage.record_run(&state.usage);
+                log_trace(config, &state)?;
+                scheduler.record_success(&task_id, now)
+            }
+            Ok(GatewayRun::Paused { .. }) => {
+                log_line(
+                    config,
+                    &format!(
+                        "{channel_name} cron '{task_id}' paused for approval; \
+                         no interactive user — recording as failure"
+                    ),
+                )?;
+                scheduler.record_failure(
+                    &task_id,
+                    now,
+                    Arc::from("cron run paused awaiting approval"),
+                )
+            }
+            Err(err) => {
+                log_line(
+                    config,
+                    &format!("{channel_name} cron '{task_id}' failed: {err}"),
+                )?;
+                scheduler.record_failure(&task_id, now, Arc::from(err.to_string()))
+            }
+        };
+        if let Err(err) = bookkeeping {
+            log_line(
+                config,
+                &format!("{channel_name} cron '{task_id}' bookkeeping failed: {err}"),
+            )?;
+            continue;
+        }
+        // Persist only the task we touched — writing the whole scheduler back
+        // would clobber another channel gateway's concurrent updates.
+        match scheduler.tasks().iter().find(|task| task.id == task_id) {
+            Some(task) => {
+                if let Err(err) = cron_store.save_task(task) {
+                    log_line(
+                        config,
+                        &format!("{channel_name} cron '{task_id}' persist failed: {err}"),
+                    )?;
+                }
+            }
+            None => log_line(
+                config,
+                &format!("{channel_name} cron '{task_id}' vanished before persist"),
+            )?,
+        }
+    }
+    Ok(())
 }
 
 fn persistent_channels(config: &WorkspaceConfig) -> Result<Vec<&'static str>, String> {
