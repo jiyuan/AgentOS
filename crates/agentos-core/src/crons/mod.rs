@@ -95,6 +95,12 @@ pub struct CronTask {
     /// Unix timestamp of the most recent scheduled tick we have already
     /// dispatched. The scheduler will re-fire only after the cron expression
     /// produces a new occurrence strictly greater than this value.
+    ///
+    /// `CronCreatorTool` anchors this at creation to the most recent instant
+    /// at or before "now", so a freshly created task never back-fires for
+    /// occurrences that predate it. `None` is treated as the epoch — only
+    /// tasks meant to fire on first sight (e.g. the cron smoke test, which
+    /// builds `CronTask` directly) should leave it unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_fired_unix: Option<u64>,
 }
@@ -270,7 +276,13 @@ impl MemoryMaintenanceCron {
         let Some(previous) = self.schedule.previous_fire_unix(now_unix)? else {
             return Ok(None);
         };
-        if previous <= self.last_fired_unix.unwrap_or(0) {
+        // First sight: anchor to the current tick rather than back-firing for
+        // every occurrence that predates the cron being seen.
+        let Some(last_fired) = self.last_fired_unix else {
+            self.last_fired_unix = Some(previous);
+            return Ok(None);
+        };
+        if previous <= last_fired {
             return Ok(None);
         }
         let report = manager.reflect(&self.caller, self.request.clone()).await?;
@@ -301,6 +313,30 @@ impl CronScheduler {
             self.tasks.push(task);
         }
         self.tasks.sort_by(|left, right| left.id.cmp(&right.id));
+    }
+
+    /// Anchor every task that has never been dispatched (`last_fired_unix` is
+    /// `None`) to `now`, recording the most recent scheduled instant at or
+    /// before it as already handled. Returns the ids of the tasks that were
+    /// changed so the caller can persist them.
+    ///
+    /// `CronCreatorTool` already anchors the tasks it creates; this is the
+    /// safety net for tasks that reach the scheduler another way — a
+    /// hand-written TOML, or a file written before anchoring existed — so they
+    /// fire on their next scheduled instant instead of back-firing for every
+    /// occurrence that predates the scheduler seeing them.
+    pub fn anchor_unfired(&mut self, now_unix: u64) -> Result<Vec<Arc<str>>, CronError> {
+        let mut anchored = Vec::new();
+        for task in &mut self.tasks {
+            if task.last_fired_unix.is_some() {
+                continue;
+            }
+            if let Some(previous) = task.schedule.previous_fire_unix(now_unix)? {
+                task.last_fired_unix = Some(previous);
+                anchored.push(Arc::clone(&task.id));
+            }
+        }
+        Ok(anchored)
     }
 
     pub fn due_invocations(&self, now_unix: u64) -> Result<Vec<CronInvocation>, CronError> {
@@ -511,5 +547,114 @@ mod tests {
         assert_eq!(t.retry_state.consecutive_failures, 0);
         assert_eq!(t.last_fired_unix, Some(unix(2026, 5, 20, 2, 17)));
         assert!(!t.is_due(fire_now + 3600).unwrap());
+    }
+
+    #[test]
+    fn persisted_task_fires_once_per_tick_across_reloads() {
+        // Mimic the gateway scheduler tick: load -> due_invocations -> run ->
+        // record_success -> save_task, repeated every 30s within one tick.
+        let dir = std::env::temp_dir().join(format!(
+            "agentos-cron-reload-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = CronStore::new(&dir);
+        store.save_task(&task("17 2 * * *")).unwrap();
+
+        let mut fires = 0;
+        for offset in 0..5u64 {
+            let now = unix(2026, 5, 21, 7, 17) + offset * 30;
+            let mut scheduler = store.load_scheduler().unwrap();
+            for invocation in scheduler.due_invocations(now).unwrap() {
+                fires += 1;
+                scheduler.record_success(&invocation.task_id, now).unwrap();
+                let fired = scheduler
+                    .tasks()
+                    .iter()
+                    .find(|t| t.id == invocation.task_id)
+                    .unwrap();
+                store.save_task(fired).unwrap();
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            fires, 1,
+            "task fired {fires} times across one scheduled tick"
+        );
+    }
+
+    #[test]
+    fn fired_task_round_trips_through_toml() {
+        let mut t = task("17 2 * * *");
+        t.mark_success(unix(2026, 5, 21, 7, 17)).unwrap();
+        assert_eq!(t.last_fired_unix, Some(unix(2026, 5, 21, 2, 17)));
+
+        let encoded = toml::to_string_pretty(&t).expect("serialize cron task");
+        let decoded: CronTask = toml::from_str(&encoded).expect("deserialize cron task");
+        assert_eq!(decoded, t, "toml round-trip dropped fire state:\n{encoded}");
+
+        // The reloaded task must not re-fire inside the same scheduled tick.
+        assert!(!decoded.is_due(unix(2026, 5, 21, 7, 47)).unwrap());
+    }
+
+    #[test]
+    fn anchor_unfired_stops_back_firing_on_first_sight() {
+        let mut scheduler = CronScheduler::new([task("17 2 * * *")]);
+        let now = unix(2026, 5, 21, 7, 17);
+        // An unanchored task would otherwise be due immediately.
+        assert!(!scheduler.due_invocations(now).unwrap().is_empty());
+
+        let anchored = scheduler.anchor_unfired(now).unwrap();
+        assert_eq!(anchored.len(), 1);
+        // Anchored: no longer back-fires for today's earlier tick...
+        assert!(scheduler.due_invocations(now).unwrap().is_empty());
+        // ...but still fires at the next genuine occurrence.
+        assert!(!scheduler
+            .due_invocations(unix(2026, 5, 22, 2, 17))
+            .unwrap()
+            .is_empty());
+        // Idempotent: an already-anchored task is left untouched.
+        assert!(scheduler
+            .anchor_unfired(unix(2026, 5, 22, 9, 0))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn memory_maintenance_cron_anchors_on_first_sight() {
+        use crate::memory::InMemoryMemory;
+        use agentos_proto::{AgentId, TaskId};
+
+        let manager = MemoryManager::new(Arc::new(InMemoryMemory::default()));
+        let caller = MemoryCaller {
+            agent_id: AgentId::new("alice"),
+            task_id: TaskId::new("t1"),
+            conversation_id: ConversationId::new("c1"),
+            user_id: None,
+            allowed_shared_domains: Vec::new(),
+            audit_read_access: false,
+        };
+        let mut cron = MemoryMaintenanceCron::new(
+            "mem-maint",
+            caller.clone(),
+            ReflectionRequest::for_conversation(&caller),
+            CronSchedule::new("17 2 * * *").unwrap(),
+        );
+
+        // First sight anchors to the current tick without running reflection.
+        let report = cron
+            .run_due(unix(2026, 5, 21, 7, 17), &manager)
+            .await
+            .unwrap();
+        assert!(report.is_none(), "memory cron back-fired on first sight");
+        assert_eq!(cron.last_fired_unix, Some(unix(2026, 5, 21, 2, 17)));
+
+        // Still within the same tick — must not run.
+        assert!(cron
+            .run_due(unix(2026, 5, 21, 23, 0), &manager)
+            .await
+            .unwrap()
+            .is_none());
     }
 }

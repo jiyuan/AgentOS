@@ -814,6 +814,25 @@ where
             return Ok(());
         }
     };
+    // Anchor any task seen for the first time so it fires on its next
+    // scheduled instant instead of back-firing on discovery, then persist the
+    // anchor so the next scan agrees. Anchor values are tick-aligned and
+    // therefore identical across concurrent channel gateways.
+    match scheduler.anchor_unfired(now) {
+        Ok(anchored) => {
+            for id in anchored {
+                if let Some(task) = scheduler.tasks().iter().find(|task| task.id == id) {
+                    if let Err(err) = cron_store.save_task(task) {
+                        log_line(
+                            config,
+                            &format!("{channel_name} cron '{id}' anchor persist failed: {err}"),
+                        )?;
+                    }
+                }
+            }
+        }
+        Err(err) => log_line(config, &format!("{channel_name} cron anchor failed: {err}"))?,
+    }
     let due = match scheduler.due_invocations(now) {
         Ok(due) => due,
         Err(err) => {

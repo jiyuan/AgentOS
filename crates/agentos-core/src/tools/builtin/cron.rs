@@ -98,13 +98,27 @@ impl Tool for CronCreatorTool {
         let schedule = CronSchedule::new(parsed.expression.as_str())
             .map_err(|err| ToolError::Failed(Arc::from(err.to_string())))?;
 
-        let task = CronTask::new(
+        let mut task = CronTask::new(
             parsed.id.as_str(),
             ChannelId::new(parsed.channel_id.as_str()),
             ConversationId::new(parsed.conversation_id.as_str()),
             parsed.prompt.as_str(),
             schedule,
         );
+
+        // Anchor the task to creation time. Without this, `last_fired_unix`
+        // stays `None` and `is_due` compares against `0`, so every past
+        // occurrence reads as pending: a task created at 14:00 with a
+        // `17 2 * * *` schedule would fire on the scheduler's very next tick
+        // instead of at 02:17 the following day.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .map_err(|err| ToolError::Failed(Arc::from(err.to_string())))?;
+        task.last_fired_unix = task
+            .schedule
+            .previous_fire_unix(now)
+            .map_err(|err| ToolError::Failed(Arc::from(err.to_string())))?;
 
         let store = CronStore::new(cron_root_for_tests().unwrap_or_else(default_cron_dir));
         store
@@ -293,7 +307,45 @@ mod tests {
         assert_eq!(task.conversation_id.as_str(), "5480467472");
         assert_eq!(task.prompt.as_ref(), "Summarize the day's notes.");
         assert_eq!(task.schedule.expression.as_ref(), "17 2 * * *");
-        assert_eq!(task.last_fired_unix, None);
+        // Anchored at creation so the task does not fire before its schedule.
+        assert!(task.last_fired_unix.is_some());
+    }
+
+    #[tokio::test]
+    async fn cron_creator_tool_anchors_task_so_it_does_not_fire_immediately() {
+        use crate::crons::CronScheduler;
+        let guard = CronDirGuard::new("cron-creator-anchored");
+        let args = json!({
+            "id": "anchored",
+            "channel_id": "telegram",
+            "conversation_id": "1",
+            "prompt": "audit",
+            "expression": "17 2 * * *",
+        });
+        let raw = RawValue::from_string(args.to_string()).unwrap();
+        CronCreatorTool
+            .call(&tool_call("cron_create", "create"), &raw)
+            .await
+            .unwrap();
+
+        let body = std::fs::read_to_string(guard.dir.join("anchored.toml")).unwrap();
+        let task: CronTask = toml::from_str(&body).unwrap();
+        assert!(
+            task.last_fired_unix.is_some(),
+            "created task must be anchored"
+        );
+
+        // A task created "now" must not be due "now" — it waits for the next
+        // matching instant rather than back-firing for today's earlier tick.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let scheduler = CronScheduler::new([task]);
+        assert!(
+            scheduler.due_invocations(now).unwrap().is_empty(),
+            "freshly created cron fired immediately instead of waiting for its schedule",
+        );
     }
 
     #[tokio::test]
