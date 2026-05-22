@@ -36,9 +36,6 @@ mod tools_config;
 use tools_config::{build_parent_tools, subagent_memory_tool_enabled, subagent_policy};
 pub use tools_config::{phase5_policy, register_builtin_tool};
 
-const DEFAULT_SHELL_ALLOWLIST: [&str; 8] =
-    ["printf", "echo", "pwd", "ls", "find", "cat", "head", "tail"];
-
 #[derive(Debug, Error)]
 pub enum RuntimeError {
     #[error("runtime failed: {0}")]
@@ -258,6 +255,8 @@ impl AgentRuntime {
                 .with_task_workspace(task_workspace.clone())
                 .with_session(session.clone())
         });
+        let shell_allowlist =
+            ShellCommandAllowlist::new(workspace_config.guardrails.shell_allowlist.iter().cloned());
 
         Ok(Self {
             workspace_config,
@@ -274,7 +273,7 @@ impl AgentRuntime {
             task_workspace,
             pii_filter: PiiFilter,
             max_output_length: MaxOutputLength::new(64_000),
-            shell_allowlist: ShellCommandAllowlist::new(DEFAULT_SHELL_ALLOWLIST),
+            shell_allowlist,
         })
     }
 
@@ -553,7 +552,7 @@ pub fn build_subagents(
                 )
                 .with_tool_guardrail(
                     "ShellCommandAllowlist",
-                    ShellCommandAllowlist::new(DEFAULT_SHELL_ALLOWLIST),
+                    ShellCommandAllowlist::new(config.guardrails.shell_allowlist.iter().cloned()),
                 );
         }
         // The skill-bundle write boundary is a hard permission gate, not an
@@ -704,7 +703,9 @@ fn main_max_turns(config: &WorkspaceConfig) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{McpServerConfig, McpToolConfig, ResourceConfig, ResourceSection};
+    use crate::config::{
+        McpServerConfig, McpToolConfig, ResourceConfig, ResourceSection, DEFAULT_SHELL_ALLOWLIST,
+    };
     use agentos_interfaces::guardrail::{GuardrailOutcome, ToolGuardrail};
     use agentos_proto::{AgentId, RunId, ToolCall, ToolCallId};
     use serde_json::value::RawValue;

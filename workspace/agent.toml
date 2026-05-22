@@ -8,6 +8,13 @@ max_turns = 256
 default = "deny"
 allowlist = ["shell", "file", "cron_create", "cron_remove", "memory"]
 
+# Programs the shell tool guardrail accepts in a call's `command` field.
+# The first eight are read-only inspection commands (the built-in default);
+# `python3` is added so skill bundles (email-digest, rss-digest) can run
+# their bundled fetch scripts.
+[guardrails]
+shell_allowlist = ["printf", "echo", "pwd", "ls", "find", "cat", "head", "tail", "python3"]
+
 [memory]
 backend = "sqlite"
 default_domain = "general"
@@ -54,7 +61,7 @@ worker_path_env = "AGENTOS_TOOL_WORKER_PATH"
 priority = ["skills", "tools", "mcp", "llm"]
 
 [resources.skills]
-enabled = ["skill-creator", "web-research", "audit-skill"]
+enabled = ["skill-creator", "web-research", "audit-skill", "email-digest", "rss-digest", "fetch-arxiv-paper-list"]
 
 [resources.tools]
 enabled = ["file", "http", "memory", "shell", "skill_validate", "cron_create", "cron_list", "cron_remove"]

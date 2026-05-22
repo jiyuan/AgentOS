@@ -9,8 +9,8 @@ Do not claim tool results unless a tool was actually used.
 policy_id = "general"
 orchestrator = "builtin.max"
 model_tier = "medium"
-tools = ["http", "file", "memory", "skill_validate", "cron_create", "cron_list", "cron_remove"]
-skills = ["web-research", "skill-creator"]
+tools = ["http", "file", "memory", "shell", "skill_validate", "cron_create", "cron_list", "cron_remove"]
+skills = ["web-research", "skill-creator", "audit-skill", "email-digest", "rss-digest", "fetch-arxiv-paper-list"]
 memory_view = "shared_readonly"
 memory_domains = ["agentos"]
 memory_tools = ["read", "write"]

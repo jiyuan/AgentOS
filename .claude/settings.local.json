@@ -8,7 +8,11 @@
       "Bash(cargo fmt *)",
       "Bash(cargo semver-checks *)",
       "Bash(cargo info *)",
-      "Bash(python3 *)"
+      "Bash(python3 *)",
+      "Bash(sed -n '495,525p' crates/agentos-core/src/runtime/mod.rs)",
+      "Bash(sed -n '1,60p' crates/agentos-core/src/config/subagents.rs)",
+      "Bash(sed -n '/fn subagent_policy/,/^}/p' crates/agentos-core/src/runtime/mod.rs)",
+      "Bash(sed -n '225,265p' crates/agentos-core/src/approve/mod.rs)"
     ]
   }
 }

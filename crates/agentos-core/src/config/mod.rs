@@ -30,6 +30,7 @@ use subagents::{normalize_memory_tool, normalize_memory_view, subagent_metadata}
 pub struct WorkspaceConfig {
     pub agent: AgentConfig,
     pub policy: PolicyConfig,
+    pub guardrails: GuardrailsConfig,
     pub memory: MemoryConfig,
     pub channels: ChannelsConfig,
     pub isolation: IsolationConfig,
@@ -74,6 +75,33 @@ impl Default for PolicyConfig {
         Self {
             default: Arc::from("deny"),
             allowlist: Vec::new(),
+        }
+    }
+}
+
+/// Programs the shell tool guardrail accepts when `agent.toml` declares no
+/// `[guardrails]` section. Deliberately limited to read-only inspection
+/// commands; widen it explicitly through `[guardrails] shell_allowlist`.
+pub const DEFAULT_SHELL_ALLOWLIST: [&str; 8] =
+    ["printf", "echo", "pwd", "ls", "find", "cat", "head", "tail"];
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(default)]
+pub struct GuardrailsConfig {
+    /// Programs the shell tool guardrail permits in a call's `command` field.
+    /// Each entry is a bare program name — arguments belong in the structured
+    /// args array, not here. Defaults to `DEFAULT_SHELL_ALLOWLIST`.
+    pub shell_allowlist: Vec<Arc<str>>,
+}
+
+impl Default for GuardrailsConfig {
+    fn default() -> Self {
+        Self {
+            shell_allowlist: DEFAULT_SHELL_ALLOWLIST
+                .iter()
+                .copied()
+                .map(Arc::from)
+                .collect(),
         }
     }
 }
@@ -227,6 +255,9 @@ impl WorkspaceConfig {
             .orchestrator_templates
             .extend(load_suborch_files(config_dir)?);
         config.validate_policy().map_err(std::io::Error::other)?;
+        config
+            .validate_guardrails()
+            .map_err(std::io::Error::other)?;
         config.validate_channels().map_err(std::io::Error::other)?;
         config.validate_resources().map_err(std::io::Error::other)?;
         config.validate_subagents().map_err(std::io::Error::other)?;
@@ -261,6 +292,20 @@ impl WorkspaceConfig {
                 "unknown policy.default '{other}'; expected allow, ask_user, or deny"
             )),
         }
+    }
+
+    pub fn validate_guardrails(&self) -> Result<(), String> {
+        for command in &self.guardrails.shell_allowlist {
+            // The shell guardrail matches the `command` field against a bare
+            // program name; an entry carrying arguments could never match and
+            // is almost always an authoring mistake.
+            if command.split_whitespace().count() != 1 {
+                return Err(format!(
+                    "guardrails.shell_allowlist entry '{command}' must be a single bare program name with no arguments"
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn validate_channels(&self) -> Result<(), String> {
@@ -664,6 +709,9 @@ stages = [
         config.channels.telegram.mode = Arc::from("poll_once");
         config.resources.llm.enabled = vec![Arc::from("gpt-other")];
         assert!(config.validate_resources().is_err());
+
+        config.guardrails.shell_allowlist = vec![Arc::from("python3 fetch_emails.py")];
+        assert!(config.validate_guardrails().is_err());
     }
 
     #[test]
@@ -683,7 +731,17 @@ stages = [
                 Arc::from("skill-creator"),
                 Arc::from("web-research"),
                 Arc::from("audit-skill"),
+                Arc::from("email-digest"),
+                Arc::from("rss-digest"),
+                Arc::from("fetch-arxiv-paper-list"),
             ]
+        );
+        assert!(
+            config
+                .guardrails
+                .shell_allowlist
+                .contains(&Arc::from("python3")),
+            "repo agent.toml should grant python3 to the shell guardrail"
         );
         assert_eq!(
             config.resources.tools.enabled,
