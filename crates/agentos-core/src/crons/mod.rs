@@ -135,6 +135,25 @@ pub struct CronInvocation {
     pub envelope: Envelope,
 }
 
+/// Prepended to a cron's `prompt` when it is replayed as a run envelope.
+///
+/// Without it, a prompt phrased like a scheduling request ("At 2:17 AM every
+/// day, generate an audit…") reads to the model as "please set up a cron", so
+/// it calls `cron_create`/`cron_list` and answers with a summary of the
+/// schedule instead of doing the work. The directive pins the envelope as the
+/// *execution* of an already-registered task, not a request to schedule one.
+const CRON_EXECUTION_DIRECTIVE: &str = "\
+[SCHEDULED TASK — EXECUTE NOW]
+This message is an automated cron tick firing right now. The cron is already \
+registered; you are the run it triggers. Carry out the instruction below \
+immediately: call whatever tools and skills it needs and deliver the result \
+to this conversation. Do NOT call cron_create, cron_list, or cron_remove, and \
+do NOT merely describe, confirm, or summarize what the schedule would do. \
+Treat the text after \"Instruction:\" as the task to perform now.
+
+Instruction:
+";
+
 impl CronTask {
     pub fn new(
         id: impl Into<Arc<str>>,
@@ -176,7 +195,10 @@ impl CronTask {
             channel_id: self.channel_id.clone(),
             conversation_id: self.conversation_id.clone(),
             sender: Arc::clone(&self.sender),
-            message: Message::text(MessageRole::User, Arc::clone(&self.prompt)),
+            message: Message::text(
+                MessageRole::User,
+                Arc::from(format!("{CRON_EXECUTION_DIRECTIVE}{}", self.prompt)),
+            ),
             metadata,
         }
     }
@@ -510,6 +532,28 @@ mod tests {
         assert_eq!(prev, unix(2026, 5, 20, 2, 17));
         let next = schedule.next_fire_unix(now).unwrap().unwrap();
         assert_eq!(next, unix(2026, 5, 21, 2, 17));
+    }
+
+    #[test]
+    fn envelope_wraps_prompt_with_execution_directive() {
+        let envelope = task("17 2 * * *").to_envelope();
+        assert_eq!(
+            envelope.metadata.get("kind").and_then(Value::as_str),
+            Some("cron"),
+        );
+        let content = envelope.message.content.as_ref();
+        // The directive must mark the run as an execution, not a scheduling
+        // request — otherwise the model just describes the cron back.
+        assert!(
+            content.contains("EXECUTE NOW"),
+            "missing execution directive: {content}",
+        );
+        assert!(content.contains("Do NOT call cron_create"));
+        // The original prompt is still present, verbatim, for the model to act on.
+        assert!(
+            content.ends_with("hello"),
+            "directive dropped the original prompt: {content}",
+        );
     }
 
     #[test]
