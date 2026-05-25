@@ -43,35 +43,65 @@ Report these metrics every time:
 | Model invocations by provider/model | Gateway log lines containing `llm provider=`, `model=` |
 | Failed tasks with timestamps and details | Gateway log lines containing `"gateway run failed"`, `"resume failed"`, `"maximum turn count exceeded"`, `"guardrail"`, or `"approval denied"` |
 
-**Important: The actual trace and session JSONL files in this workspace do not contain `token_counts` or `usage` fields on most records.** The `content_bytes` field on `orchestrator_task_assigned` events provides plan output sizes only, not input token counts. The `python3` interpreter is not available via the shell allowlist. The `llm_token_usage` event (when present in session JSONL) is the only source of exact token data including `cache_read_tokens` and `cache_write_tokens`. All other token metrics must be **estimated** from visible text character counts unless exact fields are verified present.
+**Important: The actual trace and session JSONL files in this workspace do not contain `token_counts` or `usage` fields on most records.** The `content_bytes` field on `orchestrator_task_assigned` events provides plan output sizes only, not input token counts. The `llm_token_usage` event (when present in session JSONL) is the only source of exact token data including `cache_read_tokens` and `cache_write_tokens`. All other token metrics must be **estimated** from visible text character counts unless exact fields are verified present.
 
 ## Data Sources
 
-Read sources in this order until enough evidence exists:
+Read sources in this order until enough evidence exists. Every directory listing must filter by mtime (24-hour default), and every file read must pull only the tail — see [Temporal Filtering](#temporal-filtering) and [Incremental Retrieval](#incremental-retrieval) for the two equivalent execution paths.
 
-1. `file(operation="read", path="workspace/traces", include_metadata=true, modified_within_hours=24)`
-2. `file(operation="read", path="workspace/main/sessions", include_metadata=true, modified_within_hours=24)`
-3. `file(operation="read", path="logs", include_metadata=true, modified_within_hours=24)`
+1. List `workspace/traces` filtered to the last 24 hours.
+2. List `workspace/main/sessions` filtered to the last 24 hours.
+3. List `logs` filtered to the last 24 hours.
 
-Then for each recent file, read the tail:
+Then for each file returned by those listings, retrieve the tail only:
 
-4. Trace JSONL: `file(operation="read", path="<trace-jsonl>", max_bytes=65536, tail=true)`
-5. Session JSONL: `file(operation="read", path="<session-jsonl>", max_bytes=65536, tail=true)`
-6. Gateway log: `file(operation="read", path="<log-file>", max_bytes=65536, tail=true)` or `tail` command if available
+4. Trace JSONL: `tail -n 500 <trace-jsonl>` (preferred) or `file(... max_bytes=65536, tail=true)`.
+5. Session JSONL: `tail -n 500 <session-jsonl>` (preferred) or the file-tool tail fallback.
+6. Gateway log: `tail -n 500 <log-file>` (preferred) or the file-tool tail fallback.
+
+Files whose mtime falls outside the window must not appear in steps 4–6 at all.
 
 ## Temporal Filtering
 
-Only inspect files whose directory listing reports they were modified within the requested audit window. The default window is 24 hours, so pass `modified_within_hours=24` for directory listings.
+Filter files based on their last modification time and **exclude any file whose mtime is older than the audit window**. The default window is 24 hours, so any file not modified in the last 24 hours must be skipped entirely — do not open it, do not tail it, do not parse it.
 
-If the user requests a different window, convert it to hours and use that value for `modified_within_hours`.
+Two equivalent ways to enforce the cutoff, in order of preference:
 
-If a known directory has no files modified within the window, skip that source and mention it in the data source note.
+1. **File tool directory listing** (preferred): pass `modified_within_hours=24` so the listing returns only files within the window:
+
+   ```
+   file(operation="read", path="workspace/traces", include_metadata=true, modified_within_hours=24)
+   ```
+
+2. **Shell `find` with mtime** (fallback when the directory listing path is unavailable): `find` is in the shell allowlist; use `-mmin -1440` (minutes) for a 24-hour window:
+
+   ```
+   shell(command="find", args=["workspace/traces", "-type", "f", "-mmin", "-1440"])
+   ```
+
+If the user requests a different window, convert it to hours for `modified_within_hours` (or to minutes for `find -mmin`). If a known directory has no files inside the window, skip that source entirely and mention the omission in the data-source note. Never widen the window silently to "find something" — an empty window is a valid finding.
 
 ## Incremental Retrieval
 
-For file tool reads, use `tail=true` with `max_bytes=65536`.
+Large trace, session, and gateway log files must never be loaded in full. Read only the tail — the most recent entries — to keep latency bounded and to stay inside the bounded-evidence contract of this audit.
 
-If a returned file result says it was truncated, compute the audit from the returned tail sample and mention that the report is based on bounded recent evidence. Do not continue paging through large files unless the user explicitly asks for a forensic full-history audit.
+Two equivalent paths, in order of preference:
+
+1. **`tail` shell command** (preferred for large log files): `tail` is in the shell allowlist; pull only the last N lines (default 500 — adjust upward only if a metric is still under-evidenced):
+
+   ```
+   shell(command="tail", args=["-n", "500", "<path>"])
+   ```
+
+   For very large gateway logs, prefer `tail -n 500` over a byte-bounded read because line-aligned output is cheaper to parse and never produces a truncated leading JSON record.
+
+2. **File tool tail mode** (fallback when shell is unavailable or the file is small): `tail=true` with `max_bytes=65536`:
+
+   ```
+   file(operation="read", path="<path>", max_bytes=65536, tail=true)
+   ```
+
+If any retrieved sample is marked truncated, compute the audit from that bounded tail and state in the report that it is based on bounded recent evidence. Do not page backwards through history unless the user explicitly asks for a forensic full-history audit.
 
 ## Extraction Rules
 
@@ -151,12 +181,12 @@ Gateway log lines like `trace: run=1, plan=10, llm=10` provide a quick summary o
 
 ## Workflow
 
-1. List traces directory (`workspace/traces`) with `modified_within_hours=24`.
-2. List sessions directory (`workspace/main/sessions`) with `modified_within_hours=24`.
-3. List logs directory with `modified_within_hours=24`.
-4. Read the tail of each recent trace JSONL file (`max_bytes=65536, tail=true`).
-5. Read the tail of each recent session JSONL file (`max_bytes=65536, tail=true`).
-6. Read the tail of each recent log file.
+1. List traces directory (`workspace/traces`), filtered to mtime within the audit window (24h default). Drop any file outside the window.
+2. List sessions directory (`workspace/main/sessions`) under the same mtime filter.
+3. List logs directory under the same mtime filter.
+4. For each in-window trace JSONL file, `tail -n 500` to retrieve only the most recent records.
+5. For each in-window session JSONL file, `tail -n 500` (same rule).
+6. For each in-window gateway log file, `tail -n 500` (same rule). Never read the full file.
 7. Parse each line of the retrieved trace/session/log samples to extract metrics:
    - Count LLM spans for model calls.
    - Sum `llm_token_usage` events for exact token counts (including cache read/write).
@@ -274,4 +304,3 @@ Run `skill_validate("audit-skill")` after editing this skill. The validator chec
 - The `llm_token_usage` event, when present, is the only source of exact token data (including `cache_read_tokens` and `cache_write_tokens`). Its presence is inconsistent across sessions.
 - The `content_bytes` field on `orchestrator_task_assigned` events provides output/plan byte sizes (37–164 bytes for tool plans, up to ~4000 bytes for reply plans) but does not include any input token counts.
 - Cron job execution data may not be present in the gateway log; report zeros with a note when absent.
-- `python3` is not in the shell allowlist. The `scripts/token_counter.py` helper cannot be executed in the current environment.
