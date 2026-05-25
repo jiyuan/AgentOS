@@ -61,7 +61,7 @@ worker_path_env = "AGENTOS_TOOL_WORKER_PATH"
 priority = ["skills", "tools", "mcp", "llm"]
 
 [resources.skills]
-enabled = ["skill-creator", "web-research", "audit-skill", "email-digest", "rss-digest", "fetch-arxiv-paper-list"]
+enabled = ["skill-creator", "web-research", "audit-skill", "email-digest", "rss-digest", "fetch-arxiv-paper-list", "futu-news-search", "futu-stock-digest", "futu-comment-sentiment"]
 
 [resources.tools]
 enabled = ["file", "http", "memory", "shell", "skill_validate", "cron_create", "cron_list", "cron_remove"]
@@ -141,6 +141,23 @@ examples = [
 dispatch = "delegate"
 agent_id = "edit-subagent"
 policy_id = "edit"
+
+[[routing.rules]]
+domain = "quant"
+description = "Stock analysis, news search, community sentiment, and single-stock digests. Delegates to the quant-subagent which uses futu skills for public-information analysis."
+examples = [
+  "analyze NVDA stock",
+  "what's the latest news on Tencent",
+  "check TSLA community sentiment",
+  "give me a digest for Apple",
+  "search news for 美团",
+  "英伟达最近有什么新闻",
+  "特斯拉社区情绪怎么样",
+  "帮我分析一下腾讯",
+]
+dispatch = "delegate"
+agent_id = "quant-subagent"
+policy_id = "readonly-web"
 
 [routing.fallback]
 domain = "general"
