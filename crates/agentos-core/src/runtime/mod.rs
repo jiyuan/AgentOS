@@ -185,28 +185,19 @@ impl AgentRuntime {
         }
         let mcp_specs = register_configured_mcp(&mut tools, &workspace_config).await?;
         let model_controller = LlmModelController::new();
-        let resolved_workspace_root = absolutise(&paths.workspace_root);
-        std::env::set_var("AGENTOS_WORKSPACE_ROOT", &resolved_workspace_root);
+        // Pin `AGENTOS_HOME` to the absolute resolved workspace root so every
+        // downstream caller of `agentos_interfaces::agentos_home(None)` (tool
+        // implementations, slash commands, attachment store) resolves to the
+        // same anchor regardless of the process's CWD or ambient env.
+        //
         // Skill catalog must be loaded before sub-agents are built so sub-agent
         // MaxOrchestrators can hold a clone of it and dispatch skills (e.g.
-        // web-research, skill-creator).
-        //
-        // Resolve to an absolute path so the skills root is independent of
-        // the gateway process's CWD. If the gateway was launched with a
-        // relative --config (the default is `workspace/agent.toml`), then every
-        // later `fs::write`
-        // call resolves it against whatever CWD the gateway happened to
-        // inherit. The user looking at the workspace from a shell with a
-        // different CWD would then see an empty/missing directory while the
-        // tool reports success. Anchor on CWD-at-startup once and use that
-        // resolved absolute path everywhere downstream.
+        // web-research, skill-creator). Resolve to an absolute path so the
+        // skills root is independent of the gateway process's CWD.
+        let resolved_workspace_root = absolutise(&paths.workspace_root);
+        std::env::set_var("AGENTOS_HOME", &resolved_workspace_root);
         let resolved_skills_root = absolutise(&paths.skills_dir);
-        // Pin `AGENTOS_SKILLS_DIR` to the same absolute path the loader uses,
-        // so the `skill_create` tool's `default_skills_dir` resolves to the
-        // same directory regardless of the gateway process's CWD or ambient env.
-        std::env::set_var("AGENTOS_SKILLS_DIR", &resolved_skills_root);
         let resolved_cron_dir = absolutise(&paths.cron_dir);
-        std::env::set_var("AGENTOS_CRON_DIR", &resolved_cron_dir);
         tracing::info!(
             workspace_root = %resolved_workspace_root.display(),
             skills_root = %resolved_skills_root.display(),

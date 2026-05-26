@@ -17,8 +17,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const DEFAULT_PID_PATH: &str = "workspace/run/agentos-gateway.pid";
-const DEFAULT_LOG_PATH: &str = "logs/agentos-gateway.log";
+const DEFAULT_PID_RELPATH: &str = "workspace/run/agentos-gateway.pid";
+const DEFAULT_LOG_RELPATH: &str = "logs/agentos-gateway.log";
 const OWNER_TOKEN_ENV: &str = "AGENTOS_GATEWAY_OWNER_TOKEN";
 
 /// How often the channel idle tick scans the cron store. Cron expressions
@@ -33,6 +33,7 @@ unsafe extern "C" {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ServiceConfig {
+    home: PathBuf,
     pid_path: PathBuf,
     log_path: PathBuf,
     agent_config_path: Option<PathBuf>,
@@ -45,17 +46,14 @@ struct PidRecord {
     owner_token: Option<String>,
 }
 
-impl Default for ServiceConfig {
-    fn default() -> Self {
+impl ServiceConfig {
+    fn from_home(home: PathBuf) -> Self {
         Self {
-            pid_path: env::var_os("AGENTOS_GATEWAY_PID_PATH")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(DEFAULT_PID_PATH)),
-            log_path: env::var_os("AGENTOS_GATEWAY_LOG_PATH")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(DEFAULT_LOG_PATH)),
-            agent_config_path: env::var_os("AGENTOS_AGENT_CONFIG_PATH").map(PathBuf::from),
-            session_db_path: env::var_os("AGENTOS_SESSION_DB_PATH").map(PathBuf::from),
+            pid_path: home.join(DEFAULT_PID_RELPATH),
+            log_path: home.join(DEFAULT_LOG_RELPATH),
+            agent_config_path: None,
+            session_db_path: None,
+            home,
         }
     }
 }
@@ -69,13 +67,14 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let args = env::args().skip(1).collect::<Vec<_>>();
-    load_startup_env(&args)?;
+    let env_path = load_startup_env(&args)?;
+    let home = agentos_interfaces::agentos_home(env_path.as_deref());
     let mut args = args.into_iter();
     let Some(command) = args.next() else {
         usage();
         return Err("missing subcommand".to_owned());
     };
-    let config = parse_config(args)?;
+    let config = parse_config(args, home)?;
 
     match command.as_str() {
         "start" => start(config),
@@ -109,32 +108,33 @@ Subcommands:
   status     Report whether the gateway service is running.
   config     Print the effective workspace config used by the gateway.
 
+All workspace paths derive from $AGENTOS_HOME (set in .env or the process env).
+If unset, $AGENTOS_HOME defaults to the parent dir of the loaded .env file,
+or the current working directory.
+
 Options:
-  --pid-path PATH             PID file. Default: {DEFAULT_PID_PATH}
-  --log-path PATH             Log file. Default: {DEFAULT_LOG_PATH}
-  --config PATH               Agent workspace config path.
-  --session-db-path PATH      Session database path.
+  --pid-path PATH             PID file. Default: $AGENTOS_HOME/{DEFAULT_PID_RELPATH}
+  --log-path PATH             Log file. Default: $AGENTOS_HOME/{DEFAULT_LOG_RELPATH}
+  --config PATH               Agent workspace config path. Default: $AGENTOS_HOME/workspace/agent.toml
+  --session-db-path PATH      Session database path. Default: $AGENTOS_HOME/workspace/agentos.sqlite
   --env-file PATH             Environment file. Default: {}
   --no-env-override           Keep already-exported shell variables over .env values.
   -h, --help                  Show this help.
 
 Environment:
+  AGENTOS_HOME                Workspace anchor. The only knob for path resolution.
   AGENTOS_ENV_FILE            Environment file. Default: {}
-  AGENTOS_NO_ENV_OVERRIDE     Set to 1 to keep shell variables over .env values.
-  AGENTOS_GATEWAY_PID_PATH    Default PID file path.
-  AGENTOS_GATEWAY_LOG_PATH    Default log file path.
-  AGENTOS_AGENT_CONFIG_PATH   Agent workspace config path.
-  AGENTOS_SESSION_DB_PATH     Session database path.",
+  AGENTOS_NO_ENV_OVERRIDE     Set to 1 to keep shell variables over .env values.",
         agentos_env::DEFAULT_ENV_PATH,
         agentos_env::DEFAULT_ENV_PATH
     );
 }
 
-fn parse_config<I>(args: I) -> Result<ServiceConfig, String>
+fn parse_config<I>(args: I, home: PathBuf) -> Result<ServiceConfig, String>
 where
     I: IntoIterator<Item = String>,
 {
-    let mut config = ServiceConfig::default();
+    let mut config = ServiceConfig::from_home(home);
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -174,17 +174,17 @@ where
         .ok_or_else(|| format!("{option} requires a path"))
 }
 
-fn load_startup_env(args: &[String]) -> Result<(), String> {
+fn load_startup_env(args: &[String]) -> Result<Option<PathBuf>, String> {
     let loaded = agentos_env::load_startup_env(&agentos_env::EnvLoadOptions {
         explicit_path: discover_env_path_arg(args)?,
         search_parent_dirs: false,
         allow_overrides: agentos_env::allow_env_overrides()
             && !args.iter().any(|arg| arg == "--no-env-override"),
     })?;
-    if let Some(path) = loaded {
+    if let Some(path) = &loaded {
         eprintln!("Loaded environment file: {}", path.display());
     }
-    Ok(())
+    Ok(loaded)
 }
 
 fn discover_env_path_arg(args: &[String]) -> Result<Option<PathBuf>, String> {
@@ -379,8 +379,9 @@ fn print_effective_config(config: &ServiceConfig) -> Result<(), String> {
     println!("paths.cron_dir={}", runtime_paths.cron_dir.display());
     println!(
         "paths.attachments_dir={}",
-        attachments_dir_path(&workspace_dir(&path)).display()
+        attachments_dir_path(config).display()
     );
+    println!("paths.home={}", config.home.display());
     println!("agent.id={}", workspace_config.agent.id);
     println!("agent.orchestrator={}", workspace_config.agent.orchestrator);
     println!("agent.max_turns={}", workspace_config.agent.max_turns);
@@ -541,7 +542,7 @@ fn run_persistent_channel(config: &ServiceConfig, channel: &'static str) -> Resu
 }
 
 async fn run_telegram_gateway(config: &ServiceConfig) -> Result<(), String> {
-    let attachments_dir = attachments_dir_path(&workspace_dir(&agent_config_path(config)));
+    let attachments_dir = attachments_dir_path(config);
     let channel = TelegramChannel::from_env()
         .map_err(|err| format!("failed to configure telegram channel: {err}"))?
         .with_attachments_root(attachments_dir)
@@ -550,7 +551,7 @@ async fn run_telegram_gateway(config: &ServiceConfig) -> Result<(), String> {
 }
 
 async fn run_feishu_gateway(config: &ServiceConfig) -> Result<(), String> {
-    let attachments_dir = attachments_dir_path(&workspace_dir(&agent_config_path(config)));
+    let attachments_dir = attachments_dir_path(config);
     let channel = FeishuChannel::from_env()
         .map_err(|err| format!("failed to configure feishu channel: {err}"))?
         .with_attachments_root(attachments_dir)
@@ -576,7 +577,7 @@ where
     let deps =
         deps_scope.deps_with_guardrails(&input_guardrails, &output_guardrails, &tool_guardrails);
     let gateway_service = GatewayService::new(&deps, Arc::from(runtime.active_agent.as_str()));
-    let cron_store = CronStore::new(cron_dir_path(&workspace_dir(&agent_config_path(config))));
+    let cron_store = CronStore::new(config.home.join("workspace/crons"));
     let orchestrator_handle = runtime.orchestrator.strategy_handle();
     let model_controller = runtime.model_controller.clone();
     let session_usage = SessionUsage::new();
@@ -961,66 +962,29 @@ fn agent_config_path(config: &ServiceConfig) -> PathBuf {
     config
         .agent_config_path
         .clone()
-        .or_else(|| env::var_os("AGENTOS_AGENT_CONFIG_PATH").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("workspace/agent.toml"))
+        .unwrap_or_else(|| config.home.join("workspace/agent.toml"))
 }
 
 fn runtime_paths(config: &ServiceConfig) -> RuntimePaths {
-    let agent_config_path = agent_config_path(config);
-    let workspace_dir = workspace_dir(&agent_config_path);
     RuntimePaths {
-        agent_config_path,
-        session_db_path: session_path(config, &workspace_dir),
-        trace_dir: trace_dir_path(&workspace_dir),
-        workspace_root: workspace_root_path(),
-        skills_dir: skills_dir_path(&workspace_dir),
-        cron_dir: cron_dir_path(&workspace_dir),
+        agent_config_path: agent_config_path(config),
+        session_db_path: session_path(config),
+        trace_dir: config.home.join("workspace/traces"),
+        workspace_root: config.home.clone(),
+        skills_dir: config.home.join("workspace/skills"),
+        cron_dir: config.home.join("workspace/crons"),
     }
 }
 
-fn workspace_dir(agent_config_path: &Path) -> PathBuf {
-    agent_config_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .to_path_buf()
-}
-
-fn workspace_root_path() -> PathBuf {
-    env::var_os("AGENTOS_WORKSPACE_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-}
-
-fn session_path(config: &ServiceConfig, workspace_dir: &Path) -> PathBuf {
+fn session_path(config: &ServiceConfig) -> PathBuf {
     config
         .session_db_path
         .clone()
-        .or_else(|| env::var_os("AGENTOS_SESSION_DB_PATH").map(PathBuf::from))
-        .unwrap_or_else(|| workspace_dir.join("agentos.sqlite"))
+        .unwrap_or_else(|| config.home.join("workspace/agentos.sqlite"))
 }
 
-fn trace_dir_path(workspace_dir: &Path) -> PathBuf {
-    env::var_os("AGENTOS_TRACE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace_dir.join("traces"))
-}
-
-fn skills_dir_path(workspace_dir: &Path) -> PathBuf {
-    env::var_os("AGENTOS_SKILLS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace_dir.join("skills"))
-}
-
-fn cron_dir_path(workspace_dir: &Path) -> PathBuf {
-    env::var_os("AGENTOS_CRON_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace_dir.join("crons"))
-}
-
-fn attachments_dir_path(workspace_dir: &Path) -> PathBuf {
-    env::var_os("AGENTOS_ATTACHMENTS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace_dir.join("attachments"))
+fn attachments_dir_path(config: &ServiceConfig) -> PathBuf {
+    config.home.join("workspace/attachments")
 }
 
 fn log_trace(config: &ServiceConfig, state: &agentos_interfaces::RunState) -> Result<(), String> {

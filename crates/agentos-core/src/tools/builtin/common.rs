@@ -4,8 +4,9 @@
 //!
 //! 1. **Production helpers**: `workspace_root`, `safe_workspace_path`,
 //!    `elapsed_ms`, `result_metadata`, `default_cron_dir`, `default_skills_dir`.
-//!    The runtime pins the path-related environment variables from
-//!    `RuntimePaths`; the fallbacks here are only for standalone tool use.
+//!    All path helpers derive from `AGENTOS_HOME` via
+//!    `agentos_interfaces::agentos_home(None)`. The runtime pins `AGENTOS_HOME`
+//!    once at startup; the fallbacks here are only for standalone tool use.
 //!
 //! 2. **Test plumbing**: `TEST_CRON_DIR`, `TEST_SKILLS_DIR`, and the matching
 //!    RAII guards. Production code never sets these — `cron_root_for_tests`
@@ -17,27 +18,22 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-/// Resolve the workspace root for model-supplied path checks. The runtime sets
-/// `$AGENTOS_WORKSPACE_ROOT`; standalone tool use falls back to the current
-/// directory.
+/// Resolve the workspace root for model-supplied path checks. Derived from
+/// `AGENTOS_HOME` (set by the runtime at startup, or by the user shell);
+/// standalone tool use falls back to the current directory.
 pub(crate) fn workspace_root() -> PathBuf {
-    std::env::var_os("AGENTOS_WORKSPACE_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    agentos_interfaces::agentos_home(None)
 }
 
 /// On-disk root for skill bundles, used by both the `skill_validate` tool and
 /// the skill-bundle write boundary guardrail so they resolve the same
-/// directory. Honors the test override and `$AGENTOS_SKILLS_DIR` (set by the
-/// runtime); falls back to `workspace/skills` under the workspace root, which
-/// matches the repository layout.
+/// directory. Honors the thread-local test override; otherwise derives from
+/// `AGENTOS_HOME` joined with `workspace/skills`.
 pub(crate) fn skills_dir() -> PathBuf {
     if let Some(dir) = skills_root_for_tests() {
         return dir;
     }
-    std::env::var_os("AGENTOS_SKILLS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace_root().join("workspace").join("skills"))
+    workspace_root().join("workspace").join("skills")
 }
 
 /// Validate that `requested` stays inside `root`. Reject:
@@ -92,30 +88,16 @@ pub(super) fn result_metadata(duration_ms: u64, bytes_out: u64) -> BTreeMap<Arc<
     metadata
 }
 
-/// Resolve the on-disk root for cron task files. The runtime sets
-/// `$AGENTOS_CRON_DIR`; standalone tool use falls back to `crons` under the
-/// current directory.
+/// Resolve the on-disk root for cron task files. Derived from `AGENTOS_HOME`
+/// joined with `workspace/crons`.
 pub(super) fn default_cron_dir() -> PathBuf {
-    std::env::var_os("AGENTOS_CRON_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join("crons")
-        })
+    workspace_root().join("workspace").join("crons")
 }
 
-/// Resolve the on-disk root for workspace skills. The runtime sets
-/// `$AGENTOS_SKILLS_DIR`; standalone tool use falls back to `skills` under the
-/// current directory.
+/// Resolve the on-disk root for workspace skills. Derived from `AGENTOS_HOME`
+/// joined with `workspace/skills`.
 pub(super) fn default_skills_dir() -> PathBuf {
-    std::env::var_os("AGENTOS_SKILLS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join("skills")
-        })
+    workspace_root().join("workspace").join("skills")
 }
 
 #[cfg(test)]

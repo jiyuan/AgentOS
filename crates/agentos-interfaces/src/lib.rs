@@ -9,6 +9,7 @@ pub mod guardrail;
 pub mod mcp;
 pub mod memory;
 pub mod orchestrator;
+pub mod paths;
 pub mod run_state;
 pub mod session;
 pub mod skill;
@@ -28,6 +29,7 @@ pub use orchestrator::{
     OrchestratorTemplate, Plan, ResourceEntry, ResourceIndex, ResourceKind, RoutingRule,
     RoutingTable, RunContext, Stage, SubAgentSpec, SubOrchSpec, SystemContext, TaskDomain,
 };
+pub use paths::agentos_home;
 pub use run_state::{ApprovalStatus, Interruption, InterruptionAction, RunState};
 pub use session::{Item, Session, SessionError, Transcript};
 pub use skill::{Skill, SkillError, SkillInvocation};

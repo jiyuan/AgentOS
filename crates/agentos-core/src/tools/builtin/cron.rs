@@ -24,8 +24,7 @@ pub struct CronCreatorTool;
 /// Note: `root` (and the test-only override) is intentionally *not* exposed
 /// on the LLM-visible schema. The model picking its own cron directory is a
 /// foot-gun — it'll happily write to `workspace/` and then claim success.
-/// The runtime resolves the directory itself via `$AGENTOS_CRON_DIR` or the
-/// `workspace/crons` default.
+/// The runtime resolves the directory itself via `$AGENTOS_HOME/workspace/crons`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CronCreateArgs {

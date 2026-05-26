@@ -6,7 +6,8 @@
 //! channel-specific auth.
 //!
 //! Production callers should pass the root chosen by their runtime path layer.
-//! `AGENTOS_ATTACHMENTS_DIR` remains as a standalone fallback and test override.
+//! `from_env()` derives the root from `AGENTOS_HOME` joined with
+//! `workspace/attachments`, matching the layout the runtime sets up.
 
 use agentos_interfaces::ChannelError;
 use std::fs;
@@ -20,13 +21,9 @@ pub(crate) struct AttachmentStore {
 
 impl AttachmentStore {
     pub(crate) fn from_env(channel: &str) -> Self {
-        let root = std::env::var("AGENTOS_ATTACHMENTS_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                std::env::current_dir()
-                    .unwrap_or_else(|_| PathBuf::from("."))
-                    .join("attachments")
-            });
+        let root = agentos_interfaces::agentos_home(None)
+            .join("workspace")
+            .join("attachments");
         Self::new(root, channel)
     }
 
@@ -129,11 +126,17 @@ mod tests {
     #[test]
     fn target_path_creates_parent_and_lays_out_segments() {
         let _guard = ENV_LOCK.lock().unwrap();
+        // from_env() resolves to $AGENTOS_HOME/workspace/attachments, so point
+        // AGENTOS_HOME at the temp dir and expect that layout under it.
         let tmp = env::temp_dir().join(format!("agentos-attachments-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
-        env::set_var("AGENTOS_ATTACHMENTS_DIR", &tmp);
+        let prev_home = env::var_os("AGENTOS_HOME");
+        env::set_var("AGENTOS_HOME", &tmp);
         let store = AttachmentStore::from_env("telegram");
-        env::remove_var("AGENTOS_ATTACHMENTS_DIR");
+        match prev_home {
+            Some(v) => env::set_var("AGENTOS_HOME", v),
+            None => env::remove_var("AGENTOS_HOME"),
+        }
 
         let path = store.target_path("12345", "67", "photo.jpg").unwrap();
         assert!(path.ends_with("telegram/12345/67/photo.jpg"));

@@ -45,13 +45,26 @@ Report these metrics every time:
 
 **Important: trace JSONL spans and session JSONL records do not carry token counts.** Exact token data is emitted to the gateway log by `crates/agentos-llm/src/providers/mod.rs:138` as `tracing::info!(target: "agentos_llm::usage", ...)` events with message `"llm token usage"` — but only when the gateway is started with `RUST_LOG=agentos_llm::usage=info` (or any RUST_LOG that enables that target at info). `scripts/audit_tokens.py` parses these. The `content_bytes` field on `orchestrator_task_assigned` events provides plan output sizes only, not input token counts. When no `agentos_llm::usage` lines exist, all token metrics must be **estimated** from visible text character counts and prefixed with `~`.
 
+## Workspace Resolution
+
+Every path this skill touches anchors on `$AGENTOS_HOME`, the **only** workspace knob. There are no per-path env overrides (`AGENTOS_AGENT_CONFIG_PATH`, `AGENTOS_CRON_DIR`, `AGENTOS_SKILLS_DIR`, etc. have all been removed).
+
+Resolution cascade (matches `crates/agentos-interfaces/src/paths.rs`):
+
+1. `AGENTOS_HOME` env var (set by user shell or loaded from `.env`).
+2. Parent dir of the discovered `.env` file (for the Rust binaries).
+3. `Path(__file__).resolve().parents[4]` (for `scripts/audit_tokens.py`, which lives at `$AGENTOS_HOME/workspace/skills/audit-skill/scripts/audit_tokens.py`).
+4. CWD as last resort.
+
+All path references below — `workspace/traces`, `workspace/main/sessions`, `logs/`, `workspace/crons` — are implicitly `$AGENTOS_HOME/...`. `scripts/audit_tokens.py` prints the resolved `AGENTOS_HOME` to stderr at startup.
+
 ## Data Sources
 
 Read sources in this order until enough evidence exists. Every directory listing must filter by mtime (24-hour default), and every file read must pull only the tail — see [Temporal Filtering](#temporal-filtering) and [Incremental Retrieval](#incremental-retrieval) for the two equivalent execution paths.
 
-1. List `workspace/traces` filtered to the last 24 hours.
-2. List `workspace/main/sessions` filtered to the last 24 hours.
-3. List `logs` filtered to the last 24 hours.
+1. List `$AGENTOS_HOME/workspace/traces` filtered to the last 24 hours.
+2. List `$AGENTOS_HOME/workspace/main/sessions` filtered to the last 24 hours.
+3. List `$AGENTOS_HOME/logs` filtered to the last 24 hours.
 
 Then for each file returned by those listings, retrieve the tail only:
 

@@ -27,19 +27,19 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    load_startup_env().map_err(io::Error::other)?;
+    let env_path = load_startup_env().map_err(io::Error::other)?;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
+    let home = agentos_interfaces::agentos_home(env_path.as_deref());
     let args = env::args().skip(1).collect::<Vec<_>>();
-    let agent_config_path = agent_config_path();
-    let runtime_paths = runtime_paths(agent_config_path);
+    let runtime_paths = runtime_paths(&home);
     if args.first().is_some_and(|arg| arg == "skill") {
         handle_skill_command(&args[1..], &runtime_paths.skills_dir)?;
         return Ok(());
     }
 
-    let attachments_dir = attachments_dir_path(&workspace_dir(&runtime_paths.agent_config_path));
+    let attachments_dir = attachments_dir_path(&home);
     let runtime = AgentRuntime::build(runtime_paths.clone())
         .await
         .map_err(io::Error::other)?;
@@ -53,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let orchestrator_switch = runtime.orchestrator.strategy_handle();
     let model_controller = runtime.model_controller.clone();
 
-    let state_path = state_path(&args, &workspace_dir(&runtime_paths.agent_config_path));
+    let state_path = state_path(&args, &home);
     if args.first().is_some_and(|arg| arg == "resume") {
         let channel = TuiChannel::new(
             ChannelId::new("tui"),
@@ -124,13 +124,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn load_startup_env() -> Result<(), String> {
+fn load_startup_env() -> Result<Option<PathBuf>, String> {
     agentos_env::load_startup_env(&agentos_env::EnvLoadOptions {
         explicit_path: None,
         search_parent_dirs: true,
         allow_overrides: agentos_env::allow_env_overrides(),
     })
-    .map(|_| ())
 }
 
 fn handle_skill_command(args: &[String], root: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -628,76 +627,28 @@ fn env_flag_enabled(name: &str) -> bool {
     })
 }
 
-fn state_path(args: &[String], workspace_dir: &Path) -> PathBuf {
+fn state_path(args: &[String], home: &Path) -> PathBuf {
     if args.first().is_some_and(|arg| arg == "resume") {
         if let Some(path) = args.get(1) {
             return PathBuf::from(path);
         }
     }
-    env::var_os("AGENTOS_RUN_STATE_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace_dir.join("runs").join("cli-run-1.json"))
+    home.join("workspace/runs/cli-run-1.json")
 }
 
-fn runtime_paths(agent_config_path: PathBuf) -> RuntimePaths {
-    let workspace_dir = workspace_dir(&agent_config_path);
+fn runtime_paths(home: &Path) -> RuntimePaths {
     RuntimePaths {
-        agent_config_path,
-        session_db_path: session_path(&workspace_dir),
-        trace_dir: trace_dir_path(&workspace_dir),
-        workspace_root: workspace_root_path(),
-        skills_dir: skills_dir_path(&workspace_dir),
-        cron_dir: cron_dir_path(&workspace_dir),
+        agent_config_path: home.join("workspace/agent.toml"),
+        session_db_path: home.join("workspace/agentos.sqlite"),
+        trace_dir: home.join("workspace/traces"),
+        workspace_root: home.to_path_buf(),
+        skills_dir: home.join("workspace/skills"),
+        cron_dir: home.join("workspace/crons"),
     }
 }
 
-fn workspace_dir(agent_config_path: &Path) -> PathBuf {
-    agent_config_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .to_path_buf()
-}
-
-fn workspace_root_path() -> PathBuf {
-    env::var_os("AGENTOS_WORKSPACE_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-}
-
-fn trace_dir_path(workspace_dir: &Path) -> PathBuf {
-    env::var_os("AGENTOS_TRACE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace_dir.join("traces"))
-}
-
-fn agent_config_path() -> PathBuf {
-    env::var_os("AGENTOS_AGENT_CONFIG_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("workspace/agent.toml"))
-}
-
-fn session_path(workspace_dir: &Path) -> PathBuf {
-    env::var_os("AGENTOS_SESSION_DB_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace_dir.join("agentos.sqlite"))
-}
-
-fn skills_dir_path(workspace_dir: &Path) -> PathBuf {
-    env::var_os("AGENTOS_SKILLS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace_dir.join("skills"))
-}
-
-fn cron_dir_path(workspace_dir: &Path) -> PathBuf {
-    env::var_os("AGENTOS_CRON_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace_dir.join("crons"))
-}
-
-fn attachments_dir_path(workspace_dir: &Path) -> PathBuf {
-    env::var_os("AGENTOS_ATTACHMENTS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace_dir.join("attachments"))
+fn attachments_dir_path(home: &Path) -> PathBuf {
+    home.join("workspace/attachments")
 }
 
 fn count_spans(state: &agentos_interfaces::RunState, kind: SpanKind) -> usize {

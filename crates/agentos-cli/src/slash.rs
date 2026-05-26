@@ -19,7 +19,6 @@ use agentos_core::skills::WorkspaceSkillCatalog;
 use agentos_core::tools::ToolRegistry;
 use agentos_llm::{configured_selection_for_tier, LlmModelController, LlmModelTier};
 use agentos_proto::{AgentId, ConversationId, TaskId, Usage};
-use std::env;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -549,13 +548,9 @@ pub fn format_model_reset(controller: Option<&LlmModelController>) -> String {
 }
 
 pub fn cron_dir_path() -> PathBuf {
-    env::var_os("AGENTOS_CRON_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join("crons")
-        })
+    agentos_interfaces::agentos_home(None)
+        .join("workspace")
+        .join("crons")
 }
 
 fn fragment_summary(body: &serde_json::Value, max: usize) -> String {

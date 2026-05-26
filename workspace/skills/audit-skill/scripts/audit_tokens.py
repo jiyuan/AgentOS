@@ -35,6 +35,24 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+
+def resolve_agentos_home() -> Path:
+    """Resolve the workspace anchor with the same cascade the Rust binaries use.
+
+    1. AGENTOS_HOME env var (set by user shell or by .env load).
+    2. Repo-root anchor via this file's location in the canonical bundle layout:
+       $AGENTOS_HOME/workspace/skills/audit-skill/scripts/audit_tokens.py
+       so Path(__file__).resolve().parents[4] is AGENTOS_HOME.
+    3. CWD as last resort.
+    """
+    val = os.environ.get("AGENTOS_HOME")
+    if val:
+        return Path(val).resolve()
+    try:
+        return Path(__file__).resolve().parents[4]
+    except IndexError:
+        return Path.cwd()
+
 # Gateway log line: leading bracket-epoch + free-form payload.
 #   [1779160076] trace: run=1, plan=1, llm=1
 #   [1779160076] llm token usage provider=openai model=gpt-5.4 input_tokens=...
@@ -330,13 +348,15 @@ def render_markdown(report):
 
 
 def main():
+    home = resolve_agentos_home()
+    print(f"[audit_tokens] AGENTOS_HOME = {home}", file=sys.stderr)
     parser = argparse.ArgumentParser(description="LLM token audit from gateway log")
-    parser.add_argument("--log", default="logs/agentos-gateway.log",
-                        help="Path to gateway log file")
+    parser.add_argument("--log", default=str(home / "logs" / "agentos-gateway.log"),
+                        help="Path to gateway log file (default: $AGENTOS_HOME/logs/agentos-gateway.log)")
     parser.add_argument("--hours", type=float, default=24.0,
                         help="Audit window in hours (default 24)")
-    parser.add_argument("--crons-dir", default="workspace/crons",
-                        help="Directory of cron TOML files")
+    parser.add_argument("--crons-dir", default=str(home / "workspace" / "crons"),
+                        help="Directory of cron TOML files (default: $AGENTOS_HOME/workspace/crons)")
     parser.add_argument("--cron-window-secs", type=int, default=1800,
                         help="Seconds after a cron fire that count as that cron's run (default 1800)")
     parser.add_argument("--channel-window-secs", type=int, default=300,
