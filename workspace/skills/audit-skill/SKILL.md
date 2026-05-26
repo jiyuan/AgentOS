@@ -35,7 +35,7 @@ Report these metrics every time:
 
 | Metric | Source |
 |---|---|
-| Total tokens consumed (input/output/cache hit/miss/write) | Gateway log `agentos_llm::usage` lines with `input_tokens`, `output_tokens`, `cache_read_tokens` (hit), `cache_miss_tokens`, `cache_write_tokens`; extracted by `scripts/audit_tokens.py`. Falls back to `content_bytes` on `orchestrator_task_assigned` events when no usage lines exist. |
+| Total tokens consumed (input/output/cache hit/miss/write) | Trace JSONL `event.name="llm_token_usage"` records (one per LLM call) with `call_input_tokens`, `call_output_tokens`, `call_cache_read_tokens` (hit), `call_cache_miss_tokens`, `call_cache_write_tokens`; extracted by `scripts/audit_tokens.py`. Gateway log `agentos_llm::usage` lines are a fallback when traces are unavailable. |
 | Total model calls | Trace JSONL: count of span records with `kind: "llm"` |
 | Task executions | Trace JSONL: `run_started` events, or Session JSONL: `session_started` events |
 | Task success rate | Trace JSONL: `run_finished` events, or Session JSONL: `session_finished` events |
@@ -43,7 +43,9 @@ Report these metrics every time:
 | Model invocations by provider/model | Gateway log lines containing `llm provider=`, `model=` |
 | Failed tasks with timestamps and details | Gateway log lines containing `"gateway run failed"`, `"resume failed"`, `"maximum turn count exceeded"`, `"guardrail"`, or `"approval denied"` |
 
-**Important: trace JSONL spans and session JSONL records do not carry token counts.** Exact token data is emitted to the gateway log by `crates/agentos-llm/src/providers/mod.rs:138` as `tracing::info!(target: "agentos_llm::usage", ...)` events with message `"llm token usage"` — but only when the gateway is started with `RUST_LOG=agentos_llm::usage=info` (or any RUST_LOG that enables that target at info). `scripts/audit_tokens.py` parses these. The `content_bytes` field on `orchestrator_task_assigned` events provides plan output sizes only, not input token counts. When no `agentos_llm::usage` lines exist, all token metrics must be **estimated** from visible text character counts and prefixed with `~`.
+**Token data is exact and lives in trace JSONL.** Each LLM call emits an `event.name="llm_token_usage"` record into the per-run trace file at `$AGENTOS_HOME/workspace/traces/<run-id>.jsonl`. The record carries `call_input_tokens`, `call_output_tokens`, `call_total_tokens`, `call_cache_read_tokens` (hit), `call_cache_miss_tokens`, `call_cache_write_tokens` plus rolling `run_*_tokens` snapshots. Attribution is by `run_id` (e.g. `telegram-gateway`, `telegram-gateway:edit-subagent`, `cli-run-3`), which self-identifies channel and sub-agent. The emitter is at `crates/agentos-core/src/loop/mod.rs:523`.
+
+The gateway log also receives an `agentos_llm::usage` `tracing::info!` event for the same data (`crates/agentos-core/src/loop/mod.rs:525`), but only when `RUST_LOG=agentos_llm::usage=info` is set. This is treated as a fallback. `scripts/audit_tokens.py` prefers the trace JSONL automatically.
 
 ## Workspace Resolution
 
@@ -135,44 +137,31 @@ These represent LLM invocations (orchestrator planning calls). In the current tr
 
 ### Token Consumption
 
-**Primary path: `scripts/audit_tokens.py`.** This pure-Python helper reads the gateway log, extracts every `agentos_llm::usage` `"llm token usage"` event via regex, aggregates totals, breaks them down by provider/model and by cron task, and emits a Markdown report. Always prefer it over hand-parsing.
+**Primary path: `scripts/audit_tokens.py`.** This pure-Python helper auto-selects the canonical source — trace JSONL first, gateway log as fallback — extracts every `llm_token_usage` event, aggregates totals, breaks them down by run_id / channel / sub-agent / cron, and emits a Markdown report. Always prefer it over hand-parsing.
 
 ```
 shell(command="python3", args=[
-  "workspace/skills/audit-skill/scripts/audit_tokens.py",
-  "--log", "logs/agentos-gateway.log",
-  "--hours", "24",
-  "--crons-dir", "workspace/crons"
+  "$AGENTOS_HOME/workspace/skills/audit-skill/scripts/audit_tokens.py",
+  "--hours", "24"
 ])
 ```
 
-What it extracts per line (fields emitted by `crates/agentos-llm/src/providers/mod.rs:138`):
-- `provider`, `model`
-- `input_tokens`, `output_tokens`, `total_tokens`
-- `cache_read_tokens` (= **cache hit**), `cache_miss_tokens` (= **cache miss**), `cache_write_tokens`
+The helper resolves `$AGENTOS_HOME` itself and derives `--traces-dir`, `--log`, and `--crons-dir` from it. Pin `--source=traces` or `--source=log` to force one path. Pass `--json` for machine-readable output, `-o <path>` to write to a file.
 
-Aggregations produced:
-- **Totals**: calls, input, output, total, hit, miss, write, and computed hit-rate (`read / (read + miss)`).
-- **By provider/model**: same metrics keyed by `"<provider> / <model>"`.
-- **By cron task**: one row per cron TOML under `workspace/crons/`. Attribution is by timestamp window — a token line at epoch `t` belongs to cron `c` iff `c.last_fired_unix ≤ t ≤ c.last_fired_unix + cron_window_secs` (default `1800s`, tunable via `--cron-window-secs`). On overlap, the most recently fired cron wins.
-- **By channel (non-cron task types)**: any token line not absorbed by a cron is checked against the latest gateway-log line whose payload begins with `telegram`, `feishu`, `tui`, or `cli`. If that marker is within `--channel-window-secs` (default `300s`) before the token line, the line is attributed to that channel. This gives a breakdown for non-cron task types (interactive channel runs).
-- **Uncategorized**: any in-window token line that matched neither a cron's run window nor a channel marker — typically background activity or token lines that precede the first channel marker in the window.
+**Source A — trace JSONL (canonical).** Per-LLM-call events at `$AGENTOS_HOME/workspace/traces/<run-id>.jsonl` with `record_type="event"` and `event.name="llm_token_usage"`. Each event carries:
+- `call_input_tokens`, `call_output_tokens`, `call_total_tokens`
+- `call_cache_read_tokens` (= **hit**), `call_cache_miss_tokens` (= **miss**), `call_cache_write_tokens`
+- Rolling `run_*_tokens` snapshots and `run_llm_calls` count
 
-Attribution priority is: **cron → channel → uncategorized**. Cron always wins over channel when both windows match.
+Attribution is exact, by `run_id`:
+- **By Run ID**: one row per trace file with non-zero token activity.
+- **By Channel**: derived from `run_id` prefix — `telegram-gateway*` → telegram, `feishu-gateway*` → feishu, `cli-run-*` → cli, `tui*` → tui.
+- **By Sub-Agent**: derived from the suffix after `:` in `run_id` (e.g. `telegram-gateway:edit-subagent` → `edit-subagent`).
+- **By Cron**: best-effort overlay — if a trace file's mtime falls within `[last_fired_unix, last_fired_unix + --cron-window-secs]` of a cron, that file's tokens are also attributed to the cron. Trace events have no per-record timestamp, so cron attribution is file-granular.
 
-The helper handles three failure modes explicitly: log file missing, log mtime older than the audit window, and zero `"llm token usage"` lines in the window. The last one usually means the gateway was started without `RUST_LOG=agentos_llm::usage=info` (added to `.env` and `.env.example` as the standard wire), which is the only way these lines get emitted — surface this in the report rather than reporting `0`.
+**Source B — gateway log (fallback).** Same data emitted as `tracing::info!(target: "agentos_llm::usage", ...)` at `crates/agentos-core/src/loop/mod.rs:525`. Requires `RUST_LOG=agentos_llm::usage=info` (set in `.env`). When this source is used, attribution falls back to timestamp-window matching for cron (`--cron-window-secs`) and channel (`--channel-window-secs`) since the line itself carries no `run_id`. Used only when trace JSONL is empty or `--source=log` is forced.
 
-Pass `--json` for machine-readable output, `-o <path>` to write to a file.
-
-If the helper cannot run (log missing or no usage lines), fall back to the estimation paths below and label every value as estimated with a `~` prefix:
-
-1. **Estimation fallback — session assistant transcript text**: For each `transcript_item` where `message.role` is `"assistant"`, count the characters in `message.content`. Estimate tokens as `ceil(character_count / 4)`.
-
-2. **Estimation fallback — `orchestrator_task_assigned`**: The `fields.content_bytes` field on `orchestrator_task_assigned` events (where `plan_kind` is `"reply"` and `target_type` is `"assistant"`) contains the plan output size in bytes. Use this as the output token estimate.
-
-3. **Estimation fallback — input token estimation**: Count characters in the corresponding user message from the same session turn. Estimate as `ceil(char_count / 4)`.
-
-Report exact token totals from `scripts/audit_tokens.py` when the gateway log contains `agentos_llm::usage` lines covering the window. When only partial or no exact data is available, label token values as **estimated** and prefix them with `~`.
+If both sources are empty, the helper says so plainly — do not fabricate estimates. The skill no longer maintains an "estimated from character counts" fallback.
 
 ### Model Invocations (Provider / Model)
 
@@ -227,10 +216,10 @@ Gateway log lines like `trace: run=1, plan=10, llm=10` provide a quick summary o
 4. For each in-window trace JSONL file, `tail -n 500` to retrieve only the most recent records.
 5. For each in-window session JSONL file, `tail -n 500` (same rule).
 6. For each in-window gateway log file, `tail -n 500` (same rule). Never read the full file.
-7. Run `scripts/audit_tokens.py --log logs/agentos-gateway.log --hours 24 --crons-dir workspace/crons` to extract token totals, per-provider/model breakdown, and per-cron breakdown via regex over `agentos_llm::usage` log lines. Use its output directly in the Token Consumption and Token Consumption by Cron Task sections.
+7. Run `scripts/audit_tokens.py --hours 24` to extract token totals plus by-run-id / by-channel / by-sub-agent / by-cron breakdowns from `$AGENTOS_HOME/workspace/traces/*.jsonl` (canonical) or the gateway log (fallback). Use its output directly in the Token Consumption and Token Consumption by Cron/Channel/Sub-Agent sections.
 8. Parse each line of the retrieved trace/session/log samples to extract the remaining metrics:
    - Count LLM spans for model calls.
-   - If the helper found zero token-usage lines, fall back to estimation from `content_bytes` and assistant-transcript character counts (`ceil(chars / 4)`); prefix every estimated value with `~`.
+   - If the helper printed "Source: none" both sources were empty — report zeros and surface the diagnostic. Do not invent estimates.
    - Count `run_started`/`session_started` events for task executions.
    - Count `run_finished`/`session_finished` events for successful tasks.
    - Extract provider/model from gateway startup lines (the helper also surfaces them from usage lines).
@@ -275,13 +264,13 @@ Window: last 24 hours
 | Cache write | 0      |
 | **Total**   | **0**  |
 
-_If any token values are estimated rather than exact, add a note after the table: "~ denotes estimated values. Estimation method: ..."_
+_All token values from `scripts/audit_tokens.py` are exact when sourced from trace JSONL or the gateway log. If both sources are empty, report zeros and add: "No `llm_token_usage` events in `$AGENTOS_HOME/workspace/traces/` and no usage lines in the gateway log for this window."_
 
 ***
 
 ## Token Consumption by Cron Task
 
-One row per cron defined in `workspace/crons/` that registered token activity. Attribution is by timestamp correlation between `last_fired_unix` and `agentos_llm::usage` log lines within `--cron-window-secs` (default 30 min).
+One row per cron defined in `$AGENTOS_HOME/workspace/crons/` that registered token activity. When sourced from trace JSONL (canonical), cron attribution uses each trace file's mtime within `[last_fired_unix, last_fired_unix + --cron-window-secs]` (default 30 min). When sourced from the gateway log fallback, attribution uses each token line's epoch within the same window.
 
 | Cron ID | Last Fired (UTC) | Schedule | Calls | Input | Output | Hit | Miss |
 | ------- | ---------------- | -------- | ----- | ----- | ------ | --- | ---- |
@@ -305,7 +294,7 @@ Token activity that matched neither a cron's run window nor any channel marker.
 | ----- | ----- | ------ | --- | ---- |
 | 0 | 0 | 0 | 0 | 0 |
 
-_If the gateway log has no `"llm token usage"` lines in the window, leave all the per-task-type tables at zero and add: "No token-usage log lines in window — likely `RUST_LOG=agentos_llm::usage=info` was not set when the gateway started. The wire is set in `.env`; restart the gateway to start collecting."_
+_If both trace JSONL and the gateway log are empty for the window, leave all per-task-type tables at zero and add: "No `llm_token_usage` events in trace JSONL and no usage lines in the gateway log for this window. If runs did happen, the trace directory may have been pruned or the events were never emitted."_
 
 ***
 
@@ -354,7 +343,7 @@ _If no failed tasks, leave the table body empty and add: "No failed tasks in the
 
 ## Definitions
 
-*   **Total tokens consumed**: summed from `agentos_llm::usage` `"llm token usage"` log lines within the audit window (via `scripts/audit_tokens.py`). When no such lines exist, estimated from `content_bytes` on `orchestrator_task_assigned` events and character counts in transcript text (`ceil(char_count / 4)`); estimates are prefixed `~`.
+*   **Total tokens consumed**: summed from trace JSONL `event.name="llm_token_usage"` records' `call_*_tokens` fields within the audit window (via `scripts/audit_tokens.py`). Falls back to gateway log `agentos_llm::usage` lines if trace JSONL is empty. Both sources are exact; there is no estimation path.
 *   **Cache hit / miss / write tokens**: `cache_read_tokens`, `cache_miss_tokens`, `cache_write_tokens` fields on the same log event.
 *   **Token consumption by cron task**: tokens attributed to a given cron via timestamp correlation — line at epoch `t` belongs to cron `c` iff `c.last_fired_unix ≤ t ≤ c.last_fired_unix + --cron-window-secs` (default 1800s); overlapping windows resolve to the most recently fired cron.
 *   **Token consumption by channel / task type (non-cron)**: any in-window token line not attributed to a cron is checked against the latest gateway-log line whose payload starts with `telegram`/`feishu`/`tui`/`cli`; if that marker is within `--channel-window-secs` (default 300s) before the token line, the line is attributed to that channel. This produces the non-cron task-type breakdown.
@@ -374,10 +363,10 @@ Run `skill_validate("audit-skill")` after editing this skill. The validator chec
 
 ## Known Limitations
 
-- The trace JSONL files contain `kind: "llm"` span records (e.g. `orchestrator.plan`) but these spans do not carry `fields.token_counts` or `fields.usage` dicts. Token metrics must come from gateway-log `agentos_llm::usage` lines parsed by `scripts/audit_tokens.py`.
+- Trace JSONL `kind: "llm"` span records (e.g. `orchestrator.plan`) do not themselves carry token counts. The exact counts are in sibling records with `record_type: "event"` and `event.name: "llm_token_usage"` (emitted at `crates/agentos-core/src/loop/mod.rs:523`). `scripts/audit_tokens.py` parses those.
 - The session JSONL files contain `transcript_item` records with `message.role: "assistant"` but their `metadata` object is often empty (`{}`) — no token tracking data is attached.
-- `agentos_llm::usage` log emission is gated by `RUST_LOG=agentos_llm::usage=info`. The standard wire is `.env` (loaded by `agentos_llm::env::load_startup_env` at startup of both `agentos-cli` and `agentos-gateway` — see `crates/agentos-cli/src/main.rs:30` and `crates/agentos-cli/src/bin/agentos-gateway.rs:72`). `agent.toml` has no `[env]` schema and any such block there would be silently ignored.
-- Per-cron and per-channel token attribution are both timestamp-window-based, not metadata-based. A cron and a channel run that overlap within `--cron-window-secs` may bleed into each other's buckets (cron always wins on overlap); tune the windows to typical cron run length and channel marker cadence. The token log line itself has no `cron_id` / `sender` field — proper fix requires propagating those into the `agentos_llm::usage` tracing event in `crates/agentos-llm/src/providers/mod.rs:138`.
+- `agentos_llm::usage` gateway-log emission is gated by `RUST_LOG=agentos_llm::usage=info` (set in `.env`). This only affects the fallback source; trace JSONL events are always emitted regardless of `RUST_LOG`.
+- Cron attribution from trace JSONL is **file-granular** (uses the trace file's mtime as a proxy for run end time), not per-event. A cron and a channel run that overlap within `--cron-window-secs` may attribute the same trace to both buckets. The proper fix is propagating `cron_id` / `sender` into the `llm_token_usage` event fields in `crates/agentos-core/src/loop/mod.rs:523`.
 - Channel attribution depends on gateway-log lines whose payload starts with a known channel word. If a channel's only activity in the window is the LLM call itself (no preceding marker), it lands in **Uncategorized**, not **By Channel**.
 - The `content_bytes` field on `orchestrator_task_assigned` events provides output/plan byte sizes (37–164 bytes for tool plans, up to ~4000 bytes for reply plans) but does not include any input token counts.
 - Cron job execution data may not be present in the gateway log; report zeros with a note when absent.

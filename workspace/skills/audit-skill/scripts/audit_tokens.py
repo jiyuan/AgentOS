@@ -228,6 +228,127 @@ def fold(bucket, rec):
         bucket[k] += rec.get(k, 0)
 
 
+# Mapping from trace event field names (call_*_tokens) → bucket keys.
+TRACE_CALL_FIELDS = {
+    "input_tokens": "call_input_tokens",
+    "output_tokens": "call_output_tokens",
+    "total_tokens": "call_total_tokens",
+    "cache_read_tokens": "call_cache_read_tokens",
+    "cache_write_tokens": "call_cache_write_tokens",
+    "cache_miss_tokens": "call_cache_miss_tokens",
+}
+
+
+def fold_trace_event(bucket, fields):
+    """Fold one trace `llm_token_usage` event's call_* fields into a bucket."""
+    bucket["calls"] += 1
+    for bucket_key, trace_key in TRACE_CALL_FIELDS.items():
+        bucket[bucket_key] += int(fields.get(trace_key, 0) or 0)
+
+
+def classify_run_id(run_id):
+    """Derive (parent_run, channel, subagent) from a run_id.
+
+    Conventions observed in workspace/traces/:
+      telegram-gateway                                 → (telegram-gateway, telegram, None)
+      telegram-gateway:edit-subagent                   → (telegram-gateway, telegram, edit-subagent)
+      feishu-gateway                                   → (feishu-gateway,   feishu,   None)
+      cli-run-3                                        → (cli-run-3,        cli,      None)
+      cli-run-2:general-subagent                       → (cli-run-2,        cli,      general-subagent)
+      other                                            → (other,            unknown,  None)
+    """
+    parent, _, sub = run_id.partition(":")
+    subagent = sub or None
+    if parent.startswith("telegram-gateway"):
+        channel = "telegram"
+    elif parent.startswith("feishu-gateway"):
+        channel = "feishu"
+    elif parent.startswith("cli-run-"):
+        channel = "cli"
+    elif parent.startswith("tui"):
+        channel = "tui"
+    else:
+        channel = "unknown"
+    return parent, channel, subagent
+
+
+def aggregate_from_traces(traces_dir, crons, cron_window_secs, cutoff):
+    """Read every in-window trace JSONL file and aggregate `llm_token_usage`
+    events. Returns a dict with totals + per-run/channel/subagent/cron buckets.
+
+    Attribution:
+      - run_id, channel, subagent come from the file's records (canonical).
+      - cron is a best-effort overlay using file mtime as a proxy for run end:
+        if mtime falls in [fired, fired + cron_window_secs] for some cron, the
+        whole file's tokens are attributed to that cron in addition to its
+        channel bucket.
+    """
+    result = {
+        "files_scanned": 0,
+        "files_in_window": 0,
+        "events_found": 0,
+        "totals": empty_bucket(),
+        "by_run_id": {},
+        "by_channel": {},
+        "by_subagent": {},
+        "by_cron": {c["id"]: empty_bucket() for c in crons},
+    }
+    if not traces_dir.exists():
+        return result
+    for path in sorted(traces_dir.glob("*.jsonl")):
+        result["files_scanned"] += 1
+        try:
+            mtime = int(path.stat().st_mtime)
+        except OSError:
+            continue
+        if mtime < cutoff:
+            continue
+        result["files_in_window"] += 1
+        # Cron attribution by mtime (one match wins, closest).
+        cron_id = None
+        best_delta = cron_window_secs + 1
+        for c in crons:
+            fired = c["last_fired_unix"]
+            if fired <= 0:
+                continue
+            delta = mtime - fired
+            if 0 <= delta <= cron_window_secs and delta < best_delta:
+                cron_id = c["id"]
+                best_delta = delta
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if rec.get("record_type") != "event":
+                        continue
+                    event = rec.get("event") or {}
+                    if event.get("name") != "llm_token_usage":
+                        continue
+                    fields = event.get("fields") or {}
+                    run_id = rec.get("run_id") or "?"
+                    parent, channel, subagent = classify_run_id(run_id)
+                    result["events_found"] += 1
+                    fold_trace_event(result["totals"], fields)
+                    result["by_run_id"].setdefault(run_id, empty_bucket())
+                    fold_trace_event(result["by_run_id"][run_id], fields)
+                    result["by_channel"].setdefault(channel, empty_bucket())
+                    fold_trace_event(result["by_channel"][channel], fields)
+                    if subagent:
+                        result["by_subagent"].setdefault(subagent, empty_bucket())
+                        fold_trace_event(result["by_subagent"][subagent], fields)
+                    if cron_id is not None:
+                        fold_trace_event(result["by_cron"][cron_id], fields)
+        except OSError:
+            continue
+    return result
+
+
 def render_markdown(report):
     now = report["generated_at"]
     cutoff = report["window_start"]
@@ -236,25 +357,37 @@ def render_markdown(report):
     lines.append("")
     lines.append(f"Generated: {now}")
     lines.append(f"Window: last {report['window_hours']}h (since {cutoff})")
-    lines.append(f"Source: `{report['log_path']}`")
+    src = report["source"]
+    if src == "traces":
+        lines.append(
+            f"Source: trace JSONL — `{report['traces_path']}` "
+            f"({report['trace_files_in_window']} file(s) in window, "
+            f"{report['trace_events_found']} `llm_token_usage` event(s))"
+        )
+    elif src == "log":
+        lines.append(f"Source: gateway log — `{report['log_path']}`")
+    else:
+        lines.append(
+            f"Source: none — checked traces (`{report['traces_path']}`) and log (`{report['log_path']}`)"
+        )
     lines.append("")
     lines.append("---")
     lines.append("")
-    if report["log_missing"]:
-        lines.append(f"_Log file not found at `{report['log_path']}` — no data._")
-        return "\n".join(lines) + "\n"
-    if report["log_outside_window"]:
-        lines.append(
-            f"_Log file mtime is older than the audit window "
-            f"({report['log_mtime']}). No in-window data._"
-        )
-        return "\n".join(lines) + "\n"
-    if report["usage_lines_found"] == 0:
-        lines.append(
-            "_No `llm token usage` log lines found in the window._ "
-            "Token tracing is gated by `RUST_LOG=agentos_llm::usage=info`; "
-            "if the gateway was started without it, no token data is recorded."
-        )
+    if src is None:
+        # Nothing was found in either source.
+        if report["trace_files_in_window"] == 0:
+            lines.append(
+                "_No trace JSONL files were modified in the audit window. "
+                "No gateway-log usage lines either._ "
+                "If runs did happen, check `$AGENTOS_HOME/workspace/traces/` mtimes "
+                "and the `RUST_LOG=agentos_llm::usage=info` env var."
+            )
+        else:
+            lines.append(
+                "_Trace files were present but contained no `llm_token_usage` events, "
+                "and the gateway log had no usage lines either. "
+                "Token recording may have been disabled when the runs executed._"
+            )
         return "\n".join(lines) + "\n"
 
     t = report["totals"]
@@ -276,16 +409,34 @@ def render_markdown(report):
     lines.append(f"| Cache hit rate            | {hit_rate or '-'} |")
     lines.append("")
 
-    lines.append("## By Provider / Model")
-    lines.append("")
-    lines.append("| Provider / Model | Calls | Input | Output | Hit | Miss |")
-    lines.append("| ---------------- | ----- | ----- | ------ | --- | ---- |")
-    for key, b in sorted(report["by_provider_model"].items()):
+    if src == "log":
+        lines.append("## By Provider / Model")
+        lines.append("")
+        lines.append("| Provider / Model | Calls | Input | Output | Hit | Miss |")
+        lines.append("| ---------------- | ----- | ----- | ------ | --- | ---- |")
+        for key, b in sorted(report["by_provider_model"].items()):
+            lines.append(
+                f"| {key} | {b['calls']} | {b['input_tokens']} | {b['output_tokens']} "
+                f"| {b['cache_read_tokens']} | {b['cache_miss_tokens']} |"
+            )
+        lines.append("")
+
+    if src == "traces" and report["by_run_id"]:
+        lines.append("## By Run ID")
+        lines.append("")
         lines.append(
-            f"| {key} | {b['calls']} | {b['input_tokens']} | {b['output_tokens']} "
-            f"| {b['cache_read_tokens']} | {b['cache_miss_tokens']} |"
+            "Token usage attributed by `run_id` (the canonical identifier from each trace JSONL record). "
+            "Sub-agent runs use the `<parent-run>:<subagent>` form."
         )
-    lines.append("")
+        lines.append("")
+        lines.append("| Run ID | Calls | Input | Output | Hit | Miss |")
+        lines.append("| ------ | ----- | ----- | ------ | --- | ---- |")
+        for rid, b in sorted(report["by_run_id"].items()):
+            lines.append(
+                f"| {rid} | {b['calls']} | {b['input_tokens']} | {b['output_tokens']} "
+                f"| {b['cache_read_tokens']} | {b['cache_miss_tokens']} |"
+            )
+        lines.append("")
 
     lines.append(f"## By Cron Task (run window: {report['cron_window_secs']}s)")
     lines.append("")
@@ -306,15 +457,24 @@ def render_markdown(report):
         lines.append("| _(no cron token activity in window)_ | - | - | 0 | 0 | 0 | 0 | 0 |")
     lines.append("")
 
-    lines.append(
-        f"## By Channel (non-cron, marker window: {report['channel_window_secs']}s)"
-    )
-    lines.append("")
-    lines.append(
-        "Token usage attributed to a channel via the latest gateway-log line "
-        "mentioning that channel (telegram / feishu / tui / cli) within the marker "
-        "window before each token line. Cron-attributed lines are excluded here."
-    )
+    if src == "traces":
+        lines.append("## By Channel")
+        lines.append("")
+        lines.append(
+            "Token usage attributed by `run_id` prefix: "
+            "`telegram-gateway*` → telegram, `feishu-gateway*` → feishu, "
+            "`cli-run-*` → cli, `tui*` → tui."
+        )
+    else:
+        lines.append(
+            f"## By Channel (non-cron, marker window: {report['channel_window_secs']}s)"
+        )
+        lines.append("")
+        lines.append(
+            "Token usage attributed to a channel via the latest gateway-log line "
+            "mentioning that channel (telegram / feishu / tui / cli) within the marker "
+            "window before each token line. Cron-attributed lines are excluded here."
+        )
     lines.append("")
     lines.append("| Channel | Calls | Input | Output | Hit | Miss |")
     lines.append("| ------- | ----- | ----- | ------ | --- | ---- |")
@@ -328,22 +488,41 @@ def render_markdown(report):
         lines.append("| _(no channel-attributed token activity)_ | 0 | 0 | 0 | 0 | 0 |")
     lines.append("")
 
-    u = report["uncategorized_bucket"]
-    lines.append("## Uncategorized")
-    lines.append("")
-    lines.append(
-        "Token usage from log lines that matched neither a cron's run window "
-        "nor any channel marker. Often background tasks or activity before the "
-        "first channel marker in the audit window."
-    )
-    lines.append("")
-    lines.append("| Calls | Input | Output | Hit | Miss |")
-    lines.append("| ----- | ----- | ------ | --- | ---- |")
-    lines.append(
-        f"| {u['calls']} | {u['input_tokens']} | {u['output_tokens']} "
-        f"| {u['cache_read_tokens']} | {u['cache_miss_tokens']} |"
-    )
-    lines.append("")
+    if src == "traces" and report["by_subagent"]:
+        lines.append("## By Sub-Agent")
+        lines.append("")
+        lines.append(
+            "Token usage attributed by sub-agent name (the segment after `:` in `run_id`). "
+            "Top-level runs without a sub-agent are excluded here — see **By Channel** for those."
+        )
+        lines.append("")
+        lines.append("| Sub-Agent | Calls | Input | Output | Hit | Miss |")
+        lines.append("| --------- | ----- | ----- | ------ | --- | ---- |")
+        for name, b in sorted(report["by_subagent"].items()):
+            lines.append(
+                f"| {name} | {b['calls']} | {b['input_tokens']} | {b['output_tokens']} "
+                f"| {b['cache_read_tokens']} | {b['cache_miss_tokens']} |"
+            )
+        lines.append("")
+
+    if src == "log":
+        u = report["uncategorized_bucket"]
+        lines.append("## Uncategorized")
+        lines.append("")
+        lines.append(
+            "Token usage from log lines that matched neither a cron's run window "
+            "nor any channel marker. Often background tasks or activity before the "
+            "first channel marker in the audit window."
+        )
+        lines.append("")
+        lines.append("| Calls | Input | Output | Hit | Miss |")
+        lines.append("| ----- | ----- | ------ | --- | ---- |")
+        lines.append(
+            f"| {u['calls']} | {u['input_tokens']} | {u['output_tokens']} "
+            f"| {u['cache_read_tokens']} | {u['cache_miss_tokens']} |"
+        )
+        lines.append("")
+
     return "\n".join(lines) + "\n"
 
 
@@ -357,6 +536,13 @@ def main():
                         help="Audit window in hours (default 24)")
     parser.add_argument("--crons-dir", default=str(home / "workspace" / "crons"),
                         help="Directory of cron TOML files (default: $AGENTOS_HOME/workspace/crons)")
+    parser.add_argument("--traces-dir", default=str(home / "workspace" / "traces"),
+                        help="Directory of trace JSONL files (default: $AGENTOS_HOME/workspace/traces). "
+                             "Trace JSONL is the canonical token source — exact per-call totals attributed "
+                             "by run_id. Gateway log is only used as fallback when traces are unavailable.")
+    parser.add_argument("--source", choices=["auto", "traces", "log"], default="auto",
+                        help="Token data source: traces (canonical), log (gateway log fallback), or auto "
+                             "(traces if non-empty, else log). Default: auto.")
     parser.add_argument("--cron-window-secs", type=int, default=1800,
                         help="Seconds after a cron fire that count as that cron's run (default 1800)")
     parser.add_argument("--channel-window-secs", type=int, default=300,
@@ -370,36 +556,74 @@ def main():
 
     log_path = Path(args.log)
     crons_dir = Path(args.crons_dir)
+    traces_dir = Path(args.traces_dir)
     now = time.time()
     cutoff = int(now - args.hours * 3600)
+    crons = load_crons(crons_dir)
 
     report = {
         "generated_at": datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "window_start": datetime.fromtimestamp(cutoff, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "window_hours": args.hours,
+        "source": None,  # filled in below: "traces" or "log"
         "log_path": str(log_path),
+        "traces_path": str(traces_dir),
         "log_missing": False,
         "log_outside_window": False,
         "log_mtime": None,
         "cron_window_secs": args.cron_window_secs,
         "channel_window_secs": args.channel_window_secs,
         "usage_lines_found": 0,
+        "trace_events_found": 0,
+        "trace_files_in_window": 0,
         "totals": empty_bucket(),
         "by_provider_model": {},
         "by_cron": [],
         "by_channel": {},
+        "by_run_id": {},
+        "by_subagent": {},
         "uncategorized_bucket": empty_bucket(),
     }
 
-    if not log_path.exists():
+    # --- Primary path: trace JSONL ---
+    if args.source in ("auto", "traces"):
+        trace_result = aggregate_from_traces(traces_dir, crons, args.cron_window_secs, cutoff)
+        report["trace_files_in_window"] = trace_result["files_in_window"]
+        report["trace_events_found"] = trace_result["events_found"]
+        if trace_result["events_found"] > 0:
+            report["source"] = "traces"
+            report["totals"] = trace_result["totals"]
+            report["by_run_id"] = trace_result["by_run_id"]
+            report["by_channel"] = trace_result["by_channel"]
+            report["by_subagent"] = trace_result["by_subagent"]
+            # Convert by_cron dict into the list-of-entries shape the renderer uses.
+            for c in crons:
+                report["by_cron"].append({
+                    "id": c["id"],
+                    "last_fired_unix": c["last_fired_unix"],
+                    "last_fired_iso": (
+                        datetime.fromtimestamp(c["last_fired_unix"], tz=timezone.utc)
+                        .strftime("%Y-%m-%d %H:%M UTC")
+                        if c["last_fired_unix"] > 0 else "never"
+                    ),
+                    "schedule_expression": c["schedule_expression"],
+                    "bucket": trace_result["by_cron"][c["id"]],
+                })
+    # --- Fallback path: gateway log ---
+    # Only runs when trace source returned nothing AND user didn't pin --source=traces.
+    use_log_path = (
+        args.source == "log"
+        or (args.source == "auto" and report["source"] is None)
+    )
+    if use_log_path and not log_path.exists():
         report["log_missing"] = True
-    else:
+    elif use_log_path:
         mtime = int(log_path.stat().st_mtime)
         report["log_mtime"] = datetime.fromtimestamp(mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         if mtime < cutoff:
             report["log_outside_window"] = True
         else:
-            crons = load_crons(crons_dir)
+            report["source"] = "log"
             cron_buckets = {c["id"]: empty_bucket() for c in crons}
             text = tail_bytes(log_path, args.max_bytes)
 
