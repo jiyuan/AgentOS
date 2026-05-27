@@ -11,7 +11,7 @@ use agentos_interfaces::orchestrator::{Orchestrator, Plan, RunContext};
 use agentos_interfaces::run_state::{ApprovalStatus, Interruption, InterruptionAction, RunState};
 use agentos_proto::{
     AgentId, InterruptionId, Message, MessageRole, SpanId, SpanKind, ToolCall, ToolResult,
-    ToolStatus, Usage, TOKEN_USAGE_METADATA_KEY,
+    ToolStatus, Usage,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -384,6 +384,12 @@ async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunErro
         }
     }
     let plan = deps.orchestrator.plan(&run_ctx).await?;
+    let pending_usage = std::mem::take(
+        &mut *run_ctx
+            .usage_sink
+            .lock()
+            .expect("usage_sink mutex poisoned"),
+    );
     drop(run_ctx);
     trace::record_event(
         &mut state,
@@ -407,7 +413,9 @@ async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunErro
         "orchestrator_task_assigned",
         assignment_fields,
     );
-    record_llm_usage(&mut state, deps, plan_span_id.clone(), &plan);
+    for usage in pending_usage {
+        record_llm_usage(&mut state, deps, plan_span_id.clone(), usage);
+    }
     trace::record_event(
         &mut state,
         deps.hooks,
@@ -439,34 +447,18 @@ async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunErro
     }
 }
 
-/// Fold the just-completed LLM call's token usage into the run total and emit
+/// Fold one just-completed LLM call's token usage into the run total and emit
 /// a trace event carrying both the per-call breakdown and the running totals,
 /// so the input/output split and cache hit/miss counts are persisted in
 /// `RunState` rather than living only in provider log lines.
 ///
-/// Usage rides on the assistant reply's metadata (set by the provider under
-/// `TOKEN_USAGE_METADATA_KEY`). Only `Plan::Reply` carries that message back to
-/// the loop; tool-calling orchestrators that emit `Plan::CallTool` do not
-/// surface the underlying LLM message, so those calls are still captured by the
-/// `agentos_llm::usage` log event but not folded into `RunState.usage`.
-fn record_llm_usage(state: &mut RunState, deps: &LoopDeps<'_>, span_id: SpanId, plan: &Plan) {
-    let Plan::Reply(message) = plan else {
-        return;
-    };
-    let Some(raw) = message.metadata.get(TOKEN_USAGE_METADATA_KEY) else {
-        return;
-    };
-    let call = match serde_json::from_value::<Usage>(raw.clone()) {
-        Ok(call) => call,
-        Err(err) => {
-            info!(
-                run_id = state.run_id.as_str(),
-                error = %err,
-                "discarding malformed token usage metadata on assistant reply"
-            );
-            return;
-        }
-    };
+/// One call to this function corresponds to exactly one LLM round-trip. The
+/// orchestrator (which is the only component holding the response `Message`
+/// before it is folded into a `Plan` variant) is responsible for pushing each
+/// call's `Usage` into `RunContext::usage_sink`; the loop drains the sink after
+/// `orchestrator.plan()` returns and calls this for every entry — including
+/// calls whose plan was `Plan::CallTool`, `Plan::Delegate`, etc.
+fn record_llm_usage(state: &mut RunState, deps: &LoopDeps<'_>, span_id: SpanId, call: Usage) {
     state.usage.record_call(&call);
 
     let total = state.usage;

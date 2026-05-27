@@ -203,6 +203,7 @@ impl MaxOrchestrator {
                 .complete_messages(&messages, &self.available_tools)
                 .await
                 .map_err(|err| OrchestratorError::Backend(Arc::from(err.to_string())))?;
+            ctx.push_llm_usage_from_message(&response);
             if let Some(first) = response.tool_calls.first().cloned() {
                 return Ok(Plan::CallTool(first));
             }
@@ -252,7 +253,7 @@ impl MaxOrchestrator {
         let Some(llm) = self.llm.as_ref().filter(|llm| llm.is_available()) else {
             return Ok(None);
         };
-        let Some(rule) = self.llm_route_rule(llm.as_ref(), input).await? else {
+        let Some(rule) = self.llm_route_rule(ctx, llm.as_ref(), input).await? else {
             return Ok(self.fallback_route(ctx, input));
         };
         Ok(materialize_dispatch(ctx, input, &rule.dispatch))
@@ -260,6 +261,7 @@ impl MaxOrchestrator {
 
     async fn llm_route_rule(
         &self,
+        ctx: &RunContext<'_>,
         llm: &dyn Llm,
         input: &str,
     ) -> Result<Option<&RoutingRule>, OrchestratorError> {
@@ -268,6 +270,7 @@ impl MaxOrchestrator {
             .complete_messages(&messages, &[])
             .await
             .map_err(|err| OrchestratorError::Backend(Arc::from(err.to_string())))?;
+        ctx.push_llm_usage_from_message(&response);
         let Some(decision) = parse_routing_decision(&response.content) else {
             return Ok(None);
         };

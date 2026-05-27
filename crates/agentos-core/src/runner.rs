@@ -1062,4 +1062,118 @@ mod tests {
             })
         }
     }
+
+    /// Plan::CallTool on the first turn, Plan::Reply after the tool result —
+    /// and pushes a distinct token usage sample onto `ctx.usage_sink` for each
+    /// LLM round-trip. Used to verify that the loop records usage for the
+    /// tool-calling turn, not just the final reply.
+    struct UsageReportingOrchestrator;
+
+    #[async_trait]
+    impl Orchestrator for UsageReportingOrchestrator {
+        async fn plan(&self, ctx: &RunContext<'_>) -> Result<Plan, OrchestratorError> {
+            let Some(item) = ctx.state.transcript.items.last() else {
+                return Ok(Plan::Reply(Message::text(MessageRole::Assistant, "")));
+            };
+            match item.message.role {
+                MessageRole::User => {
+                    ctx.push_llm_usage(agentos_proto::Usage {
+                        input_tokens: 1000,
+                        output_tokens: 20,
+                        total_tokens: 1020,
+                        cache_read_tokens: 800,
+                        cache_write_tokens: 0,
+                        cache_miss_tokens: 200,
+                        tool_calls: 0,
+                    });
+                    let args = RawValue::from_string(json!({ "ok": true }).to_string()).unwrap();
+                    Ok(Plan::CallTool(ToolCall {
+                        id: ToolCallId::new("usage-mock"),
+                        name: Arc::from("mock"),
+                        args,
+                    }))
+                }
+                MessageRole::Tool => {
+                    ctx.push_llm_usage(agentos_proto::Usage {
+                        input_tokens: 50,
+                        output_tokens: 7,
+                        total_tokens: 57,
+                        cache_read_tokens: 50,
+                        cache_write_tokens: 0,
+                        cache_miss_tokens: 0,
+                        tool_calls: 0,
+                    });
+                    Ok(Plan::Reply(Message::text(MessageRole::Assistant, "done")))
+                }
+                MessageRole::Assistant | MessageRole::System => {
+                    Ok(Plan::Reply(Message::text(MessageRole::Assistant, "")))
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_records_llm_usage_for_tool_calling_turns_not_just_replies() {
+        // Regression: `record_llm_usage` used to gate on `Plan::Reply` and drop
+        // every tool-calling LLM round's tokens on the floor. The local audit
+        // therefore under-reported by however many tool rounds happened. The
+        // loop now drains a `usage_sink` populated by the orchestrator after
+        // each LLM call, regardless of which `Plan` variant follows.
+        let session = InMemorySession::default();
+        let orchestrator = UsageReportingOrchestrator;
+        let mut tools = ToolRegistry::new();
+        tools.register(MockApprovalTool);
+        let deps = RunnerDeps {
+            orchestrator: &orchestrator,
+            session: &session,
+            memory_manager: None,
+            hooks: None,
+            max_turns: 4,
+            active_agent: AgentId::new("parent"),
+            tools: Some(&tools),
+            trace_sink: None,
+            task_workspace: None,
+            policy: &Policy::allow_tools(["mock"]),
+            subagents: None,
+            input_guardrails: &[],
+            output_guardrails: &[],
+            tool_guardrails: &[],
+        };
+        let input = Envelope {
+            channel_id: ChannelId::new("telegram"),
+            conversation_id: ConversationId::new("chat-1"),
+            sender: Arc::from("user"),
+            message: Message::text(MessageRole::User, "run tool"),
+            metadata: BTreeMap::new(),
+        };
+
+        let (output, state) = match run_envelope(input, RunId::new("usage-run"), &deps)
+            .await
+            .expect("run should finish")
+        {
+            RunOutcome::Finished { output, state } => (output, state),
+            RunOutcome::Paused(_) => panic!("expected finished run"),
+        };
+
+        assert_eq!(output.message.content.as_ref(), "done");
+
+        // Both calls folded into the run total: 1000 + 50 = 1050 input, etc.
+        assert_eq!(state.usage.input_tokens, 1050);
+        assert_eq!(state.usage.output_tokens, 27);
+        assert_eq!(state.usage.cache_read_tokens, 850);
+        assert_eq!(state.usage.cache_miss_tokens, 200);
+        assert_eq!(state.usage.tool_calls, 2);
+
+        // One trace event per LLM round-trip — verifies the tool-calling round
+        // is no longer silently dropped.
+        let llm_events = state
+            .trace_events
+            .iter()
+            .filter(|e| e.name.as_ref() == "llm_token_usage")
+            .count();
+        assert_eq!(
+            llm_events, 2,
+            "expected 2 llm_token_usage trace events (one per LLM call), got {llm_events}"
+        );
+    }
 }

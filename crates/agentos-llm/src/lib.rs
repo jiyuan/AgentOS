@@ -70,6 +70,7 @@ impl Orchestrator for LlmOrchestrator {
             .complete(ctx)
             .await
             .map_err(|err| OrchestratorError::Backend(Arc::from(err.to_string())))?;
+        ctx.push_llm_usage_from_message(&response);
         Ok(Plan::Reply(response))
     }
 }

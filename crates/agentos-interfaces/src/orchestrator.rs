@@ -1,11 +1,11 @@
 use crate::run_state::RunState;
 use crate::session::Transcript;
-use agentos_proto::{AgentId, Message, Namespace, RecordId, TaskId, ToolCall};
+use agentos_proto::{AgentId, Message, Namespace, RecordId, TaskId, ToolCall, Usage};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -155,6 +155,15 @@ pub struct RunContext<'a> {
     pub transcript: &'a Transcript,
     pub memory_fragments: Vec<MemoryFragment>,
     pub resource_index: ResourceIndex,
+    /// Per-call token usage that the orchestrator observed during this `plan()`
+    /// invocation. The orchestrator pushes one entry per LLM call (regardless
+    /// of whether the resulting `Plan` is a `Reply`, `CallTool`, `Delegate`,
+    /// etc.); the loop drains the sink after `plan()` returns and emits one
+    /// `llm_token_usage` trace event plus one `agentos_llm::usage`-style log
+    /// line per entry. Without this sink, tool-calling LLM responses (whose
+    /// response `Message` is consumed by `Plan::CallTool` and never reaches
+    /// the loop) would have their token usage silently dropped.
+    pub usage_sink: Arc<Mutex<Vec<Usage>>>,
 }
 
 impl<'a> RunContext<'a> {
@@ -180,12 +189,40 @@ impl<'a> RunContext<'a> {
             transcript: &state.transcript,
             memory_fragments: Vec::new(),
             resource_index: ResourceIndex::default(),
+            usage_sink: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     pub fn with_resource_index(mut self, resource_index: ResourceIndex) -> Self {
         self.resource_index = resource_index;
         self
+    }
+
+    /// Push one LLM call's token usage into the sink so the loop records it as
+    /// a `llm_token_usage` trace event after `plan()` returns. Orchestrators
+    /// must call this once per LLM round-trip — including rounds that resolve
+    /// to `Plan::CallTool`, where the response `Message` (which carries
+    /// `TOKEN_USAGE_METADATA_KEY`) is otherwise discarded.
+    pub fn push_llm_usage(&self, usage: Usage) {
+        if let Ok(mut guard) = self.usage_sink.lock() {
+            guard.push(usage);
+        }
+    }
+
+    /// Extract `TOKEN_USAGE_METADATA_KEY` from an LLM response `Message` and
+    /// push it onto [`Self::usage_sink`]. No-op if the metadata is missing or
+    /// malformed; callers that pre-deserialize should use [`push_llm_usage`]
+    /// directly.
+    pub fn push_llm_usage_from_message(&self, message: &Message) {
+        let Some(raw) = message
+            .metadata
+            .get(agentos_proto::TOKEN_USAGE_METADATA_KEY)
+        else {
+            return;
+        };
+        if let Ok(usage) = serde_json::from_value::<Usage>(raw.clone()) {
+            self.push_llm_usage(usage);
+        }
     }
 }
 

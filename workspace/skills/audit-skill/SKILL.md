@@ -43,9 +43,11 @@ Report these metrics every time:
 | Model invocations by provider/model | Gateway log lines containing `llm provider=`, `model=` |
 | Failed tasks with timestamps and details | Gateway log lines containing `"gateway run failed"`, `"resume failed"`, `"maximum turn count exceeded"`, `"guardrail"`, or `"approval denied"` |
 
-**Token data is exact and lives in trace JSONL.** Each LLM call emits an `event.name="llm_token_usage"` record into the per-run trace file at `$AGENTOS_HOME/workspace/traces/<run-id>.jsonl`. The record carries `call_input_tokens`, `call_output_tokens`, `call_total_tokens`, `call_cache_read_tokens` (hit), `call_cache_miss_tokens`, `call_cache_write_tokens` plus rolling `run_*_tokens` snapshots. Attribution is by `run_id` (e.g. `telegram-gateway`, `telegram-gateway:edit-subagent`, `cli-run-3`), which self-identifies channel and sub-agent. The emitter is at `crates/agentos-core/src/loop/mod.rs:523`.
+**Token data is exact and lives in trace JSONL.** Every LLM round-trip — regardless of whether the orchestrator's resulting plan was `Plan::Reply`, `Plan::CallTool`, or `Plan::Delegate` — emits an `event.name="llm_token_usage"` record into the per-run trace file at `$AGENTOS_HOME/workspace/traces/<run-id>.jsonl`. The record carries `call_input_tokens`, `call_output_tokens`, `call_total_tokens`, `call_cache_read_tokens` (hit), `call_cache_miss_tokens`, `call_cache_write_tokens` plus rolling `run_*_tokens` snapshots. Attribution is by `run_id` (e.g. `telegram-gateway`, `telegram-gateway:edit-subagent`, `cli-run-3`), which self-identifies channel and sub-agent.
 
-The gateway log also receives an `agentos_llm::usage` `tracing::info!` event for the same data (`crates/agentos-core/src/loop/mod.rs:525`), but only when `RUST_LOG=agentos_llm::usage=info` is set. This is treated as a fallback. `scripts/audit_tokens.py` prefers the trace JSONL automatically.
+The emission path: orchestrators push each LLM call's `Usage` into `RunContext::usage_sink` (see `crates/agentos-interfaces/src/orchestrator.rs`); the loop drains the sink after `orchestrator.plan()` returns and emits one trace event per entry via `record_llm_usage` in `crates/agentos-core/src/loop/mod.rs`. The gateway log also receives an `agentos_llm::usage` `tracing::info!` event for every call from the provider layer at `crates/agentos-llm/src/providers/mod.rs::log_token_usage`, but only when `RUST_LOG=agentos_llm::usage=info` is set. `scripts/audit_tokens.py` prefers the trace JSONL automatically.
+
+> **Cross-check available.** `scripts/audit_tokens.py --cross-check` compares the trace-JSONL totals against the gateway-log totals when both are present. The two emitters live at different layers (loop vs. provider), so a divergence above `--cross-check-tolerance` (default 5 %) is strong evidence that one layer is silently dropping events — re-emit with `--source=log` to inspect the log-derived numbers. Use this whenever the local audit disagrees with backend telemetry.
 
 ## Workspace Resolution
 
@@ -363,7 +365,7 @@ Run `skill_validate("audit-skill")` after editing this skill. The validator chec
 
 ## Known Limitations
 
-- Trace JSONL `kind: "llm"` span records (e.g. `orchestrator.plan`) do not themselves carry token counts. The exact counts are in sibling records with `record_type: "event"` and `event.name: "llm_token_usage"` (emitted at `crates/agentos-core/src/loop/mod.rs:523`). `scripts/audit_tokens.py` parses those.
+- Trace JSONL `kind: "llm"` span records (e.g. `orchestrator.plan`) do not themselves carry token counts. The exact counts are in sibling records with `record_type: "event"` and `event.name: "llm_token_usage"` (emitted from `crates/agentos-core/src/loop/mod.rs::record_llm_usage`). `scripts/audit_tokens.py` parses those.
 - The session JSONL files contain `transcript_item` records with `message.role: "assistant"` but their `metadata` object is often empty (`{}`) — no token tracking data is attached.
 - `agentos_llm::usage` gateway-log emission is gated by `RUST_LOG=agentos_llm::usage=info` (set in `.env`). This only affects the fallback source; trace JSONL events are always emitted regardless of `RUST_LOG`.
 - Cron attribution from trace JSONL is **file-granular** (uses the trace file's mtime as a proxy for run end time), not per-event. A cron and a channel run that overlap within `--cron-window-secs` may attribute the same trace to both buckets. The proper fix is propagating `cron_id` / `sender` into the `llm_token_usage` event fields in `crates/agentos-core/src/loop/mod.rs:523`.

@@ -58,6 +58,7 @@ impl Orchestrator for MinOrchestrator {
             .complete_messages(&messages, &self.tool_specs)
             .await
             .map_err(|err| OrchestratorError::Backend(Arc::from(err.to_string())))?;
+        ctx.push_llm_usage_from_message(&response);
         if let Some(first) = response.tool_calls.first().cloned() {
             return Ok(Plan::CallTool(first));
         }

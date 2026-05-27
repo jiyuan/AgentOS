@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-Audit AgentOS LLM token consumption from gateway log lines.
+Audit AgentOS LLM token consumption from trace JSONL (canonical) or gateway
+log (fallback).
 
-Reads `agentos_llm::usage` `"llm token usage"` events emitted by
-crates/agentos-llm/src/providers/mod.rs:138, aggregates totals, and produces
-a Markdown report. Pure Python stdlib — no third-party deps.
+Trace JSONL events are emitted by `crates/agentos-core/src/loop/mod.rs`
+(`record_llm_usage`) once per LLM round-trip — including tool-calling rounds.
+Gateway-log `"llm token usage"` lines are emitted by
+`crates/agentos-llm/src/providers/mod.rs` (`log_token_usage`) at the provider
+layer for the same calls. The two emitters live in different layers, so
+`--cross-check` validates that they agree. Pure Python stdlib — no third-party
+deps.
 
 Source-of-truth event fields:
     provider, model,
@@ -270,6 +275,74 @@ def classify_run_id(run_id):
     else:
         channel = "unknown"
     return parent, channel, subagent
+
+
+def quick_log_totals(log_path, cutoff, max_bytes):
+    """Tail the gateway log and sum every in-window `llm token usage` line into
+    a totals bucket. Cheaper than the full log path because it ignores cron /
+    channel attribution. Used only by `--cross-check` to validate trace JSONL
+    against the provider-layer log emission — divergence between the two
+    indicates a layer is silently dropping events.
+    """
+    totals = empty_bucket()
+    if not log_path.exists():
+        return totals, "missing"
+    mtime = int(log_path.stat().st_mtime)
+    if mtime < cutoff:
+        return totals, "stale"
+    text = tail_bytes(log_path, max_bytes)
+    for line in text.splitlines():
+        m = EPOCH_RE.match(line)
+        if not m:
+            continue
+        epoch = int(m.group(1))
+        if epoch < cutoff:
+            continue
+        rec = parse_usage_line(m.group(2))
+        if rec is None:
+            continue
+        fold(totals, rec)
+    return totals, "ok"
+
+
+def emit_cross_check(report, log_totals, tolerance):
+    """Compare trace-JSONL totals against gateway-log totals; warn on stderr
+    when call count or total tokens diverge by more than `tolerance`
+    (relative).
+    """
+    trace_totals = report["totals"]
+    if trace_totals["calls"] == 0 and log_totals["calls"] == 0:
+        return
+    keys = ("calls", "input_tokens", "output_tokens", "cache_read_tokens", "cache_miss_tokens")
+    divergences = []
+    for key in keys:
+        t = trace_totals[key]
+        l = log_totals[key]
+        if t == 0 and l == 0:
+            continue
+        ref = max(t, l)
+        rel = abs(t - l) / ref if ref > 0 else 0.0
+        if rel > tolerance:
+            divergences.append((key, t, l, rel))
+    if not divergences:
+        return
+    print(
+        "[audit_tokens] cross-check WARN: trace JSONL and gateway log disagree "
+        f"by more than {tolerance:.0%} on these metrics:",
+        file=sys.stderr,
+    )
+    for key, t, l, rel in divergences:
+        print(
+            f"    {key}: trace={t} log={l} (rel diff {rel:.1%})",
+            file=sys.stderr,
+        )
+    print(
+        "    One emitter is dropping events. Trace events are written by "
+        "`crates/agentos-core/src/loop/mod.rs::record_llm_usage`; the gateway "
+        "log line is written by `crates/agentos-llm/src/providers/mod.rs::log_token_usage`. "
+        "Re-run with `--source=log` to inspect the log-derived totals.",
+        file=sys.stderr,
+    )
 
 
 def aggregate_from_traces(traces_dir, crons, cron_window_secs, cutoff):
@@ -543,6 +616,16 @@ def main():
     parser.add_argument("--source", choices=["auto", "traces", "log"], default="auto",
                         help="Token data source: traces (canonical), log (gateway log fallback), or auto "
                              "(traces if non-empty, else log). Default: auto.")
+    parser.add_argument("--cross-check", action="store_true",
+                        help="If both trace JSONL and gateway-log sources have data, cross-check their "
+                             "call counts and totals; print a stderr warning when they disagree by more "
+                             "than --cross-check-tolerance. The trace and log emitters live at different "
+                             "layers of the loop (`crates/agentos-core/src/loop/mod.rs` vs "
+                             "`crates/agentos-llm/src/providers/mod.rs`), so a divergence here signals that "
+                             "one layer is silently dropping events.")
+    parser.add_argument("--cross-check-tolerance", type=float, default=0.05,
+                        help="Relative-difference threshold (0.0–1.0) for --cross-check warnings on "
+                             "call counts and total tokens. Default: 0.05 (5%%).")
     parser.add_argument("--cron-window-secs", type=int, default=1800,
                         help="Seconds after a cron fire that count as that cron's run (default 1800)")
     parser.add_argument("--channel-window-secs", type=int, default=300,
@@ -682,6 +765,20 @@ def main():
                     "schedule_expression": c["schedule_expression"],
                     "bucket": cron_buckets[c["id"]],
                 })
+
+    # --- Cross-check trace vs log when requested ---
+    # Only meaningful when traces are the active source; the inverse direction
+    # (--source=log) doesn't have an independent trace bucket to compare to.
+    if args.cross_check and report["source"] == "traces":
+        log_totals, status = quick_log_totals(log_path, cutoff, args.max_bytes)
+        if status == "ok":
+            emit_cross_check(report, log_totals, args.cross_check_tolerance)
+        else:
+            print(
+                f"[audit_tokens] cross-check skipped: gateway log {status} "
+                f"({log_path})",
+                file=sys.stderr,
+            )
 
     if args.json:
         out = json.dumps(report, indent=2)
