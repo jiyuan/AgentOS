@@ -32,6 +32,10 @@
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
+# Python dependencies
+__pycache__/
+*.pyc
+
 # macOS rubish
 .DS_Store
 
