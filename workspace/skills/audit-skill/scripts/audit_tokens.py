@@ -360,6 +360,7 @@ def aggregate_from_traces(traces_dir, crons, cron_window_secs, cutoff):
         "files_scanned": 0,
         "files_in_window": 0,
         "events_found": 0,
+        "run_started_count": 0,
         "totals": empty_bucket(),
         "by_run_id": {},
         "by_channel": {},
@@ -401,7 +402,11 @@ def aggregate_from_traces(traces_dir, crons, cron_window_secs, cutoff):
                     if rec.get("record_type") != "event":
                         continue
                     event = rec.get("event") or {}
-                    if event.get("name") != "llm_token_usage":
+                    event_name = event.get("name")
+                    if event_name == "run_started":
+                        result["run_started_count"] += 1
+                        continue
+                    if event_name != "llm_token_usage":
                         continue
                     fields = event.get("fields") or {}
                     run_id = rec.get("run_id") or "?"
@@ -468,6 +473,8 @@ def render_markdown(report):
     lines.append("")
     lines.append("| Metric                    | Value |")
     lines.append("| ------------------------- | ----- |")
+    lines.append(f"| LLM API invocations (compare to remote billed requests) | {t['calls']} |")
+    lines.append(f"| User-facing tasks (`run_started`, context only) | {report['user_facing_tasks']} |")
     lines.append(f"| LLM calls (with usage)    | {t['calls']} |")
     lines.append(f"| Input tokens              | {t['input_tokens']} |")
     lines.append(f"| Output tokens             | {t['output_tokens']} |")
@@ -659,6 +666,7 @@ def main():
         "usage_lines_found": 0,
         "trace_events_found": 0,
         "trace_files_in_window": 0,
+        "user_facing_tasks": 0,
         "totals": empty_bucket(),
         "by_provider_model": {},
         "by_cron": [],
@@ -673,6 +681,7 @@ def main():
         trace_result = aggregate_from_traces(traces_dir, crons, args.cron_window_secs, cutoff)
         report["trace_files_in_window"] = trace_result["files_in_window"]
         report["trace_events_found"] = trace_result["events_found"]
+        report["user_facing_tasks"] = trace_result["run_started_count"]
         if trace_result["events_found"] > 0:
             report["source"] = "traces"
             report["totals"] = trace_result["totals"]
