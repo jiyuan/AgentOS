@@ -18,7 +18,7 @@ mod long_connection;
 mod proto;
 mod websocket;
 
-use event::{feishu_allowed_source_ids_from_env, feishu_receive_id_type, AttachmentDescriptor};
+use event::{feishu_allowed_source_ids_from_env, AttachmentDescriptor};
 use long_connection::{FeishuEndpoint, FeishuLongConnection};
 
 const DEFAULT_API_BASE: &str = "https://open.feishu.cn/open-apis";
@@ -167,11 +167,10 @@ impl FeishuChannel {
             "msg_type": msg_type,
             "content": content_json,
         });
-        let receive_id_type = feishu_receive_id_type(receive_id, self.receive_id_type.as_ref());
         let url = format!(
             "{}?receive_id_type={}",
             self.api_url("im/v1/messages"),
-            receive_id_type
+            self.receive_id_type.as_ref()
         );
         let response: Value = post_json(&url, Some(token.as_ref()), &body).await?;
         if response.get("code").and_then(Value::as_i64) == Some(0) {
@@ -383,10 +382,16 @@ impl FeishuChannel {
     async fn receive_long_connection(&mut self) -> Result<Option<Envelope>, ChannelError> {
         let channel_id = self.id.clone();
         let allowed_source_ids = self.allowed_source_ids.clone();
+        let receive_id_type = Arc::clone(&self.receive_id_type);
         let log_receive_errors = self.log_receive_errors;
         let connection = self.long_connection().await?;
         let parsed = match connection
-            .receive_next_event(&channel_id, &allowed_source_ids, log_receive_errors)
+            .receive_next_event(
+                &channel_id,
+                &allowed_source_ids,
+                receive_id_type.as_ref(),
+                log_receive_errors,
+            )
             .await
         {
             Ok(parsed) => parsed,

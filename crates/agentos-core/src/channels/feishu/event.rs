@@ -22,6 +22,7 @@ pub(super) fn parse_event(
     payload: &Value,
     channel_id: &ChannelId,
     allowed_source_ids: &[Arc<str>],
+    receive_id_type: &str,
 ) -> Option<ParsedFeishuEvent> {
     let event_type = payload
         .get("header")
@@ -126,10 +127,18 @@ pub(super) fn parse_event(
         metadata.insert(Arc::from("chat_type"), Value::String(chat_type.to_owned()));
     }
 
+    let conversation_id = match receive_id_type {
+        "open_id" | "user_id" | "union_id" => sender_id
+            .and_then(|sender| sender.get(receive_id_type))
+            .and_then(Value::as_str)
+            .unwrap_or(chat_id),
+        _ => chat_id,
+    };
+
     Some(ParsedFeishuEvent {
         envelope: Envelope {
             channel_id: channel_id.clone(),
-            conversation_id: ConversationId::new(chat_id),
+            conversation_id: ConversationId::new(conversation_id),
             sender,
             message: Message::text(MessageRole::User, text),
             metadata,
@@ -276,18 +285,6 @@ fn feishu_allowed_ids_summary(allowed_source_ids: &[Arc<str>]) -> String {
     }
 }
 
-pub(super) fn feishu_receive_id_type<'a>(receive_id: &str, configured: &'a str) -> &'a str {
-    if receive_id.starts_with("oc_") {
-        "chat_id"
-    } else if receive_id.starts_with("ou_") {
-        "open_id"
-    } else if receive_id.starts_with("on_") {
-        "union_id"
-    } else {
-        configured
-    }
-}
-
 pub(super) fn feishu_allowed_source_ids_from_env() -> Vec<Arc<str>> {
     let mut values = Vec::new();
     extend_allowed_source_ids(&mut values, env::var("AGENTOS_FEISHU_ALLOWED_ID").ok());
@@ -336,7 +333,8 @@ mod tests {
 
     #[test]
     fn parses_text_message() {
-        let parsed = parse_event(&text_event("hello"), &channel_id(), &[]).expect("parsed");
+        let parsed =
+            parse_event(&text_event("hello"), &channel_id(), &[], "chat_id").expect("parsed");
         assert_eq!(parsed.envelope.message.content.as_ref(), "hello");
         assert!(parsed.attachments.is_empty());
         assert_eq!(parsed.message_id, "om_1");
@@ -356,7 +354,7 @@ mod tests {
                 }
             }
         });
-        let parsed = parse_event(&payload, &channel_id(), &[]).expect("parsed");
+        let parsed = parse_event(&payload, &channel_id(), &[], "chat_id").expect("parsed");
         assert!(parsed.envelope.message.content.is_empty());
         assert_eq!(parsed.attachments.len(), 1);
         let desc = &parsed.attachments[0];
@@ -379,7 +377,7 @@ mod tests {
                 }
             }
         });
-        let parsed = parse_event(&payload, &channel_id(), &[]).expect("parsed");
+        let parsed = parse_event(&payload, &channel_id(), &[], "chat_id").expect("parsed");
         assert_eq!(parsed.attachments.len(), 1);
         let desc = &parsed.attachments[0];
         assert_eq!(desc.kind, AttachmentKind::Document);
@@ -401,7 +399,7 @@ mod tests {
                 }
             }
         });
-        assert!(parse_event(&payload, &channel_id(), &[]).is_none());
+        assert!(parse_event(&payload, &channel_id(), &[], "chat_id").is_none());
         let reason = feishu_drop_reason(&payload, &[]).expect("reason");
         assert!(reason.contains("unsupported message_type=audio"));
     }
@@ -409,6 +407,30 @@ mod tests {
     #[test]
     fn allowed_source_filter_applies() {
         let allowed = [Arc::from("ou_other")];
-        assert!(parse_event(&text_event("hi"), &channel_id(), &allowed).is_none());
+        assert!(parse_event(&text_event("hi"), &channel_id(), &allowed, "chat_id").is_none());
+    }
+
+    #[test]
+    fn open_id_receive_type_uses_sender_open_id_as_conversation() {
+        let parsed = parse_event(&text_event("hi"), &channel_id(), &[], "open_id").expect("parsed");
+        assert_eq!(parsed.envelope.conversation_id.as_str(), "ou_a");
+    }
+
+    #[test]
+    fn open_id_receive_type_falls_back_to_chat_id_when_sender_missing() {
+        let payload = json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": { "user_id": "uid_x" } },
+                "message": {
+                    "chat_id": "oc_1",
+                    "message_id": "om_5",
+                    "message_type": "text",
+                    "content": json!({ "text": "hi" }).to_string(),
+                }
+            }
+        });
+        let parsed = parse_event(&payload, &channel_id(), &[], "open_id").expect("parsed");
+        assert_eq!(parsed.envelope.conversation_id.as_str(), "oc_1");
     }
 }

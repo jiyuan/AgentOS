@@ -30,6 +30,7 @@ impl FeishuLongConnection {
         &mut self,
         channel_id: &ChannelId,
         allowed_source_ids: &[Arc<str>],
+        receive_id_type: &str,
         log_receive_errors: bool,
     ) -> Result<Option<ParsedFeishuEvent>, ChannelError> {
         loop {
@@ -65,7 +66,9 @@ impl FeishuLongConnection {
                 })?;
             let started = Instant::now();
             self.ack_event(&frame, started).await?;
-            if let Some(parsed) = parse_event(&payload, channel_id, allowed_source_ids) {
+            if let Some(parsed) =
+                parse_event(&payload, channel_id, allowed_source_ids, receive_id_type)
+            {
                 return Ok(Some(parsed));
             }
             if log_receive_errors {
