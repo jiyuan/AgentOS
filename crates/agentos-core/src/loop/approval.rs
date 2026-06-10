@@ -1,7 +1,7 @@
 use crate::approve::{tool_call_approval_id, Policy, PolicyDecision};
 use agentos_interfaces::orchestrator::{Plan, SubOrchSpec};
 use agentos_interfaces::run_state::{ApprovalStatus, Interruption, InterruptionAction, RunState};
-use agentos_proto::InterruptionId;
+use agentos_proto::{InterruptionId, ToolCall};
 use std::sync::Arc;
 
 use super::ApproveCtx;
@@ -12,6 +12,19 @@ pub(super) enum ApproveTransition {
         plan: Plan,
         turns: usize,
     },
+    /// A policy `deny` on a tool call. Recoverable: the loop records a denied
+    /// `ToolResult` and lets the model observe it and replan, rather than
+    /// aborting the whole run (which would also kill the sub-agent and the
+    /// gateway conversation above it).
+    DenyTool {
+        state: RunState,
+        call: ToolCall,
+        reason: Arc<str>,
+        turns: usize,
+    },
+    /// A policy `deny` on a structural plan (handoff/delegate/escalate/resume).
+    /// Fatal: there is no tool-call id to attach a result to, and a denied
+    /// routing decision is not something the model can retry around.
     Deny {
         reason: Arc<str>,
     },
@@ -30,7 +43,15 @@ pub(super) fn approve_transition(ctx: ApproveCtx, policy: &Policy) -> ApproveTra
             plan: ctx.plan,
             turns: ctx.turns,
         },
-        PolicyDecision::Deny { reason } => ApproveTransition::Deny { reason },
+        PolicyDecision::Deny { reason } => match ctx.plan {
+            Plan::CallTool(call) => ApproveTransition::DenyTool {
+                state: ctx.state,
+                call,
+                reason,
+                turns: ctx.turns,
+            },
+            _ => ApproveTransition::Deny { reason },
+        },
         PolicyDecision::AskUser { reason } => pause_for_approval(ctx, reason),
     }
 }

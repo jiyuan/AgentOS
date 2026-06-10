@@ -143,7 +143,12 @@ pub fn resume_approved(state: RunState) -> Result<RunLoopState, RunError> {
             child_state,
         },
     };
-    Ok(RunLoopState::Act(ActCtx { state, plan, turns }))
+    Ok(RunLoopState::Act(ActCtx {
+        state,
+        plan,
+        turns,
+        denied: None,
+    }))
 }
 
 #[derive(Debug)]
@@ -169,6 +174,11 @@ pub struct ActCtx {
     pub state: RunState,
     pub plan: Plan,
     pub turns: usize,
+    /// Set when the Approve state denied this (tool) plan. The Act state then
+    /// records a denied `ToolResult` instead of executing the tool, keeping the
+    /// `Plan -> Approve -> Act -> Observe` progression intact so the model can
+    /// read the denial and replan on the next turn.
+    pub denied: Option<Arc<str>>,
 }
 
 #[derive(Debug)]
@@ -529,9 +539,23 @@ fn record_llm_usage(state: &mut RunState, deps: &LoopDeps<'_>, span_id: SpanId, 
 
 async fn approve(ctx: ApproveCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunError> {
     match approve_transition(ctx, deps.policy) {
-        ApproveTransition::Allow { state, plan, turns } => {
-            Ok(RunLoopState::Act(ActCtx { state, plan, turns }))
-        }
+        ApproveTransition::Allow { state, plan, turns } => Ok(RunLoopState::Act(ActCtx {
+            state,
+            plan,
+            turns,
+            denied: None,
+        })),
+        ApproveTransition::DenyTool {
+            state,
+            call,
+            reason,
+            turns,
+        } => Ok(RunLoopState::Act(ActCtx {
+            state,
+            plan: Plan::CallTool(call),
+            turns,
+            denied: Some(reason),
+        })),
         ApproveTransition::Deny { reason } => Err(RunError::ApprovalDenied { reason }),
         ApproveTransition::Pause { state } => Ok(RunLoopState::Paused(state)),
         ApproveTransition::Unsupported { reason } => Err(RunError::ApprovalUnsupported { reason }),
@@ -539,15 +563,26 @@ async fn approve(ctx: ApproveCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, R
 }
 
 async fn act(ctx: ActCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunError> {
-    let mut state = ctx.state;
-    match ctx.plan {
+    let ActCtx {
+        mut state,
+        plan,
+        turns,
+        denied,
+    } = ctx;
+    match plan {
         Plan::CallTool(call) => {
             // Record the assistant turn that requested the tool *before*
             // executing it. OpenAI/Anthropic/DeepSeek all 400 if a tool result
             // arrives without a preceding assistant turn carrying that
             // tool_call's id.
             state.transcript.items.push(assistant_tool_call_item(&call));
-            let result = execute_tool(&mut state, deps, call).await?;
+            // A policy denial short-circuits execution: surface it as a denied
+            // `ToolResult` the model can read and recover from, rather than
+            // aborting the run (and the sub-agent / gateway above it).
+            let result = match denied {
+                Some(reason) => denied_tool_result(&mut state, deps, &call, reason),
+                None => execute_tool(&mut state, deps, call).await?,
+            };
             state.transcript.items.push(tool_result_item(result));
         }
         Plan::Delegate(spec) => match execute_delegate(&mut state, deps, &spec).await? {
@@ -602,7 +637,7 @@ async fn act(ctx: ActCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunError>
 
     Ok(RunLoopState::Observe(ObserveCtx {
         state,
-        turns: ctx.turns + 1,
+        turns: turns + 1,
     }))
 }
 
@@ -756,6 +791,45 @@ async fn execute_tool(
     );
     trace::record_event(state, deps.hooks, tool_span_id, "tool_finished", fields);
     Ok(result)
+}
+
+/// Record a denied tool call: a `Tool` span/event for the trace (so a denied
+/// call still shows up alongside executed ones) plus the `Denied` `ToolResult`
+/// fed back into the transcript for the model to observe.
+fn denied_tool_result(
+    state: &mut RunState,
+    deps: &LoopDeps<'_>,
+    call: &ToolCall,
+    reason: Arc<str>,
+) -> ToolResult {
+    let parent_id = trace::run_span_id(state);
+    let mut fields = BTreeMap::new();
+    fields.insert(Arc::from("tool_name"), metadata_value(call.name.as_ref()));
+    fields.insert(Arc::from("tool_call_id"), metadata_value(call.id.as_str()));
+    fields.insert(Arc::from("approval_denied"), Value::Bool(true));
+    let tool_span_id = trace::record_span(
+        state,
+        parent_id,
+        SpanKind::Tool,
+        format!("tool.{}", call.name),
+        fields,
+    );
+    let mut event_fields = BTreeMap::new();
+    event_fields.insert(
+        Arc::from("status"),
+        metadata_value(tool_status_name(&ToolStatus::Denied)),
+    );
+    event_fields.insert(Arc::from("reason"), metadata_value(reason.as_ref()));
+    trace::record_event(state, deps.hooks, tool_span_id, "tool_denied", event_fields);
+
+    let mut metadata = BTreeMap::new();
+    metadata.insert(Arc::from("approval_denied"), Value::Bool(true));
+    ToolResult {
+        call_id: call.id.clone(),
+        status: ToolStatus::Denied,
+        content: Arc::from(format!("tool call denied by policy: {reason}")),
+        metadata,
+    }
 }
 
 fn guardrail_tool_result(call: &ToolCall, guardrail: &Arc<str>, reason: Arc<str>) -> ToolResult {

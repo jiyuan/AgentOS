@@ -856,6 +856,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn policy_denied_tool_call_returns_denied_result_to_model_not_run_error() {
+        // A policy that denies the tool used to abort the entire run with
+        // `ApprovalDenied`, which propagated up and failed the sub-agent and
+        // the gateway conversation above it. It must now surface the denial as
+        // a `Denied` tool result the model reads and recovers from.
+        let session = InMemorySession::default();
+        let orchestrator = ToolThenReplyOrchestrator;
+        let mut tools = ToolRegistry::new();
+        tools.register(MockApprovalTool);
+        let deps = RunnerDeps {
+            orchestrator: &orchestrator,
+            session: &session,
+            memory_manager: None,
+            hooks: None,
+            max_turns: 4,
+            active_agent: AgentId::new("parent"),
+            tools: Some(&tools),
+            trace_sink: None,
+            task_workspace: None,
+            // No rule grants "mock"; the default decision is Deny.
+            policy: &Policy::default(),
+            subagents: None,
+            input_guardrails: &[],
+            output_guardrails: &[],
+            tool_guardrails: &[],
+        };
+        let input = Envelope {
+            channel_id: ChannelId::new("telegram"),
+            conversation_id: ConversationId::new("chat-1"),
+            sender: Arc::from("user"),
+            message: Message::text(MessageRole::User, "run tool"),
+            metadata: BTreeMap::new(),
+        };
+
+        let (state, output) = match run_envelope(input, RunId::new("policy-deny-run"), &deps)
+            .await
+            .expect("policy denial should become a tool result, not a run error")
+        {
+            RunOutcome::Finished { state, output } => (state, output),
+            RunOutcome::Paused(_) => panic!("expected finished run"),
+        };
+
+        assert!(
+            output
+                .message
+                .content
+                .contains("tool call denied by policy: tool 'mock' is not allowed"),
+            "model should see the denial reason, got: {}",
+            output.message.content
+        );
+        // The denied call still records a tool span so the trace stays coherent.
+        let denied_spans = state
+            .trace_spans
+            .iter()
+            .filter(|span| {
+                span.kind == SpanKind::Tool
+                    && span.fields.get("approval_denied") == Some(&serde_json::Value::Bool(true))
+            })
+            .count();
+        assert_eq!(denied_spans, 1, "expected one denied tool span");
+    }
+
+    #[tokio::test]
     async fn budget_exhausted_finishes_with_partial_result_not_error() {
         // An orchestrator that never replies used to abort the whole run with
         // `MaxTurnsExceeded`. It must now terminate gracefully: a finished run
