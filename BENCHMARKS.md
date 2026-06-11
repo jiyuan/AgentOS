@@ -35,7 +35,7 @@ Reads `crates/agentos-core/benches/loop_overhead.rs`. Re-uses the tokio runtime 
 
 ## Planned bench coverage
 
-These remain unwritten — file an issue or add a `criterion_group` next to `bench_reply_turn` when you need any of them:
+These remain unwritten — file an issue or add a `criterion_group` next to `bench_reply_turn` when you need any of them. They are scheduled as Phase 1.1 of [`docs/OPTIMIZATION_ROADMAP.md`](docs/OPTIMIZATION_ROADMAP.md):
 
 - Tool-call turn with `Approve::Allow`.
 - Tool-call turn with `Approve::AskUser` (pause + resume serialization overhead).

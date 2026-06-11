@@ -170,7 +170,8 @@ Why this matters:
 
 Resolution target:
 
-- Decide whether the compatibility wrapper should remain public.
+- Decide whether the compatibility wrapper should remain public. Scheduled as
+  Phase 2.3 of [`OPTIMIZATION_ROADMAP.md`](OPTIMIZATION_ROADMAP.md).
 
 Exit checks:
 
@@ -194,6 +195,7 @@ Resolution target:
 
 - Rebuild the test plan around architectural invariants, not phase history.
 - Keep tests targeted and deterministic.
+- Scheduled as Phase 2.1 of [`OPTIMIZATION_ROADMAP.md`](OPTIMIZATION_ROADMAP.md).
 
 Exit checks:
 
