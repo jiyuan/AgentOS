@@ -1,3 +1,4 @@
+use super::telemetry::field_key;
 use crate::subagents::SubAgentRunOutput;
 use agentos_interfaces::orchestrator::SubOrchSpec;
 use agentos_interfaces::session::Item;
@@ -12,11 +13,11 @@ pub(super) fn tool_result_item(result: ToolResult) -> Item {
     let mut metadata = result.metadata;
     let content = bounded_tool_content(result.content, &mut metadata);
     metadata.insert(
-        Arc::from("tool_call_id"),
+        field_key("tool_call_id"),
         metadata_value(result.call_id.as_str()),
     );
     metadata.insert(
-        Arc::from("tool_status"),
+        field_key("tool_status"),
         metadata_value(tool_status_name(&result.status)),
     );
     Item {
@@ -42,12 +43,12 @@ fn bounded_tool_content(content: Arc<str>, metadata: &mut BTreeMap<Arc<str>, Val
         end -= 1;
     }
 
-    metadata.insert(Arc::from("content_truncated"), Value::Bool(true));
+    metadata.insert(field_key("content_truncated"), Value::Bool(true));
     metadata.insert(
-        Arc::from("content_original_bytes"),
+        field_key("content_original_bytes"),
         Value::from(content.len() as u64),
     );
-    metadata.insert(Arc::from("content_returned_bytes"), Value::from(end as u64));
+    metadata.insert(field_key("content_returned_bytes"), Value::from(end as u64));
 
     Arc::from(format!(
         "{}\n\n[tool result truncated: returned {} of {} bytes; request a smaller range, tail, or summary if more detail is needed]",
@@ -59,9 +60,9 @@ fn bounded_tool_content(content: Arc<str>, metadata: &mut BTreeMap<Arc<str>, Val
 
 pub(super) fn assistant_tool_call_item(call: &ToolCall) -> Item {
     let mut metadata = BTreeMap::new();
-    metadata.insert(Arc::from("kind"), metadata_value("tool_call"));
-    metadata.insert(Arc::from("tool_call_id"), metadata_value(call.id.as_str()));
-    metadata.insert(Arc::from("tool_name"), metadata_value(call.name.as_ref()));
+    metadata.insert(field_key("kind"), metadata_value("tool_call"));
+    metadata.insert(field_key("tool_call_id"), metadata_value(call.id.as_str()));
+    metadata.insert(field_key("tool_name"), metadata_value(call.name.as_ref()));
     Item {
         message: Message {
             role: MessageRole::Assistant,
@@ -77,17 +78,17 @@ pub(super) fn assistant_tool_call_item(call: &ToolCall) -> Item {
 
 pub(super) fn subagent_result_item(result: SubAgentRunOutput) -> Item {
     let mut metadata = BTreeMap::new();
-    metadata.insert(Arc::from("kind"), metadata_value("subagent_result"));
+    metadata.insert(field_key("kind"), metadata_value("subagent_result"));
     metadata.insert(
-        Arc::from("subagent_id"),
+        field_key("subagent_id"),
         metadata_value(result.agent_id.as_str()),
     );
     metadata.insert(
-        Arc::from("policy_id"),
+        field_key("policy_id"),
         metadata_value(result.policy_id.as_ref()),
     );
     metadata.insert(
-        Arc::from("child_run_id"),
+        field_key("child_run_id"),
         metadata_value(result.state.run_id.as_str()),
     );
     Item {
@@ -108,13 +109,13 @@ pub(super) fn suborchestrator_result_item(
     results: Vec<(Arc<str>, SubAgentRunOutput)>,
 ) -> Item {
     let mut metadata = BTreeMap::new();
-    metadata.insert(Arc::from("kind"), metadata_value("suborchestrator_result"));
+    metadata.insert(field_key("kind"), metadata_value("suborchestrator_result"));
     metadata.insert(
-        Arc::from("template"),
+        field_key("template"),
         metadata_value(spec.template.name.as_ref()),
     );
-    metadata.insert(Arc::from("task_id"), metadata_value(spec.task_id.as_str()));
-    metadata.insert(Arc::from("stages"), Value::from(results.len()));
+    metadata.insert(field_key("task_id"), metadata_value(spec.task_id.as_str()));
+    metadata.insert(field_key("stages"), Value::from(results.len()));
     let content = if results.is_empty() {
         format!(
             "sub-orchestrator '{}' completed with no stages",

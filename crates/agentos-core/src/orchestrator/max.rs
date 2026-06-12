@@ -1,7 +1,8 @@
 use super::commands::deterministic_plan_from_user_text;
 use super::routing::{
-    latest_user_content, materialize_dispatch, parse_routing_decision, routing_classifier_messages,
-    rule_for_domain_key, ROUTER_CONFIDENCE_THRESHOLD,
+    input_overlaps_vocabulary, latest_user_content, materialize_dispatch, parse_routing_decision,
+    routing_classifier_messages, routing_domains_json, routing_vocabulary, rule_for_domain_key,
+    ROUTER_CONFIDENCE_THRESHOLD,
 };
 use crate::memory::{
     memory_caller_from_context, HydrationRequest, MemoryManager, MemoryStore, RetrievalStrategy,
@@ -17,12 +18,12 @@ use agentos_interfaces::tool::ToolSpec;
 use agentos_llm::Llm;
 use agentos_proto::{Message, MessageRole};
 use async_trait::async_trait;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 const DEFAULT_MEMORY_HYDRATION_MAX_FRAGMENTS: usize = 5;
 const DEFAULT_MEMORY_HYDRATION_MAX_TOKENS: usize = 1_200;
 
-#[derive(Default)]
 pub struct MaxOrchestrator {
     available_tools: Vec<ToolSpec>,
     resource_index: ResourceIndex,
@@ -31,6 +32,37 @@ pub struct MaxOrchestrator {
     memory_hydrator: Option<MemoryHydrator>,
     skill_catalog: WorkspaceSkillCatalog,
     skill_planners: Vec<Arc<dyn SkillPlanner>>,
+    /// `[routing].llm_classifier` config: when false, routing decisions never
+    /// spend an LLM round-trip and unmatched input goes to the fallback rule.
+    llm_routing_enabled: bool,
+    /// Lexical vocabulary of the specialized routes, precomputed by
+    /// [`Self::with_routing_table`]. Empty when the pre-filter is disabled
+    /// (no rules, or rules without examples).
+    routing_vocabulary: BTreeSet<String>,
+    /// Classifier domain catalog JSON, precomputed by
+    /// [`Self::with_routing_table`] — the table is fixed per orchestrator.
+    routing_domains_json: Arc<str>,
+    /// Concatenated SKILL.md prelude, precomputed by
+    /// [`Self::with_skill_catalog`] — the catalog is fixed per orchestrator.
+    skill_prelude: Option<Message>,
+}
+
+impl Default for MaxOrchestrator {
+    fn default() -> Self {
+        Self {
+            available_tools: Vec::new(),
+            resource_index: ResourceIndex::default(),
+            routing_table: RoutingTable::default(),
+            llm: None,
+            memory_hydrator: None,
+            skill_catalog: WorkspaceSkillCatalog::default(),
+            skill_planners: Vec::new(),
+            llm_routing_enabled: true,
+            routing_vocabulary: BTreeSet::new(),
+            routing_domains_json: Arc::from("[]"),
+            skill_prelude: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -72,11 +104,7 @@ impl MaxOrchestrator {
         Self {
             available_tools,
             resource_index,
-            routing_table: RoutingTable::default(),
-            llm: None,
-            memory_hydrator: None,
-            skill_catalog: WorkspaceSkillCatalog::default(),
-            skill_planners: Vec::new(),
+            ..Self::default()
         }
     }
 
@@ -86,7 +114,17 @@ impl MaxOrchestrator {
     }
 
     pub fn with_routing_table(mut self, routing_table: RoutingTable) -> Self {
+        self.routing_vocabulary = routing_vocabulary(&routing_table);
+        self.routing_domains_json = Arc::from(routing_domains_json(&routing_table));
         self.routing_table = routing_table;
+        self
+    }
+
+    /// Enable or disable the LLM routing classifier (`[routing].llm_classifier`
+    /// in `agent.toml`). When disabled, input that no deterministic route
+    /// claims goes straight to the fallback dispatch.
+    pub fn with_llm_routing(mut self, enabled: bool) -> Self {
+        self.llm_routing_enabled = enabled;
         self
     }
 
@@ -109,6 +147,7 @@ impl MaxOrchestrator {
         // changes — each planner gates on `catalog.contains(name)` so an
         // empty / narrowed catalog produces silent no-ops in the chain.
         self.skill_planners = builtin_skill_planners(skill_catalog.clone());
+        self.skill_prelude = build_skill_prelude(&skill_catalog);
         self.skill_catalog = skill_catalog;
         self
     }
@@ -219,27 +258,9 @@ impl MaxOrchestrator {
     }
 
     fn skill_prelude_message(&self) -> Option<Message> {
-        let skills = self.skill_catalog.skills().collect::<Vec<_>>();
-        if skills.is_empty() {
-            return None;
-        }
-        let mut body = String::from(
-            "# Available workspace skills\n\n\
-             The following workspace skills are enabled for this run. Read \
-             each skill's instructions before deciding whether to invoke its \
-             tools — the SKILL.md body is the contract the skill expects you \
-             to follow.\n",
-        );
-        for skill in skills {
-            body.push_str("\n---\n## skill: ");
-            body.push_str(&skill.name);
-            body.push_str("\n\n");
-            body.push_str(skill.instructions.as_ref());
-            if !skill.instructions.ends_with('\n') {
-                body.push('\n');
-            }
-        }
-        Some(Message::text(MessageRole::System, body))
+        // Precomputed by `with_skill_catalog`: the catalog is fixed per
+        // orchestrator, and this clone is Arc-backed and cheap.
+        self.skill_prelude.clone()
     }
 
     async fn route_user_text_with_llm(
@@ -248,6 +269,15 @@ impl MaxOrchestrator {
         input: &str,
     ) -> Result<Option<Plan>, OrchestratorError> {
         if self.routing_table.rules.is_empty() {
+            return Ok(self.fallback_route(ctx, input));
+        }
+        // Skip the classifier's LLM round-trip when routing is disabled by
+        // config, or when the input shares no significant vocabulary with any
+        // specialized route — strong evidence of general traffic that the
+        // classifier would send to the fallback anyway. Any token overlap
+        // keeps today's behavior (classifier decides), so the pre-filter can
+        // save a round-trip but never reroute a matched input.
+        if !self.llm_routing_enabled || self.input_is_clearly_general(input) {
             return Ok(self.fallback_route(ctx, input));
         }
         let Some(llm) = self.llm.as_ref().filter(|llm| llm.is_available()) else {
@@ -259,13 +289,18 @@ impl MaxOrchestrator {
         Ok(materialize_dispatch(ctx, input, &rule.dispatch))
     }
 
+    fn input_is_clearly_general(&self, input: &str) -> bool {
+        !self.routing_vocabulary.is_empty()
+            && !input_overlaps_vocabulary(input, &self.routing_vocabulary)
+    }
+
     async fn llm_route_rule(
         &self,
         ctx: &RunContext<'_>,
         llm: &dyn Llm,
         input: &str,
     ) -> Result<Option<&RoutingRule>, OrchestratorError> {
-        let messages = routing_classifier_messages(input, &self.routing_table);
+        let messages = routing_classifier_messages(input, &self.routing_domains_json);
         let response = llm
             .complete_messages(&messages, &[])
             .await
@@ -531,6 +566,30 @@ impl MaxOrchestrator {
         let rule = allow_fallback.then_some(&self.routing_table.fallback)?;
         materialize_dispatch(ctx, input, &rule.dispatch)
     }
+}
+
+fn build_skill_prelude(catalog: &WorkspaceSkillCatalog) -> Option<Message> {
+    let skills = catalog.skills().collect::<Vec<_>>();
+    if skills.is_empty() {
+        return None;
+    }
+    let mut body = String::from(
+        "# Available workspace skills\n\n\
+         The following workspace skills are enabled for this run. Read \
+         each skill's instructions before deciding whether to invoke its \
+         tools — the SKILL.md body is the contract the skill expects you \
+         to follow.\n",
+    );
+    for skill in skills {
+        body.push_str("\n---\n## skill: ");
+        body.push_str(&skill.name);
+        body.push_str("\n\n");
+        body.push_str(skill.instructions.as_ref());
+        if !skill.instructions.ends_with('\n') {
+            body.push('\n');
+        }
+    }
+    Some(Message::text(MessageRole::System, body))
 }
 
 fn resource_index_from_tools(tools: &[ToolSpec]) -> ResourceIndex {
@@ -947,6 +1006,108 @@ mod tests {
         match plan {
             Plan::CallTool(call) => assert_eq!(call.name.as_ref(), "file"),
             other => panic!("expected repair file tool call, got {other:?}"),
+        }
+    }
+
+    /// Routing table whose rules all carry examples, which activates the
+    /// lexical pre-filter (sparse tables keep always-classify behavior).
+    fn exampled_routing_table() -> RoutingTable {
+        RoutingTable {
+            rules: vec![RoutingRule {
+                domain: TaskDomain::SoftwareDev,
+                description: Arc::from("Implementation and debugging work."),
+                examples: vec![
+                    Arc::from("fix this failing test"),
+                    Arc::from("implement the orchestrator plan"),
+                ],
+                dispatch: DispatchTarget::Delegate(SubAgentSpec {
+                    agent_id: AgentId::new("dev-subagent"),
+                    policy_id: Arc::from("dev"),
+                    metadata: BTreeMap::new(),
+                }),
+            }],
+            fallback: RoutingRule {
+                domain: TaskDomain::General,
+                description: Arc::from("fallback"),
+                examples: Vec::new(),
+                dispatch: DispatchTarget::Delegate(SubAgentSpec {
+                    agent_id: AgentId::new("general-subagent"),
+                    policy_id: Arc::from("general"),
+                    metadata: BTreeMap::new(),
+                }),
+            },
+        }
+    }
+
+    fn user_run_state(input: &str) -> RunState {
+        let mut state = RunState::new(RunId::new("run-routing"), AgentId::new("default"));
+        state.transcript.items.push(Item {
+            message: Message::text(MessageRole::User, input),
+            metadata: BTreeMap::new(),
+        });
+        state
+    }
+
+    #[tokio::test]
+    async fn general_chat_without_vocabulary_overlap_skips_router_llm() {
+        let llm = Arc::new(ToolCallingLlm::default());
+        let orch = MaxOrchestrator::default()
+            .with_routing_table(exampled_routing_table())
+            .with_llm(llm.clone());
+        let state = user_run_state("good morning, hope the weekend went well");
+        let ctx = RunContext::from_state(&state);
+
+        let plan = orch.plan(&ctx).await.expect("plan should succeed");
+        assert!(
+            !llm.saw_router_prompt.load(Ordering::SeqCst),
+            "general chat with no route-vocabulary overlap must not spend a classifier call"
+        );
+        match plan {
+            Plan::Delegate(spec) => assert_eq!(spec.agent_id.as_str(), "general-subagent"),
+            other => panic!("expected fallback dispatch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn vocabulary_overlap_still_uses_router_llm() {
+        let llm = Arc::new(ToolCallingLlm::default());
+        let orch = MaxOrchestrator::default()
+            .with_routing_table(exampled_routing_table())
+            .with_llm(llm.clone());
+        // "fix" overlaps the software_dev examples, so the classifier decides.
+        let state = user_run_state("fix the login flow");
+        let ctx = RunContext::from_state(&state);
+
+        let plan = orch.plan(&ctx).await.expect("plan should succeed");
+        assert!(
+            llm.saw_router_prompt.load(Ordering::SeqCst),
+            "input sharing route vocabulary must still be classified by the LLM"
+        );
+        match plan {
+            Plan::Delegate(spec) => assert_eq!(spec.agent_id.as_str(), "dev-subagent"),
+            other => panic!("expected classified dispatch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_llm_classifier_routes_to_fallback_without_llm() {
+        let llm = Arc::new(ToolCallingLlm::default());
+        let orch = MaxOrchestrator::default()
+            .with_routing_table(exampled_routing_table())
+            .with_llm_routing(false)
+            .with_llm(llm.clone());
+        // Overlapping input — but the classifier is disabled by config.
+        let state = user_run_state("fix this failing test");
+        let ctx = RunContext::from_state(&state);
+
+        let plan = orch.plan(&ctx).await.expect("plan should succeed");
+        assert!(
+            !llm.saw_router_prompt.load(Ordering::SeqCst),
+            "llm_classifier = false must never spend a classifier call"
+        );
+        match plan {
+            Plan::Delegate(spec) => assert_eq!(spec.agent_id.as_str(), "general-subagent"),
+            other => panic!("expected fallback dispatch, got {other:?}"),
         }
     }
 

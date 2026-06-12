@@ -4,7 +4,7 @@ use agentos_interfaces::orchestrator::{
 use agentos_proto::{Message, MessageRole};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 pub(super) const ROUTER_CONFIDENCE_THRESHOLD: f32 = 0.60;
@@ -28,10 +28,10 @@ pub(super) fn rule_for_domain_key<'a>(
         })
 }
 
-pub(super) fn routing_classifier_messages(
-    input: &str,
-    routing_table: &RoutingTable,
-) -> Vec<Message> {
+/// Serialize the routing table into the classifier's domain catalog. The
+/// table is fixed per orchestrator, so callers build this once at
+/// construction time instead of on every routing decision.
+pub(super) fn routing_domains_json(routing_table: &RoutingTable) -> String {
     let domains = routing_table
         .rules
         .iter()
@@ -45,6 +45,10 @@ pub(super) fn routing_classifier_messages(
             })
         })
         .collect::<Vec<_>>();
+    serde_json::to_string_pretty(&domains).unwrap_or_else(|_| "[]".to_owned())
+}
+
+pub(super) fn routing_classifier_messages(input: &str, domains_json: &str) -> Vec<Message> {
     vec![
         Message::text(
             MessageRole::System,
@@ -52,13 +56,59 @@ pub(super) fn routing_classifier_messages(
         ),
         Message::text(
             MessageRole::User,
-            format!(
-                "Routing domains:\n{}\n\nUser prompt:\n{}",
-                serde_json::to_string_pretty(&domains).unwrap_or_else(|_| "[]".to_owned()),
-                input
-            ),
+            format!("Routing domains:\n{domains_json}\n\nUser prompt:\n{input}"),
         ),
     ]
+}
+
+/// Function words carrying no routing signal. Kept strictly grammatical so
+/// the vocabulary stays conservative: an over-broad stopword list could make
+/// a routable input look general and skip the classifier wrongly, whereas a
+/// too-small list only means the classifier runs (today's behavior).
+const ROUTING_STOPWORDS: [&str; 42] = [
+    "and", "are", "but", "can", "could", "did", "does", "for", "from", "had", "has", "have", "how",
+    "into", "its", "our", "please", "should", "that", "the", "their", "them", "then", "there",
+    "these", "they", "this", "those", "wants", "was", "were", "what", "when", "where", "which",
+    "who", "why", "will", "with", "would", "you", "your",
+];
+
+fn significant_tokens(input: &str) -> impl Iterator<Item = String> + '_ {
+    input
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| token.len() >= 3)
+        .map(str::to_ascii_lowercase)
+        .filter(|token| ROUTING_STOPWORDS.binary_search(&token.as_str()).is_err())
+}
+
+/// Build the lexical vocabulary of every *specialized* route (domain key,
+/// description, and examples; the fallback rule describes general traffic
+/// and is deliberately excluded).
+///
+/// Returns an empty set — disabling the pre-filter — unless every
+/// specialized rule carries at least one example: the examples are the
+/// evidence that makes "no token overlap" a sound signal for general
+/// traffic. Sparse tables keep today's always-classify behavior.
+pub(super) fn routing_vocabulary(routing_table: &RoutingTable) -> BTreeSet<String> {
+    if routing_table
+        .rules
+        .iter()
+        .any(|rule| rule.examples.is_empty())
+    {
+        return BTreeSet::new();
+    }
+    let mut vocabulary = BTreeSet::new();
+    for rule in &routing_table.rules {
+        vocabulary.extend(significant_tokens(&domain_key(&rule.domain)));
+        vocabulary.extend(significant_tokens(&rule.description));
+        for example in &rule.examples {
+            vocabulary.extend(significant_tokens(example));
+        }
+    }
+    vocabulary
+}
+
+pub(super) fn input_overlaps_vocabulary(input: &str, vocabulary: &BTreeSet<String>) -> bool {
+    significant_tokens(input).any(|token| vocabulary.contains(&token))
 }
 
 fn dispatch_descriptor(dispatch: &DispatchTarget) -> Value {
@@ -181,6 +231,72 @@ mod tests {
     use agentos_interfaces::orchestrator::{OrchestratorTemplate, Stage, SubAgentSpec, TaskDomain};
     use agentos_proto::AgentId;
 
+    fn rule(domain: TaskDomain, description: &str, examples: &[&str]) -> RoutingRule {
+        RoutingRule {
+            domain,
+            description: Arc::from(description),
+            examples: examples.iter().map(|example| Arc::from(*example)).collect(),
+            dispatch: DispatchTarget::Direct,
+        }
+    }
+
+    #[test]
+    fn vocabulary_is_empty_when_any_rule_lacks_examples() {
+        let table = RoutingTable {
+            rules: vec![
+                rule(
+                    TaskDomain::SoftwareDev,
+                    "fix bugs",
+                    &["fix this failing test"],
+                ),
+                rule(TaskDomain::Research, "investigate sources", &[]),
+            ],
+            fallback: rule(TaskDomain::General, "general chat", &[]),
+        };
+        assert!(
+            routing_vocabulary(&table).is_empty(),
+            "pre-filter must stay disabled for tables without full example coverage"
+        );
+    }
+
+    #[test]
+    fn vocabulary_collects_significant_tokens_and_excludes_fallback() {
+        let table = RoutingTable {
+            rules: vec![rule(
+                TaskDomain::SoftwareDev,
+                "Implementation and debugging.",
+                &["fix this failing test"],
+            )],
+            fallback: rule(TaskDomain::General, "weekend chatter", &["good morning"]),
+        };
+        let vocabulary = routing_vocabulary(&table);
+        for expected in [
+            "software",
+            "dev",
+            "implementation",
+            "debugging",
+            "fix",
+            "failing",
+            "test",
+        ] {
+            assert!(vocabulary.contains(expected), "missing token '{expected}'");
+        }
+        // Stopwords and fallback vocabulary are excluded.
+        assert!(!vocabulary.contains("and"));
+        assert!(!vocabulary.contains("this"));
+        assert!(!vocabulary.contains("weekend"));
+        assert!(!vocabulary.contains("morning"));
+
+        assert!(input_overlaps_vocabulary(
+            "please fix the build",
+            &vocabulary
+        ));
+        assert!(!input_overlaps_vocabulary(
+            "good morning, hope you slept well",
+            &vocabulary
+        ));
+    }
+
     #[test]
     fn routing_prompt_includes_subagent_functional_descriptions() {
         let mut research_metadata = BTreeMap::new();
@@ -227,7 +343,8 @@ mod tests {
             },
         };
 
-        let messages = routing_classifier_messages("compare these sources", &table);
+        let messages =
+            routing_classifier_messages("compare these sources", &routing_domains_json(&table));
         let prompt = messages
             .iter()
             .map(|message| message.content.as_ref())

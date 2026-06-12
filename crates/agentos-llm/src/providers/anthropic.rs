@@ -2,10 +2,10 @@ use crate::providers::content::{
     append_descriptors, document_mime, format_text_document, image_mime, read_base64,
     read_text_document,
 };
-use crate::providers::{attach_token_usage, log_token_usage, post_json};
+use crate::providers::{attach_token_usage, log_token_usage, post_json, raw_args_from_json_value};
 use agentos_interfaces::tool::ToolSpec;
 use agentos_proto::{Attachment, AttachmentKind, Message, MessageRole, ToolCall, ToolCallId};
-use serde_json::{json, value::RawValue, Value};
+use serde_json::{json, Value};
 use std::env;
 use std::sync::Arc;
 
@@ -75,9 +75,7 @@ pub async fn complete(
                 let Some(name) = block.get("name").and_then(Value::as_str) else {
                     continue;
                 };
-                let args_json = block.get("input").cloned().unwrap_or(json!({}));
-                let args_str = serde_json::to_string(&args_json).unwrap_or_else(|_| "{}".into());
-                if let Ok(args) = RawValue::from_string(args_str) {
+                if let Some(args) = raw_args_from_json_value(block.get("input")) {
                     tool_calls.push(ToolCall {
                         id: ToolCallId::new(id),
                         name: Arc::from(name),
@@ -251,6 +249,7 @@ fn document_block(attachment: &Attachment) -> Option<Value> {
 mod tests {
     use super::*;
     use agentos_proto::{Attachment, AttachmentKind};
+    use serde_json::value::RawValue;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;

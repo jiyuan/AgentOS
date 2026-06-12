@@ -69,6 +69,7 @@ dependencies = [
  "agentos-proto",
  "async-trait",
  "base64",
+ "bytes",
  "rand 0.8.6",
  "reqwest",
  "serde",

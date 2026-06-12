@@ -1,7 +1,7 @@
 use super::delegate::{execute_delegate, DelegateOutcome};
 use super::telemetry::{
-    record_suborch_failure, record_telemetry_event, suborch_stage_agent_telemetry_fields,
-    suborch_stage_telemetry_fields, suborch_telemetry_fields,
+    field_key, record_suborch_failure, record_telemetry_event,
+    suborch_stage_agent_telemetry_fields, suborch_stage_telemetry_fields, suborch_telemetry_fields,
 };
 use super::{LoopDeps, RunError};
 use crate::subagents::{SubAgentError, SubAgentPausedRun, SubAgentRunOutput};
@@ -29,11 +29,11 @@ pub(super) async fn execute_escalate(
     let parent_id = trace::run_span_id(state);
     let mut fields = BTreeMap::new();
     fields.insert(
-        Arc::from("template"),
+        field_key("template"),
         Value::String(spec.template.name.as_ref().to_owned()),
     );
     fields.insert(
-        Arc::from("task_id"),
+        field_key("task_id"),
         Value::String(spec.task_id.as_str().to_owned()),
     );
     let span_id = trace::record_span(
@@ -99,18 +99,20 @@ pub(super) async fn execute_escalate(
         suborch_telemetry_fields(spec),
     );
 
-    let mut pending = spec.template.stages.clone();
-    let mut completed: BTreeMap<Arc<str>, ()> = BTreeMap::new();
-    let mut ordered = Vec::new();
-    while !pending.is_empty() {
-        let Some(index) = pending.iter().position(|stage| {
-            stage
-                .depends_on
-                .iter()
-                .all(|dependency| completed.contains_key(dependency))
-        }) else {
+    // Resolve the full execution order up front (no stage clones), so a
+    // template with unsatisfied or cyclic dependencies fails before any
+    // stage runs instead of after a partial execution. Config loading
+    // performs the same check, so this only triggers for templates built
+    // programmatically.
+    let execution_order = match crate::config::stage_execution_order(
+        &spec.template.stages,
+        |stage| &stage.name,
+        |stage| &stage.depends_on,
+    ) {
+        Ok(order) => order,
+        Err(message) => {
             let error = RunError::SubAgent(SubAgentError::Run(Arc::from(format!(
-                "sub-orchestrator '{}' has unsatisfied or cyclic dependencies",
+                "sub-orchestrator '{}' has {message}",
                 spec.template.name
             ))));
             record_suborch_failure(
@@ -122,15 +124,18 @@ pub(super) async fn execute_escalate(
                 &error.to_string(),
             );
             return Err(error);
-        };
-        let stage = pending.remove(index);
+        }
+    };
+    let mut ordered = Vec::with_capacity(execution_order.len());
+    for index in execution_order {
+        let stage = &spec.template.stages[index];
         let stage_name = Arc::clone(&stage.name);
         record_telemetry_event(
             state,
             deps.hooks,
             span_id.clone(),
             "suborch_stage_assigned",
-            suborch_stage_telemetry_fields(spec, &stage),
+            suborch_stage_telemetry_fields(spec, stage),
         );
         let mut stage_agent = stage.agent.clone();
         if !stage_agent.metadata.contains_key("prompt") {
@@ -141,7 +146,7 @@ pub(super) async fn execute_escalate(
                     .last()
                     .map(|item| Value::String(item.message.content.to_string()))
             }) {
-                stage_agent.metadata.insert(Arc::from("prompt"), prompt);
+                stage_agent.metadata.insert(field_key("prompt"), prompt);
             }
         }
         record_telemetry_event(
@@ -156,7 +161,7 @@ pub(super) async fn execute_escalate(
             Ok(DelegateOutcome::Paused(paused)) => {
                 let mut fields =
                     suborch_stage_agent_telemetry_fields(spec, &stage_name, &stage_agent);
-                fields.insert(Arc::from("status"), Value::String("paused".to_owned()));
+                fields.insert(field_key("status"), Value::String("paused".to_owned()));
                 record_telemetry_event(
                     state,
                     deps.hooks,
@@ -172,8 +177,8 @@ pub(super) async fn execute_escalate(
             Err(error) => {
                 let mut fields =
                     suborch_stage_agent_telemetry_fields(spec, &stage_name, &stage_agent);
-                fields.insert(Arc::from("status"), Value::String("failed".to_owned()));
-                fields.insert(Arc::from("error"), Value::String(error.to_string()));
+                fields.insert(field_key("status"), Value::String("failed".to_owned()));
+                fields.insert(field_key("error"), Value::String(error.to_string()));
                 record_telemetry_event(
                     state,
                     deps.hooks,
@@ -193,9 +198,9 @@ pub(super) async fn execute_escalate(
             }
         };
         let mut fields = suborch_stage_agent_telemetry_fields(spec, &stage_name, &stage_agent);
-        fields.insert(Arc::from("status"), Value::String("succeeded".to_owned()));
+        fields.insert(field_key("status"), Value::String("succeeded".to_owned()));
         fields.insert(
-            Arc::from("child_run_id"),
+            field_key("child_run_id"),
             Value::String(result.state.run_id.as_str().to_owned()),
         );
         record_telemetry_event(
@@ -205,12 +210,11 @@ pub(super) async fn execute_escalate(
             "suborch_stage_call_finished",
             fields,
         );
-        ordered.push((Arc::clone(&stage_name), result));
-        completed.insert(stage_name, ());
+        ordered.push((stage_name, result));
     }
 
     let mut fields = BTreeMap::new();
-    fields.insert(Arc::from("stages"), Value::from(ordered.len()));
+    fields.insert(field_key("stages"), Value::from(ordered.len()));
     record_telemetry_event(
         state,
         deps.hooks,
@@ -226,8 +230,8 @@ pub(super) async fn execute_escalate(
         fields.clone(),
     );
     let mut teardown_fields = suborch_telemetry_fields(spec);
-    teardown_fields.insert(Arc::from("status"), Value::String("succeeded".to_owned()));
-    teardown_fields.insert(Arc::from("stages"), Value::from(ordered.len()));
+    teardown_fields.insert(field_key("status"), Value::String("succeeded".to_owned()));
+    teardown_fields.insert(field_key("stages"), Value::from(ordered.len()));
     record_telemetry_event(
         state,
         deps.hooks,

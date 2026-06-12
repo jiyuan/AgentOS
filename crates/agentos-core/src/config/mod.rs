@@ -21,6 +21,8 @@ pub use memory::{
 pub use orchestrator::{RoutingConfig, RoutingRuleConfig, StageConfig, TemplateConfig};
 pub use subagents::SubAgentConfig;
 
+pub(crate) use orchestrator::stage_execution_order;
+
 use normalize::normalize_domain;
 use orchestrator::rule_from_config;
 use subagents::{normalize_memory_tool, normalize_memory_view, subagent_metadata};
@@ -261,8 +263,26 @@ impl WorkspaceConfig {
         config.validate_channels().map_err(std::io::Error::other)?;
         config.validate_resources().map_err(std::io::Error::other)?;
         config.validate_subagents().map_err(std::io::Error::other)?;
+        config
+            .validate_orchestrator_templates()
+            .map_err(std::io::Error::other)?;
         config.routing_table().map_err(std::io::Error::other)?;
         Ok(config)
+    }
+
+    /// Reject templates whose stage dependencies cannot be scheduled, so a
+    /// cyclic or dangling `depends_on` fails at config load instead of
+    /// mid-run at the first escalation.
+    pub fn validate_orchestrator_templates(&self) -> Result<(), String> {
+        for template in &self.orchestrator_templates {
+            stage_execution_order(
+                &template.stages,
+                |stage| &stage.name,
+                |stage| &stage.depends_on,
+            )
+            .map_err(|err| format!("orchestrator template '{}' has {err}", template.name))?;
+        }
+        Ok(())
     }
 
     fn resolve_paths(&mut self, config_dir: &Path) {

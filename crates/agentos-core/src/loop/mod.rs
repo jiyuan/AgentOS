@@ -32,7 +32,7 @@ use items::{
     assistant_tool_call_item, metadata_value, subagent_result_item, suborchestrator_result_item,
     tool_result_item, tool_status_name,
 };
-use telemetry::{plan_assignment_fields, record_telemetry_event};
+use telemetry::{field_key, plan_assignment_fields, record_telemetry_event};
 
 #[derive(Debug, Error)]
 pub enum RunError {
@@ -254,9 +254,9 @@ fn budget_exhausted_message(state: &RunState, max_turns: usize) -> Message {
     let mut message = Message::text(MessageRole::Assistant, body);
     message
         .metadata
-        .insert(Arc::from("run_truncated"), Value::Bool(true));
+        .insert(field_key("run_truncated"), Value::Bool(true));
     message.metadata.insert(
-        Arc::from("run_truncated_max_turns"),
+        field_key("run_truncated_max_turns"),
         Value::from(max_turns as u64),
     );
     message
@@ -274,8 +274,8 @@ async fn budget_exhausted_finish(
 ) -> FinalOutput {
     let parent_id = trace::run_span_id(&state);
     let mut fields = BTreeMap::new();
-    fields.insert(Arc::from("turns"), Value::from(turns as u64));
-    fields.insert(Arc::from("max_turns"), Value::from(deps.max_turns as u64));
+    fields.insert(field_key("turns"), Value::from(turns as u64));
+    fields.insert(field_key("max_turns"), Value::from(deps.max_turns as u64));
     let span_id = trace::record_span(
         &mut state,
         parent_id,
@@ -348,7 +348,7 @@ async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunErro
 
     let mut state = ctx.state;
     let mut fields = BTreeMap::new();
-    fields.insert(Arc::from("turn"), Value::from(ctx.turns));
+    fields.insert(field_key("turn"), Value::from(ctx.turns));
     let parent_id = trace::run_span_id(&state);
     let plan_span_id = trace::record_span(&mut state, parent_id, SpanKind::State, "plan", fields);
     trace::record_event(
@@ -377,11 +377,11 @@ async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunErro
     deps.orchestrator.hydrate(&mut run_ctx).await?;
     let mut hydrate_fields = BTreeMap::new();
     hydrate_fields.insert(
-        Arc::from("memory_fragments"),
+        field_key("memory_fragments"),
         Value::from(run_ctx.memory_fragments.len()),
     );
     hydrate_fields.insert(
-        Arc::from("resources"),
+        field_key("resources"),
         Value::from(run_ctx.resource_index.entries.len()),
     );
     for key in [
@@ -477,54 +477,54 @@ fn record_llm_usage(state: &mut RunState, deps: &LoopDeps<'_>, span_id: SpanId, 
     let total = state.usage;
     let mut fields = BTreeMap::new();
     fields.insert(
-        Arc::from("call_input_tokens"),
+        field_key("call_input_tokens"),
         Value::from(call.input_tokens),
     );
     fields.insert(
-        Arc::from("call_output_tokens"),
+        field_key("call_output_tokens"),
         Value::from(call.output_tokens),
     );
     fields.insert(
-        Arc::from("call_total_tokens"),
+        field_key("call_total_tokens"),
         Value::from(call.total_tokens),
     );
     fields.insert(
-        Arc::from("call_cache_read_tokens"),
+        field_key("call_cache_read_tokens"),
         Value::from(call.cache_read_tokens),
     );
     fields.insert(
-        Arc::from("call_cache_write_tokens"),
+        field_key("call_cache_write_tokens"),
         Value::from(call.cache_write_tokens),
     );
     fields.insert(
-        Arc::from("call_cache_miss_tokens"),
+        field_key("call_cache_miss_tokens"),
         Value::from(call.cache_miss_tokens),
     );
     fields.insert(
-        Arc::from("run_input_tokens"),
+        field_key("run_input_tokens"),
         Value::from(total.input_tokens),
     );
     fields.insert(
-        Arc::from("run_output_tokens"),
+        field_key("run_output_tokens"),
         Value::from(total.output_tokens),
     );
     fields.insert(
-        Arc::from("run_total_tokens"),
+        field_key("run_total_tokens"),
         Value::from(total.total_tokens),
     );
     fields.insert(
-        Arc::from("run_cache_read_tokens"),
+        field_key("run_cache_read_tokens"),
         Value::from(total.cache_read_tokens),
     );
     fields.insert(
-        Arc::from("run_cache_write_tokens"),
+        field_key("run_cache_write_tokens"),
         Value::from(total.cache_write_tokens),
     );
     fields.insert(
-        Arc::from("run_cache_miss_tokens"),
+        field_key("run_cache_miss_tokens"),
         Value::from(total.cache_miss_tokens),
     );
-    fields.insert(Arc::from("run_llm_calls"), Value::from(total.tool_calls));
+    fields.insert(field_key("run_llm_calls"), Value::from(total.tool_calls));
     trace::record_event(state, deps.hooks, span_id, "llm_token_usage", fields);
 
     info!(
@@ -681,10 +681,10 @@ fn execute_handoff(
     let from_agent = state.active_agent.clone();
     let parent_id = trace::run_span_id(state);
     let mut fields = BTreeMap::new();
-    fields.insert(Arc::from("from_agent"), metadata_value(from_agent.as_str()));
-    fields.insert(Arc::from("to_agent"), metadata_value(agent_id.as_str()));
+    fields.insert(field_key("from_agent"), metadata_value(from_agent.as_str()));
+    fields.insert(field_key("to_agent"), metadata_value(agent_id.as_str()));
     if let Some(payload) = payload {
-        fields.insert(Arc::from("payload"), payload);
+        fields.insert(field_key("payload"), payload);
     }
     let span_id = trace::record_span(
         state,
@@ -705,7 +705,7 @@ fn execute_handoff(
 
     let mut fields = BTreeMap::new();
     fields.insert(
-        Arc::from("active_agent"),
+        field_key("active_agent"),
         metadata_value(state.active_agent.as_str()),
     );
     trace::record_event(state, deps.hooks, span_id, "handoff_finished", fields);
@@ -725,8 +725,8 @@ async fn execute_tool(
 ) -> Result<ToolResult, RunError> {
     let parent_id = trace::run_span_id(state);
     let mut fields = BTreeMap::new();
-    fields.insert(Arc::from("tool_name"), metadata_value(call.name.as_ref()));
-    fields.insert(Arc::from("tool_call_id"), metadata_value(call.id.as_str()));
+    fields.insert(field_key("tool_name"), metadata_value(call.name.as_ref()));
+    fields.insert(field_key("tool_call_id"), metadata_value(call.id.as_str()));
     let tool_span_id = trace::record_span(
         state,
         parent_id,
@@ -789,7 +789,7 @@ async fn execute_tool(
 
     let mut fields = BTreeMap::new();
     fields.insert(
-        Arc::from("status"),
+        field_key("status"),
         metadata_value(tool_status_name(&result.status)),
     );
     trace::record_event(state, deps.hooks, tool_span_id, "tool_finished", fields);
@@ -807,9 +807,9 @@ fn denied_tool_result(
 ) -> ToolResult {
     let parent_id = trace::run_span_id(state);
     let mut fields = BTreeMap::new();
-    fields.insert(Arc::from("tool_name"), metadata_value(call.name.as_ref()));
-    fields.insert(Arc::from("tool_call_id"), metadata_value(call.id.as_str()));
-    fields.insert(Arc::from("approval_denied"), Value::Bool(true));
+    fields.insert(field_key("tool_name"), metadata_value(call.name.as_ref()));
+    fields.insert(field_key("tool_call_id"), metadata_value(call.id.as_str()));
+    fields.insert(field_key("approval_denied"), Value::Bool(true));
     let tool_span_id = trace::record_span(
         state,
         parent_id,
@@ -819,14 +819,14 @@ fn denied_tool_result(
     );
     let mut event_fields = BTreeMap::new();
     event_fields.insert(
-        Arc::from("status"),
+        field_key("status"),
         metadata_value(tool_status_name(&ToolStatus::Denied)),
     );
-    event_fields.insert(Arc::from("reason"), metadata_value(reason.as_ref()));
+    event_fields.insert(field_key("reason"), metadata_value(reason.as_ref()));
     trace::record_event(state, deps.hooks, tool_span_id, "tool_denied", event_fields);
 
     let mut metadata = BTreeMap::new();
-    metadata.insert(Arc::from("approval_denied"), Value::Bool(true));
+    metadata.insert(field_key("approval_denied"), Value::Bool(true));
     ToolResult {
         call_id: call.id.clone(),
         status: ToolStatus::Denied,
@@ -837,8 +837,8 @@ fn denied_tool_result(
 
 fn guardrail_tool_result(call: &ToolCall, guardrail: &Arc<str>, reason: Arc<str>) -> ToolResult {
     let mut metadata = BTreeMap::new();
-    metadata.insert(Arc::from("guardrail"), metadata_value(guardrail.as_ref()));
-    metadata.insert(Arc::from("guardrail_tripped"), Value::Bool(true));
+    metadata.insert(field_key("guardrail"), metadata_value(guardrail.as_ref()));
+    metadata.insert(field_key("guardrail_tripped"), Value::Bool(true));
     ToolResult {
         call_id: call.id.clone(),
         status: ToolStatus::Failed,

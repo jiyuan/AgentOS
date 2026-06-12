@@ -1,8 +1,8 @@
 use crate::providers::content::append_descriptors;
-use crate::providers::{attach_token_usage, log_token_usage, post_json};
+use crate::providers::{attach_token_usage, log_token_usage, post_json, raw_args_from_json_value};
 use agentos_interfaces::tool::ToolSpec;
 use agentos_proto::{Message, MessageRole, ToolCall, ToolCallId};
-use serde_json::{json, value::RawValue, Value};
+use serde_json::{json, Value};
 use std::env;
 use std::sync::Arc;
 
@@ -76,11 +76,10 @@ fn parse_tool_calls(message: &Value) -> Vec<ToolCall> {
             let function = call.get("function")?;
             let name = function.get("name").and_then(Value::as_str)?;
             // Ollama returns `function.arguments` as a JSON object directly,
-            // not a string. Normalise to a JSON-encoded string so it round-trips
-            // identically to OpenAI/DeepSeek through the rest of the pipeline.
-            let args_json = function.get("arguments").cloned().unwrap_or(json!({}));
-            let args_str = serde_json::to_string(&args_json).ok()?;
-            let args = RawValue::from_string(args_str).ok()?;
+            // not a string. Serialize it into a RawValue (no clone, no
+            // re-parse) so it round-trips identically to OpenAI/DeepSeek
+            // through the rest of the pipeline.
+            let args = raw_args_from_json_value(function.get("arguments"))?;
             let id = call
                 .get("id")
                 .and_then(Value::as_str)

@@ -1,8 +1,10 @@
 use crate::providers::content::append_descriptors;
-use crate::providers::{attach_token_usage, format_provider_error, log_token_usage, post_json};
+use crate::providers::{
+    attach_token_usage, format_provider_error, log_token_usage, post_json, raw_args_from_json_str,
+};
 use agentos_interfaces::tool::ToolSpec;
 use agentos_proto::{Message, MessageRole, ToolCall, ToolCallId};
-use serde_json::{json, value::RawValue, Value};
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::sync::Arc;
@@ -112,11 +114,7 @@ fn parse_tool_calls(message: &Value) -> Vec<ToolCall> {
             let id = call.get("id").and_then(Value::as_str)?;
             let function = call.get("function")?;
             let name = function.get("name").and_then(Value::as_str)?;
-            let args_str = function
-                .get("arguments")
-                .and_then(Value::as_str)
-                .unwrap_or("{}");
-            let args = RawValue::from_string(args_str.to_owned()).ok()?;
+            let args = raw_args_from_json_str(function.get("arguments"))?;
             Some(ToolCall {
                 id: ToolCallId::new(id),
                 name: Arc::from(name),
@@ -257,6 +255,7 @@ fn is_reasoning_content_passback_error(error: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::value::RawValue;
 
     fn raw_args(s: &str) -> Box<RawValue> {
         RawValue::from_string(s.to_owned()).unwrap()

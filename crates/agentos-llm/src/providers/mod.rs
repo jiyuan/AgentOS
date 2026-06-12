@@ -5,6 +5,7 @@ pub mod ollama;
 pub mod openai;
 
 use agentos_proto::{Message, TOKEN_USAGE_METADATA_KEY};
+use bytes::Bytes;
 use rand::Rng;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
 use reqwest::{Client, StatusCode};
@@ -180,6 +181,29 @@ pub(crate) fn attach_token_usage(message: &mut Message, usage: TokenUsage) {
     }
 }
 
+/// Build tool-call args from a provider field that encodes them as a JSON
+/// *string* (OpenAI/DeepSeek `function.arguments`). Validates the untrusted
+/// string and allocates exactly once, preserving the provider's bytes.
+pub(crate) fn raw_args_from_json_str(
+    args: Option<&Value>,
+) -> Option<Box<serde_json::value::RawValue>> {
+    let args_str = args.and_then(Value::as_str).unwrap_or("{}");
+    serde_json::value::RawValue::from_string(args_str.to_owned()).ok()
+}
+
+/// Build tool-call args from a provider field that carries them as a JSON
+/// *object* (Anthropic `input`, Ollama `function.arguments`). Serializes the
+/// borrowed value straight into a `RawValue` — no intermediate clone and no
+/// re-parse. Object keys serialize in sorted order.
+pub(crate) fn raw_args_from_json_value(
+    args: Option<&Value>,
+) -> Option<Box<serde_json::value::RawValue>> {
+    match args {
+        Some(value) => serde_json::value::to_raw_value(value).ok(),
+        None => serde_json::value::RawValue::from_string("{}".to_owned()).ok(),
+    }
+}
+
 const MAX_ATTEMPTS: u32 = 5;
 const BASE_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_BACKOFF: Duration = Duration::from_secs(8);
@@ -221,15 +245,19 @@ pub(crate) async fn post_json(
     headers: &[(&str, String)],
     payload: &Value,
 ) -> Result<JsonHttpResponse, String> {
-    let body = serde_json::to_vec(payload)
-        .map_err(|err| format!("failed to encode LLM request: {err}"))?;
+    // `Bytes` so the retry loop re-sends by bumping a refcount instead of
+    // copying the full serialized body on every attempt.
+    let body = Bytes::from(
+        serde_json::to_vec(payload)
+            .map_err(|err| format!("failed to encode LLM request: {err}"))?,
+    );
     let header_map = build_header_map(headers)?;
     let client = shared_client();
 
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
-        match send_once(client, url, &header_map, &body).await {
+        match send_once(client, url, &header_map, body.clone()).await {
             Ok(response) => {
                 if attempt < MAX_ATTEMPTS && is_retryable_status(response.status) {
                     let retry_after = parse_retry_after(&response.headers);
@@ -253,12 +281,12 @@ async fn send_once(
     client: &Client,
     url: &str,
     headers: &HeaderMap,
-    body: &[u8],
+    body: Bytes,
 ) -> Result<JsonHttpResponse, String> {
     let response = client
         .post(url)
         .headers(headers.clone())
-        .body(body.to_vec())
+        .body(body)
         .send()
         .await
         .map_err(|err| format!("LLM request failed: {err}; http_metadata=unavailable"))?;
@@ -613,5 +641,36 @@ mod tests {
             let delay = backoff_delay(attempt, None);
             assert!(delay <= MAX_BACKOFF, "attempt {attempt}: {delay:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod arg_extraction_tests {
+    use super::{raw_args_from_json_str, raw_args_from_json_value};
+    use serde_json::{json, Value};
+
+    #[test]
+    fn both_arg_shapes_produce_identical_raw_values_for_sorted_input() {
+        // String-encoded shape (OpenAI/DeepSeek) vs object shape
+        // (Anthropic/Ollama) must hand identical bytes downstream when the
+        // provider emits sorted keys.
+        let as_object = json!({"a": 1, "b": "two"});
+        let as_string = Value::String(r#"{"a":1,"b":"two"}"#.to_owned());
+
+        let from_value = raw_args_from_json_value(Some(&as_object)).expect("object args");
+        let from_str = raw_args_from_json_str(Some(&as_string)).expect("string args");
+        assert_eq!(from_value.get(), from_str.get());
+    }
+
+    #[test]
+    fn missing_args_default_to_empty_object_in_both_shapes() {
+        assert_eq!(raw_args_from_json_value(None).expect("default").get(), "{}");
+        assert_eq!(raw_args_from_json_str(None).expect("default").get(), "{}");
+    }
+
+    #[test]
+    fn invalid_arg_string_is_rejected() {
+        let invalid = Value::String("{not json".to_owned());
+        assert!(raw_args_from_json_str(Some(&invalid)).is_none());
     }
 }

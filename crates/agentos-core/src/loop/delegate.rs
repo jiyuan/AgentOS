@@ -1,5 +1,5 @@
 use super::telemetry::{
-    record_subagent_failure, record_telemetry_event, subagent_telemetry_fields,
+    field_key, record_subagent_failure, record_telemetry_event, subagent_telemetry_fields,
 };
 use super::{LoopDeps, RunError};
 use crate::runner::ResumeDecision;
@@ -28,11 +28,11 @@ pub(super) async fn execute_delegate(
     let parent_id = trace::run_span_id(state);
     let mut fields = BTreeMap::new();
     fields.insert(
-        Arc::from("subagent_id"),
+        field_key("subagent_id"),
         Value::String(spec.agent_id.as_str().to_owned()),
     );
     fields.insert(
-        Arc::from("policy_id"),
+        field_key("policy_id"),
         Value::String(spec.policy_id.as_ref().to_owned()),
     );
     let span_id = trace::record_span(
@@ -54,15 +54,15 @@ pub(super) async fn execute_delegate(
     let input = child_input_envelope(spec, state);
     let run_id = child_run_id(spec, state);
     create_fields.insert(
-        Arc::from("child_run_id"),
+        field_key("child_run_id"),
         Value::String(run_id.as_str().to_owned()),
     );
     create_fields.insert(
-        Arc::from("conversation_id"),
+        field_key("conversation_id"),
         Value::String(input.conversation_id.as_str().to_owned()),
     );
     create_fields.insert(
-        Arc::from("metadata_keys"),
+        field_key("metadata_keys"),
         Value::from(input.metadata.len()),
     );
     record_telemetry_event(
@@ -125,15 +125,15 @@ pub(super) async fn execute_delegate(
 
     let mut fields = BTreeMap::new();
     fields.insert(
-        Arc::from("child_run_id"),
+        field_key("child_run_id"),
         Value::String(result.state.run_id.as_str().to_owned()),
     );
     fields.insert(
-        Arc::from("trace_spans"),
+        field_key("trace_spans"),
         Value::from(result.state.trace_spans.len()),
     );
     fields.insert(
-        Arc::from("trace_events"),
+        field_key("trace_events"),
         Value::from(result.state.trace_events.len()),
     );
     record_telemetry_event(
@@ -151,9 +151,9 @@ pub(super) async fn execute_delegate(
         fields,
     );
     let mut teardown_fields = subagent_telemetry_fields(spec);
-    teardown_fields.insert(Arc::from("status"), Value::String("succeeded".to_owned()));
+    teardown_fields.insert(field_key("status"), Value::String("succeeded".to_owned()));
     teardown_fields.insert(
-        Arc::from("child_run_id"),
+        field_key("child_run_id"),
         Value::String(result.state.run_id.as_str().to_owned()),
     );
     record_telemetry_event(
@@ -179,7 +179,7 @@ pub(super) async fn execute_resume_delegate(
     let input = Envelope {
         channel_id: paused.channel_id.clone(),
         conversation_id: paused.conversation_id.clone(),
-        sender: Arc::from("subagent-resume"),
+        sender: field_key("subagent-resume"),
         message: Message::text(MessageRole::User, ""),
         metadata: BTreeMap::new(),
     };
@@ -196,7 +196,7 @@ pub(super) async fn execute_resume_delegate(
             );
             let mut fields = subagent_telemetry_fields(spec);
             fields.insert(
-                Arc::from("child_run_id"),
+                field_key("child_run_id"),
                 Value::String(result.state.run_id.as_str().to_owned()),
             );
             record_telemetry_event(

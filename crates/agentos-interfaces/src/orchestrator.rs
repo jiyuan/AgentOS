@@ -220,7 +220,9 @@ impl<'a> RunContext<'a> {
         else {
             return;
         };
-        if let Ok(usage) = serde_json::from_value::<Usage>(raw.clone()) {
+        // Deserialize by reference — `&Value` implements `Deserializer`, so
+        // there is no need to clone the metadata value first.
+        if let Ok(usage) = Usage::deserialize(raw) {
             self.push_llm_usage(usage);
         }
     }

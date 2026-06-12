@@ -86,6 +86,14 @@ name = "remote_echo"
 description = "Static MCP-backed echo tool"
 response = "static MCP response"
 
+# Routing: deterministic skill/diagnostic routes always apply. The LLM
+# classifier (one extra model round-trip per routed turn) only runs when the
+# input shares vocabulary with a specialized rule below; set
+# `llm_classifier = false` to never spend that round-trip and send unmatched
+# input straight to the fallback.
+[routing]
+llm_classifier = true
+
 [[routing.rules]]
 domain = "software_dev"
 description = "Implementation, debugging, submitted issue fixes, regressions, tests, architecture, code review, and repository maintenance."

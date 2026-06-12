@@ -4,36 +4,48 @@ Target loop overhead: ≤ 2 ms per turn excluding LLM and tool latency. This is 
 
 ## Current results
 
-Captured 2026-06-11 with the criterion harness (100 samples, 3 s warmup) on `current_thread` tokio runtimes, release profile, unless noted.
+Captured 2026-06-11 (post roadmap Phase 3) with the criterion harness
+(100 samples, 3 s warmup) on `current_thread` tokio runtimes, release
+profile, unless noted. Single-turn wall times move ±5–8% between runs on
+this machine; treat deltas inside that band as noise.
 
-| Bench | Mean | 95% CI | Verdict |
-|---|---|---|---|
-| `loop_overhead/reply_turn` | **1.18 µs** | [1.181, 1.185] µs | ~1690× under the 2 ms ceiling. |
-| `loop_overhead/tool_turn_allow` | **3.08 µs** | [3.075, 3.093] µs | Approve + tool dispatch + extra states add ~1.9 µs over a reply turn. |
-| `loop_overhead/ask_user_pause_resume` | **7.80 µs** | [7.782, 7.821] µs | Full interruption cycle: pause, JSON persist round-trip, approve, resume, finish. |
-| `loop_overhead/paused_state_json_round_trip` | **3.61 µs** | [3.603, 3.622] µs | `RunState` serialize + deserialize alone — roughly half the pause/resume cycle. |
-| `loop_overhead/hydrated_memory_plan_turn` | **268.8 µs** | [267.9, 269.7] µs | SQLite-backed hydration dominates the turn (~230× a reply turn) but stays ~7× under the ceiling. |
-
-Allocation counts (counting global allocator, 2000 iterations, deterministic):
-
-| Scenario | Allocations/turn | Bytes/turn |
+| Bench | Mean | Verdict |
 |---|---|---|
-| `alloc_count/reply_turn` | **46** | 3 936 |
-| `alloc_count/tool_turn_allow` | **130** | 12 362 |
+| `loop_overhead/reply_turn` | **1.19 µs** | ~1690× under the 2 ms ceiling; unchanged through Phase 3 (within noise). |
+| `loop_overhead/tool_turn_allow` | **3.00 µs** | Approve + tool dispatch + extra states add ~1.8 µs over a reply turn. |
+| `loop_overhead/ask_user_pause_resume` | **7.71 µs** | Full interruption cycle: pause, JSON persist round-trip, approve, resume, finish. |
+| `loop_overhead/paused_state_json_round_trip` | **3.55 µs** | `RunState` serialize + deserialize alone — roughly half the pause/resume cycle. |
+| `loop_overhead/hydrated_memory_plan_turn` | **273.6 µs** | SQLite-backed hydration dominates the turn (~230× a reply turn) but stays ~7× under the ceiling. |
 
-These are the baselines for the allocation-reduction work in
-[`docs/OPTIMIZATION_ROADMAP.md`](docs/OPTIMIZATION_ROADMAP.md) Phase 3
-(telemetry field maps, transcript clones, prelude caching).
+Allocation counts (counting global allocator, 2000 iterations,
+deterministic). Phase 3 (interned telemetry field keys, gated log
+serialization, cached skill prelude) cut both scenarios by ~20%:
+
+| Scenario | Allocations/turn | Bytes/turn | Phase 1 baseline |
+|---|---|---|---|
+| `alloc_count/reply_turn` | **37** | 3 560 | 46 / 3 936 |
+| `alloc_count/tool_turn_allow` | **104** | 11 370 | 130 / 12 362 |
 
 Concurrency / tail latency (1000 concurrent tool-call conversations per round, 5 rounds, 16 shard threads):
 
-| Metric | Value |
-|---|---|
-| p50 per-conversation latency | **3.1 µs** |
-| p95 | **3.9 µs** |
-| p99 | **6.1 µs** |
-| max (5000 samples) | **43.9 µs** |
-| throughput | ~1.3–1.5 M conversations/s |
+| Metric | Value | Phase 1 baseline |
+|---|---|---|
+| p50 per-conversation latency | **3.0 µs** | 3.1 µs |
+| p95 | **3.8 µs** | 3.9 µs |
+| p99 | **10.4 µs** | 6.1 µs |
+| throughput | ~1.5 M conversations/s | ~1.3–1.5 M/s |
+
+### Performance finding: shared interned `Arc<str>` keys contend under concurrency
+
+The first Phase 3 implementation interned telemetry field keys in a
+process-global table. Single-thread benches improved, but the
+1000-conversation bench regressed ~3.5× on p50 (3.1 µs → 10.8 µs): every
+clone/drop of a shared key `Arc` became a contended refcount RMW bouncing
+between all 16 shard threads. The fix (current implementation,
+`loop/telemetry.rs`) interns **per thread** via `thread_local!`, restoring
+p50 to 3.0 µs while keeping the allocation win. Rule of thumb for this
+codebase: never share refcounted hot-path constants across shard threads —
+intern per thread or per runtime.
 
 ### Architectural finding: the loop future is `!Send`
 

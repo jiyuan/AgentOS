@@ -159,7 +159,13 @@ allocator pressure under concurrency (visible via benches 1.1/1.2), not the
 single-turn number, which is already 1.08 µs. Items 3.1–3.2 save real
 wall-clock latency.
 
-### 3.1 Cut the extra LLM classifier round-trip in routing (biggest win)
+### 3.1 Cut the extra LLM classifier round-trip in routing (biggest win) — **done 2026-06-11**
+
+Outcome: (a) lexical pre-filter — the classifier only runs when the input
+shares significant vocabulary with a specialized route, and only for tables
+where every rule carries examples; (c) `[routing].llm_classifier` config
+flag. The classifier domain catalog JSON is also precomputed per
+orchestrator instead of rebuilt per decision.
 
 `MaxOrchestrator::route_user_text_with_llm`
 (`crates/agentos-core/src/orchestrator/max.rs:245-279`) spends a full LLM
@@ -175,7 +181,7 @@ plus token cost, dwarfing everything else here. Do, in order of preference:
 Effort: M. Verify: existing routing tests plus new heuristic-path tests;
 manual latency comparison (LLM-bound, no benchmark).
 
-### 3.2 Stop copying the request body per retry attempt
+### 3.2 Stop copying the request body per retry attempt — **done 2026-06-11**
 
 `send_once` (`crates/agentos-llm/src/providers/mod.rs:252-263`) does
 `headers.clone()` + `body.to_vec()` on every attempt — up to 5 full-body
@@ -185,7 +191,13 @@ Switch the body parameter to `bytes::Bytes` (clone is a refcount bump).
 Effort: S, internal-only. Verify: `cargo test -p agentos-llm`; retry/backoff
 tests pass.
 
-### 3.3 Telemetry allocation diet
+### 3.3 Telemetry allocation diet — **done 2026-06-11** (~20% fewer allocs/turn)
+
+Outcome notes: keys are interned **per thread** (`thread_local!`), not in
+global statics as planned below — the global table regressed concurrency
+p50 ~3.5× from cross-thread `Arc` refcount contention (see the finding in
+`BENCHMARKS.md`). The failure-helper map clones were kept: both emitted
+events genuinely carry identical fields and the path is cold.
 
 `crates/agentos-core/src/loop/telemetry.rs` allocates ~40+ times per plan
 turn:
@@ -204,7 +216,7 @@ turn:
 Effort: S–M. Verify: alloc bench (1.2) before/after — target single-digit
 allocations per turn; trace-output snapshot tests unchanged.
 
-### 3.4 Cache the skill prelude
+### 3.4 Cache the skill prelude — **done 2026-06-11** (built in `with_skill_catalog`, no `OnceLock` needed)
 
 `skill_prelude_message()` (`max.rs:221-243`) rebuilds the full concatenated
 SKILL.md prelude `String` on every `plan()` call; the catalog is fixed per
@@ -215,7 +227,7 @@ to Phase 4.2, which removes the empty-map case for free.
 
 Effort: S. Verify: alloc bench delta; prelude unit tests.
 
-### 3.5 Standardize provider tool-arg extraction
+### 3.5 Standardize provider tool-arg extraction — **done 2026-06-11** (`raw_args_from_json_str` / `raw_args_from_json_value`; object shape now uses `to_raw_value`, no clone or re-parse)
 
 `openai.rs`, `anthropic.rs`, `deepseek.rs`, and `ollama.rs` each do their own
 `Value → String → RawValue` round-trip with extra `to_owned()`. Add one
@@ -225,7 +237,7 @@ one allocation; one place to fix escaping bugs.
 Effort: M. Verify: provider fixture tests plus a shared round-trip test
 asserting byte-identical `RawValue` output across providers.
 
-### 3.6 Topo-sort escalation stages at template load
+### 3.6 Topo-sort escalation stages at template load — **done 2026-06-11**
 
 `crates/agentos-core/src/loop/escalate.rs:102` clones
 `spec.template.stages` wholesale, then resolves dependencies O(stages²) per
@@ -236,17 +248,25 @@ templates get rejected at load time instead of at runtime.
 Effort: S–M. Verify: existing escalation tests plus a
 cyclic-template-rejected-at-load test.
 
-### 3.7 Small-fry batch (opportunistic, alongside 3.3–3.6)
+Outcome note (done 2026-06-11): the order is computed index-based at
+escalation start (no stage clones; the whole order resolves before any stage
+runs, so a broken template no longer partially executes), and
+`WorkspaceConfig::load` rejects cyclic/dangling `depends_on` at startup via
+the shared `config::stage_execution_order`. The order is not persisted on
+`OrchestratorTemplate` because that is an `agentos-interfaces` wire type —
+revisit alongside 4.2 if it ever shows up in a profile.
+
+### 3.7 Small-fry batch (opportunistic, alongside 3.3–3.6) — **done 2026-06-11**
 
 - `crates/agentos-interfaces/src/orchestrator.rs:223` — drop the
   `raw.clone()` before `serde_json::from_value` in
   `push_llm_usage_from_message`.
-- `crates/agentos-core/src/loop/items.rs` — replace the
-  `is_char_boundary()` walk in 64 KB truncation with a bounded backward scan
-  (≤3 iterations).
+- `crates/agentos-core/src/loop/items.rs` — no change needed: the
+  `is_char_boundary()` walk is already bounded to ≤3 iterations (UTF-8
+  boundary distance); the original finding overstated it.
 - `approve/mod.rs decide()` re-parses tool args per decision but is already
-  well-gated by `tool_has_arg_constraints()` — leave it unless the tool-turn
-  bench (1.1) flags it.
+  well-gated by `tool_has_arg_constraints()` — left as is; the tool-turn
+  bench does not flag it.
 
 Effort: S. Verify: full test suite; tool-turn bench unchanged or better.
 

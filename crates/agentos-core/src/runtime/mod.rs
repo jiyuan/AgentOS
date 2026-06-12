@@ -224,6 +224,7 @@ impl AgentRuntime {
         let max_orchestrator = MaxOrchestrator::with_tools(tools.specs())
             .with_resource_index(resource_index)
             .with_routing_table(routing_table)
+            .with_llm_routing(workspace_config.routing.llm_classifier)
             .with_skill_catalog(skill_catalog.clone())
             .with_llm(high_llm.clone())
             .with_memory_hydrator(

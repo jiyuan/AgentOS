@@ -4,10 +4,11 @@ use crate::providers::content::{
 };
 use crate::providers::{
     attach_token_usage, first_env, format_openai_error, log_token_usage, post_json,
+    raw_args_from_json_str,
 };
 use agentos_interfaces::tool::ToolSpec;
 use agentos_proto::{Attachment, AttachmentKind, Message, MessageRole, ToolCall, ToolCallId};
-use serde_json::{json, value::RawValue, Value};
+use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::env;
 use std::sync::Arc;
@@ -101,13 +102,9 @@ fn parse_tool_calls(message: &Value) -> Vec<ToolCall> {
             let id = call.get("id").and_then(Value::as_str)?;
             let function = call.get("function")?;
             let name = function.get("name").and_then(Value::as_str)?;
-            let args_str = function
-                .get("arguments")
-                .and_then(Value::as_str)
-                .unwrap_or("{}");
-            // Arguments come as a JSON string. Re-parse into RawValue so we
+            // Arguments come as a JSON string. Validate into RawValue so we
             // can hand a canonical RawValue downstream without re-encoding.
-            let args = RawValue::from_string(args_str.to_owned()).ok()?;
+            let args = raw_args_from_json_str(function.get("arguments"))?;
             Some(ToolCall {
                 id: ToolCallId::new(id),
                 name: Arc::from(name),
@@ -315,6 +312,7 @@ fn document_block(attachment: &Attachment) -> Option<Value> {
 mod tests {
     use super::*;
     use agentos_proto::AttachmentKind;
+    use serde_json::value::RawValue;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
