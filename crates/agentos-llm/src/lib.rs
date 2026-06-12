@@ -3,6 +3,8 @@
 pub mod env;
 pub mod providers;
 
+pub use providers::ProviderError;
+
 use agentos_interfaces::orchestrator::{Orchestrator, OrchestratorError, Plan, RunContext};
 use agentos_interfaces::tool::ToolSpec;
 use agentos_proto::{Message, MessageRole};
@@ -234,9 +236,9 @@ impl Llm for EnvLlm {
             "anthropic" => providers::anthropic::complete(&selection.model, messages, tools).await,
             "deepseek" => providers::deepseek::complete(&selection.model, messages, tools).await,
             "ollama" => providers::ollama::complete(&selection.model, messages, tools).await,
-            other => Err(format!("unknown LLM provider: {other}")),
+            other => Err(ProviderError::UnknownProvider(Arc::from(other))),
         }
-        .map_err(|err| LlmError::Provider(Arc::from(err)))?;
+        .map_err(|err| LlmError::Provider(Arc::from(err.to_string())))?;
         // Belt-and-braces: providers may forget to set the role; force Assistant.
         let mut message = message;
         message.role = MessageRole::Assistant;

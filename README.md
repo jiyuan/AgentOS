@@ -40,8 +40,10 @@ scripts/install-agentos.sh
 ## Architecture overview
 
 AgentOS is layered into an immutable core engine, an agent-owned workspace, and
-swappable extensions. Core crates must never depend on workspace or extension
-content.
+extension implementations behind the `agentos-interfaces` traits. Extensions
+are compiled in and selected through `agent.toml` (there is no dynamic plugin
+loading — see the extension boundary section of the architecture doc). Core
+crates must never depend on workspace or extension content.
 
 - `agentos-proto`: serializable wire and domain types.
 - `agentos-interfaces`: public extension traits and shared run-state types.

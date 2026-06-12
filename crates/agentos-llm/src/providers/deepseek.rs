@@ -1,6 +1,7 @@
 use crate::providers::content::append_descriptors;
 use crate::providers::{
     attach_token_usage, format_provider_error, log_token_usage, post_json, raw_args_from_json_str,
+    ProviderError,
 };
 use agentos_interfaces::tool::ToolSpec;
 use agentos_proto::{Message, MessageRole, ToolCall, ToolCallId};
@@ -15,9 +16,10 @@ pub async fn complete(
     model: &str,
     messages: &[Message],
     tools: &[ToolSpec],
-) -> Result<Message, String> {
-    let api_key =
-        env::var("DEEPSEEK_API_KEY").map_err(|_| "missing DEEPSEEK_API_KEY".to_owned())?;
+) -> Result<Message, ProviderError> {
+    let api_key = env::var("DEEPSEEK_API_KEY").map_err(|_| ProviderError::MissingCredentials {
+        variable: "DEEPSEEK_API_KEY",
+    })?;
     let base_url = env::var("AGENTOS_DEEPSEEK_BASE_URL")
         .or_else(|_| env::var("DEEPSEEK_BASE_URL"))
         .or_else(|_| env::var("DEEPSEEK_HOST"))
@@ -56,11 +58,11 @@ pub async fn complete(
         .and_then(Value::as_array)
         .and_then(|choices| choices.first())
         .and_then(|choice| choice.get("message"))
-        .ok_or_else(|| {
-            format!(
+        .ok_or_else(|| ProviderError::MalformedResponse {
+            detail: format!(
                 "DeepSeek response missing assistant message: {}",
                 response.body
-            )
+            ),
         })?;
     let mut message = assistant_message_from_value(message);
     if let Some(usage) = token_usage {

@@ -78,10 +78,31 @@ Current reference-implementation decisions:
 - Built-in deterministic skill planners remain core reference planners.
   Workspace skill content remains workspace-owned data.
 
+How extensions are wired today (decided 2026-06-12, roadmap Phase 4.4):
+
+- Implementations are **compiled in**, selected by `agent.toml` strings:
+  `[agent].orchestrator` picks `builtin.max`/`builtin.min`, `[memory].backend`
+  picks the built-in stores, channels and tools are enabled by name. There is
+  no plugin loader; the `extensions/` directory is a home for future
+  first-party extension crates, not a drop-in mechanism.
+- Adding an implementation therefore means: a new crate that implements the
+  `agentos-interfaces` traits, a dependency edge from `agentos-cli` (never
+  from core), a registration arm in `agentos-core::runtime` construction or
+  the CLI wiring, and a rebuild.
+- Dynamic library loading was considered and **rejected**: Rust has no stable
+  ABI, and a `dlopen`-style surface would bypass both the import-boundary
+  check and the supply-chain posture of the authorization layer.
+- A link-time factory registry in `agentos-interfaces` (extension crates
+  register constructors; core stays free of extension imports) is the
+  designated upgrade path if out-of-tree extensions materialize — design doc
+  required first.
+- `Approve` stays a concrete engine regardless; the extension surface is
+  orchestrators, memory, tools, channels, skills, and guardrails only.
+
 Boundary enforcement:
 
 - `scripts/check-import-boundaries.sh` enforces compile-time dependency
-  boundaries.
+  boundaries (with a `--self-test` negative-fixture mode).
 - Core crates must not import workspace-owned code or extension crates.
 - Runtime path strings in docs, comments, tests, and user examples are not
   dependency-boundary violations.

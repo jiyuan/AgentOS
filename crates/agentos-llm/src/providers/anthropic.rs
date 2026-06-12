@@ -2,7 +2,9 @@ use crate::providers::content::{
     append_descriptors, document_mime, format_text_document, image_mime, read_base64,
     read_text_document,
 };
-use crate::providers::{attach_token_usage, log_token_usage, post_json, raw_args_from_json_value};
+use crate::providers::{
+    attach_token_usage, log_token_usage, post_json, raw_args_from_json_value, ProviderError,
+};
 use agentos_interfaces::tool::ToolSpec;
 use agentos_proto::{Attachment, AttachmentKind, Message, MessageRole, ToolCall, ToolCallId};
 use serde_json::{json, Value};
@@ -13,9 +15,10 @@ pub async fn complete(
     model: &str,
     messages: &[Message],
     tools: &[ToolSpec],
-) -> Result<Message, String> {
-    let api_key =
-        env::var("ANTHROPIC_API_KEY").map_err(|_| "missing ANTHROPIC_API_KEY".to_owned())?;
+) -> Result<Message, ProviderError> {
+    let api_key = env::var("ANTHROPIC_API_KEY").map_err(|_| ProviderError::MissingCredentials {
+        variable: "ANTHROPIC_API_KEY",
+    })?;
     let base_url = env::var("AGENTOS_ANTHROPIC_BASE_URL")
         .or_else(|_| env::var("ANTHROPIC_BASE_URL"))
         .unwrap_or_else(|_| "https://api.anthropic.com/v1".to_owned());
@@ -50,11 +53,11 @@ pub async fn complete(
         .body
         .get("content")
         .and_then(Value::as_array)
-        .ok_or_else(|| {
-            format!(
+        .ok_or_else(|| ProviderError::MalformedResponse {
+            detail: format!(
                 "Anthropic response missing assistant content: {}",
                 response.body
-            )
+            ),
         })?;
     let mut text = String::new();
     let mut tool_calls = Vec::new();

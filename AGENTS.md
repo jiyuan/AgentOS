@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Agent OS is an agent-agnostic runtime written in Rust. It has three layers: an immutable core engine (`crates/`), an agent-modifiable workspace (`workspace/`), and swappable extensions (`extensions/`). The core engine must never depend on workspace or extensions.
+Agent OS is an agent-agnostic runtime written in Rust. It has three layers: an immutable core engine (`crates/`), an agent-modifiable workspace (`workspace/`), and compiled-in extensions selected via `agent.toml` (`extensions/`). The core engine must never depend on workspace or extensions.
 
 ## Project structure
 
@@ -21,7 +21,7 @@ agentos/
 │   └── agentos-cli/          # Binary entry point.
 ├── workspace/                # Agent-owned config and data. Not a Cargo crate.
 │   └── agent.toml            # Agent wiring: orchestrator, memory, channels, policy.
-├── extensions/               # Drop-in orchestrator and memory implementations.
+├── extensions/               # Compiled-in extension crates (selected via agent.toml).
 │   ├── orchestrators/
 │   └── memory/
 ├── DESIGN.md                 # Loop state machine diagram and safety architecture.

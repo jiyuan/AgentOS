@@ -4,7 +4,7 @@ use crate::providers::content::{
 };
 use crate::providers::{
     attach_token_usage, first_env, format_openai_error, log_token_usage, post_json,
-    raw_args_from_json_str,
+    raw_args_from_json_str, ProviderError,
 };
 use agentos_interfaces::tool::ToolSpec;
 use agentos_proto::{Attachment, AttachmentKind, Message, MessageRole, ToolCall, ToolCallId};
@@ -17,8 +17,10 @@ pub async fn complete(
     model: &str,
     messages: &[Message],
     tools: &[ToolSpec],
-) -> Result<Message, String> {
-    let api_key = env::var("OPENAI_API_KEY").map_err(|_| "missing OPENAI_API_KEY".to_owned())?;
+) -> Result<Message, ProviderError> {
+    let api_key = env::var("OPENAI_API_KEY").map_err(|_| ProviderError::MissingCredentials {
+        variable: "OPENAI_API_KEY",
+    })?;
     let base_url = env::var("AGENTOS_OPENAI_BASE_URL")
         .or_else(|_| env::var("OPENAI_BASE_URL"))
         .unwrap_or_else(|_| "https://api.openai.com/v1".to_owned());
@@ -60,7 +62,9 @@ pub async fn complete(
         .and_then(Value::as_array)
         .and_then(|choices| choices.first())
         .and_then(|choice| choice.get("message"))
-        .ok_or_else(|| format!("OpenAI response missing message: {}", response.body))?;
+        .ok_or_else(|| ProviderError::MalformedResponse {
+            detail: format!("OpenAI response missing message: {}", response.body),
+        })?;
     let content = message
         .get("content")
         .and_then(Value::as_str)

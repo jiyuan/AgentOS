@@ -54,9 +54,10 @@ Known verification warning:
   `crates/agentos-cli/src/bin/agentos-gateway.rs` size as allowlisted legacy
   debt.
 - 2026-06-11 audit: `crates/agentos-core/src/loop/mod.rs` crossed the ceiling
-  (866 production LOC) during the max-turns budget work and is now allowlisted
-  as tracked debt; the split is scheduled as Phase 4.1 of
-  [`OPTIMIZATION_ROADMAP.md`](OPTIMIZATION_ROADMAP.md).
+  (866 production LOC) during the max-turns budget work. Resolved 2026-06-12
+  (roadmap Phase 4.1): the budget-exhaustion path and usage accounting moved
+  to `loop/budget.rs`, and the allowlist now holds only the two entry-point
+  binaries, as A6 intends.
 
 ## Architectural Findings To Resolve
 

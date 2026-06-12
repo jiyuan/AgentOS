@@ -276,9 +276,18 @@ Effort: S. Verify: full test suite; tool-turn bench unchanged or better.
 
 These need the Phase 2 safety net and the Phase 1.3 semver-checks job.
 
-### 4.1 Split oversized modules
+### 4.1 Split oversized modules — **done 2026-06-12**
 
-Pure code motion, no behavior change:
+Outcome: `loop/mod.rs` 869 → 689 lines (budget-exhaustion path +
+`record_llm_usage` moved to `loop/budget.rs`) and its allowlist entry is
+removed — the allowlist now holds only the two entry-point binaries, which
+PLAN.md A6 explicitly permits, so the CLI/gateway shrink is closed as
+policy-compliant rather than refactored. The YAML parser moved to
+`approve/yaml.rs` with a comment recording the deliberate no-`serde_yaml`
+decision. `orchestrator/max.rs` is under the production-LOC ceiling
+(its 994 raw lines are mostly tests) and was left intact.
+
+Original plan, for reference:
 
 - `loop/mod.rs` (866 production LOC — over the ceiling, allowlisted
   2026-06-11) → extract the budget-exhaustion path and `record_llm_usage`
@@ -299,41 +308,53 @@ Effort: M. Verify: `scripts/check-module-size.sh` passes with a smaller
 (ideally empty) allowlist; full tests; `git diff --stat` shows moves, not
 rewrites.
 
-### 4.2 Wire format: make metadata optional — **risky**
+### 4.2 Wire format: make metadata optional — **closed 2026-06-12 as no-op (premise was wrong)**
 
-`agentos-proto` types (`Message`, `Envelope`, `TraceEvent`, `ToolResult`)
-always allocate a `BTreeMap<Arc<str>, Value>` for metadata, even when empty,
-and serialize `"metadata": {}` on every wire item — multiplied by transcript
-length on every LLM call. Change to `Option<BTreeMap<...>>` with
-`#[serde(default, skip_serializing_if = "Option::is_none")]`.
+The Phase-1 audit behind this item claimed metadata maps are "always
+allocated even when empty" and that `"metadata": {}` is serialized on every
+wire item. A direct re-audit found both claims false:
 
-Risk flags:
+1. `std::collections::BTreeMap::new()` is `const` and allocation-free —
+   an empty map allocates nothing until its first insert, and cloning an
+   empty map is free. `Option<BTreeMap>` would save zero allocations.
+2. Every `metadata`/`fields` field across `agentos-proto`
+   (`Message`, `Envelope`, `ToolResult`, `TraceSpan`, `TraceEvent`) and
+   `agentos-interfaces` (`Item`, `Record`, `SkillInvocation`, all spec
+   types) already carries
+   `#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]` —
+   empty maps are already omitted from the wire and persisted JSON.
 
-- Wire-format and public-API change — every construction/access site across
-  all crates changes.
-- Old persisted `RunState` blobs (paused sessions) must still deserialize.
-  Commit a fixture serialized from the *pre-change* version first; the 2.1
-  round-trip test is the gate.
-- External consumers of the JSON wire format see fields disappear.
+The `Option<BTreeMap>` migration would have been a breaking churn-only
+change. Nothing to do; the deep-clone cost of *non-empty* maps remains and
+is tracked implicitly by the alloc bench.
 
-Effort: M–L (mechanical but wide). Verify:
-`cargo semver-checks check-release -p agentos-proto -p agentos-interfaces`
-(expect a major bump); old-fixture deserialization test; alloc bench delta.
+### 4.3 `agentos-llm` error model: `String` → thiserror enum — **done 2026-06-12 (scoped)**
 
-### 4.3 `agentos-llm` error model: `String` → thiserror enum — **API-breaking**
+Two premise corrections from implementation: a typed `LlmError` already
+existed at the `Llm` trait boundary, and the retry loop was already
+structural (status-code based, deciding *before* errors become strings) —
+so "retry logic depends on error-string formatting" was stale. The
+delivered scope: a `ProviderError` thiserror enum
+(`MissingCredentials` / `Encode` / `InvalidHeader` / `Transport` /
+`MalformedResponse` / `Api { provider, status, detail }` /
+`UnknownProvider`) now flows through `post_json` and all four provider
+adapters, re-exported as `agentos_llm::ProviderError`, and is stringified
+into the existing `LlmError::Provider` only at the trait boundary. Display
+text matches the legacy messages, so logs and operators see no change.
+Breaking only for direct callers of `providers::*::complete` (none in-tree
+besides `EnvLlm`). Startup/config `Result<_, String>` paths in `env.rs` and
+`lib.rs` are out of scope — they are anyhow-style setup errors, tracked as
+future hygiene.
 
-Provider errors are `Result<_, String>` throughout `providers/`, violating
-the project's thiserror convention and forcing retry logic to depend on
-error-string formatting. Introduce an `LlmError` enum (`Http { status,
-retry_after }`, `Provider { code, message }`, `Transport`, `Decode`, …) so
-retry decisions match variants structurally.
+### 4.4 Decide and document the extensions/plugin boundary — **done 2026-06-12 (option a)**
 
-Ship together with 4.2 as one major-version event, not two.
+Outcome: `docs/ARCHITECTURE.md` §4 now states the real mechanism
+(compiled-in implementations selected by `agent.toml` strings; no plugin
+loader; dylib loading rejected; link-time registry named as the upgrade
+path), and the "swappable"/"drop-in" phrasing in `README.md` and
+`CLAUDE.md` was corrected to match.
 
-Effort: M. Verify: `cargo semver-checks check-release -p agentos-llm`
-(expect major); retry tests rewritten to assert on variants.
-
-### 4.4 Decide and document the extensions/plugin boundary
+Original options, for reference:
 
 Orchestrators and memory backends are compiled-in enums selected by
 `agent.toml` strings; `extensions/` exists but the plugin path is weaker than
@@ -372,3 +393,20 @@ user-visible latency and token cost), 3.2 (retry-storm resilience), allocator
 pressure at 1000-conversation concurrency (3.3/3.4/4.2, visible only once
 bench 1.1 exists), and the panic-path and test-coverage risk reduction in
 Phase 2.
+
+## Status (2026-06-12): all four phases executed
+
+Every item is closed; per-item outcome notes live in the sections above. The
+"4.2 + 4.3 major-version event" never happened: 4.2 dissolved on re-audit
+(the metadata maps were never allocated-when-empty nor serialized-when-empty)
+and 4.3 landed without touching the public `Llm` trait. Open follow-ups
+carried out of this roadmap:
+
+- Delete the deprecated `runtime::load_workspace_config()` wrapper after one
+  release (Phase 2.3 note; equivalence tests are the gate).
+- Making the loop future `Send` (or formally adopting thread-per-core) — the
+  `!Send` finding recorded in `BENCHMARKS.md`.
+- `env.rs` / `lib.rs` startup-path `Result<_, String>` hygiene in
+  `agentos-llm` (out of 4.3's scope).
+- Link-time extension registry design doc, if out-of-tree extension demand
+  materializes (Phase 4.4 note).

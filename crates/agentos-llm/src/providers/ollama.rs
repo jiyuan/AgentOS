@@ -1,5 +1,7 @@
 use crate::providers::content::append_descriptors;
-use crate::providers::{attach_token_usage, log_token_usage, post_json, raw_args_from_json_value};
+use crate::providers::{
+    attach_token_usage, log_token_usage, post_json, raw_args_from_json_value, ProviderError,
+};
 use agentos_interfaces::tool::ToolSpec;
 use agentos_proto::{Message, MessageRole, ToolCall, ToolCallId};
 use serde_json::{json, Value};
@@ -10,7 +12,7 @@ pub async fn complete(
     model: &str,
     messages: &[Message],
     tools: &[ToolSpec],
-) -> Result<Message, String> {
+) -> Result<Message, ProviderError> {
     let host = env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_owned());
     let serialized = messages.iter().map(flat_message).collect::<Vec<_>>();
     let mut payload = json!({
@@ -30,10 +32,13 @@ pub async fn complete(
         &payload,
     )
     .await?;
-    let message_value = response
-        .body
-        .get("message")
-        .ok_or_else(|| format!("Ollama response missing message: {}", response.body))?;
+    let message_value =
+        response
+            .body
+            .get("message")
+            .ok_or_else(|| ProviderError::MalformedResponse {
+                detail: format!("Ollama response missing message: {}", response.body),
+            })?;
     let content = message_value
         .get("content")
         .and_then(Value::as_str)

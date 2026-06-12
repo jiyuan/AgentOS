@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use thiserror::Error;
 use tokio::time::sleep;
 
 #[derive(Debug)]
@@ -22,6 +23,46 @@ pub(crate) struct JsonHttpResponse {
     pub status: Option<u16>,
     pub headers: BTreeMap<String, String>,
     pub body: Value,
+}
+
+/// Structured error for the provider adapter layer (roadmap Phase 4.3).
+///
+/// Surfaced through the `Llm` trait boundary as `LlmError::Provider` text;
+/// the variants exist so provider plumbing follows the project's typed-error
+/// convention and failure classes stay matchable without parsing strings.
+/// `detail` fields carry the full human-readable diagnostics (HTTP metadata,
+/// request ids, hints) that operators already rely on in logs.
+#[derive(Debug, Error)]
+pub enum ProviderError {
+    /// A required credential environment variable is unset.
+    #[error("missing {variable}")]
+    MissingCredentials { variable: &'static str },
+    /// The request payload could not be serialized.
+    #[error("failed to encode LLM request: {source}")]
+    Encode {
+        #[source]
+        source: serde_json::Error,
+    },
+    /// A configured header name or value was invalid.
+    #[error("{detail}")]
+    InvalidHeader { detail: String },
+    /// The HTTP exchange failed before a JSON body was decoded. Always
+    /// retried by `post_json`'s backoff loop.
+    #[error("LLM request failed: {detail}")]
+    Transport { detail: String },
+    /// The response was not the JSON shape the provider promises.
+    #[error("{detail}")]
+    MalformedResponse { detail: String },
+    /// The provider returned an explicit API error object.
+    #[error("{detail}")]
+    Api {
+        provider: Arc<str>,
+        status: Option<u16>,
+        detail: String,
+    },
+    /// Configuration names a provider this build does not support.
+    #[error("unknown LLM provider: {0}")]
+    UnknownProvider(Arc<str>),
 }
 
 /// Tokens consumed by a single LLM call, normalised across providers.
@@ -244,12 +285,11 @@ pub(crate) async fn post_json(
     url: &str,
     headers: &[(&str, String)],
     payload: &Value,
-) -> Result<JsonHttpResponse, String> {
+) -> Result<JsonHttpResponse, ProviderError> {
     // `Bytes` so the retry loop re-sends by bumping a refcount instead of
     // copying the full serialized body on every attempt.
     let body = Bytes::from(
-        serde_json::to_vec(payload)
-            .map_err(|err| format!("failed to encode LLM request: {err}"))?,
+        serde_json::to_vec(payload).map_err(|source| ProviderError::Encode { source })?,
     );
     let header_map = build_header_map(headers)?;
     let client = shared_client();
@@ -282,31 +322,36 @@ async fn send_once(
     url: &str,
     headers: &HeaderMap,
     body: Bytes,
-) -> Result<JsonHttpResponse, String> {
+) -> Result<JsonHttpResponse, ProviderError> {
     let response = client
         .post(url)
         .headers(headers.clone())
         .body(body)
         .send()
         .await
-        .map_err(|err| format!("LLM request failed: {err}; http_metadata=unavailable"))?;
+        .map_err(|err| ProviderError::Transport {
+            detail: format!("{err}; http_metadata=unavailable"),
+        })?;
     let status = response.status().as_u16();
     let header_map = collect_headers(response.headers());
-    let bytes = response.bytes().await.map_err(|err| {
-        format!(
-            "LLM request failed: {err}; {}",
-            describe_http_response(Some(status), &header_map)
-        )
-    })?;
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|err| ProviderError::Transport {
+            detail: format!(
+                "{err}; {}",
+                describe_http_response(Some(status), &header_map)
+            ),
+        })?;
     let body = if bytes.is_empty() {
         Value::Null
     } else {
-        serde_json::from_slice(&bytes).map_err(|err| {
-            format!(
+        serde_json::from_slice(&bytes).map_err(|err| ProviderError::MalformedResponse {
+            detail: format!(
                 "failed to parse LLM response: {err}; {}; body={}",
                 describe_http_response(Some(status), &header_map),
                 String::from_utf8_lossy(&bytes),
-            )
+            ),
         })?
     };
     Ok(JsonHttpResponse {
@@ -316,13 +361,18 @@ async fn send_once(
     })
 }
 
-fn build_header_map(headers: &[(&str, String)]) -> Result<HeaderMap, String> {
+fn build_header_map(headers: &[(&str, String)]) -> Result<HeaderMap, ProviderError> {
     let mut map = HeaderMap::with_capacity(headers.len() + 1);
     for (name, value) in headers {
-        let header_name = HeaderName::from_bytes(name.as_bytes())
-            .map_err(|err| format!("invalid header name {name}: {err}"))?;
-        let header_value = HeaderValue::from_str(value)
-            .map_err(|err| format!("invalid header value for {name}: {err}"))?;
+        let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|err| {
+            ProviderError::InvalidHeader {
+                detail: format!("invalid header name {name}: {err}"),
+            }
+        })?;
+        let header_value =
+            HeaderValue::from_str(value).map_err(|err| ProviderError::InvalidHeader {
+                detail: format!("invalid header value for {name}: {err}"),
+            })?;
         map.insert(header_name, header_value);
     }
     if !map.contains_key(CONTENT_TYPE) {
@@ -379,7 +429,7 @@ pub(crate) fn first_env<const N: usize>(names: [&str; N]) -> Option<String> {
     names.into_iter().find_map(|name| env::var(name).ok())
 }
 
-pub(crate) fn format_openai_error(response: &JsonHttpResponse, error: &Value) -> String {
+pub(crate) fn format_openai_error(response: &JsonHttpResponse, error: &Value) -> ProviderError {
     format_provider_error_with_hint("OpenAI", response, error, openai_quota_hint(error))
 }
 
@@ -387,7 +437,7 @@ pub(crate) fn format_provider_error(
     provider: &str,
     response: &JsonHttpResponse,
     error: &Value,
-) -> String {
+) -> ProviderError {
     format_provider_error_with_hint(
         provider,
         response,
@@ -401,13 +451,17 @@ fn format_provider_error_with_hint(
     response: &JsonHttpResponse,
     error: &Value,
     hint: &str,
-) -> String {
-    format!(
-        "{provider} error: {}; {}; hint={}",
-        error,
-        describe_http_response(response.status, &response.headers),
-        hint,
-    )
+) -> ProviderError {
+    ProviderError::Api {
+        provider: Arc::from(provider),
+        status: response.status,
+        detail: format!(
+            "{provider} error: {}; {}; hint={}",
+            error,
+            describe_http_response(response.status, &response.headers),
+            hint,
+        ),
+    }
 }
 
 fn describe_http_response(status: Option<u16>, headers: &BTreeMap<String, String>) -> String {
@@ -672,5 +726,48 @@ mod arg_extraction_tests {
     fn invalid_arg_string_is_rejected() {
         let invalid = Value::String("{not json".to_owned());
         assert!(raw_args_from_json_str(Some(&invalid)).is_none());
+    }
+}
+
+#[cfg(test)]
+mod provider_error_tests {
+    use super::{format_openai_error, JsonHttpResponse, ProviderError};
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn api_errors_are_matchable_and_keep_operator_diagnostics() {
+        let response = JsonHttpResponse {
+            status: Some(429),
+            headers: BTreeMap::from([("x-request-id".to_owned(), "req-123".to_owned())]),
+            body: json!({}),
+        };
+        let error = format_openai_error(&response, &json!({"code": "insufficient_quota"}));
+        let ProviderError::Api {
+            provider,
+            status,
+            detail,
+        } = &error
+        else {
+            panic!("expected Api variant, got {error:?}");
+        };
+        assert_eq!(provider.as_ref(), "OpenAI");
+        assert_eq!(*status, Some(429));
+        assert!(detail.contains("http_status=429"));
+        assert!(detail.contains("x-request-id=req-123"));
+        assert!(
+            detail.contains("prepaid API credits"),
+            "quota hint preserved"
+        );
+        // Display carries the full diagnostic line for logs.
+        assert_eq!(error.to_string(), *detail);
+    }
+
+    #[test]
+    fn missing_credentials_text_matches_legacy_message() {
+        let error = ProviderError::MissingCredentials {
+            variable: "OPENAI_API_KEY",
+        };
+        assert_eq!(error.to_string(), "missing OPENAI_API_KEY");
     }
 }
