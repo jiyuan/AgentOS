@@ -394,11 +394,14 @@ async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunErro
         }
     }
     let plan = deps.orchestrator.plan(&run_ctx).await?;
+    // The sink is append-only, so even a poisoned guard (an orchestrator
+    // panicked mid-push) holds a structurally valid Vec — recover it rather
+    // than propagating the panic into the run loop.
     let pending_usage = std::mem::take(
         &mut *run_ctx
             .usage_sink
             .lock()
-            .expect("usage_sink mutex poisoned"),
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
     );
     drop(run_ctx);
     trace::record_event(

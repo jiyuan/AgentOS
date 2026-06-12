@@ -4,7 +4,7 @@ use agentos_core::config::WorkspaceConfig;
 use agentos_core::crons::CronStore;
 use agentos_core::gateway::{GatewayRun, GatewayService};
 use agentos_core::runner::ResumeDecision;
-use agentos_core::runtime::{load_workspace_config, AgentRuntime, RuntimePaths};
+use agentos_core::runtime::{AgentRuntime, RuntimePaths};
 use agentos_interfaces::Channel;
 use agentos_llm::env as agentos_env;
 use agentos_proto::{Envelope, Message, MessageRole, RunId, SpanKind};
@@ -367,7 +367,7 @@ fn status(config: &ServiceConfig) -> Result<(), String> {
 fn print_effective_config(config: &ServiceConfig) -> Result<(), String> {
     let path = agent_config_path(config);
     let runtime_paths = runtime_paths(config);
-    let workspace_config = load_workspace_config(&path)
+    let workspace_config = WorkspaceConfig::load(&path)
         .map_err(|err| format!("failed to load workspace config: {err}"))?;
     let channels = persistent_channels(&workspace_config)?;
     println!("config.path={}", path.display());
@@ -453,7 +453,7 @@ fn serve(config: &ServiceConfig) -> Result<(), String> {
         ),
     )?;
 
-    let workspace_config = load_workspace_config(&agent_config_path(config))
+    let workspace_config = WorkspaceConfig::load(&agent_config_path(config))
         .map_err(|err| format!("failed to load workspace config: {err}"))?;
     let channels = persistent_channels(&workspace_config)?;
     if !channels.is_empty() {

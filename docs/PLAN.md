@@ -53,6 +53,10 @@ Known verification warning:
 - `scripts/check-module-size.sh` still reports the existing
   `crates/agentos-cli/src/bin/agentos-gateway.rs` size as allowlisted legacy
   debt.
+- 2026-06-11 audit: `crates/agentos-core/src/loop/mod.rs` crossed the ceiling
+  (866 production LOC) during the max-turns budget work and is now allowlisted
+  as tracked debt; the split is scheduled as Phase 4.1 of
+  [`OPTIMIZATION_ROADMAP.md`](OPTIMIZATION_ROADMAP.md).
 
 ## Architectural Findings To Resolve
 
@@ -168,39 +172,42 @@ Why this matters:
   `AgentRuntime::build`.
 - Tests can pass against one loader while production uses another.
 
-Resolution target:
+Resolution (2026-06-11, roadmap Phase 2.3):
 
-- Decide whether the compatibility wrapper should remain public. Scheduled as
-  Phase 2.3 of [`OPTIMIZATION_ROADMAP.md`](OPTIMIZATION_ROADMAP.md).
-
-Exit checks:
-
-- Add tests proving sub-agent and sub-orchestrator file loading works through the
-  canonical loader.
-- Remove or restrict the divergent loader.
+- `runtime::load_workspace_config()` is now `#[deprecated]` and delegates to
+  `WorkspaceConfig::load()`. All in-tree call sites (runtime build, gateway
+  binary) use the canonical loader directly.
+- `crates/agentos-core/tests/config_loader.rs` asserts both loaders produce
+  identical configs for the repository `workspace/agent.toml` (covering
+  subagents/suborchs sibling-file loading), a minimal fixture, and the
+  missing-file default path.
+- Remaining step: delete the deprecated wrapper after one release.
 
 ### A5. Required Regression Tests Are Missing Or Stale
 
-Current state:
+Resolved (2026-06-11, roadmap Phase 2.1). Invariant coverage now lives in
+`crates/agentos-core/tests/`:
 
-- The workspace test suite passes, but observed tests do not cover several
-  documented load-bearing scenarios:
-  - adversarial max-turn loop,
-  - `Policy::narrow` property-style coverage,
-  - paused `RunState` JSON round trip through resume with trace continuity,
-  - parent/child policy narrowing across configured sub-agents,
-  - import-boundary negative fixture.
+- `loop_invariants.rs` — adversarial max-turn loop (exact budget bound,
+  truncation notice) and paused `RunState` JSON round trip through resume
+  with trace continuity (also the regression gate for any future wire-format
+  change).
+- `policy_narrow_props.rs` — `Policy::narrow` property tests (proptest,
+  1000 cases per property: reflexivity, default monotonicity, no decision
+  above the parent default on unexposed actions, widening rejection). Note:
+  the narrowing contract is deliberately tool-granular — a child `allow` on
+  a tool the parent exposes with argument-constrained rules bypasses those
+  argument constraints (`parent_exposes_tool` escape hatch); the properties
+  encode the contract the code guarantees.
+- `runner_narrowing.rs` — parent/child policy narrowing across configured
+  sub-agents at runner level (widening child rejected at delegation; parent
+  does not inherit child permissions; legitimate narrowing executes without
+  pause).
+- `import_boundary.rs` — drives the checker's `--self-test` negative
+  fixtures, proving violating manifests are rejected.
 
-Resolution target:
-
-- Rebuild the test plan around architectural invariants, not phase history.
-- Keep tests targeted and deterministic.
-- Scheduled as Phase 2.1 of [`OPTIMIZATION_ROADMAP.md`](OPTIMIZATION_ROADMAP.md).
-
-Exit checks:
-
-- `cargo test --workspace` includes invariant coverage for run loop, approve,
-  resume, config, sub-agent narrowing, and boundary scripts.
+Exit check met: `cargo test --workspace` includes invariant coverage for run
+loop, approve, resume, config, sub-agent narrowing, and boundary scripts.
 
 ### A6. Module-Size Governance Is Not Enforced
 
@@ -237,7 +244,8 @@ Tasks:
 4. Done: choose and document the real import-boundary invariant in the checker.
 5. Done: fix `check-import-boundaries.sh` permissions and behavior.
 6. Done: fix `check-module-size.sh`.
-7. Add invariant tests for policy narrowing, max turns, and pause/resume.
+7. Done (2026-06-11): invariant tests for policy narrowing, max turns, and
+   pause/resume live in `crates/agentos-core/tests/` (see A5).
 
 Exit criteria:
 

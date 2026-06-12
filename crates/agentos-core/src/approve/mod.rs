@@ -379,19 +379,15 @@ fn parse_policy_yaml(input: &str) -> Result<Policy, PolicyError> {
             if let Some(rule) = current_rule.take() {
                 policy.rules.push(rule);
             }
-            current_rule = Some(PolicyRule {
+            let mut rule = PolicyRule {
                 action: PolicyAction::Any,
                 decision: PolicyVerb::Deny,
                 reason: None,
                 arg_equals: BTreeMap::new(),
-            });
+            };
             in_args = false;
-            apply_rule_field(
-                current_rule.as_mut().expect("rule was just initialized"),
-                rest,
-                line_number,
-                &mut in_args,
-            )?;
+            apply_rule_field(&mut rule, rest, line_number, &mut in_args)?;
+            current_rule = Some(rule);
             continue;
         }
 

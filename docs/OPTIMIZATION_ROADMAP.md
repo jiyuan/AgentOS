@@ -91,7 +91,7 @@ fails the boundary job when wired in.
 Cheap, and it protects the invariants every later phase refactors around.
 Best landed after 1.3 so the tests run on every PR.
 
-### 2.1 A5 regression suite
+### 2.1 A5 regression suite — **done 2026-06-11**
 
 The five missing tests from `PLAN.md` finding A5:
 
@@ -110,7 +110,13 @@ Files: `crates/agentos-core/tests/`, proptest dev-dependency, fixture crate;
 update `PLAN.md` A5 status.
 Effort: M. Verify: `cargo test --workspace`.
 
-### 2.2 Remove panic paths from library code
+### 2.2 Remove panic paths from library code — **done 2026-06-11**
+
+Outcome note: the `approve/mod.rs:527,599` citations turned out to be
+`#[cfg(test)]` code (allowed); the real fixes were `approve/mod.rs:390`
+(restructured away the `Option`), `loop/mod.rs:401`, and the same
+poisoned-mutex pattern in `task_workspace.rs:104` (both recover via
+`PoisonError::into_inner`).
 
 Violations of the no-`unwrap()`/no-panic rule on live paths:
 
@@ -125,7 +131,7 @@ Violations of the no-`unwrap()`/no-panic rule on live paths:
 Effort: S. Verify: grep shows no `expect(`/`unwrap(` outside tests/benches in
 `agentos-core` and `agentos-llm` src; full test suite passes.
 
-### 2.3 Close A4: a single workspace-config loader
+### 2.3 Close A4: a single workspace-config loader — **done 2026-06-11** (wrapper deletion pending one release)
 
 `runtime::load_workspace_config()` is a compatibility wrapper around the
 canonical `WorkspaceConfig::load()`, with the deprecation decision pending.
@@ -135,14 +141,14 @@ the wrapper `#[deprecated]` for one release, then delete it.
 Files: `crates/agentos-core/src/runtime/`, `PLAN.md` A4.
 Effort: S–M. Verify: equivalence test; workspace compiles after removal.
 
-### 2.4 Module-size allowlist audit
+### 2.4 Module-size allowlist audit — **done 2026-06-11 (pulled into Phase 1)**
 
-`crates/agentos-core/src/orchestrator/max.rs` is 994 lines — over the ~800
-hard ceiling. Confirm its allowlist status in `scripts/check-module-size.sh`;
-record the Phase 4.1 split as the exit plan for it and the existing
-CLI/gateway allowlist entries.
-
-Effort: S. Verify: script output documented in `PLAN.md`.
+Audited while wiring CI: `orchestrator/max.rs` (994 raw lines) is *under* the
+ceiling once `#[cfg(test)]` blocks are excluded, but
+`crates/agentos-core/src/loop/mod.rs` (866 production LOC) crossed it during
+the max-turns budget work. It is now allowlisted as tracked debt in
+`scripts/check-module-size.sh` with the Phase 4.1 split as the exit plan;
+recorded in `PLAN.md`.
 
 ---
 
@@ -254,9 +260,14 @@ These need the Phase 2 safety net and the Phase 1.3 semver-checks job.
 
 Pure code motion, no behavior change:
 
-- `orchestrator/max.rs` (994 lines) → `max/mod.rs` (planner core),
-  `max/routing.rs` (routing + 3.1 heuristics), `max/prelude.rs` (skill
-  prelude + 3.4 cache). Pair with 3.1/3.4 when touching the file anyway.
+- `loop/mod.rs` (866 production LOC — over the ceiling, allowlisted
+  2026-06-11) → extract the budget-exhaustion path and `record_llm_usage`
+  plumbing into sibling modules next to `approval.rs`/`telemetry.rs`, then
+  drop the allowlist entry.
+- `orchestrator/max.rs` (994 raw lines, near-ceiling) → `max/mod.rs`
+  (planner core), `max/routing.rs` (routing + 3.1 heuristics),
+  `max/prelude.rs` (skill prelude + 3.4 cache). Pair with 3.1/3.4 when
+  touching the file anyway.
 - `approve/mod.rs` (619 lines) → extract the hand-written YAML parser to
   `approve/yaml.rs`. Keep it hand-written — do not add a `serde_yaml`
   dependency without an explicit decision; the minimal parser is likely a

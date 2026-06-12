@@ -168,7 +168,7 @@ pub struct AgentRuntime {
 
 impl AgentRuntime {
     pub async fn build(paths: RuntimePaths) -> Result<Self, String> {
-        let workspace_config = load_workspace_config(&paths.agent_config_path)
+        let workspace_config = WorkspaceConfig::load(&paths.agent_config_path)
             .map_err(|err| format!("failed to load workspace config: {err}"))?;
         if workspace_config.memory.semantic_backend_is_sqlite_vec() {
             SqliteVecSemanticIndex::register_auto_extension()
@@ -336,6 +336,11 @@ fn probe_skills_root(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[deprecated(
+    since = "0.5.0",
+    note = "use `config::WorkspaceConfig::load` directly; this compatibility \
+            wrapper will be removed (docs/PLAN.md finding A4)"
+)]
 pub fn load_workspace_config(path: &Path) -> Result<WorkspaceConfig, std::io::Error> {
     WorkspaceConfig::load(path)
 }

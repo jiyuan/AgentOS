@@ -27,7 +27,28 @@ tracing.workspace = true
 [dev-dependencies]
 agentos-interfaces = { workspace = true, features = ["test-support"] }
 criterion = "0.5"
+proptest = "1"
 
 [[bench]]
 name = "loop_overhead"
+harness = false
+
+[[bench]]
+name = "tool_turn"
+harness = false
+
+[[bench]]
+name = "pause_resume"
+harness = false
+
+[[bench]]
+name = "memory_turn"
+harness = false
+
+[[bench]]
+name = "concurrency"
+harness = false
+
+[[bench]]
+name = "alloc_count"
 harness = false

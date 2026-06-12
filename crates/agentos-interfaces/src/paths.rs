@@ -91,7 +91,7 @@ mod tests {
         with_env_unset("AGENTOS_HOME", || {
             let resolved = agentos_home(None);
             // Should equal CWD, which is at minimum non-empty.
-            assert!(resolved.as_os_str().len() > 0);
+            assert!(!resolved.as_os_str().is_empty());
         });
     }
 }

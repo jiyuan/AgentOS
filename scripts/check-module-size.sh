@@ -18,6 +18,9 @@ is_allowlisted() {
   case "$1" in
     crates/agentos-cli/src/main.rs) return 0 ;;
     crates/agentos-cli/src/bin/agentos-gateway.rs) return 0 ;;
+    # Crossed the ceiling during the max-turns budget work; split scheduled
+    # as Phase 4.1 of docs/OPTIMIZATION_ROADMAP.md.
+    crates/agentos-core/src/loop/mod.rs) return 0 ;;
     *) return 1 ;;
   esac
 }

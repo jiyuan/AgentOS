@@ -98,10 +98,13 @@ impl TaskWorkspace {
     }
 
     fn writer(&self) -> Option<Arc<SessionWriter>> {
+        // A poisoned guard still holds a structurally valid Option<Arc<_>>
+        // (assignment happens after construction completes), so recover
+        // instead of propagating a panic into every session write.
         let mut guard = self
             .writer
             .lock()
-            .expect("session writer mutex not poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(writer) = guard.as_ref() {
             return Some(writer.clone());
         }

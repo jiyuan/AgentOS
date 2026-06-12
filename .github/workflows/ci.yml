@@ -1,0 +1,79 @@
+# CI for Agent OS. Wires the existing manual verification matrix
+# (docs/PLAN.md "Ongoing Verification Matrix") into GitHub Actions — no new
+# policy, just machine enforcement of the checks contributors already run.
+#
+# Scheduled as Phase 1.3 of docs/OPTIMIZATION_ROADMAP.md.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  checks:
+    name: fmt, clippy, boundaries, module size
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all --check
+      - name: Type check
+        run: cargo check --workspace
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --workspace -- -D warnings
+      - name: Import boundaries
+        run: bash scripts/check-import-boundaries.sh
+      - name: Module size ceiling
+        run: bash scripts/check-module-size.sh
+
+  test:
+    name: workspace tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests
+        run: cargo test --workspace
+
+  bench-smoke:
+    name: bench compile + smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Smoke mode only: CI runners are too noisy to gate on timings, so this
+      # proves every bench (criterion and custom harnesses) still compiles
+      # and runs, nothing more.
+      - name: Smoke-run benches
+        run: cargo bench -p agentos-core -- --test
+
+  semver-checks:
+    name: semver-checks (advisory)
+    runs-on: ubuntu-latest
+    # Advisory while interface evolution policy settles: surfaces breaking
+    # changes in the job log without blocking the merge. Flip to required
+    # before tagging a release.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-semver-checks
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks
+      - name: Check interface crates
+        run: |
+          cargo semver-checks check-release -p agentos-interfaces
+          cargo semver-checks check-release -p agentos-proto
