@@ -10,6 +10,7 @@ agentos-interfaces.workspace = true
 agentos-proto.workspace = true
 async-trait.workspace = true
 base64 = "0.22"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

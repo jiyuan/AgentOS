@@ -70,6 +70,7 @@ dependencies = [
  "async-trait",
  "base64",
  "bytes",
+ "futures-util",
  "rand 0.8.6",
  "reqwest",
  "serde",
