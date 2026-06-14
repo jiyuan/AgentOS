@@ -296,6 +296,32 @@ impl Llm for EnvLlm {
         message.role = MessageRole::Assistant;
         Ok(message)
     }
+
+    async fn complete_stream(&self, ctx: &RunContext<'_>) -> Result<CompletionStream, LlmError> {
+        let Some(selection) = self.current_selection() else {
+            return Err(LlmError::Unconfigured(Arc::from(self.tier.name())));
+        };
+        validate_llm_selection(&selection).map_err(|err| LlmError::Provider(Arc::from(err)))?;
+        let messages = ctx
+            .state
+            .transcript
+            .items
+            .iter()
+            .map(|item| item.message.clone())
+            .collect::<Vec<_>>();
+        // Providers with a native SSE path stream incrementally. Anthropic and
+        // Ollama have no native path yet, so they fall back to the buffered
+        // completion adapted into a single terminal chunk — an identical final
+        // message, just without incremental text.
+        let stream = match selection.provider.as_ref() {
+            "openai" => providers::openai::complete_stream(&selection.model, &messages, &[]).await,
+            "deepseek" => {
+                providers::deepseek::complete_stream(&selection.model, &messages, &[]).await
+            }
+            _ => return Ok(single_message_stream(self.complete(ctx).await?)),
+        };
+        stream.map_err(|err| LlmError::Provider(Arc::from(err.to_string())))
+    }
 }
 
 pub fn configured_selection_for_tier(tier: LlmModelTier) -> Result<Option<LlmSelection>, String> {

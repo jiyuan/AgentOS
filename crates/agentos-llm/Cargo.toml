@@ -16,6 +16,6 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["time"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "http2"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "http2", "stream"] }
 rand = "0.8"
 bytes = "1"
