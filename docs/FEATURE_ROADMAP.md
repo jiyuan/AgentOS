@@ -76,6 +76,13 @@ and every existing call site keep working unchanged.
   `cargo semver-checks check-release -p agentos-interfaces` reports additive-only.
 - Exit: trait has `complete_stream()`; a non-streaming provider yields exactly one
   delta equal to its `complete()` result.
+- **Status: done** (commit `d13719b`). Implemented as `CompletionEvent { Text,
+  Done }` + a `CompletionStream` alias in `agentos-llm` (kept out of proto — it
+  is in-process only). Default `Llm::complete_stream` adapts `complete()` via the
+  public `single_message_stream()` helper. The delta type was simplified from the
+  "tool-call delta / usage" sketch: tool calls and usage ride on the terminal
+  `Done(Message)` rather than as separate streamed events, which keeps the loop's
+  existing final-message handling unchanged.
 
 ### A2. Provider implementations
 
@@ -92,6 +99,16 @@ terminal event. Reuse the one-`reqwest::Client`-per-provider rule and the existi
   the non-streaming `complete()` result for the same prompt (recorded fixture).
 - Exit: at least the OpenAI-compatible and Anthropic providers stream natively;
   usage accounting matches the non-streaming path byte-for-byte on the final text.
+- **Status: openai + deepseek done** (commit `5650878`); anthropic + ollama
+  intentionally remain on the A1 fallback (still correct, just non-incremental).
+  Shared SSE decoder in `providers/stream.rs` (`chat.completion.chunk` format:
+  byte-buffered line splitting so multi-byte UTF-8 across network chunks is never
+  decoded mid-codepoint; tool-call fragments merged by index; final
+  `include_usage` chunk logged + attached through the same path as the buffered
+  response). `post_sse()` in `providers/mod.rs` is single-attempt (no retry of a
+  partially consumed stream). `EnvLlm::complete_stream` dispatches
+  openai/deepseek natively. **Remaining:** anthropic SSE (different event shape —
+  `message_start` / `content_block_delta` / `message_delta`).
 
 ### A3. Loop + channel plumbing
 
@@ -115,6 +132,31 @@ optional incremental egress (edit-in-place for Telegram/Feishu, append for TUI).
   violation still trips before finish.
 - Exit: streaming is opt-in via config, default-off path is byte-identical to
   today, guardrails and usage accounting unaffected.
+- **Status: not started.** Design settled while building A1/A2:
+  - **Injection via a sink on `RunContext`**, mirroring the existing `usage_sink`
+    field (added in commit `aaadb51`): add an optional
+    `stream_sink: Option<Arc<dyn Fn(&str) + Send + Sync>>`. `LoopDeps` carries it
+    and `loop/mod.rs::plan()` sets it on the freshly built `RunContext` (same
+    spot the `usage_sink` is drained). When `None`, orchestrators call
+    `complete()` exactly as today — default path stays byte-identical.
+  - **Orchestrators** `LlmOrchestrator` (`agentos-llm`), `MinOrchestrator`,
+    `MaxOrchestrator`: when a sink is present and no tools are in play, drain
+    `complete_stream(ctx)`, push each `Text` chunk to the sink, and return
+    `Plan::Reply(done_message)`.
+  - **Constraint to resolve first:** `complete_stream(ctx)` carries *no tool
+    specs*, but `MinOrchestrator`/`MaxOrchestrator` pass specs via
+    `complete_messages(messages, tools)`. So either (a) restrict streaming to the
+    no-tool reply turn (simplest; tool-deciding turns stay buffered), or (b) add a
+    `complete_messages_stream(messages, tools)` trait method. Recommend (a) for
+    the first cut — the visible win is the final natural-language reply, and
+    tool-call turns produce little user-facing text anyway.
+  - **Egress:** CLI TUI first (sink writes tokens to stdout); Telegram/Feishu
+    edit-in-place is a follow-up — until then they keep receiving the final reply
+    with no regression.
+  - **Interface note:** adding a field to `RunContext` is technically a breaking
+    change to `agentos-interfaces`; the repo already accepts this pattern
+    (`usage_sink`). Run `cargo semver-checks check-release -p agentos-interfaces`
+    and note it.
 
 ## Track B — Memory Intelligence
 
@@ -241,5 +283,10 @@ deployment:
 
 ## Status
 
-2026-06-12: roadmap authored; no items started. Implementation deferred to later
-sessions per the planning decision (this session produced the roadmap only).
+- 2026-06-12: roadmap authored.
+- 2026-06-13: **Track A1 done** (`d13719b`) — streaming trait surface + default
+  fallback. **Track A2 done for openai + deepseek** (`5650878`) — native SSE
+  decoding with usage parity; anthropic streaming and Track A3 (loop/channel
+  wiring) remain. See each item's Status note above. All work landed on branch
+  `docs/feature-roadmap`; `cargo test -p agentos-llm`, workspace check, clippy,
+  fmt, and the import-boundary / module-size scripts are green.
