@@ -111,6 +111,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             print!("{delta}");
             let _ = io::stdout().flush();
             flag.store(true, Ordering::Relaxed);
+            // Egress is synchronous (stdout); hand back an already-ready future.
+            Box::pin(std::future::ready(()))
         });
         deps.stream_sink = Some(sink);
     }

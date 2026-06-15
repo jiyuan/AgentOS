@@ -32,7 +32,7 @@ pub(crate) async fn complete_message(
     let mut done = None;
     while let Some(event) = stream.next().await {
         match event? {
-            CompletionEvent::Text(chunk) => ctx.emit_stream_delta(&chunk),
+            CompletionEvent::Text(chunk) => ctx.emit_stream_delta(&chunk).await,
             CompletionEvent::Done(message) => done = Some(message),
         }
     }

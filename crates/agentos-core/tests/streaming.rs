@@ -90,6 +90,7 @@ async fn min_orchestrator_streams_chunks_and_returns_full_reply() {
     let captured = Arc::clone(&deltas);
     let sink: StreamSink = Arc::new(move |delta: &str| {
         captured.lock().expect("sink lock").push(delta.to_owned());
+        Box::pin(std::future::ready(()))
     });
     ctx.stream_sink = Some(sink);
 

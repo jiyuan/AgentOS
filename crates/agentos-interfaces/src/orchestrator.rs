@@ -5,6 +5,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
@@ -149,15 +151,19 @@ pub enum DispatchTarget {
 }
 
 /// Sink for incremental assistant text produced while an orchestrator streams a
-/// reply. Installed by the runtime entrypoint (e.g. the CLI TUI) when it wants
-/// to render tokens as they arrive; `None` — the default — means buffered
-/// planning that is byte-identical to a non-streaming run. The closure receives
-/// each text chunk in order; concatenating every chunk reproduces the final
-/// reply's `content`. Streamed text is *provisional*: output guardrails still
-/// run on the assembled message before the loop finishes, but a violation
-/// surfaces after the user has already seen the tokens, so the run errors
-/// instead of committing a reply.
-pub type StreamSink = Arc<dyn Fn(&str) + Send + Sync>;
+/// reply. Installed by the runtime entrypoint (the CLI TUI, or the gateway for a
+/// streaming channel) when it wants to surface tokens as they arrive; `None` —
+/// the default — means buffered planning that is byte-identical to a
+/// non-streaming run. The closure receives each text chunk in order;
+/// concatenating every chunk reproduces the final reply's `content`.
+///
+/// The callback is async so a sink can perform I/O (a channel edit-in-place HTTP
+/// call) directly; the orchestrator awaits each delta. It returns a `'static`
+/// boxed future, so the closure copies the chunk it needs before awaiting.
+/// Streamed text is *provisional*: output guardrails still run on the assembled
+/// message before the loop finishes, but a violation surfaces after the user has
+/// already seen the tokens, so the run errors instead of committing a reply.
+pub type StreamSink = Arc<dyn Fn(&str) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 pub struct RunContext<'a> {
     pub state: &'a RunState,
@@ -236,10 +242,10 @@ impl<'a> RunContext<'a> {
     }
 
     /// Forward one chunk of incremental assistant text to the installed
-    /// [`StreamSink`]. No-op when none is installed.
-    pub fn emit_stream_delta(&self, delta: &str) {
+    /// [`StreamSink`], awaiting its egress. No-op when none is installed.
+    pub async fn emit_stream_delta(&self, delta: &str) {
         if let Some(sink) = &self.stream_sink {
-            sink(delta);
+            sink(delta).await;
         }
     }
 

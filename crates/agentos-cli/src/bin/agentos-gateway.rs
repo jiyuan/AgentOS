@@ -5,9 +5,10 @@ use agentos_core::crons::CronStore;
 use agentos_core::gateway::{GatewayRun, GatewayService};
 use agentos_core::runner::ResumeDecision;
 use agentos_core::runtime::{AgentRuntime, RuntimePaths};
-use agentos_interfaces::Channel;
+use agentos_interfaces::orchestrator::StreamSink;
+use agentos_interfaces::{Channel, StreamEgress};
 use agentos_llm::env as agentos_env;
-use agentos_proto::{Envelope, Message, MessageRole, RunId, SpanKind};
+use agentos_proto::{ConversationId, Envelope, Message, MessageRole, RunId, SpanKind};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -18,6 +19,27 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_PID_RELPATH: &str = "workspace/run/agentos-gateway.pid";
+
+/// Channel edit-in-place streaming is on by default; set
+/// `AGENTOS_GATEWAY_STREAM=0|false|off` to fall back to a single buffered reply.
+fn gateway_streaming_enabled() -> bool {
+    !matches!(
+        env::var("AGENTOS_GATEWAY_STREAM").ok().as_deref(),
+        Some("0") | Some("false") | Some("off")
+    )
+}
+
+/// Build a [`StreamSink`] that forwards each assistant text delta to a channel's
+/// edit-in-place [`StreamEgress`] for `conversation`. The closure owns the chunk
+/// before awaiting, so the returned future is `'static`.
+fn channel_stream_sink(egress: Arc<dyn StreamEgress>, conversation: ConversationId) -> StreamSink {
+    Arc::new(move |delta: &str| {
+        let egress = Arc::clone(&egress);
+        let conversation = conversation.clone();
+        let delta = delta.to_owned();
+        Box::pin(async move { egress.push_delta(&conversation, &delta).await })
+    })
+}
 const DEFAULT_LOG_RELPATH: &str = "logs/agentos-gateway.log";
 const OWNER_TOKEN_ENV: &str = "AGENTOS_GATEWAY_OWNER_TOKEN";
 
@@ -703,7 +725,21 @@ where
             Arc::from("task_id"),
             serde_json::json!(runtime.orchestrator.current_strategy().task_id()),
         );
-        match gateway_service
+        // Per-message deps so a streaming channel can edit its reply in place.
+        // The base `gateway_service` (no sink) still drives crons.
+        let mut run_deps = deps_scope.deps_with_guardrails(
+            &input_guardrails,
+            &output_guardrails,
+            &tool_guardrails,
+        );
+        if gateway_streaming_enabled() {
+            if let Some(egress) = channel.stream_egress() {
+                run_deps.stream_sink =
+                    Some(channel_stream_sink(egress, input.conversation_id.clone()));
+            }
+        }
+        let run_service = GatewayService::new(&run_deps, Arc::from(runtime.active_agent.as_str()));
+        match run_service
             .run_envelope(&channel, input.clone(), run_id.clone())
             .await
         {
@@ -738,7 +774,7 @@ where
                         reason: Arc::from(format!("rejected by {channel_name} user")),
                     }
                 };
-                match gateway_service
+                match run_service
                     .resume(&channel, paused, &approval_id, decision)
                     .await
                 {
