@@ -132,7 +132,23 @@ optional incremental egress (edit-in-place for Telegram/Feishu, append for TUI).
   violation still trips before finish.
 - Exit: streaming is opt-in via config, default-off path is byte-identical to
   today, guardrails and usage accounting unaffected.
-- **Status: not started.** Design settled while building A1/A2:
+- **Status: done** (commit `3f1e6af`). Implemented exactly as the design note
+  below: `StreamSink` + optional `RunContext.stream_sink` (mirroring
+  `usage_sink`), threaded through `LoopDeps`/`RunnerDeps` and installed in
+  `loop/mod.rs::plan()`; `Llm::complete_messages_stream` added so `Max` streams
+  with its skill prelude + tools; a shared `orchestrator/streaming.rs` helper
+  drives `Min`/`Max`; `LlmOrchestrator` streams its reply. CLI TUI renders tokens
+  to stdout (on by default; `AGENTOS_TUI_STREAM=0` to disable), coordinating with
+  `TuiChannel::send` via a shared flag so the reply prints once. Only the TUI
+  installs a sink, so gateway/one-shot paths stay byte-identical.
+  **Caveats / deviations:** (1) streamed text is *provisional* — output
+  guardrails still gate the finish (a violation errors the run) but tokens are
+  already on screen; documented as the streaming trade-off. (2) Telegram/Feishu
+  edit-in-place egress is still future work (they get the final reply, no
+  regression). (3) `agentos-interfaces` gained a public `RunContext` field
+  (breaking, like `usage_sink`); `cargo semver-checks` can't verify it locally —
+  the crate isn't published — so it's noted rather than machine-checked.
+- **Original design note (for reference):**
   - **Injection via a sink on `RunContext`**, mirroring the existing `usage_sink`
     field (added in commit `aaadb51`): add an optional
     `stream_sink: Option<Arc<dyn Fn(&str) + Send + Sync>>`. `LoopDeps` carries it
@@ -286,7 +302,11 @@ deployment:
 - 2026-06-12: roadmap authored.
 - 2026-06-13: **Track A1 done** (`d13719b`) — streaming trait surface + default
   fallback. **Track A2 done for openai + deepseek** (`5650878`) — native SSE
-  decoding with usage parity; anthropic streaming and Track A3 (loop/channel
-  wiring) remain. See each item's Status note above. All work landed on branch
-  `docs/feature-roadmap`; `cargo test -p agentos-llm`, workspace check, clippy,
-  fmt, and the import-boundary / module-size scripts are green.
+  decoding with usage parity.
+- 2026-06-15: **Track A3 done** (`3f1e6af`) — streaming wired through the loop,
+  the Min/Max/Llm orchestrators, and the CLI TUI. **Track A is functionally
+  complete** end-to-end for openai + deepseek. Remaining Track-A follow-ups:
+  native Anthropic SSE (A2) and Telegram/Feishu edit-in-place egress (A3); both
+  degrade gracefully today. All work on branch `docs/feature-roadmap`;
+  `cargo test --workspace`, clippy `-D warnings`, fmt, and the import-boundary /
+  module-size scripts are green.
