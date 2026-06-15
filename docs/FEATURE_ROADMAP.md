@@ -99,16 +99,19 @@ terminal event. Reuse the one-`reqwest::Client`-per-provider rule and the existi
   the non-streaming `complete()` result for the same prompt (recorded fixture).
 - Exit: at least the OpenAI-compatible and Anthropic providers stream natively;
   usage accounting matches the non-streaming path byte-for-byte on the final text.
-- **Status: openai + deepseek done** (commit `5650878`); anthropic + ollama
-  intentionally remain on the A1 fallback (still correct, just non-incremental).
-  Shared SSE decoder in `providers/stream.rs` (`chat.completion.chunk` format:
-  byte-buffered line splitting so multi-byte UTF-8 across network chunks is never
-  decoded mid-codepoint; tool-call fragments merged by index; final
-  `include_usage` chunk logged + attached through the same path as the buffered
-  response). `post_sse()` in `providers/mod.rs` is single-attempt (no retry of a
-  partially consumed stream). `EnvLlm::complete_stream` dispatches
-  openai/deepseek natively. **Remaining:** anthropic SSE (different event shape —
-  `message_start` / `content_block_delta` / `message_delta`).
+- **Status: done** for openai + deepseek (`5650878`) and anthropic (`26a28d2`);
+  only ollama remains on the A1 single-chunk fallback. Shared SSE machinery in
+  `providers/stream.rs` behind an `SseAccumulator` trait + `run_sse_stream()`
+  driver (byte-buffered line splitting so multi-byte UTF-8 across network chunks
+  is never decoded mid-codepoint). `OpenAiAccumulator` handles the
+  `chat.completion.chunk` shape (tool-call fragments merged by index; final
+  `include_usage` chunk); `AnthropicAccumulator` handles the typed Messages event
+  stream (content-block-indexed text/tool-use, `input_json_delta` argument
+  assembly, usage reassembled from `message_start` + `message_delta`). Usage is
+  logged + attached through the same path as the buffered response in every case.
+  `post_sse()` in `providers/mod.rs` is single-attempt (no retry of a partially
+  consumed stream). `EnvLlm::complete_messages_stream` dispatches
+  openai/deepseek/anthropic natively.
 
 ### A3. Loop + channel plumbing
 
@@ -304,9 +307,10 @@ deployment:
   fallback. **Track A2 done for openai + deepseek** (`5650878`) — native SSE
   decoding with usage parity.
 - 2026-06-15: **Track A3 done** (`3f1e6af`) — streaming wired through the loop,
-  the Min/Max/Llm orchestrators, and the CLI TUI. **Track A is functionally
-  complete** end-to-end for openai + deepseek. Remaining Track-A follow-ups:
-  native Anthropic SSE (A2) and Telegram/Feishu edit-in-place egress (A3); both
-  degrade gracefully today. All work on branch `docs/feature-roadmap`;
-  `cargo test --workspace`, clippy `-D warnings`, fmt, and the import-boundary /
-  module-size scripts are green.
+  the Min/Max/Llm orchestrators, and the CLI TUI. **Native Anthropic SSE done**
+  (`26a28d2`), completing A2 for all HTTP providers. **Track A is complete**
+  end-to-end for openai + deepseek + anthropic (ollama uses the single-chunk
+  fallback; Telegram/Feishu edit-in-place egress is the one remaining A3
+  follow-up, and degrades gracefully today). All work on branch
+  `docs/feature-roadmap`; `cargo test --workspace`, clippy `-D warnings`, fmt,
+  and the import-boundary / module-size scripts are green.
