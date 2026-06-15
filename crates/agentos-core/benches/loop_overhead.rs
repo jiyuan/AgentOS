@@ -70,6 +70,7 @@ fn bench_reply_turn(c: &mut Criterion) {
                 input_guardrails: &[],
                 output_guardrails: &[],
                 tool_guardrails: &[],
+                stream_sink: None,
             };
             black_box(runtime.block_on(drive_to_finish(&deps)));
         });

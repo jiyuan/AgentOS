@@ -332,6 +332,8 @@ impl SubAgentInvocation {
                 input_guardrails: &input_guardrails,
                 output_guardrails: &output_guardrails,
                 tool_guardrails: &tool_guardrails,
+                // Sub-agents never stream to the parent's egress.
+                stream_sink: None,
             };
             let result = match run_envelope(input, run_id, &deps).await {
                 Ok(RunOutcome::Finished { state, output }) => {
@@ -436,6 +438,7 @@ impl SubAgentInvocation {
                     input_guardrails: &input_guardrails,
                     output_guardrails: &output_guardrails,
                     tool_guardrails: &tool_guardrails,
+                    stream_sink: None,
                 };
                 let paused_run = PausedRun {
                     channel_id: paused.channel_id.clone(),

@@ -90,6 +90,22 @@ pub trait Llm: Send + Sync {
         let message = self.complete(ctx).await?;
         Ok(single_message_stream(message))
     }
+
+    /// Stream a completion over an explicit message list and tool set — the
+    /// streaming counterpart of [`Llm::complete_messages`]. Unlike
+    /// [`Llm::complete_stream`] this carries tool specs, so a tool-capable
+    /// orchestrator can stream the final reply while still receiving tool calls
+    /// on the terminal [`CompletionEvent::Done`] (a tool-call turn emits no
+    /// `Text`). The default falls back to the buffered call adapted into a
+    /// single terminal chunk.
+    async fn complete_messages_stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+    ) -> Result<CompletionStream, LlmError> {
+        let message = self.complete_messages(messages, tools).await?;
+        Ok(single_message_stream(message))
+    }
 }
 
 /// Adapt a complete (non-streamed) assistant message into a [`CompletionStream`]
@@ -119,14 +135,34 @@ impl LlmOrchestrator {
 #[async_trait]
 impl Orchestrator for LlmOrchestrator {
     async fn plan(&self, ctx: &RunContext<'_>) -> Result<Plan, OrchestratorError> {
-        let response = self
-            .llm
-            .complete(ctx)
-            .await
-            .map_err(|err| OrchestratorError::Backend(Arc::from(err.to_string())))?;
+        let response = if ctx.has_stream_sink() {
+            drain_reply_stream(self.llm.complete_stream(ctx).await, ctx).await
+        } else {
+            self.llm.complete(ctx).await
+        }
+        .map_err(|err| OrchestratorError::Backend(Arc::from(err.to_string())))?;
         ctx.push_llm_usage_from_message(&response);
         Ok(Plan::Reply(response))
     }
+}
+
+/// Drain a [`CompletionStream`], forwarding each `Text` chunk to the run's
+/// stream sink and returning the assembled final message. Shared by the
+/// in-crate `LlmOrchestrator`; core orchestrators have their own helper over
+/// [`Llm::complete_messages_stream`].
+async fn drain_reply_stream(
+    stream: Result<CompletionStream, LlmError>,
+    ctx: &RunContext<'_>,
+) -> Result<Message, LlmError> {
+    let mut stream = stream?;
+    let mut done = None;
+    while let Some(event) = stream.next().await {
+        match event? {
+            CompletionEvent::Text(chunk) => ctx.emit_stream_delta(&chunk),
+            CompletionEvent::Done(message) => done = Some(message),
+        }
+    }
+    done.ok_or_else(|| LlmError::Provider(Arc::from("stream ended without a final message")))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -298,10 +334,6 @@ impl Llm for EnvLlm {
     }
 
     async fn complete_stream(&self, ctx: &RunContext<'_>) -> Result<CompletionStream, LlmError> {
-        let Some(selection) = self.current_selection() else {
-            return Err(LlmError::Unconfigured(Arc::from(self.tier.name())));
-        };
-        validate_llm_selection(&selection).map_err(|err| LlmError::Provider(Arc::from(err)))?;
         let messages = ctx
             .state
             .transcript
@@ -309,16 +341,33 @@ impl Llm for EnvLlm {
             .iter()
             .map(|item| item.message.clone())
             .collect::<Vec<_>>();
+        // Mirror `complete`, which sends no tools field on the bare reply path.
+        self.complete_messages_stream(&messages, &[]).await
+    }
+
+    async fn complete_messages_stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+    ) -> Result<CompletionStream, LlmError> {
+        let Some(selection) = self.current_selection() else {
+            return Err(LlmError::Unconfigured(Arc::from(self.tier.name())));
+        };
+        validate_llm_selection(&selection).map_err(|err| LlmError::Provider(Arc::from(err)))?;
         // Providers with a native SSE path stream incrementally. Anthropic and
         // Ollama have no native path yet, so they fall back to the buffered
         // completion adapted into a single terminal chunk — an identical final
         // message, just without incremental text.
         let stream = match selection.provider.as_ref() {
-            "openai" => providers::openai::complete_stream(&selection.model, &messages, &[]).await,
+            "openai" => providers::openai::complete_stream(&selection.model, messages, tools).await,
             "deepseek" => {
-                providers::deepseek::complete_stream(&selection.model, &messages, &[]).await
+                providers::deepseek::complete_stream(&selection.model, messages, tools).await
             }
-            _ => return Ok(single_message_stream(self.complete(ctx).await?)),
+            _ => {
+                return Ok(single_message_stream(
+                    self.complete_messages(messages, tools).await?,
+                ))
+            }
         };
         stream.map_err(|err| LlmError::Provider(Arc::from(err.to_string())))
     }

@@ -12,7 +12,7 @@ use crate::subagents::SubAgentRegistry;
 use crate::task_workspace::{TaskWorkspace, TaskWorkspaceError};
 use crate::tools::ToolRegistry;
 use crate::trace;
-use agentos_interfaces::orchestrator::Orchestrator;
+use agentos_interfaces::orchestrator::{Orchestrator, StreamSink};
 use agentos_interfaces::run_state::InterruptionAction;
 use agentos_interfaces::session::{Item, Session, SessionError};
 use agentos_interfaces::RunState;
@@ -81,6 +81,11 @@ pub struct RunnerDeps<'a> {
     pub input_guardrails: &'a [InputGuardrailEntry<'a>],
     pub output_guardrails: &'a [OutputGuardrailEntry<'a>],
     pub tool_guardrails: &'a [ToolGuardrailEntry<'a>],
+    /// Optional incremental-text sink forwarded to the run loop (see
+    /// [`StreamSink`]). Entrypoints that render streaming output (the CLI TUI)
+    /// set it; everything else leaves it `None` for buffered, byte-identical
+    /// behavior.
+    pub stream_sink: Option<StreamSink>,
 }
 
 pub trait TraceSink: Send + Sync {
@@ -284,6 +289,7 @@ pub async fn run_envelope(
         input_guardrails: deps.input_guardrails,
         output_guardrails: deps.output_guardrails,
         tool_guardrails: deps.tool_guardrails,
+        stream_sink: deps.stream_sink.clone(),
     };
     let mut current = RunLoopState::Start(StartCtx { state });
 
@@ -364,6 +370,7 @@ pub async fn resume_run(
         input_guardrails: deps.input_guardrails,
         output_guardrails: deps.output_guardrails,
         tool_guardrails: deps.tool_guardrails,
+        stream_sink: deps.stream_sink.clone(),
     };
     let mut current = match resume_approved(paused.state) {
         Ok(current) => current,
@@ -687,6 +694,7 @@ mod tests {
             input_guardrails: &[],
             output_guardrails: &[],
             tool_guardrails: &[],
+            stream_sink: None,
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),
@@ -784,6 +792,7 @@ mod tests {
             input_guardrails: &[],
             output_guardrails: &[],
             tool_guardrails: &[],
+            stream_sink: None,
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),
@@ -832,6 +841,7 @@ mod tests {
             input_guardrails: &[],
             output_guardrails: &[],
             tool_guardrails: &guardrails,
+            stream_sink: None,
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),
@@ -881,6 +891,7 @@ mod tests {
             input_guardrails: &[],
             output_guardrails: &[],
             tool_guardrails: &[],
+            stream_sink: None,
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),
@@ -943,6 +954,7 @@ mod tests {
             input_guardrails: &[],
             output_guardrails: &[],
             tool_guardrails: &[],
+            stream_sink: None,
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),
@@ -1201,6 +1213,7 @@ mod tests {
             input_guardrails: &[],
             output_guardrails: &[],
             tool_guardrails: &[],
+            stream_sink: None,
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),

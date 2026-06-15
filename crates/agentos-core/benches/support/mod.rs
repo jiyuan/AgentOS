@@ -137,6 +137,7 @@ pub fn make_deps<'a>(
         input_guardrails: &[],
         output_guardrails: &[],
         tool_guardrails: &[],
+        stream_sink: None,
     }
 }
 

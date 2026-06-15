@@ -407,6 +407,7 @@ impl<'a> RuntimeDepsScope<'a> {
             input_guardrails: &[],
             output_guardrails: &[],
             tool_guardrails: &[],
+            stream_sink: None,
         }
     }
 
@@ -452,6 +453,7 @@ impl<'a> RuntimeDepsScope<'a> {
             input_guardrails,
             output_guardrails,
             tool_guardrails,
+            stream_sink: None,
         }
     }
 

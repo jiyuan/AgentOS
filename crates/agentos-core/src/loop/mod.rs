@@ -7,7 +7,7 @@ use crate::trace;
 use agentos_interfaces::guardrail::{
     GuardrailError, GuardrailOutcome, Input, InputGuardrail, OutputGuardrail, ToolGuardrail,
 };
-use agentos_interfaces::orchestrator::{Orchestrator, Plan, RunContext};
+use agentos_interfaces::orchestrator::{Orchestrator, Plan, RunContext, StreamSink};
 use agentos_interfaces::run_state::{ApprovalStatus, Interruption, InterruptionAction, RunState};
 use agentos_proto::{AgentId, InterruptionId, Message, SpanKind, ToolCall, ToolResult, ToolStatus};
 use serde_json::Value;
@@ -73,6 +73,10 @@ pub struct LoopDeps<'a> {
     pub input_guardrails: &'a [InputGuardrailEntry<'a>],
     pub output_guardrails: &'a [OutputGuardrailEntry<'a>],
     pub tool_guardrails: &'a [ToolGuardrailEntry<'a>],
+    /// Optional sink for incremental assistant text. When set, the loop installs
+    /// it on each plan's [`RunContext`] so a streaming-capable orchestrator can
+    /// emit tokens as they arrive. `None` keeps planning buffered.
+    pub stream_sink: Option<StreamSink>,
 }
 
 pub struct InputGuardrailEntry<'a> {
@@ -260,6 +264,7 @@ async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunErro
         BTreeMap::new(),
     );
     let mut run_ctx = RunContext::from_state(&state);
+    run_ctx.stream_sink = deps.stream_sink.clone();
     deps.orchestrator.hydrate(&mut run_ctx).await?;
     let mut hydrate_fields = BTreeMap::new();
     hydrate_fields.insert(
