@@ -2,9 +2,12 @@ use crate::providers::content::{
     append_descriptors, document_mime, format_text_document, image_mime, read_base64,
     read_text_document,
 };
+use crate::providers::stream::anthropic_stream;
 use crate::providers::{
-    attach_token_usage, log_token_usage, post_json, raw_args_from_json_value, ProviderError,
+    attach_token_usage, log_token_usage, post_json, post_sse, raw_args_from_json_value,
+    ProviderError,
 };
+use crate::CompletionStream;
 use agentos_interfaces::tool::ToolSpec;
 use agentos_proto::{Attachment, AttachmentKind, Message, MessageRole, ToolCall, ToolCallId};
 use serde_json::{json, Value};
@@ -16,38 +19,9 @@ pub async fn complete(
     messages: &[Message],
     tools: &[ToolSpec],
 ) -> Result<Message, ProviderError> {
-    let api_key = env::var("ANTHROPIC_API_KEY").map_err(|_| ProviderError::MissingCredentials {
-        variable: "ANTHROPIC_API_KEY",
-    })?;
-    let base_url = env::var("AGENTOS_ANTHROPIC_BASE_URL")
-        .or_else(|_| env::var("ANTHROPIC_BASE_URL"))
-        .unwrap_or_else(|_| "https://api.anthropic.com/v1".to_owned());
-
-    let serialized = messages
-        .iter()
-        .filter(|message| message.role != MessageRole::System)
-        .map(build_message)
-        .collect::<Vec<_>>();
-
-    let mut payload = json!({
-        "model": model,
-        "max_tokens": 1024,
-        "messages": serialized,
-    });
-    if !tools.is_empty() {
-        payload["tools"] = json!(tools.iter().map(anthropic_tool_spec).collect::<Vec<_>>());
-    }
-    let response = post_json(
-        "llm",
-        &format!("{}/messages", base_url.trim_end_matches('/')),
-        &[
-            ("x-api-key", api_key),
-            ("anthropic-version", "2023-06-01".to_owned()),
-            ("Content-Type", "application/json".to_owned()),
-        ],
-        &payload,
-    )
-    .await?;
+    let (url, headers) = endpoint_and_headers()?;
+    let payload = base_payload(model, messages, tools);
+    let response = post_json("llm", &url, &headers, &payload).await?;
     let token_usage = log_token_usage("anthropic", model, &response.body);
     let content_blocks = response
         .body
@@ -101,6 +75,59 @@ pub async fn complete(
         attach_token_usage(&mut message, usage);
     }
     Ok(message)
+}
+
+/// Stream a Messages completion over SSE. Builds the same request as
+/// [`complete`] plus `stream: true`, then hands the live response to the shared
+/// Anthropic SSE decoder.
+pub async fn complete_stream(
+    model: &str,
+    messages: &[Message],
+    tools: &[ToolSpec],
+) -> Result<CompletionStream, ProviderError> {
+    let (url, headers) = endpoint_and_headers()?;
+    let mut payload = base_payload(model, messages, tools);
+    payload["stream"] = json!(true);
+    let response = post_sse("anthropic", &url, &headers, &payload).await?;
+    Ok(anthropic_stream(Arc::from(model), response))
+}
+
+/// `(messages URL, request headers)` shared by the buffered and streaming
+/// request builders.
+type Endpoint = (String, Vec<(&'static str, String)>);
+
+fn endpoint_and_headers() -> Result<Endpoint, ProviderError> {
+    let api_key = env::var("ANTHROPIC_API_KEY").map_err(|_| ProviderError::MissingCredentials {
+        variable: "ANTHROPIC_API_KEY",
+    })?;
+    let base_url = env::var("AGENTOS_ANTHROPIC_BASE_URL")
+        .or_else(|_| env::var("ANTHROPIC_BASE_URL"))
+        .unwrap_or_else(|_| "https://api.anthropic.com/v1".to_owned());
+    Ok((
+        format!("{}/messages", base_url.trim_end_matches('/')),
+        vec![
+            ("x-api-key", api_key),
+            ("anthropic-version", "2023-06-01".to_owned()),
+            ("Content-Type", "application/json".to_owned()),
+        ],
+    ))
+}
+
+fn base_payload(model: &str, messages: &[Message], tools: &[ToolSpec]) -> Value {
+    let serialized = messages
+        .iter()
+        .filter(|message| message.role != MessageRole::System)
+        .map(build_message)
+        .collect::<Vec<_>>();
+    let mut payload = json!({
+        "model": model,
+        "max_tokens": 1024,
+        "messages": serialized,
+    });
+    if !tools.is_empty() {
+        payload["tools"] = json!(tools.iter().map(anthropic_tool_spec).collect::<Vec<_>>());
+    }
+    payload
 }
 
 fn anthropic_tool_spec(spec: &ToolSpec) -> Value {

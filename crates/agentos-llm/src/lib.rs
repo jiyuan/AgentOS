@@ -354,14 +354,17 @@ impl Llm for EnvLlm {
             return Err(LlmError::Unconfigured(Arc::from(self.tier.name())));
         };
         validate_llm_selection(&selection).map_err(|err| LlmError::Provider(Arc::from(err)))?;
-        // Providers with a native SSE path stream incrementally. Anthropic and
-        // Ollama have no native path yet, so they fall back to the buffered
-        // completion adapted into a single terminal chunk — an identical final
-        // message, just without incremental text.
+        // Providers with a native SSE path stream incrementally. Ollama has no
+        // native path yet, so it falls back to the buffered completion adapted
+        // into a single terminal chunk — an identical final message, just
+        // without incremental text.
         let stream = match selection.provider.as_ref() {
             "openai" => providers::openai::complete_stream(&selection.model, messages, tools).await,
             "deepseek" => {
                 providers::deepseek::complete_stream(&selection.model, messages, tools).await
+            }
+            "anthropic" => {
+                providers::anthropic::complete_stream(&selection.model, messages, tools).await
             }
             _ => {
                 return Ok(single_message_stream(
