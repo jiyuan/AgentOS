@@ -170,8 +170,12 @@ optional incremental egress (edit-in-place for Telegram/Feishu, append for TUI).
     the first cut — the visible win is the final natural-language reply, and
     tool-call turns produce little user-facing text anyway.
   - **Egress:** CLI TUI first (sink writes tokens to stdout); Telegram/Feishu
-    edit-in-place is a follow-up — until then they keep receiving the final reply
-    with no regression.
+    edit-in-place followed (`9553fc6`, `a17034f`). To support async channel
+    egress the `StreamSink` was made async (`Fn(&str) -> BoxFuture`) and a
+    `StreamEgress` handle was added to the `Channel` trait — decoupled from the
+    `&mut self` receive path, with per-conversation throttled edits and
+    finalization in `Channel::send`. On by default in the gateway;
+    `AGENTOS_GATEWAY_STREAM=0` disables.
   - **Interface note:** adding a field to `RunContext` is technically a breaking
     change to `agentos-interfaces`; the repo already accepts this pattern
     (`usage_sink`). Run `cargo semver-checks check-release -p agentos-interfaces`
@@ -308,9 +312,10 @@ deployment:
   decoding with usage parity.
 - 2026-06-15: **Track A3 done** (`3f1e6af`) — streaming wired through the loop,
   the Min/Max/Llm orchestrators, and the CLI TUI. **Native Anthropic SSE done**
-  (`26a28d2`), completing A2 for all HTTP providers. **Track A is complete**
-  end-to-end for openai + deepseek + anthropic (ollama uses the single-chunk
-  fallback; Telegram/Feishu edit-in-place egress is the one remaining A3
-  follow-up, and degrades gracefully today). All work on branch
-  `docs/feature-roadmap`; `cargo test --workspace`, clippy `-D warnings`, fmt,
-  and the import-boundary / module-size scripts are green.
+  (`26a28d2`), completing A2 for all HTTP providers. **Telegram + Feishu
+  edit-in-place egress done** (`9553fc6`, `a17034f`) via an async `StreamSink`
+  and a `Channel` `StreamEgress` handle. **Track A is fully complete** for
+  openai + deepseek + anthropic across the CLI TUI and both chat channels
+  (ollama uses the single-chunk fallback). No remaining Track-A follow-ups. All
+  work on branch `docs/feature-roadmap`; `cargo test --workspace`, clippy
+  `-D warnings`, fmt, and the import-boundary / module-size scripts are green.
