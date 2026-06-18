@@ -1,8 +1,9 @@
 use agentos_cli::slash::{self, Parsed, SessionUsage, SlashCommand, SlashContext};
 use agentos_core::channels::{feishu::FeishuChannel, telegram::TelegramChannel};
 use agentos_core::config::WorkspaceConfig;
-use agentos_core::crons::CronStore;
+use agentos_core::crons::{CronSchedule, CronStore, MemoryMaintenanceCron};
 use agentos_core::gateway::{GatewayRun, GatewayService};
+use agentos_core::memory::MemoryManager;
 use agentos_core::runner::ResumeDecision;
 use agentos_core::runtime::{AgentRuntime, RuntimePaths};
 use agentos_interfaces::orchestrator::StreamSink;
@@ -39,6 +40,62 @@ fn channel_stream_sink(egress: Arc<dyn StreamEgress>, conversation: Conversation
         let delta = delta.to_owned();
         Box::pin(async move { egress.push_delta(&conversation, &delta).await })
     })
+}
+
+/// Build the scheduled memory-reflection cron from `[memory.reflection]`, or
+/// `None` when disabled. A malformed schedule expression is a hard config error.
+fn build_reflection_cron(
+    runtime: &AgentRuntime,
+    config: &ServiceConfig,
+) -> Result<Option<MemoryMaintenanceCron>, String> {
+    let reflection = &runtime.workspace_config.memory.reflection;
+    if !reflection.enabled {
+        return Ok(None);
+    }
+    let schedule = CronSchedule::new(reflection.schedule.as_ref())
+        .map_err(|err| format!("invalid [memory.reflection].schedule: {err}"))?;
+    log_line(
+        config,
+        &format!("memory reflection scheduled: {}", reflection.schedule),
+    )?;
+    Ok(Some(MemoryMaintenanceCron::new(
+        "memory-maintenance",
+        runtime.active_agent.clone(),
+        reflection.params(),
+        schedule,
+    )))
+}
+
+/// Drive the reflection cron on an idle tick, logging a one-line summary when a
+/// sweep runs. Reflection is best-effort maintenance — a failure is logged, not
+/// propagated, so it never takes the gateway loop down.
+async fn run_memory_reflection(
+    config: &ServiceConfig,
+    channel_name: &str,
+    cron: Option<&mut MemoryMaintenanceCron>,
+    manager: &MemoryManager,
+    now_unix: u64,
+) -> Result<(), String> {
+    let Some(cron) = cron else {
+        return Ok(());
+    };
+    match cron.run_due(now_unix, manager).await {
+        Ok(Some(report)) => log_line(
+            config,
+            &format!(
+                "{channel_name} memory reflection: promoted {}, procedural {}, superseded {}, indexed {}",
+                report.promoted_records.len(),
+                report.procedural_candidates.len(),
+                report.superseded_records.len(),
+                report.index.indexed_records,
+            ),
+        ),
+        Ok(None) => Ok(()),
+        Err(err) => log_line(
+            config,
+            &format!("{channel_name} memory reflection failed: {err}"),
+        ),
+    }
 }
 const DEFAULT_LOG_RELPATH: &str = "logs/agentos-gateway.log";
 const OWNER_TOKEN_ENV: &str = "AGENTOS_GATEWAY_OWNER_TOKEN";
@@ -604,6 +661,7 @@ where
     let model_controller = runtime.model_controller.clone();
     let session_usage = SessionUsage::new();
     let mut last_cron_scan: u64 = 0;
+    let mut reflection_cron = build_reflection_cron(&runtime, config)?;
     log_line(config, &format!("{channel_name} gateway loop started"))?;
 
     loop {
@@ -633,6 +691,14 @@ where
                     &cron_store,
                     &gateway_service,
                     &session_usage,
+                    now,
+                )
+                .await?;
+                run_memory_reflection(
+                    config,
+                    channel_name,
+                    reflection_cron.as_mut(),
+                    &runtime.memory_manager,
                     now,
                 )
                 .await?;

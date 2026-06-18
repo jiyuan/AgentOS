@@ -15,8 +15,8 @@ mod orchestrator;
 mod subagents;
 
 pub use memory::{
-    MemoryConfig, MemoryPolicyConfig, MemoryQdrantConfig, MemoryRetentionConfig,
-    MemorySharedDomainConfig, MemorySqliteVecConfig,
+    MemoryConfig, MemoryPolicyConfig, MemoryQdrantConfig, MemoryReflectionConfig,
+    MemoryRetentionConfig, MemorySharedDomainConfig, MemorySqliteVecConfig,
 };
 pub use orchestrator::{RoutingConfig, RoutingRuleConfig, StageConfig, TemplateConfig};
 pub use subagents::SubAgentConfig;

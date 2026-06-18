@@ -25,8 +25,8 @@ pub use qdrant::{QdrantSemanticConfig, QdrantSemanticIndex};
 use query::{estimate_fragment_tokens, selector_matches_record};
 pub(crate) use query::{record_is_active, record_matches_query};
 pub use reflection::{
-    LexicalIndexReport, MemoryMaintenance, PromotionReport, ReflectionReport, ReflectionRequest,
-    RetentionReport, RetentionRequest, StoreRetentionBudget,
+    LexicalIndexReport, MemoryMaintenance, PromotionReport, ReflectionParams, ReflectionReport,
+    ReflectionRequest, RetentionReport, RetentionRequest, StoreRetentionBudget,
 };
 pub use scope::{
     EpisodeOutcome, EpisodeRecord, HydrationRequest, HydrationResult, HydrationStats, MemoryCaller,
