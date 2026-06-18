@@ -10,6 +10,26 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+/// Parameters for a whole-memory maintenance pass over every conversation that
+/// holds episodes. The per-conversation scopes are derived at sweep time, so
+/// this carries only the knobs that apply uniformly across them.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReflectionParams {
+    #[serde(default = "default_min_episode_repetitions")]
+    pub min_episode_repetitions: usize,
+    #[serde(default)]
+    pub rebuild_lexical_index: bool,
+}
+
+impl Default for ReflectionParams {
+    fn default() -> Self {
+        Self {
+            min_episode_repetitions: default_min_episode_repetitions(),
+            rebuild_lexical_index: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ReflectionRequest {
     pub episode_scope: MemoryScope,
@@ -113,6 +133,10 @@ pub trait MemoryMaintenance: Send + Sync {
     fn apply_retention(&self, request: &RetentionRequest) -> Result<RetentionReport, MemoryError>;
 
     fn rebuild_lexical_index(&self) -> Result<LexicalIndexReport, MemoryError>;
+
+    /// Distinct conversation owner ids that hold active episodic records — the
+    /// set of scopes [`MemoryManager::reflect_all`] sweeps on a maintenance tick.
+    fn episodic_conversation_owners(&self) -> Result<Vec<Arc<str>>, MemoryError>;
 }
 
 impl MemoryManager {
@@ -220,6 +244,62 @@ impl MemoryManager {
         );
 
         Ok(report)
+    }
+
+    /// Sweep every conversation that holds episodes, promoting repeated
+    /// episodes to semantic facts (and successful tool trajectories to
+    /// procedural candidates) and superseding contradicted facts, then rebuild
+    /// the lexical index once. Returns a combined report. A no-op (empty report)
+    /// when the backend has no maintenance support (e.g. the in-memory store).
+    pub async fn reflect_all(
+        &self,
+        agent_id: &agentos_proto::AgentId,
+        params: &ReflectionParams,
+    ) -> Result<ReflectionReport, MemoryError> {
+        let Some(maintenance) = self.maintenance() else {
+            return Ok(ReflectionReport::default());
+        };
+        let owners = maintenance.episodic_conversation_owners()?;
+        let mut combined = ReflectionReport::default();
+        for owner in owners {
+            let conversation = agentos_proto::ConversationId::new(owner.as_ref());
+            let caller = MemoryCaller {
+                agent_id: agent_id.clone(),
+                task_id: agentos_proto::TaskId::new("memory-maintenance"),
+                conversation_id: conversation,
+                user_id: None,
+                allowed_shared_domains: Vec::new(),
+                audit_read_access: false,
+            };
+            // Per-conversation: promotion + supersession only. Retention and the
+            // lexical-index rebuild are global, so run them once after the sweep.
+            let mut request = ReflectionRequest::for_conversation(&caller);
+            request.min_episode_repetitions = params.min_episode_repetitions;
+            request.retention = RetentionRequest::default();
+            request.rebuild_lexical_index = false;
+            let report = self.reflect(&caller, request).await?;
+            combined.episode_candidates += report.episode_candidates;
+            combined.promoted_records.extend(report.promoted_records);
+            combined
+                .procedural_candidates
+                .extend(report.procedural_candidates);
+            combined
+                .superseded_records
+                .extend(report.superseded_records);
+        }
+        if params.rebuild_lexical_index {
+            combined.index = maintenance.rebuild_lexical_index()?;
+        }
+        tracing::info!(
+            operation = "reflection_sweep",
+            agent_id = agent_id.as_str(),
+            promoted_records = combined.promoted_records.len(),
+            procedural_candidates = combined.procedural_candidates.len(),
+            superseded_records = combined.superseded_records.len(),
+            indexed_records = combined.index.indexed_records,
+            "memory reflection sweep finished"
+        );
+        Ok(combined)
     }
 
     async fn promote_semantic_fact(
@@ -349,6 +429,26 @@ impl MemoryManager {
 }
 
 impl MemoryMaintenance for SqliteStore {
+    fn episodic_conversation_owners(&self) -> Result<Vec<Arc<str>>, MemoryError> {
+        let conn = self.memory_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT owner_id FROM memory_records \
+                 WHERE store = 'episodic' AND owner_kind = 'conversation' \
+                 AND status = 'active' AND owner_id IS NOT NULL AND owner_id <> ''",
+            )
+            .map_err(memory_sqlite_error)?;
+        let owners = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(memory_sqlite_error)?
+            .collect::<Result<Vec<String>, _>>()
+            .map_err(memory_sqlite_error)?
+            .into_iter()
+            .map(Arc::from)
+            .collect();
+        Ok(owners)
+    }
+
     fn mark_record_status(
         &self,
         record_id: &RecordId,

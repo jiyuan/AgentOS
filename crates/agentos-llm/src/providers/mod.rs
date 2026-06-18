@@ -3,6 +3,7 @@ pub(crate) mod content;
 pub mod deepseek;
 pub mod ollama;
 pub mod openai;
+pub(crate) mod stream;
 
 use agentos_proto::{Message, TOKEN_USAGE_METADATA_KEY};
 use bytes::Bytes;
@@ -315,6 +316,58 @@ pub(crate) async fn post_json(
             }
         }
     }
+}
+
+/// Send a streaming chat-completion request and hand back the live response for
+/// SSE decoding. Unlike [`post_json`] this neither buffers nor retries the body
+/// — the caller consumes `response.bytes_stream()`, and re-sending a partially
+/// consumed stream is unsafe. A non-success status is read to completion and
+/// surfaced as a typed [`ProviderError`] so streaming callers get the same
+/// operator diagnostics as the buffered path.
+pub(crate) async fn post_sse(
+    provider: &str,
+    url: &str,
+    headers: &[(&str, String)],
+    payload: &Value,
+) -> Result<reqwest::Response, ProviderError> {
+    let body = Bytes::from(
+        serde_json::to_vec(payload).map_err(|source| ProviderError::Encode { source })?,
+    );
+    let header_map = build_header_map(headers)?;
+    let client = shared_client();
+    let response = client
+        .post(url)
+        .headers(header_map)
+        .body(body)
+        .send()
+        .await
+        .map_err(|err| ProviderError::Transport {
+            detail: format!("{err}; http_metadata=unavailable"),
+        })?;
+    let status = response.status().as_u16();
+    if (200..300).contains(&status) {
+        return Ok(response);
+    }
+    let header_map = collect_headers(response.headers());
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|err| ProviderError::Transport {
+            detail: format!(
+                "{err}; {}",
+                describe_http_response(Some(status), &header_map)
+            ),
+        })?;
+    let error_body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    let error = error_body.get("error").cloned().unwrap_or(error_body);
+    Err(ProviderError::Api {
+        provider: Arc::from(provider),
+        status: Some(status),
+        detail: format!(
+            "{provider} streaming error: {error}; {}",
+            describe_http_response(Some(status), &header_map)
+        ),
+    })
 }
 
 async fn send_once(

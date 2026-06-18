@@ -9,6 +9,7 @@ use agentos_interfaces::orchestrator::{Orchestrator, OrchestratorError, Plan, Ru
 use agentos_interfaces::tool::ToolSpec;
 use agentos_proto::{Message, MessageRole};
 use async_trait::async_trait;
+use futures_util::stream::{self, BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::env as std_env;
 use std::sync::Arc;
@@ -33,6 +34,30 @@ pub enum LlmError {
     Unconfigured(Arc<str>),
 }
 
+/// One event emitted while streaming a single LLM completion.
+///
+/// A streaming completion yields zero or more [`CompletionEvent::Text`] chunks
+/// followed by exactly one terminal [`CompletionEvent::Done`]. Concatenating
+/// every `Text` chunk reproduces the final message's `content`, so a consumer
+/// can render incremental output and still treat `Done` as authoritative — it
+/// carries any tool calls and the `agentos.token_usage` metadata that the
+/// run loop folds into `RunState`. Providers without a native streaming API
+/// satisfy this contract through the default [`Llm::complete_stream`], which
+/// emits the whole reply as one `Text` chunk and then `Done`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CompletionEvent {
+    /// An incremental chunk of assistant-visible text.
+    Text(Arc<str>),
+    /// The fully assembled assistant message. Always the final event of a
+    /// successful stream.
+    Done(Message),
+}
+
+/// A boxed stream of [`CompletionEvent`]s. `'static` because providers build it
+/// from owned data (cloned transcript messages, an owned HTTP body stream) and
+/// never borrow the `RunContext` that started the call.
+pub type CompletionStream = BoxStream<'static, Result<CompletionEvent, LlmError>>;
+
 #[async_trait]
 pub trait Llm: Send + Sync {
     fn is_available(&self) -> bool {
@@ -52,6 +77,49 @@ pub trait Llm: Send + Sync {
     ) -> Result<Message, LlmError> {
         Err(LlmError::Unconfigured(Arc::from("messages")))
     }
+
+    /// Stream a single completion as a sequence of [`CompletionEvent`]s.
+    ///
+    /// The default implementation calls [`Llm::complete`] and adapts the result
+    /// into a non-incremental stream — one `Text` chunk carrying the whole
+    /// reply (omitted when the reply has no text body) followed by `Done`. A
+    /// provider with a native streaming API overrides this to emit `Text`
+    /// chunks as tokens arrive; overrides must uphold the [`CompletionEvent`]
+    /// contract so the concatenated chunks equal the final message `content`.
+    async fn complete_stream(&self, ctx: &RunContext<'_>) -> Result<CompletionStream, LlmError> {
+        let message = self.complete(ctx).await?;
+        Ok(single_message_stream(message))
+    }
+
+    /// Stream a completion over an explicit message list and tool set — the
+    /// streaming counterpart of [`Llm::complete_messages`]. Unlike
+    /// [`Llm::complete_stream`] this carries tool specs, so a tool-capable
+    /// orchestrator can stream the final reply while still receiving tool calls
+    /// on the terminal [`CompletionEvent::Done`] (a tool-call turn emits no
+    /// `Text`). The default falls back to the buffered call adapted into a
+    /// single terminal chunk.
+    async fn complete_messages_stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+    ) -> Result<CompletionStream, LlmError> {
+        let message = self.complete_messages(messages, tools).await?;
+        Ok(single_message_stream(message))
+    }
+}
+
+/// Adapt a complete (non-streamed) assistant message into a [`CompletionStream`]
+/// that satisfies the [`CompletionEvent`] contract: the full text as one `Text`
+/// chunk (skipped when empty, e.g. a tool-call-only reply) followed by `Done`.
+/// Used by the default [`Llm::complete_stream`] and by providers that have no
+/// native streaming path.
+pub fn single_message_stream(message: Message) -> CompletionStream {
+    let mut events: Vec<Result<CompletionEvent, LlmError>> = Vec::with_capacity(2);
+    if !message.content.is_empty() {
+        events.push(Ok(CompletionEvent::Text(message.content.clone())));
+    }
+    events.push(Ok(CompletionEvent::Done(message)));
+    stream::iter(events).boxed()
 }
 
 pub struct LlmOrchestrator {
@@ -67,14 +135,34 @@ impl LlmOrchestrator {
 #[async_trait]
 impl Orchestrator for LlmOrchestrator {
     async fn plan(&self, ctx: &RunContext<'_>) -> Result<Plan, OrchestratorError> {
-        let response = self
-            .llm
-            .complete(ctx)
-            .await
-            .map_err(|err| OrchestratorError::Backend(Arc::from(err.to_string())))?;
+        let response = if ctx.has_stream_sink() {
+            drain_reply_stream(self.llm.complete_stream(ctx).await, ctx).await
+        } else {
+            self.llm.complete(ctx).await
+        }
+        .map_err(|err| OrchestratorError::Backend(Arc::from(err.to_string())))?;
         ctx.push_llm_usage_from_message(&response);
         Ok(Plan::Reply(response))
     }
+}
+
+/// Drain a [`CompletionStream`], forwarding each `Text` chunk to the run's
+/// stream sink and returning the assembled final message. Shared by the
+/// in-crate `LlmOrchestrator`; core orchestrators have their own helper over
+/// [`Llm::complete_messages_stream`].
+async fn drain_reply_stream(
+    stream: Result<CompletionStream, LlmError>,
+    ctx: &RunContext<'_>,
+) -> Result<Message, LlmError> {
+    let mut stream = stream?;
+    let mut done = None;
+    while let Some(event) = stream.next().await {
+        match event? {
+            CompletionEvent::Text(chunk) => ctx.emit_stream_delta(&chunk).await,
+            CompletionEvent::Done(message) => done = Some(message),
+        }
+    }
+    done.ok_or_else(|| LlmError::Provider(Arc::from("stream ended without a final message")))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -244,6 +332,48 @@ impl Llm for EnvLlm {
         message.role = MessageRole::Assistant;
         Ok(message)
     }
+
+    async fn complete_stream(&self, ctx: &RunContext<'_>) -> Result<CompletionStream, LlmError> {
+        let messages = ctx
+            .state
+            .transcript
+            .items
+            .iter()
+            .map(|item| item.message.clone())
+            .collect::<Vec<_>>();
+        // Mirror `complete`, which sends no tools field on the bare reply path.
+        self.complete_messages_stream(&messages, &[]).await
+    }
+
+    async fn complete_messages_stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+    ) -> Result<CompletionStream, LlmError> {
+        let Some(selection) = self.current_selection() else {
+            return Err(LlmError::Unconfigured(Arc::from(self.tier.name())));
+        };
+        validate_llm_selection(&selection).map_err(|err| LlmError::Provider(Arc::from(err)))?;
+        // Providers with a native SSE path stream incrementally. Ollama has no
+        // native path yet, so it falls back to the buffered completion adapted
+        // into a single terminal chunk — an identical final message, just
+        // without incremental text.
+        let stream = match selection.provider.as_ref() {
+            "openai" => providers::openai::complete_stream(&selection.model, messages, tools).await,
+            "deepseek" => {
+                providers::deepseek::complete_stream(&selection.model, messages, tools).await
+            }
+            "anthropic" => {
+                providers::anthropic::complete_stream(&selection.model, messages, tools).await
+            }
+            _ => {
+                return Ok(single_message_stream(
+                    self.complete_messages(messages, tools).await?,
+                ))
+            }
+        };
+        stream.map_err(|err| LlmError::Provider(Arc::from(err.to_string())))
+    }
 }
 
 pub fn configured_selection_for_tier(tier: LlmModelTier) -> Result<Option<LlmSelection>, String> {
@@ -370,5 +500,56 @@ fn env_presence(names: &[&str]) -> &'static str {
         "set"
     } else {
         "unset"
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    use agentos_proto::MessageRole;
+
+    async fn collect(stream: CompletionStream) -> Vec<CompletionEvent> {
+        stream
+            .map(|item| item.expect("fallback stream never errors"))
+            .collect()
+            .await
+    }
+
+    #[tokio::test]
+    async fn single_message_stream_emits_text_then_done() {
+        let message = Message::text(MessageRole::Assistant, "hello world");
+        let events = collect(single_message_stream(message.clone())).await;
+        assert_eq!(
+            events,
+            vec![
+                CompletionEvent::Text(Arc::from("hello world")),
+                CompletionEvent::Done(message),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn single_message_stream_skips_empty_text_for_tool_call_only_reply() {
+        // A tool-call-only assistant reply has empty content, so the stream
+        // carries only the terminal Done event.
+        let message = Message::text(MessageRole::Assistant, "");
+        let events = collect(single_message_stream(message.clone())).await;
+        assert_eq!(events, vec![CompletionEvent::Done(message)]);
+    }
+
+    #[tokio::test]
+    async fn concatenated_text_chunks_equal_final_content() {
+        // The core contract every streaming provider must also uphold.
+        let message = Message::text(MessageRole::Assistant, "the quick brown fox");
+        let events = collect(single_message_stream(message)).await;
+        let mut text = String::new();
+        let mut done = None;
+        for event in events {
+            match event {
+                CompletionEvent::Text(chunk) => text.push_str(&chunk),
+                CompletionEvent::Done(message) => done = Some(message),
+            }
+        }
+        assert_eq!(text, done.expect("done event present").content.as_ref());
     }
 }

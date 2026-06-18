@@ -66,14 +66,26 @@ jobs:
     # before tagging a release.
     continue-on-error: true
     steps:
+      # Full history so the git baseline below is reachable.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-semver-checks
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-semver-checks
+      # These crates are unpublished, so the default crates.io baseline can't be
+      # fetched. Compare against the PR base commit (or the previous commit on a
+      # push) via git instead. Reported as a warning, not a hard failure, so the
+      # advisory job stays green while the diff is still visible in the log.
       - name: Check interface crates
         run: |
-          cargo semver-checks check-release -p agentos-interfaces
-          cargo semver-checks check-release -p agentos-proto
+          baseline="${{ github.event.pull_request.base.sha }}"
+          [ -z "$baseline" ] && baseline="HEAD^"
+          echo "semver baseline: $baseline"
+          for crate in agentos-interfaces agentos-proto; do
+            cargo semver-checks check-release -p "$crate" --baseline-rev "$baseline" \
+              || echo "::warning::$crate: semver-checks reported changes vs $baseline (advisory; see log)"
+          done

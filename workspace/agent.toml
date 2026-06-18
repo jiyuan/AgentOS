@@ -22,12 +22,35 @@ hydration_enabled = true
 hydrate_max_fragments = 5
 hydrate_max_estimated_tokens = 1200
 hydrate_stores = ["semantic", "episodic"]
+# Record an episodic memory after each non-trivial run (failures, denials,
+# approvals, multi-step/tool/sub-agent runs, explicit writes). Set false to
+# disable all long-term memory writes from runs.
 episode_recording_enabled = true
-semantic_backend = "sqlite_vec"  # aliases: "sqlite_vec", "qdrant", "none"
+# Semantic retrieval index:
+#   "sqlite_vec" (default) — persistent, but hashing-based (lexical-vector).
+#   "qdrant"               — external Qdrant server.
+#   "vector"               — the agentos-memory-vector extension crate, injected
+#                            by the CLI (core never depends on it). Uses a real
+#                            embeddings API when AGENTOS_EMBEDDINGS_* / OPENAI_API_KEY
+#                            is set (paraphrase-capable retrieval), else an offline
+#                            hashing fallback. In-memory: rebuilt from writes after
+#                            a restart. Choose "vector" for real semantics,
+#                            "sqlite_vec" for persistence.
+#   "none"                 — lexical (FTS) retrieval only.
+semantic_backend = "sqlite_vec"
 
 [memory.sqlite_vec]
 table = "memory_records_vec"
 vector_dimensions = 384
+
+# Scheduled whole-memory reflection: promotes repeated episodes into semantic
+# facts, supersedes contradicted facts, and rebuilds the lexical index off the
+# run hot path. Driven by the persistent gateway's idle tick.
+[memory.reflection]
+enabled = true
+schedule = "0 3 * * *"  # daily at 03:00 (minute-resolution cron)
+min_episode_repetitions = 2
+rebuild_lexical_index = true
 
 [memory.retention]
 max_records = 10000

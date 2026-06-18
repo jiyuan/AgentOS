@@ -2,7 +2,7 @@ use super::hybrid::{
     hash_embedding, memory_backend_error, metadata_embedding, searchable_record_text,
     SemanticIndex, SemanticSearchHit,
 };
-use super::{MemoryError, MemoryScope};
+use super::MemoryError;
 use crate::http::shared_client;
 use agentos_interfaces::memory::Record;
 use agentos_proto::{Namespace, RecordId};
@@ -134,11 +134,22 @@ impl QdrantSemanticIndex {
         }
     }
 
-    fn upsert_body(&self, scope: &MemoryScope, record: &Record) -> Result<Value, MemoryError> {
+    fn upsert_body(&self, record: &Record) -> Result<Value, MemoryError> {
         let Some(record_id) = &record.id else {
             return Err(memory_backend_error(
                 "qdrant upsert requires a stable memory record id",
             ));
+        };
+        // The scope fields are mirrored onto the record by `managed_metadata`,
+        // so the payload is built from the record alone (the index ABI carries
+        // no `MemoryScope`).
+        let meta = |key: &str| {
+            record
+                .metadata
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned()
         };
         Ok(json!({
             "points": [{
@@ -147,10 +158,10 @@ impl QdrantSemanticIndex {
                 "payload": {
                     "record_id": record_id.as_str(),
                     "namespace": record.namespace.as_str(),
-                    "store": scope.store.as_str(),
-                    "owner_kind": scope.owner.kind(),
-                    "visibility": scope.visibility.as_str(),
-                    "domain": scope.domain_name(),
+                    "store": meta("store"),
+                    "owner_kind": meta("owner_kind"),
+                    "visibility": meta("visibility"),
+                    "domain": meta("domain"),
                 },
             }],
         }))
@@ -159,8 +170,8 @@ impl QdrantSemanticIndex {
 
 #[async_trait]
 impl SemanticIndex for QdrantSemanticIndex {
-    async fn upsert(&self, scope: &MemoryScope, record: &Record) -> Result<(), MemoryError> {
-        let body = self.upsert_body(scope, record)?;
+    async fn upsert(&self, record: &Record) -> Result<(), MemoryError> {
+        let body = self.upsert_body(record)?;
         self.request_json(
             Method::PUT,
             &format!(

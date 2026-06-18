@@ -53,11 +53,10 @@ impl Orchestrator for MinOrchestrator {
             .iter()
             .map(|item| item.message.clone())
             .collect::<Vec<_>>();
-        let response = self
-            .llm
-            .complete_messages(&messages, &self.tool_specs)
-            .await
-            .map_err(|err| OrchestratorError::Backend(Arc::from(err.to_string())))?;
+        let response =
+            super::streaming::complete_message(&*self.llm, ctx, &messages, &self.tool_specs)
+                .await
+                .map_err(|err| OrchestratorError::Backend(Arc::from(err.to_string())))?;
         ctx.push_llm_usage_from_message(&response);
         if let Some(first) = response.tool_calls.first().cloned() {
             return Ok(Plan::CallTool(first));

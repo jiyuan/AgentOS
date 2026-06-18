@@ -1,5 +1,7 @@
 use super::normalize::{normalize_config_token, normalize_domain};
-use crate::memory::{MemoryStore, QdrantSemanticConfig, RetrievalStrategy, SqliteVecConfig};
+use crate::memory::{
+    MemoryStore, QdrantSemanticConfig, ReflectionParams, RetrievalStrategy, SqliteVecConfig,
+};
 use crate::orchestrator::MemoryHydrationSettings;
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -20,6 +22,7 @@ pub struct MemoryConfig {
     pub qdrant: MemoryQdrantConfig,
     pub sqlite_vec: MemorySqliteVecConfig,
     pub episode_recording_enabled: bool,
+    pub reflection: MemoryReflectionConfig,
     pub retention: MemoryRetentionConfig,
     pub policy: MemoryPolicyConfig,
     pub shared_domains: Vec<MemorySharedDomainConfig>,
@@ -40,9 +43,46 @@ impl Default for MemoryConfig {
             qdrant: MemoryQdrantConfig::default(),
             sqlite_vec: MemorySqliteVecConfig::default(),
             episode_recording_enabled: false,
+            reflection: MemoryReflectionConfig::default(),
             retention: MemoryRetentionConfig::default(),
             policy: MemoryPolicyConfig::default(),
             shared_domains: Vec::new(),
+        }
+    }
+}
+
+/// `[memory.reflection]`: a scheduled whole-memory maintenance sweep that
+/// promotes repeated episodes into semantic facts, supersedes contradicted
+/// facts, and rebuilds the lexical index. Disabled in the conservative default;
+/// the deployment `agent.toml` opts in (mirroring `episode_recording_enabled`).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(default)]
+pub struct MemoryReflectionConfig {
+    pub enabled: bool,
+    /// Cron expression (minute-resolution) for the sweep.
+    pub schedule: Arc<str>,
+    /// Minimum repeated episodes (by summary) before promotion to a semantic
+    /// fact. Floored at 2 by the reflection engine.
+    pub min_episode_repetitions: usize,
+    pub rebuild_lexical_index: bool,
+}
+
+impl Default for MemoryReflectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            schedule: Arc::from("0 3 * * *"),
+            min_episode_repetitions: 2,
+            rebuild_lexical_index: true,
+        }
+    }
+}
+
+impl MemoryReflectionConfig {
+    pub fn params(&self) -> ReflectionParams {
+        ReflectionParams {
+            min_episode_repetitions: self.min_episode_repetitions,
+            rebuild_lexical_index: self.rebuild_lexical_index,
         }
     }
 }
@@ -171,10 +211,10 @@ impl MemoryConfig {
         self.semantic_backend = Arc::from(normalize_config_token(&self.semantic_backend));
         match self.semantic_backend.as_ref() {
             "none" | "qdrant" | "memory.qdrant" | "sqlite" | "memory.sqlite" | "sqlite_vec"
-            | "memory.sqlite_vec" => {}
+            | "memory.sqlite_vec" | "vector" => {}
             other => {
                 return Err(format!(
-                    "unknown memory semantic_backend '{other}'; expected none, sqlite/sqlite_vec, or qdrant"
+                    "unknown memory semantic_backend '{other}'; expected none, sqlite/sqlite_vec, qdrant, or vector"
                 ));
             }
         }

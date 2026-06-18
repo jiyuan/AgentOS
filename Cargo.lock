@@ -10,11 +10,12 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agentos-cli"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "agentos-core",
  "agentos-interfaces",
  "agentos-llm",
+ "agentos-memory-vector",
  "agentos-proto",
  "async-trait",
  "serde",
@@ -26,7 +27,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "agentos-interfaces",
  "agentos-llm",
@@ -51,7 +52,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-interfaces"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "agentos-proto",
  "async-trait",
@@ -63,13 +64,14 @@ dependencies = [
 
 [[package]]
 name = "agentos-llm"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "agentos-interfaces",
  "agentos-proto",
  "async-trait",
  "base64",
  "bytes",
+ "futures-util",
  "rand 0.8.6",
  "reqwest",
  "serde",
@@ -80,8 +82,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentos-memory-vector"
+version = "0.6.0"
+dependencies = [
+ "agentos-interfaces",
+ "agentos-proto",
+ "async-trait",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "agentos-proto"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -620,6 +635,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e3450815272ef58cec6d564423f6e755e25379b217b0bc688e295ba24df6b1d"
 
 [[package]]
+name = "futures-io"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cecba35d7ad927e23624b22ad55235f2239cfa44fd10428eecbeba6d6a717718"
+
+[[package]]
+name = "futures-macro"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e835b70203e41293343137df5c0664546da5745f82ec9b84d40be8336958447b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "futures-sink"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -638,8 +670,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "389ca41296e6190b48053de0321d02a77f32f8a5d2461dd38762c0593805c6d6"
 dependencies = [
  "futures-core",
+ "futures-io",
+ "futures-macro",
  "futures-sink",
  "futures-task",
+ "memchr",
  "pin-project-lite",
  "slab",
 ]
@@ -1478,12 +1513,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
  "webpki-roots 1.0.7",
 ]
@@ -2306,6 +2343,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "49757b3c82ebf16c57d69365a142940b384176c24df52a087fb748e2085359ea"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

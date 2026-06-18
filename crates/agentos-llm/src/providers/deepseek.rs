@@ -1,8 +1,10 @@
 use crate::providers::content::append_descriptors;
+use crate::providers::stream::openai_compatible_stream;
 use crate::providers::{
-    attach_token_usage, format_provider_error, log_token_usage, post_json, raw_args_from_json_str,
-    ProviderError,
+    attach_token_usage, format_provider_error, log_token_usage, post_json, post_sse,
+    raw_args_from_json_str, ProviderError,
 };
+use crate::CompletionStream;
 use agentos_interfaces::tool::ToolSpec;
 use agentos_proto::{Message, MessageRole, ToolCall, ToolCallId};
 use serde_json::{json, Value};
@@ -69,6 +71,47 @@ pub async fn complete(
         attach_token_usage(&mut message, usage);
     }
     Ok(message)
+}
+
+/// Stream a chat completion over SSE. Mirrors [`complete`]'s request with
+/// `stream: true` and usage in the final chunk; reasoning models' incremental
+/// `reasoning_content` is captured into message metadata, not surfaced as text.
+/// The non-stream reasoning-passback retry is intentionally not replicated — a
+/// streamed request cannot be safely resent once bytes have flowed.
+pub async fn complete_stream(
+    model: &str,
+    messages: &[Message],
+    tools: &[ToolSpec],
+) -> Result<CompletionStream, ProviderError> {
+    let api_key = env::var("DEEPSEEK_API_KEY").map_err(|_| ProviderError::MissingCredentials {
+        variable: "DEEPSEEK_API_KEY",
+    })?;
+    let base_url = env::var("AGENTOS_DEEPSEEK_BASE_URL")
+        .or_else(|_| env::var("DEEPSEEK_BASE_URL"))
+        .or_else(|_| env::var("DEEPSEEK_HOST"))
+        .unwrap_or_else(|_| "https://api.deepseek.com".to_owned());
+    let serialized = serialize_messages(messages);
+    let mut payload = json!({
+        "model": model,
+        "messages": serialized,
+        "stream": true,
+        "stream_options": { "include_usage": true },
+    });
+    if !tools.is_empty() {
+        payload["tools"] = json!(tools.iter().map(tool_to_function).collect::<Vec<_>>());
+    }
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    let headers = [
+        ("Authorization", format!("Bearer {api_key}")),
+        ("Content-Type", "application/json".to_owned()),
+    ];
+    let response = post_sse("deepseek", &url, &headers, &payload).await?;
+    Ok(openai_compatible_stream(
+        "deepseek",
+        Arc::from(model),
+        Some(REASONING_CONTENT_METADATA_KEY),
+        response,
+    ))
 }
 
 fn assistant_message_from_value(message: &Value) -> Message {

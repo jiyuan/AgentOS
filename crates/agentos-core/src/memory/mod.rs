@@ -25,8 +25,8 @@ pub use qdrant::{QdrantSemanticConfig, QdrantSemanticIndex};
 use query::{estimate_fragment_tokens, selector_matches_record};
 pub(crate) use query::{record_is_active, record_matches_query};
 pub use reflection::{
-    LexicalIndexReport, MemoryMaintenance, PromotionReport, ReflectionReport, ReflectionRequest,
-    RetentionReport, RetentionRequest, StoreRetentionBudget,
+    LexicalIndexReport, MemoryMaintenance, PromotionReport, ReflectionParams, ReflectionReport,
+    ReflectionRequest, RetentionReport, RetentionRequest, StoreRetentionBudget,
 };
 pub use scope::{
     EpisodeOutcome, EpisodeRecord, HydrationRequest, HydrationResult, HydrationStats, MemoryCaller,
@@ -116,7 +116,7 @@ impl MemoryManager {
             body,
             metadata,
         };
-        self.upsert_semantic_index(&scope, &indexed_record).await;
+        self.upsert_semantic_index(&indexed_record).await;
         self.append_access_log(
             MemoryOperation::Write,
             Some(&id),
@@ -629,11 +629,11 @@ impl MemoryManager {
         Ok(())
     }
 
-    async fn upsert_semantic_index(&self, scope: &MemoryScope, record: &Record) {
+    async fn upsert_semantic_index(&self, record: &Record) {
         let Some(index) = &self.semantic_index else {
             return;
         };
-        if let Err(err) = index.upsert(scope, record).await {
+        if let Err(err) = index.upsert(record).await {
             tracing::warn!(
                 operation = "semantic_index_upsert",
                 namespace = record.namespace.as_str(),

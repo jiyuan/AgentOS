@@ -2,10 +2,12 @@ use crate::providers::content::{
     append_descriptors, document_mime, format_text_document, image_mime, read_base64,
     read_text_document,
 };
+use crate::providers::stream::openai_compatible_stream;
 use crate::providers::{
-    attach_token_usage, first_env, format_openai_error, log_token_usage, post_json,
+    attach_token_usage, first_env, format_openai_error, log_token_usage, post_json, post_sse,
     raw_args_from_json_str, ProviderError,
 };
+use crate::CompletionStream;
 use agentos_interfaces::tool::ToolSpec;
 use agentos_proto::{Attachment, AttachmentKind, Message, MessageRole, ToolCall, ToolCallId};
 use serde_json::{json, Value};
@@ -18,40 +20,9 @@ pub async fn complete(
     messages: &[Message],
     tools: &[ToolSpec],
 ) -> Result<Message, ProviderError> {
-    let api_key = env::var("OPENAI_API_KEY").map_err(|_| ProviderError::MissingCredentials {
-        variable: "OPENAI_API_KEY",
-    })?;
-    let base_url = env::var("AGENTOS_OPENAI_BASE_URL")
-        .or_else(|_| env::var("OPENAI_BASE_URL"))
-        .unwrap_or_else(|_| "https://api.openai.com/v1".to_owned());
-    let mut headers = vec![
-        ("Authorization", format!("Bearer {api_key}")),
-        ("Content-Type", "application/json".to_owned()),
-    ];
-    if let Some(organization) = first_env(["OPENAI_ORGANIZATION", "OPENAI_ORG_ID"]) {
-        headers.push(("OpenAI-Organization", organization));
-    }
-    if let Some(project) = first_env(["OPENAI_PROJECT", "OPENAI_PROJECT_ID"]) {
-        headers.push(("OpenAI-Project", project));
-    }
-    let serialized = serialize_messages(messages);
-    let mut payload = json!({
-        "model": model,
-        "messages": serialized,
-        "temperature": 0.7,
-    });
-    if !tools.is_empty() {
-        payload["tools"] = json!(tools.iter().map(tool_to_function).collect::<Vec<_>>());
-        // One call per turn — the loop iterates so we don't need parallelism.
-        payload["parallel_tool_calls"] = json!(false);
-    }
-    let response = post_json(
-        "llm",
-        &format!("{}/chat/completions", base_url.trim_end_matches('/')),
-        &headers,
-        &payload,
-    )
-    .await?;
+    let (url, headers) = endpoint_and_headers()?;
+    let payload = base_payload(model, messages, tools);
+    let response = post_json("llm", &url, &headers, &payload).await?;
     if let Some(error) = response.body.get("error") {
         return Err(format_openai_error(&response, error));
     }
@@ -83,6 +54,69 @@ pub async fn complete(
         attach_token_usage(&mut message, usage);
     }
     Ok(message)
+}
+
+/// Stream a chat completion over SSE. Builds the same request as [`complete`]
+/// plus `stream: true` and `stream_options.include_usage` so the final chunk
+/// carries token usage, then hands the live response to the shared decoder.
+pub async fn complete_stream(
+    model: &str,
+    messages: &[Message],
+    tools: &[ToolSpec],
+) -> Result<CompletionStream, ProviderError> {
+    let (url, headers) = endpoint_and_headers()?;
+    let mut payload = base_payload(model, messages, tools);
+    payload["stream"] = json!(true);
+    payload["stream_options"] = json!({ "include_usage": true });
+    let response = post_sse("openai", &url, &headers, &payload).await?;
+    Ok(openai_compatible_stream(
+        "openai",
+        Arc::from(model),
+        None,
+        response,
+    ))
+}
+
+/// `(chat-completions URL, request headers)` shared by the buffered and
+/// streaming request builders.
+type Endpoint = (String, Vec<(&'static str, String)>);
+
+fn endpoint_and_headers() -> Result<Endpoint, ProviderError> {
+    let api_key = env::var("OPENAI_API_KEY").map_err(|_| ProviderError::MissingCredentials {
+        variable: "OPENAI_API_KEY",
+    })?;
+    let base_url = env::var("AGENTOS_OPENAI_BASE_URL")
+        .or_else(|_| env::var("OPENAI_BASE_URL"))
+        .unwrap_or_else(|_| "https://api.openai.com/v1".to_owned());
+    let mut headers = vec![
+        ("Authorization", format!("Bearer {api_key}")),
+        ("Content-Type", "application/json".to_owned()),
+    ];
+    if let Some(organization) = first_env(["OPENAI_ORGANIZATION", "OPENAI_ORG_ID"]) {
+        headers.push(("OpenAI-Organization", organization));
+    }
+    if let Some(project) = first_env(["OPENAI_PROJECT", "OPENAI_PROJECT_ID"]) {
+        headers.push(("OpenAI-Project", project));
+    }
+    Ok((
+        format!("{}/chat/completions", base_url.trim_end_matches('/')),
+        headers,
+    ))
+}
+
+fn base_payload(model: &str, messages: &[Message], tools: &[ToolSpec]) -> Value {
+    let serialized = serialize_messages(messages);
+    let mut payload = json!({
+        "model": model,
+        "messages": serialized,
+        "temperature": 0.7,
+    });
+    if !tools.is_empty() {
+        payload["tools"] = json!(tools.iter().map(tool_to_function).collect::<Vec<_>>());
+        // One call per turn — the loop iterates so we don't need parallelism.
+        payload["parallel_tool_calls"] = json!(false);
+    }
+    payload
 }
 
 fn tool_to_function(spec: &ToolSpec) -> Value {

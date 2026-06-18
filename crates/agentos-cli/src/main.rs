@@ -10,6 +10,7 @@ use agentos_core::runtime::{AgentRuntime, OrchestratorStrategy, RuntimePaths};
 use agentos_core::skills::{
     create_skill, validate_skill_dir, SkillCreation, SkillResourceKind, WorkspaceSkillCatalog,
 };
+use agentos_interfaces::orchestrator::StreamSink;
 use agentos_interfaces::{Channel, ChannelError};
 use agentos_llm::{env as agentos_env, LlmModelController};
 use agentos_proto::{
@@ -20,7 +21,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing_subscriber::EnvFilter;
@@ -40,14 +41,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let attachments_dir = attachments_dir_path(&home);
-    let runtime = AgentRuntime::build(runtime_paths.clone())
-        .await
-        .map_err(io::Error::other)?;
+    let runtime =
+        AgentRuntime::build_with(runtime_paths.clone(), &agentos_cli::semantic_index_factory)
+            .await
+            .map_err(io::Error::other)?;
     let deps_scope = runtime.deps_scope();
     let input_guardrails = deps_scope.input_guardrails();
     let output_guardrails = deps_scope.output_guardrails();
     let tool_guardrails = deps_scope.tool_guardrails();
-    let deps =
+    let mut deps =
         deps_scope.deps_with_guardrails(&input_guardrails, &output_guardrails, &tool_guardrails);
     let active_agent = runtime.active_agent.clone();
     let orchestrator_switch = runtime.orchestrator.strategy_handle();
@@ -60,6 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ConversationId::new("terminal"),
             None,
             None,
+            Arc::new(AtomicBool::new(false)),
         );
         resume_from_disk(&channel, &state_path, &args, &deps).await?;
         return Ok(());
@@ -99,11 +102,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // Streaming TUI egress: a shared flag lets the token sink and the channel's
+    // final send coordinate so the reply is printed once. Disable with
+    // AGENTOS_TUI_STREAM=0 to fall back to a single buffered print.
+    let streamed = Arc::new(AtomicBool::new(false));
+    if tui_streaming_enabled() {
+        let flag = Arc::clone(&streamed);
+        let sink: StreamSink = Arc::new(move |delta: &str| {
+            print!("{delta}");
+            let _ = io::stdout().flush();
+            flag.store(true, Ordering::Relaxed);
+            // Egress is synchronous (stdout); hand back an already-ready future.
+            Box::pin(std::future::ready(()))
+        });
+        deps.stream_sink = Some(sink);
+    }
     let mut channel = TuiChannel::new(
         ChannelId::new("tui"),
         ConversationId::new("terminal"),
         Some(orchestrator_switch),
         Some(model_controller),
+        Arc::clone(&streamed),
     );
     let cron_store = CronStore::new(&runtime_paths.cron_dir);
     let memory_manager = runtime.memory_manager.clone();
@@ -122,6 +141,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     Ok(())
+}
+
+/// Streaming TUI output is on by default; `AGENTOS_TUI_STREAM=0|false|off`
+/// reverts to a single buffered print per reply.
+fn tui_streaming_enabled() -> bool {
+    !matches!(
+        env::var("AGENTOS_TUI_STREAM").ok().as_deref(),
+        Some("0") | Some("false") | Some("off")
+    )
 }
 
 fn load_startup_env() -> Result<Option<PathBuf>, String> {
@@ -457,6 +485,8 @@ async fn run_tui_loop(
         {
             Ok(result) => result,
             Err(err) => {
+                // Close any partially streamed line before the error message.
+                channel.finish_stream_line();
                 println!("{}", user_facing_error_message(&err.to_string()));
                 turn += 1;
                 continue;
@@ -692,6 +722,10 @@ struct TuiChannel {
     conversation_id: ConversationId,
     orchestrator_strategy: Option<Arc<AtomicU8>>,
     model_controller: Option<LlmModelController>,
+    /// Shared with the streaming sink: set true once any token has been printed
+    /// incrementally this turn, so `send` (and the error path) emit only a
+    /// terminating newline instead of re-printing the whole reply.
+    streamed: Arc<AtomicBool>,
 }
 
 enum TuiInput {
@@ -706,12 +740,23 @@ impl TuiChannel {
         conversation_id: ConversationId,
         orchestrator_strategy: Option<Arc<AtomicU8>>,
         model_controller: Option<LlmModelController>,
+        streamed: Arc<AtomicBool>,
     ) -> Self {
         Self {
             id,
             conversation_id,
             orchestrator_strategy,
             model_controller,
+            streamed,
+        }
+    }
+
+    /// Terminate a partially streamed line if any tokens were printed this turn,
+    /// resetting the flag. Used on the error path where `send` is never reached.
+    fn finish_stream_line(&self) {
+        if self.streamed.swap(false, Ordering::Relaxed) {
+            println!();
+            let _ = io::stdout().flush();
         }
     }
 
@@ -782,7 +827,13 @@ impl Channel for TuiChannel {
     }
 
     async fn send(&self, env: Envelope) -> Result<(), ChannelError> {
-        println!("{}", env.message.content);
+        // When the reply was streamed token-by-token this turn, the text is
+        // already on screen — just close the line. Otherwise print it whole.
+        if self.streamed.swap(false, Ordering::Relaxed) {
+            println!();
+        } else {
+            println!("{}", env.message.content);
+        }
         io::stdout()
             .flush()
             .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))

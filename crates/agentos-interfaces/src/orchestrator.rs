@@ -5,6 +5,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
@@ -148,7 +150,21 @@ pub enum DispatchTarget {
     Direct,
 }
 
-#[derive(Debug)]
+/// Sink for incremental assistant text produced while an orchestrator streams a
+/// reply. Installed by the runtime entrypoint (the CLI TUI, or the gateway for a
+/// streaming channel) when it wants to surface tokens as they arrive; `None` —
+/// the default — means buffered planning that is byte-identical to a
+/// non-streaming run. The closure receives each text chunk in order;
+/// concatenating every chunk reproduces the final reply's `content`.
+///
+/// The callback is async so a sink can perform I/O (a channel edit-in-place HTTP
+/// call) directly; the orchestrator awaits each delta. It returns a `'static`
+/// boxed future, so the closure copies the chunk it needs before awaiting.
+/// Streamed text is *provisional*: output guardrails still run on the assembled
+/// message before the loop finishes, but a violation surfaces after the user has
+/// already seen the tokens, so the run errors instead of committing a reply.
+pub type StreamSink = Arc<dyn Fn(&str) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
 pub struct RunContext<'a> {
     pub state: &'a RunState,
     pub system: SystemContext,
@@ -164,6 +180,26 @@ pub struct RunContext<'a> {
     /// response `Message` is consumed by `Plan::CallTool` and never reaches
     /// the loop) would have their token usage silently dropped.
     pub usage_sink: Arc<Mutex<Vec<Usage>>>,
+    /// Optional sink for incremental assistant text (see [`StreamSink`]). The
+    /// loop installs it on the context before `plan()`; an orchestrator that
+    /// supports streaming pushes each text chunk through
+    /// [`RunContext::emit_stream_delta`].
+    pub stream_sink: Option<StreamSink>,
+}
+
+impl std::fmt::Debug for RunContext<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunContext")
+            .field("state", &self.state)
+            .field("system", &self.system)
+            .field("transcript", &self.transcript)
+            .field("memory_fragments", &self.memory_fragments)
+            .field("resource_index", &self.resource_index)
+            .field("usage_sink", &self.usage_sink)
+            // `StreamSink` is a closure (no Debug); report only its presence.
+            .field("stream_sink", &self.stream_sink.is_some())
+            .finish()
+    }
 }
 
 impl<'a> RunContext<'a> {
@@ -190,12 +226,27 @@ impl<'a> RunContext<'a> {
             memory_fragments: Vec::new(),
             resource_index: ResourceIndex::default(),
             usage_sink: Arc::new(Mutex::new(Vec::new())),
+            stream_sink: None,
         }
     }
 
     pub fn with_resource_index(mut self, resource_index: ResourceIndex) -> Self {
         self.resource_index = resource_index;
         self
+    }
+
+    /// Whether a streaming sink is installed for this run. Orchestrators use
+    /// this to choose between a streamed and a buffered LLM call.
+    pub fn has_stream_sink(&self) -> bool {
+        self.stream_sink.is_some()
+    }
+
+    /// Forward one chunk of incremental assistant text to the installed
+    /// [`StreamSink`], awaiting its egress. No-op when none is installed.
+    pub async fn emit_stream_delta(&self, delta: &str) {
+        if let Some(sink) = &self.stream_sink {
+            sink(delta).await;
+        }
     }
 
     /// Push one LLM call's token usage into the sink so the loop records it as

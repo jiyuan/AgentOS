@@ -305,6 +305,10 @@ Exit criteria:
 
 ## Later Work
 
+Net-new *feature* work (LLM streaming, memory intelligence, the extension
+ecosystem) now lives in [`FEATURE_ROADMAP.md`](FEATURE_ROADMAP.md). The items
+below are the remaining architecture/hardening tasks tracked by this plan.
+
 These items are useful but should wait until the invariant and config milestones
 are complete:
 

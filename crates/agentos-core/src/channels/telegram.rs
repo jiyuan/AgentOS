@@ -1,16 +1,17 @@
 use crate::channels::attachments::{file_size, AttachmentStore};
 use crate::channels::text::split_text;
-use agentos_interfaces::{Channel, ChannelError};
+use agentos_interfaces::{Channel, ChannelError, StreamEgress};
 use agentos_proto::{
     Attachment, AttachmentKind, ChannelId, ConversationId, Envelope, Message, MessageRole,
 };
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Telegram Bot API origin. Overridable via `AGENTOS_TELEGRAM_API_BASE` so the
 /// channel can be pointed at a local mock during tests.
@@ -25,6 +26,79 @@ pub struct TelegramChannel {
     attachments: AttachmentStore,
     api_base: Arc<str>,
     file_base: Arc<str>,
+    /// Per-conversation edit-in-place state, shared with the `StreamEgress`
+    /// handle so `send` can finalize a message the egress streamed.
+    stream_state: Arc<Mutex<HashMap<String, TelegramEditState>>>,
+}
+
+/// In-flight streamed reply for one chat: the placeholder message being edited,
+/// the accumulated text, and when it was last edited (for throttling).
+#[derive(Default)]
+struct TelegramEditState {
+    message_id: Option<String>,
+    buffer: String,
+    last_edit: Option<Instant>,
+}
+
+/// Minimum gap between Telegram `editMessageText` calls per chat. Telegram rate
+/// limits edits per chat; ~1 update/sec stays comfortably under the cap.
+const STREAM_EDIT_INTERVAL: Duration = Duration::from_millis(900);
+
+/// Shareable, `'static` streaming handle decoupled from the receive-owning
+/// channel (whose `receive` is `&mut self`). Holds just the HTTP credentials and
+/// the shared edit state.
+struct TelegramStreamEgress {
+    api_base: Arc<str>,
+    token: Arc<str>,
+    state: Arc<Mutex<HashMap<String, TelegramEditState>>>,
+}
+
+#[async_trait]
+impl StreamEgress for TelegramStreamEgress {
+    async fn push_delta(&self, conversation: &ConversationId, delta: &str) {
+        let chat = conversation.as_str().to_owned();
+        // Accumulate under the lock, decide whether an edit is due, then release
+        // the lock before the (blocking) HTTP call.
+        let (due, text, message_id) = {
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = guard.entry(chat.clone()).or_default();
+            entry.buffer.push_str(delta);
+            let now = Instant::now();
+            let due = entry
+                .last_edit
+                .is_none_or(|last| now.duration_since(last) >= STREAM_EDIT_INTERVAL);
+            if due {
+                entry.last_edit = Some(now);
+                (
+                    true,
+                    clamp_stream_text(&entry.buffer),
+                    entry.message_id.clone(),
+                )
+            } else {
+                (false, String::new(), None)
+            }
+        };
+        if !due || text.is_empty() {
+            return;
+        }
+        // Best-effort: a failed placeholder/edit just means this tick isn't
+        // shown; `Channel::send` still delivers the complete reply.
+        match message_id {
+            None => {
+                if let Some(id) = tg_send_message(&self.api_base, &self.token, &chat, &text) {
+                    self.state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .entry(chat)
+                        .or_default()
+                        .message_id = Some(id);
+                }
+            }
+            Some(id) => {
+                let _ = tg_edit_message(&self.api_base, &self.token, &chat, &id, &text);
+            }
+        }
+    }
 }
 
 impl TelegramChannel {
@@ -56,6 +130,7 @@ impl TelegramChannel {
             attachments: AttachmentStore::from_env("telegram"),
             api_base: Arc::from(api_base.trim_end_matches('/').to_owned()),
             file_base: Arc::from(file_base.trim_end_matches('/').to_owned()),
+            stream_state: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -71,6 +146,15 @@ impl TelegramChannel {
 
     fn api_url(&self, method: &str) -> String {
         format!("{}/bot{}/{method}", self.api_base, self.token)
+    }
+
+    /// Remove and return any streaming state for `chat_id`, so `send` can
+    /// finalize a streamed reply exactly once.
+    fn take_stream_state(&self, chat_id: &str) -> Option<TelegramEditState> {
+        self.stream_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(chat_id)
     }
 
     fn file_url(&self, file_path: &str) -> String {
@@ -291,15 +375,38 @@ impl Channel for TelegramChannel {
 
     async fn send(&self, env: Envelope) -> Result<(), ChannelError> {
         let chat_id = env.conversation_id.as_str();
+        let text = env.message.content.as_ref();
+
+        // If this reply was streamed, finalize the placeholder by editing it to
+        // the authoritative full text (so the last throttled delta is flushed),
+        // instead of posting a duplicate message. Falls back to a fresh send
+        // when there's no placeholder or the text is too long for one message.
+        let streamed = self.take_stream_state(chat_id);
+        let text_finalized = if let Some(message_id) = streamed.and_then(|state| state.message_id) {
+            if !text.is_empty() && text.chars().count() <= TELEGRAM_TEXT_LIMIT {
+                tg_edit_message(&self.api_base, &self.token, chat_id, &message_id, text)?;
+                true
+            } else {
+                // Too long to fit the edited message; deliver as fresh chunks.
+                self.send_text(chat_id, text)?;
+                true
+            }
+        } else {
+            false
+        };
+
         if env.message.attachments.is_empty() {
-            return self.send_text(chat_id, &env.message.content);
+            if text_finalized {
+                return Ok(());
+            }
+            return self.send_text(chat_id, text);
         }
 
         // Telegram captions are capped at 1024 chars. If the reply text is
-        // longer, send it as a separate message first and don't attach a
-        // caption — otherwise the multipart sendPhoto/sendDocument would 400.
-        let text = env.message.content.as_ref();
-        let caption = if text.is_empty() {
+        // longer (or was already delivered via streaming), send it as a separate
+        // message first and don't attach a caption — otherwise the multipart
+        // sendPhoto/sendDocument would 400.
+        let caption = if text_finalized || text.is_empty() {
             None
         } else if text.chars().count() <= TELEGRAM_CAPTION_LIMIT {
             Some(text)
@@ -314,6 +421,14 @@ impl Channel for TelegramChannel {
         }
         Ok(())
     }
+
+    fn stream_egress(&self) -> Option<Arc<dyn StreamEgress>> {
+        Some(Arc::new(TelegramStreamEgress {
+            api_base: Arc::clone(&self.api_base),
+            token: Arc::clone(&self.token),
+            state: Arc::clone(&self.stream_state),
+        }))
+    }
 }
 
 /// curl `--max-time` for the `getUpdates` long poll. Must stay well above the
@@ -326,6 +441,84 @@ const TELEGRAM_TEXT_LIMIT: usize = 4096;
 
 /// Telegram sendPhoto/sendDocument caption hard limit: 1024 characters.
 const TELEGRAM_CAPTION_LIMIT: usize = 1024;
+
+/// Clamp a streamed in-flight buffer to Telegram's per-message limit so an
+/// over-long preview still edits cleanly. The final authoritative text is
+/// delivered by [`Channel::send`].
+fn clamp_stream_text(buffer: &str) -> String {
+    if buffer.chars().count() <= TELEGRAM_TEXT_LIMIT {
+        buffer.to_owned()
+    } else {
+        buffer.chars().take(TELEGRAM_TEXT_LIMIT).collect()
+    }
+}
+
+/// POST `sendMessage`, returning the new message id. Best-effort (`None` on any
+/// failure) — the streaming placeholder is non-essential.
+fn tg_send_message(api_base: &str, token: &str, chat_id: &str, text: &str) -> Option<String> {
+    let output = Command::new("curl")
+        .args(["--silent", "--show-error", "--max-time", "10", "-X", "POST"])
+        .arg(format!("{api_base}/bot{token}/sendMessage"))
+        .args([
+            "-d",
+            &format!("chat_id={chat_id}"),
+            "--data-urlencode",
+            &format!("text={text}"),
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let response: Value = serde_json::from_slice(&output.stdout).ok()?;
+    response
+        .get("result")?
+        .get("message_id")?
+        .as_i64()
+        .map(|id| id.to_string())
+}
+
+/// POST `editMessageText`. Returns an error so `Channel::send`'s finalize can
+/// fall back to a fresh message; a no-op "message is not modified" reply (the
+/// placeholder already shows the final text) counts as success.
+fn tg_edit_message(
+    api_base: &str,
+    token: &str,
+    chat_id: &str,
+    message_id: &str,
+    text: &str,
+) -> Result<(), ChannelError> {
+    let output = Command::new("curl")
+        .args(["--silent", "--show-error", "--max-time", "10", "-X", "POST"])
+        .arg(format!("{api_base}/bot{token}/editMessageText"))
+        .args([
+            "-d",
+            &format!("chat_id={chat_id}"),
+            "-d",
+            &format!("message_id={message_id}"),
+            "--data-urlencode",
+            &format!("text={text}"),
+        ])
+        .output()
+        .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(ChannelError::Backend(Arc::from(stderr.trim().to_owned())));
+    }
+    let response: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
+    if response.get("ok").and_then(Value::as_bool) == Some(true) {
+        return Ok(());
+    }
+    let description = response
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if description.contains("not modified") {
+        return Ok(());
+    }
+    Err(ChannelError::Backend(Arc::from(response.to_string())))
+}
 
 fn check_send_response(
     status: &std::process::ExitStatus,
@@ -508,6 +701,16 @@ mod tests {
 
     fn channel_id() -> ChannelId {
         ChannelId::new("telegram")
+    }
+
+    #[test]
+    fn clamp_stream_text_truncates_to_message_limit() {
+        let short = "hello";
+        assert_eq!(clamp_stream_text(short), short);
+
+        let long: String = "x".repeat(TELEGRAM_TEXT_LIMIT + 50);
+        let clamped = clamp_stream_text(&long);
+        assert_eq!(clamped.chars().count(), TELEGRAM_TEXT_LIMIT);
     }
 
     #[test]

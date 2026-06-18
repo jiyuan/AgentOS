@@ -1,6 +1,6 @@
-use crate::memory::{MemoryCaller, MemoryManager, ReflectionReport, ReflectionRequest};
+use crate::memory::{MemoryManager, ReflectionParams, ReflectionReport};
 use agentos_interfaces::memory::MemoryError;
-use agentos_proto::{ChannelId, ConversationId, Envelope, Message, MessageRole};
+use agentos_proto::{AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole};
 use chrono::{DateTime, TimeZone, Utc};
 use croner::Cron;
 use serde::{Deserialize, Serialize};
@@ -258,11 +258,16 @@ pub struct CronStore {
     root: PathBuf,
 }
 
+/// A scheduled whole-memory reflection sweep. On each due tick it runs
+/// [`MemoryManager::reflect_all`] across every conversation that holds episodes
+/// — promoting repeated episodes to semantic facts, superseding contradicted
+/// ones, and rebuilding the lexical index — off the run hot path.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MemoryMaintenanceCron {
     pub id: Arc<str>,
-    pub caller: MemoryCaller,
-    pub request: ReflectionRequest,
+    pub agent_id: AgentId,
+    #[serde(default)]
+    pub params: ReflectionParams,
     pub schedule: CronSchedule,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
@@ -273,14 +278,14 @@ pub struct MemoryMaintenanceCron {
 impl MemoryMaintenanceCron {
     pub fn new(
         id: impl Into<Arc<str>>,
-        caller: MemoryCaller,
-        request: ReflectionRequest,
+        agent_id: AgentId,
+        params: ReflectionParams,
         schedule: CronSchedule,
     ) -> Self {
         Self {
             id: id.into(),
-            caller,
-            request,
+            agent_id,
+            params,
             schedule,
             enabled: true,
             last_fired_unix: None,
@@ -307,7 +312,7 @@ impl MemoryMaintenanceCron {
         if previous <= last_fired {
             return Ok(None);
         }
-        let report = manager.reflect(&self.caller, self.request.clone()).await?;
+        let report = manager.reflect_all(&self.agent_id, &self.params).await?;
         self.last_fired_unix = Some(previous);
         Ok(Some(report))
     }
@@ -668,21 +673,12 @@ mod tests {
     #[tokio::test]
     async fn memory_maintenance_cron_anchors_on_first_sight() {
         use crate::memory::InMemoryMemory;
-        use agentos_proto::{AgentId, TaskId};
 
         let manager = MemoryManager::new(Arc::new(InMemoryMemory::default()));
-        let caller = MemoryCaller {
-            agent_id: AgentId::new("alice"),
-            task_id: TaskId::new("t1"),
-            conversation_id: ConversationId::new("c1"),
-            user_id: None,
-            allowed_shared_domains: Vec::new(),
-            audit_read_access: false,
-        };
         let mut cron = MemoryMaintenanceCron::new(
             "mem-maint",
-            caller.clone(),
-            ReflectionRequest::for_conversation(&caller),
+            AgentId::new("alice"),
+            ReflectionParams::default(),
             CronSchedule::new("17 2 * * *").unwrap(),
         );
 
