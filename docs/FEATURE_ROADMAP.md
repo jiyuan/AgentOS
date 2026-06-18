@@ -278,6 +278,16 @@ It doubles as the backend Track B3 needs.
   `agentos-cli`; the §16 matrix stays green.
 - Exit: a real extension crate is wired and selectable by config; core has no edge
   to it.
+- **Status: done** (`605f16e`). The natural extension trait was `SemanticIndex`
+  (the vector index), not `Memory` — so the move was `SemanticIndex` →
+  `agentos-interfaces` (decoupled from the core `MemoryScope`: `upsert` now takes
+  only `&Record`, with Qdrant reading the scope fields from managed metadata).
+  New `extensions/memory/agentos-memory-vector` (in-memory cosine over a local
+  hashing embedder) implements it. The "registration arm" is
+  `AgentRuntime::build_with(paths, semantic_factory)`: the **CLI** owns the
+  `Fn(&str) -> Option<Arc<dyn SemanticIndex>>` factory (`"vector"` → the
+  extension), so only `agentos-cli` depends on the extension — core never names
+  it. `cargo tree` confirms the edge; the §16 matrix is green.
 
 ### C2. Link-time factory registry (conditional)
 
@@ -295,6 +305,8 @@ extensions, prefer leaving this **deferred** — the manual arm is likely fine.
   `cargo semver-checks check-release -p agentos-interfaces` documents the addition.
 - Exit: deferred by default; revisit only when a second/third out-of-tree extension
   makes the manual arm a real cost.
+- **Status: deferred** (as intended). C1's CLI-owned factory is a single
+  `match` arm — not painful — so the link-time registry isn't warranted yet.
 
 ### C3. Boundary regression for the new edge
 
@@ -307,6 +319,11 @@ extension crate edge: `agentos-core` must never gain a dependency on the extensi
 - Verify: `bash scripts/check-import-boundaries.sh`; a deliberately broken manifest
   adding the extension as a core dep is rejected.
 - Exit: CI rejects any core→extension dependency for the new crate.
+- **Status: done** (`605f16e`). The checker now also rejects a core/interfaces
+  dependency on a *named* extension crate (catching a workspace-inherited
+  `agentos-memory-vector.workspace = true` that the `extensions/` path-pattern
+  can't see), with a new `--self-test` fixture exercised by
+  `tests/import_boundary.rs`.
 
 ## Sequencing
 
@@ -346,3 +363,14 @@ deployment:
   (`reflect_all` over all conversations, `[memory.reflection]`, gateway idle-tick
   driver) for B2. **B3 (vector retrieval default) remains, blocked on C1.** Same
   verification matrix green.
+- 2026-06-18: **Track C1 + C3 done** (`605f16e`); **C2 deferred** as intended.
+  `SemanticIndex` moved to `agentos-interfaces`; first extension crate
+  `agentos-memory-vector` implements it; injected via
+  `AgentRuntime::build_with` + a CLI-owned factory so only `agentos-cli` depends
+  on it; import-boundary checker extended to reject core→extension edges. This
+  **unblocks B3**: the vector backend now exists and is selectable
+  (`semantic_backend = "vector"`). The remaining B3 work is making it the
+  *default* with a *real* embedder — the extension's hashing embedder is
+  lexical-vector, not true paraphrase semantics (same limitation as the built-in
+  `sqlite_vec`), so true semantic retrieval needs a real embedding source (local
+  model or provider endpoint). Verification matrix green.
