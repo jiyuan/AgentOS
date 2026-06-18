@@ -26,9 +26,17 @@ hydrate_stores = ["semantic", "episodic"]
 # approvals, multi-step/tool/sub-agent runs, explicit writes). Set false to
 # disable all long-term memory writes from runs.
 episode_recording_enabled = true
-# "sqlite_vec"/"qdrant"/"none" are built-in; "vector" selects the
-# agentos-memory-vector extension crate (in-memory cosine index), injected by
-# the CLI via AgentRuntime::build_with — core never depends on the extension.
+# Semantic retrieval index:
+#   "sqlite_vec" (default) — persistent, but hashing-based (lexical-vector).
+#   "qdrant"               — external Qdrant server.
+#   "vector"               — the agentos-memory-vector extension crate, injected
+#                            by the CLI (core never depends on it). Uses a real
+#                            embeddings API when AGENTOS_EMBEDDINGS_* / OPENAI_API_KEY
+#                            is set (paraphrase-capable retrieval), else an offline
+#                            hashing fallback. In-memory: rebuilt from writes after
+#                            a restart. Choose "vector" for real semantics,
+#                            "sqlite_vec" for persistence.
+#   "none"                 — lexical (FTS) retrieval only.
 semantic_backend = "sqlite_vec"
 
 [memory.sqlite_vec]

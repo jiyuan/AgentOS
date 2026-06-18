@@ -1,44 +1,107 @@
 //! `agentos-memory-vector` — a first-party AgentOS extension crate.
 //!
-//! This is the reference example of the extension contract: it depends **only**
-//! on `agentos-interfaces` (plus `agentos-proto` for the id types) and
-//! implements the public [`SemanticIndex`] trait. The runtime never names this
-//! crate; the CLI selects it by the `[memory].semantic_backend = "vector"`
-//! config string and injects it through `AgentRuntime::build_with`.
+//! Reference example of the extension contract: depends only on
+//! `agentos-interfaces` (+ `agentos-proto` for id types, `reqwest` for the
+//! embeddings HTTP call) and implements the public [`SemanticIndex`] trait. The
+//! runtime never names this crate; the CLI selects it by the
+//! `[memory].semantic_backend = "vector"` config string and injects it through
+//! `AgentRuntime::build_with`.
 //!
 //! [`VectorSemanticIndex`] is an in-process cosine-similarity index over a
-//! deterministic local hashing embedder — no network, no extra storage. The
-//! embedder is intentionally simple (hashed-token bag-of-words), so retrieval is
-//! lexical-vector rather than true paraphrase semantics; swapping in a real
-//! embedding source (a local model, or a provider endpoint) is a drop-in change
-//! behind the same trait. Vectors live in memory and are rebuilt from new writes
-//! after a restart; the core lexical (FTS) path is the durable fallback.
+//! pluggable [`Embedder`]:
+//!
+//! - [`ApiEmbedder`] calls an OpenAI-compatible `/embeddings` endpoint for real
+//!   (paraphrase-capable) semantic vectors. Selected by [`VectorSemanticIndex::from_env`]
+//!   when `AGENTOS_EMBEDDINGS_API_KEY` (or `OPENAI_API_KEY`) is set.
+//! - [`HashingEmbedder`] is a deterministic, offline bag-of-hashed-tokens
+//!   embedder (lexical-vector, not true semantics) used as the fallback when no
+//!   embeddings API is configured.
+//!
+//! Embedding failures degrade gracefully: a failed `upsert` skips indexing that
+//! record and a failed `search` returns no hits, so the core lexical (FTS) path
+//! still serves retrieval. Vectors live in memory and are rebuilt from new
+//! writes after a restart.
 
 use agentos_interfaces::memory::{MemoryError, Record};
 use agentos_interfaces::semantic::{SemanticIndex, SemanticSearchHit};
 use agentos_proto::{Namespace, RecordId};
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
-/// Default embedding width. Wide enough to keep hash collisions low for short
-/// memory records while staying cheap to score.
+/// Default width for the offline [`HashingEmbedder`]. Wide enough to keep hash
+/// collisions low for short memory records while staying cheap to score.
 pub const DEFAULT_DIMENSIONS: usize = 384;
 
-/// In-memory cosine-similarity [`SemanticIndex`]. Records are embedded with a
-/// local hashing embedder and grouped by namespace; `search` ranks a namespace's
+const DEFAULT_EMBEDDINGS_BASE_URL: &str = "https://api.openai.com/v1";
+const DEFAULT_EMBEDDINGS_MODEL: &str = "text-embedding-3-small";
+
+/// Turns text into a unit-normalized embedding vector. `None` signals the
+/// embedding is unavailable (e.g. the API errored), so the index degrades to
+/// "no semantic hit" rather than failing the run.
+#[async_trait]
+pub trait Embedder: Send + Sync {
+    async fn embed(&self, text: &str) -> Option<Vec<f32>>;
+}
+
+/// In-memory cosine-similarity [`SemanticIndex`] over a pluggable [`Embedder`].
+/// Records are embedded and grouped by namespace; `search` ranks a namespace's
 /// vectors against the embedded query.
 pub struct VectorSemanticIndex {
-    dimensions: usize,
+    embedder: Arc<dyn Embedder>,
     // namespace -> (record id -> unit-normalized embedding)
     vectors: Mutex<HashMap<String, HashMap<String, Vec<f32>>>>,
 }
 
 impl VectorSemanticIndex {
-    pub fn new(dimensions: usize) -> Self {
+    pub fn new(embedder: Arc<dyn Embedder>) -> Self {
         Self {
-            dimensions: dimensions.max(1),
+            embedder,
             vectors: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Offline index backed by the deterministic hashing embedder.
+    pub fn with_hashing(dimensions: usize) -> Self {
+        Self::new(Arc::new(HashingEmbedder::new(dimensions)))
+    }
+
+    /// Select the embedder from the environment: an OpenAI-compatible
+    /// [`ApiEmbedder`] when `AGENTOS_EMBEDDINGS_API_KEY` (or `OPENAI_API_KEY`) is
+    /// set, otherwise the offline [`HashingEmbedder`]. Knobs:
+    /// `AGENTOS_EMBEDDINGS_BASE_URL` (default OpenAI), `AGENTOS_EMBEDDINGS_MODEL`
+    /// (default `text-embedding-3-small`).
+    pub fn from_env() -> Self {
+        let api_key = std::env::var("AGENTOS_EMBEDDINGS_API_KEY")
+            .ok()
+            .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+            .filter(|key| !key.trim().is_empty());
+        match api_key {
+            Some(api_key) => {
+                let base_url = std::env::var("AGENTOS_EMBEDDINGS_BASE_URL")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| DEFAULT_EMBEDDINGS_BASE_URL.to_owned());
+                let model = std::env::var("AGENTOS_EMBEDDINGS_MODEL")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| DEFAULT_EMBEDDINGS_MODEL.to_owned());
+                tracing::info!(
+                    target: "agentos_memory_vector",
+                    model = model.as_str(),
+                    "vector semantic index using API embeddings"
+                );
+                Self::new(Arc::new(ApiEmbedder::new(&base_url, Some(api_key), model)))
+            }
+            None => {
+                tracing::info!(
+                    target: "agentos_memory_vector",
+                    "vector semantic index using offline hashing embedder (no embeddings API configured)"
+                );
+                Self::with_hashing(DEFAULT_DIMENSIONS)
+            }
         }
     }
 
@@ -51,7 +114,7 @@ impl VectorSemanticIndex {
 
 impl Default for VectorSemanticIndex {
     fn default() -> Self {
-        Self::new(DEFAULT_DIMENSIONS)
+        Self::with_hashing(DEFAULT_DIMENSIONS)
     }
 }
 
@@ -63,7 +126,11 @@ impl SemanticIndex for VectorSemanticIndex {
                 "vector index upsert requires a stable record id".into(),
             ));
         };
-        let vector = hash_embedding(&searchable_text(record), self.dimensions);
+        // Best-effort: if the embedder is unavailable, leave the record
+        // unindexed (the core lexical path still retrieves it).
+        let Some(vector) = self.embedder.embed(&searchable_text(record)).await else {
+            return Ok(());
+        };
         self.lock()
             .entry(record.namespace.as_str().to_owned())
             .or_default()
@@ -80,7 +147,9 @@ impl SemanticIndex for VectorSemanticIndex {
         if limit == 0 || query.trim().is_empty() {
             return Ok(Vec::new());
         }
-        let query_vector = hash_embedding(query, self.dimensions);
+        let Some(query_vector) = self.embedder.embed(query).await else {
+            return Ok(Vec::new());
+        };
         let guard = self.lock();
         let Some(namespace_vectors) = guard.get(namespace.as_str()) else {
             return Ok(Vec::new());
@@ -120,6 +189,98 @@ impl SemanticIndex for VectorSemanticIndex {
     }
 }
 
+/// Deterministic offline embedder: a bag of hashed alphanumeric tokens mapped
+/// onto a fixed-width vector, L2-normalized so a dot product is cosine
+/// similarity. Shared tokens raise similarity (lexical-vector, not paraphrase).
+pub struct HashingEmbedder {
+    dimensions: usize,
+}
+
+impl HashingEmbedder {
+    pub fn new(dimensions: usize) -> Self {
+        Self {
+            dimensions: dimensions.max(1),
+        }
+    }
+}
+
+#[async_trait]
+impl Embedder for HashingEmbedder {
+    async fn embed(&self, text: &str) -> Option<Vec<f32>> {
+        let mut vector = vec![0.0f32; self.dimensions];
+        for token in text
+            .split(|ch: char| !ch.is_alphanumeric())
+            .filter(|token| !token.is_empty())
+        {
+            let hash = fnv1a64(token.to_ascii_lowercase().as_bytes());
+            let index = (hash as usize) % self.dimensions;
+            vector[index] += if hash & 1 == 0 { 1.0 } else { -1.0 };
+        }
+        normalize(&mut vector);
+        Some(vector)
+    }
+}
+
+/// Real semantic embedder: calls an OpenAI-compatible `POST {base}/embeddings`
+/// endpoint (`{ "model", "input" }` → `data[0].embedding`). Returns `None` on
+/// any transport/parse error so the index degrades gracefully.
+pub struct ApiEmbedder {
+    client: reqwest::Client,
+    url: String,
+    api_key: Option<String>,
+    model: String,
+}
+
+impl ApiEmbedder {
+    pub fn new(base_url: &str, api_key: Option<String>, model: impl Into<String>) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .unwrap_or_default();
+        Self {
+            client,
+            url: format!("{}/embeddings", base_url.trim_end_matches('/')),
+            api_key,
+            model: model.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl Embedder for ApiEmbedder {
+    async fn embed(&self, text: &str) -> Option<Vec<f32>> {
+        let mut request = self
+            .client
+            .post(&self.url)
+            .json(&serde_json::json!({ "model": self.model, "input": text }));
+        if let Some(api_key) = &self.api_key {
+            request = request.bearer_auth(api_key);
+        }
+        let response = match request.send().await.and_then(|r| r.error_for_status()) {
+            Ok(response) => response,
+            Err(err) => {
+                tracing::warn!(
+                    target: "agentos_memory_vector",
+                    error = %err,
+                    "embeddings request failed; record will not be semantically indexed"
+                );
+                return None;
+            }
+        };
+        let body: serde_json::Value = response.json().await.ok()?;
+        let values = body.get("data")?.get(0)?.get("embedding")?.as_array()?;
+        let mut vector: Vec<f32> = values
+            .iter()
+            .filter_map(|value| value.as_f64().map(|number| number as f32))
+            .collect();
+        if vector.is_empty() {
+            return None;
+        }
+        normalize(&mut vector);
+        Some(vector)
+    }
+}
+
 /// The text a record is embedded from: its JSON body plus serialized metadata.
 fn searchable_text(record: &Record) -> String {
     let mut text = record.body.to_string();
@@ -130,30 +291,19 @@ fn searchable_text(record: &Record) -> String {
     text
 }
 
-/// Deterministic bag-of-hashed-tokens embedding, L2-normalized so a dot product
-/// is cosine similarity. Each alphanumeric token hashes to one dimension with a
-/// sign, so shared tokens raise similarity.
-fn hash_embedding(input: &str, dimensions: usize) -> Vec<f32> {
-    let mut vector = vec![0.0f32; dimensions];
-    for token in input
-        .split(|ch: char| !ch.is_alphanumeric())
-        .filter(|token| !token.is_empty())
-    {
-        let hash = fnv1a64(token.to_ascii_lowercase().as_bytes());
-        let index = (hash as usize) % dimensions;
-        vector[index] += if hash & 1 == 0 { 1.0 } else { -1.0 };
-    }
+fn dot(left: &[f32], right: &[f32]) -> f32 {
+    left.iter().zip(right).map(|(a, b)| a * b).sum()
+}
+
+/// Scale a vector to unit length so a dot product equals cosine similarity.
+/// No-op for the zero vector.
+fn normalize(vector: &mut [f32]) {
     let magnitude = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
     if magnitude > 0.0 {
-        for component in &mut vector {
+        for component in vector {
             *component /= magnitude;
         }
     }
-    vector
-}
-
-fn dot(left: &[f32], right: &[f32]) -> f32 {
-    left.iter().zip(right).map(|(a, b)| a * b).sum()
 }
 
 fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -180,8 +330,40 @@ mod tests {
         }
     }
 
+    /// A deterministic embedder that hands back caller-chosen vectors, so index
+    /// ranking can be asserted independently of any embedding scheme.
+    struct FixedEmbedder;
+
+    #[async_trait]
+    impl Embedder for FixedEmbedder {
+        async fn embed(&self, text: &str) -> Option<Vec<f32>> {
+            // "near" -> aligned with the query; "far" -> orthogonal; else zero.
+            let vector = match text {
+                t if t.contains("near") => vec![1.0, 0.0],
+                t if t.contains("far") => vec![0.0, 1.0],
+                _ => vec![0.0, 0.0],
+            };
+            Some(vector)
+        }
+    }
+
     #[tokio::test]
-    async fn search_ranks_token_overlap_above_unrelated() {
+    async fn ranks_by_embedder_similarity() {
+        let index = VectorSemanticIndex::new(Arc::new(FixedEmbedder));
+        index.upsert(&record("r-near", "ns", "near")).await.unwrap();
+        index.upsert(&record("r-far", "ns", "far")).await.unwrap();
+
+        // Query embeds to [1,0] ("near"); only the aligned record scores > 0.
+        let hits = index
+            .search(&Namespace::new("ns"), "near", 5)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].record_id.as_str(), "r-near");
+    }
+
+    #[tokio::test]
+    async fn hashing_fallback_ranks_token_overlap() {
         let index = VectorSemanticIndex::default();
         index
             .upsert(&record(
@@ -199,7 +381,6 @@ mod tests {
             ))
             .await
             .unwrap();
-
         let hits = index
             .search(&Namespace::new("ns"), "deploy payment service", 5)
             .await

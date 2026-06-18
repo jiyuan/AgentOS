@@ -88,8 +88,10 @@ dependencies = [
  "agentos-interfaces",
  "agentos-proto",
  "async-trait",
+ "reqwest",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

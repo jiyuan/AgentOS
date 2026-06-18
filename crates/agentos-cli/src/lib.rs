@@ -17,8 +17,10 @@ use std::sync::Arc;
 /// `sqlite_vec` / `qdrant` / `none` selection.
 pub fn semantic_index_factory(backend: &str) -> Option<Arc<dyn SemanticIndex>> {
     match backend {
+        // `from_env` picks a real embeddings API when configured, else the
+        // offline hashing embedder.
         "vector" => Some(Arc::new(
-            agentos_memory_vector::VectorSemanticIndex::default(),
+            agentos_memory_vector::VectorSemanticIndex::from_env(),
         )),
         _ => None,
     }
