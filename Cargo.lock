@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agentos-cli"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "agentos-core",
  "agentos-interfaces",
@@ -27,7 +27,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "agentos-interfaces",
  "agentos-llm",
@@ -52,7 +52,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-interfaces"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "agentos-proto",
  "async-trait",
@@ -64,7 +64,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-llm"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "agentos-interfaces",
  "agentos-proto",
@@ -83,7 +83,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-memory-vector"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "agentos-interfaces",
  "agentos-proto",
@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "agentos-proto"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "serde",
  "serde_json",
