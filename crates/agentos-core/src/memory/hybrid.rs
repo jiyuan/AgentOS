@@ -1,35 +1,15 @@
-use super::{MemoryError, MemoryScope};
+use super::MemoryError;
 use agentos_interfaces::memory::Record;
-use agentos_proto::{Namespace, RecordId};
-use async_trait::async_trait;
+use agentos_proto::RecordId;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+// The vector-index ABI now lives in `agentos-interfaces` so out-of-tree
+// extension crates can implement it without depending on core. Re-exported here
+// so the in-crate reference impls and call sites keep their `super::` paths.
+pub use agentos_interfaces::semantic::{SemanticIndex, SemanticSearchHit};
+
 pub(crate) const RRF_K: f64 = 60.0;
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct SemanticSearchHit {
-    pub record_id: RecordId,
-    pub score: f64,
-}
-
-#[async_trait]
-pub trait SemanticIndex: Send + Sync {
-    async fn upsert(&self, scope: &MemoryScope, record: &Record) -> Result<(), MemoryError>;
-
-    async fn search(
-        &self,
-        namespace: &Namespace,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<SemanticSearchHit>, MemoryError>;
-
-    async fn delete(
-        &self,
-        namespace: &Namespace,
-        record_ids: &[RecordId],
-    ) -> Result<(), MemoryError>;
-}
 
 pub(crate) fn reciprocal_rank_fusion(
     ranked_lists: &[Vec<RecordId>],

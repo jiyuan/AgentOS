@@ -2,7 +2,7 @@ use super::hybrid::{
     hash_embedding, memory_backend_error, metadata_embedding, searchable_record_text,
     stable_hash_u64, vector_json, SemanticIndex, SemanticSearchHit,
 };
-use super::{memory_sqlite_error, MemoryError, MemoryScope, SqliteStore};
+use super::{memory_sqlite_error, MemoryError, SqliteStore};
 use agentos_interfaces::memory::Record;
 use agentos_proto::{Namespace, RecordId};
 use async_trait::async_trait;
@@ -82,7 +82,7 @@ impl SqliteVecSemanticIndex {
 
 #[async_trait]
 impl SemanticIndex for SqliteVecSemanticIndex {
-    async fn upsert(&self, _scope: &MemoryScope, record: &Record) -> Result<(), MemoryError> {
+    async fn upsert(&self, record: &Record) -> Result<(), MemoryError> {
         let Some(record_id) = &record.id else {
             return Err(memory_backend_error(
                 "sqlite_vec upsert requires a stable memory record id",

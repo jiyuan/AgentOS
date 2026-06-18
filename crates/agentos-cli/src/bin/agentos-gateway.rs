@@ -647,7 +647,9 @@ async fn run_channel_gateway<C>(
 where
     C: Channel,
 {
-    let runtime = AgentRuntime::build(runtime_paths(config)).await?;
+    let runtime =
+        AgentRuntime::build_with(runtime_paths(config), &agentos_cli::semantic_index_factory)
+            .await?;
     log_line(config, &runtime.orchestrator.describe_llm())?;
     let deps_scope = runtime.deps_scope();
     let input_guardrails = deps_scope.input_guardrails();

@@ -11,6 +11,7 @@ pub mod memory;
 pub mod orchestrator;
 pub mod paths;
 pub mod run_state;
+pub mod semantic;
 pub mod session;
 pub mod skill;
 pub mod tool;
@@ -31,6 +32,7 @@ pub use orchestrator::{
 };
 pub use paths::agentos_home;
 pub use run_state::{ApprovalStatus, Interruption, InterruptionAction, RunState};
+pub use semantic::{SemanticIndex, SemanticSearchHit};
 pub use session::{Item, Session, SessionError, Transcript};
 pub use skill::{Skill, SkillError, SkillInvocation};
 pub use tool::{Tool, ToolError, ToolMetadata, ToolSpec};

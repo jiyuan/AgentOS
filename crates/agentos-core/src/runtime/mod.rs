@@ -4,7 +4,8 @@ use crate::guardrails::{
     MaxOutputLength, PiiFilter, ShellCommandAllowlist, SkillBundleWriteGuardrail,
 };
 use crate::memory::{
-    InMemoryMemory, MemoryManager, QdrantSemanticIndex, SqliteStore, SqliteVecSemanticIndex,
+    InMemoryMemory, MemoryManager, QdrantSemanticIndex, SemanticIndex, SqliteStore,
+    SqliteVecSemanticIndex,
 };
 use crate::orchestrator::{
     EchoOrchestrator, MaxOrchestrator, MemoryHydrationSettings, MinOrchestrator,
@@ -168,6 +169,19 @@ pub struct AgentRuntime {
 
 impl AgentRuntime {
     pub async fn build(paths: RuntimePaths) -> Result<Self, String> {
+        Self::build_with(paths, &|_| None).await
+    }
+
+    /// Build the runtime, consulting `semantic_factory` to resolve the
+    /// `[memory].semantic_backend` config string to an externally-provided
+    /// [`SemanticIndex`] (e.g. an extension crate's) before falling back to the
+    /// built-in `sqlite_vec` / `qdrant` / `none` selection. This is the
+    /// boundary-respecting extension hook: the CLI supplies the factory, so core
+    /// never names an extension crate.
+    pub async fn build_with(
+        paths: RuntimePaths,
+        semantic_factory: SemanticIndexFactory<'_>,
+    ) -> Result<Self, String> {
         let workspace_config = WorkspaceConfig::load(&paths.agent_config_path)
             .map_err(|err| format!("failed to load workspace config: {err}"))?;
         if workspace_config.memory.semantic_backend_is_sqlite_vec() {
@@ -178,7 +192,8 @@ impl AgentRuntime {
             SqliteStore::open(paths.session_db_path)
                 .map_err(|err| format!("failed to open session store: {err}"))?,
         );
-        let memory_manager = build_memory_manager(&workspace_config, session.clone())?;
+        let memory_manager =
+            build_memory_manager(&workspace_config, session.clone(), semantic_factory)?;
         let mut tools = build_parent_tools(&workspace_config, memory_manager.clone())?;
         if let Some(path) = isolation_worker_path(&workspace_config) {
             tools = tools.with_subprocess_isolation(path);
@@ -346,9 +361,17 @@ pub fn load_workspace_config(path: &Path) -> Result<WorkspaceConfig, std::io::Er
     WorkspaceConfig::load(path)
 }
 
+/// Resolves a `[memory].semantic_backend` config string to an externally
+/// provided [`SemanticIndex`], or `None` to use the built-in selection. The CLI
+/// supplies this so an extension crate's index can be injected without core
+/// depending on the extension. See [`AgentRuntime::build_with`].
+pub type SemanticIndexFactory<'a> =
+    &'a (dyn Fn(&str) -> Option<Arc<dyn SemanticIndex>> + Send + Sync);
+
 fn build_memory_manager(
     config: &WorkspaceConfig,
     session: Arc<SqliteStore>,
+    semantic_factory: SemanticIndexFactory<'_>,
 ) -> Result<Arc<MemoryManager>, String> {
     let (manager, sqlite_store) = if config.memory.backend_is_in_memory() {
         (
@@ -366,6 +389,11 @@ fn build_memory_manager(
     } else {
         (MemoryManager::new_sqlite(session.clone()), Some(session))
     };
+
+    // An injected (extension) index wins over the built-in backends.
+    if let Some(index) = semantic_factory(config.memory.semantic_backend.as_ref()) {
+        return Ok(Arc::new(manager.with_semantic_index(index)));
+    }
 
     if config.memory.semantic_backend_is_qdrant() {
         let qdrant = QdrantSemanticIndex::new((&config.memory.qdrant).into())

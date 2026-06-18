@@ -5,6 +5,7 @@ members = [
     "crates/agentos-interfaces",
     "crates/agentos-llm",
     "crates/agentos-proto",
+    "extensions/memory/agentos-memory-vector",
 ]
 resolver = "2"
 
@@ -18,6 +19,7 @@ repository = "https://github.com/jiyuan/AgentOS"
 agentos-core = { path = "crates/agentos-core" }
 agentos-interfaces = { path = "crates/agentos-interfaces" }
 agentos-llm = { path = "crates/agentos-llm" }
+agentos-memory-vector = { path = "extensions/memory/agentos-memory-vector" }
 agentos-proto = { path = "crates/agentos-proto" }
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

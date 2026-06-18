@@ -15,6 +15,7 @@ dependencies = [
  "agentos-core",
  "agentos-interfaces",
  "agentos-llm",
+ "agentos-memory-vector",
  "agentos-proto",
  "async-trait",
  "serde",
@@ -78,6 +79,17 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "agentos-memory-vector"
+version = "0.5.0"
+dependencies = [
+ "agentos-interfaces",
+ "agentos-proto",
+ "async-trait",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

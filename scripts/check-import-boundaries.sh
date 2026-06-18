@@ -7,9 +7,16 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # paths, but they must not compile against workspace-owned or extension crates.
 pattern='(\.\./\.\./workspace|\.\./\.\./extensions|workspace/|extensions/)'
 
-# Returns 0 (success) when the manifest contains a boundary violation.
+# First-party extension crate names. Core/interfaces must not depend on these
+# even via a workspace-inherited edge (`name.workspace = true`), which carries
+# no `extensions/` path for the pattern above to catch. Pipe-separated for the
+# alternation; add new extension crates here.
+ext_names='agentos-memory-vector'
+
+# Returns 0 (success) when the manifest contains a boundary violation: either a
+# workspace/extension path dependency, or a dependency on a named extension crate.
 manifest_violates() {
-  grep -Eq "$pattern" "$1"
+  grep -Eq "$pattern" "$1" || grep -Eq "(^|[^[:alnum:]_-])($ext_names)([^[:alnum:]_-]|\$)" "$1"
 }
 
 # Self-test: prove the checker actually rejects violating manifests instead of
@@ -27,6 +34,10 @@ EOF
 [dependencies]
 agent-config = { path = "../../workspace" }
 EOF
+  cat > "$tmp/violating-extension-name.toml" <<'EOF'
+[dependencies]
+agentos-memory-vector.workspace = true
+EOF
   cat > "$tmp/clean.toml" <<'EOF'
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -39,6 +50,10 @@ EOF
   fi
   if ! manifest_violates "$tmp/violating-workspace.toml"; then
     echo "self-test FAILED: workspace path dependency was not rejected"
+    exit 1
+  fi
+  if ! manifest_violates "$tmp/violating-extension-name.toml"; then
+    echo "self-test FAILED: workspace-inherited extension dependency was not rejected"
     exit 1
   fi
   if manifest_violates "$tmp/clean.toml"; then

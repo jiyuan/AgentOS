@@ -41,9 +41,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let attachments_dir = attachments_dir_path(&home);
-    let runtime = AgentRuntime::build(runtime_paths.clone())
-        .await
-        .map_err(io::Error::other)?;
+    let runtime =
+        AgentRuntime::build_with(runtime_paths.clone(), &agentos_cli::semantic_index_factory)
+            .await
+            .map_err(io::Error::other)?;
     let deps_scope = runtime.deps_scope();
     let input_guardrails = deps_scope.input_guardrails();
     let output_guardrails = deps_scope.output_guardrails();

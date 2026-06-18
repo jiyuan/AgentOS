@@ -211,10 +211,10 @@ impl MemoryConfig {
         self.semantic_backend = Arc::from(normalize_config_token(&self.semantic_backend));
         match self.semantic_backend.as_ref() {
             "none" | "qdrant" | "memory.qdrant" | "sqlite" | "memory.sqlite" | "sqlite_vec"
-            | "memory.sqlite_vec" => {}
+            | "memory.sqlite_vec" | "vector" => {}
             other => {
                 return Err(format!(
-                    "unknown memory semantic_backend '{other}'; expected none, sqlite/sqlite_vec, or qdrant"
+                    "unknown memory semantic_backend '{other}'; expected none, sqlite/sqlite_vec, qdrant, or vector"
                 ));
             }
         }
