@@ -251,8 +251,19 @@ embedding model vs. a provider embeddings endpoint reached through `agentos-llm`
   fallback when embeddings are unavailable.
 - Exit: vector retrieval is the configured default for chosen domains, with graceful
   fallback; the embedding source is documented.
-- **Status: blocked on C1** (the vector extension crate). B1 and B2 are done, so
-  this is the only remaining Track-B item.
+- **Status: done** (`cd18642`). The `agentos-memory-vector` extension gained a
+  pluggable `Embedder`: `ApiEmbedder` calls an OpenAI-compatible `/embeddings`
+  endpoint (real paraphrase-capable vectors), with the offline `HashingEmbedder`
+  as fallback; `from_env()` auto-selects on `AGENTOS_EMBEDDINGS_API_KEY` /
+  `OPENAI_API_KEY`. Embedding failures degrade gracefully (no semantic hit →
+  core lexical FTS still serves), satisfying "lexical+recency remains the
+  fallback". Embedding source documented in `.env.example` + `agent.toml`.
+  **Deviation:** the shipped `semantic_backend` default stays `sqlite_vec`
+  (persistent) rather than flipping to `vector`, because the vector extension is
+  in-memory — `vector` is documented as the opt-in for real semantics. Making
+  real embeddings the *persistent* default would mean injecting the embedder
+  into the core `sqlite_vec` path (it already honors a precomputed
+  `metadata["embedding"]`); that's the remaining follow-up.
 
 ## Track C — Extension Ecosystem (internal composition first)
 
@@ -374,3 +385,9 @@ deployment:
   lexical-vector, not true paraphrase semantics (same limitation as the built-in
   `sqlite_vec`), so true semantic retrieval needs a real embedding source (local
   model or provider endpoint). Verification matrix green.
+- 2026-06-18: **Track B3 done** (`cd18642`) — real embeddings (OpenAI-compatible
+  `/embeddings`) behind the vector extension's pluggable `Embedder`, with offline
+  hashing fallback and graceful degradation. **The roadmap is now complete**
+  except two explicitly-deferred follow-ups: C2 (link-time registry, not needed
+  for one extension) and making real embeddings the *persistent* default (inject
+  the embedder into core `sqlite_vec`). Verification matrix green.
