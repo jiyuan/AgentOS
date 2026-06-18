@@ -200,6 +200,13 @@ under `[memory]` so it can be disabled.
   episodic record; a trivial reply produces none.
 - Exit: episode recording runs as a post-finish side effect by default, with a
   documented `[memory]` toggle.
+- **Status: done** (already implemented; `624abf8` documents it). The recording
+  policy was already wired in `runner/episodes.rs` (skips trivial runs via
+  `EpisodeRecord::should_record`; records failures/denials/approvals/multi-step/
+  tool/sub-agent/explicit-write runs) and gated by `[memory]
+  .episode_recording_enabled`, which the deployment `agent.toml` enables. The
+  struct `Default` stays `false` (conservative, matching `hydration_enabled`); a
+  clarifying comment was added to `agent.toml`.
 
 ### B2. Cron-driven reflection
 
@@ -215,6 +222,19 @@ path on a schedule.
   `memory_access_log` records the promotion.
 - Exit: a default deployment runs reflection on a configurable schedule; promotion
   and supersession are visible in the audit log and in subsequent hydration.
+- **Status: done** (`624abf8`). `reflect()` existed but was never driven in
+  production, and the existing `MemoryMaintenanceCron` was single-conversation
+  while episodes are per-conversation. Added `MemoryManager::reflect_all` (sweeps
+  every conversation with episodes via a new
+  `MemoryMaintenance::episodic_conversation_owners`, promotes + supersedes per
+  scope, rebuilds the lexical index once), reshaped `MemoryMaintenanceCron` to
+  drive it, added `[memory.reflection]` config, and wired it into the gateway's
+  idle tick (best-effort, one-line summary logged). **Deviation:** retention
+  pruning ("compression of old episodes") is left at `RetentionRequest::default`
+  for now — focus is promotion/supersession/index; wiring `[memory.retention]`
+  into the sweep is a small follow-up. **Note:** each channel-gateway thread runs
+  its own sweep over the shared DB (matches the existing per-channel cron model);
+  fine for a single primary channel.
 
 ### B3. Vector retrieval as the deployment default
 
@@ -231,6 +251,8 @@ embedding model vs. a provider embeddings endpoint reached through `agentos-llm`
   fallback when embeddings are unavailable.
 - Exit: vector retrieval is the configured default for chosen domains, with graceful
   fallback; the embedding source is documented.
+- **Status: blocked on C1** (the vector extension crate). B1 and B2 are done, so
+  this is the only remaining Track-B item.
 
 ## Track C — Extension Ecosystem (internal composition first)
 
@@ -319,3 +341,8 @@ deployment:
   (ollama uses the single-chunk fallback). No remaining Track-A follow-ups. All
   work on branch `docs/feature-roadmap`; `cargo test --workspace`, clippy
   `-D warnings`, fmt, and the import-boundary / module-size scripts are green.
+- 2026-06-18: **Track B1 + B2 done** (`624abf8`). Episode recording was already
+  wired (B1); added the cron-driven whole-memory reflection sweep
+  (`reflect_all` over all conversations, `[memory.reflection]`, gateway idle-tick
+  driver) for B2. **B3 (vector retrieval default) remains, blocked on C1.** Same
+  verification matrix green.
