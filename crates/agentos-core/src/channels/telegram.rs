@@ -1,5 +1,6 @@
 use crate::channels::attachments::{file_size, AttachmentStore};
 use crate::channels::text::split_text;
+use crate::http::shared_client;
 use agentos_interfaces::{Channel, ChannelError, StreamEgress};
 use agentos_proto::{
     Attachment, AttachmentKind, ChannelId, ConversationId, Envelope, Message, MessageRole,
@@ -85,7 +86,7 @@ impl StreamEgress for TelegramStreamEgress {
         // shown; `Channel::send` still delivers the complete reply.
         match message_id {
             None => {
-                if let Some(id) = tg_send_message(&self.api_base, &self.token, &chat, &text) {
+                if let Some(id) = tg_send_message(&self.api_base, &self.token, &chat, &text).await {
                     self.state
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -95,7 +96,7 @@ impl StreamEgress for TelegramStreamEgress {
                 }
             }
             Some(id) => {
-                let _ = tg_edit_message(&self.api_base, &self.token, &chat, &id, &text);
+                let _ = tg_edit_message(&self.api_base, &self.token, &chat, &id, &text).await;
             }
         }
     }
@@ -384,7 +385,7 @@ impl Channel for TelegramChannel {
         let streamed = self.take_stream_state(chat_id);
         let text_finalized = if let Some(message_id) = streamed.and_then(|state| state.message_id) {
             if !text.is_empty() && text.chars().count() <= TELEGRAM_TEXT_LIMIT {
-                tg_edit_message(&self.api_base, &self.token, chat_id, &message_id, text)?;
+                tg_edit_message(&self.api_base, &self.token, chat_id, &message_id, text).await?;
                 true
             } else {
                 // Too long to fit the edited message; deliver as fresh chunks.
@@ -455,22 +456,20 @@ fn clamp_stream_text(buffer: &str) -> String {
 
 /// POST `sendMessage`, returning the new message id. Best-effort (`None` on any
 /// failure) — the streaming placeholder is non-essential.
-fn tg_send_message(api_base: &str, token: &str, chat_id: &str, text: &str) -> Option<String> {
-    let output = Command::new("curl")
-        .args(["--silent", "--show-error", "--max-time", "10", "-X", "POST"])
-        .arg(format!("{api_base}/bot{token}/sendMessage"))
-        .args([
-            "-d",
-            &format!("chat_id={chat_id}"),
-            "--data-urlencode",
-            &format!("text={text}"),
-        ])
-        .output()
+///
+/// Uses the pooled async HTTP client (not a `curl` subprocess) because this runs
+/// on the streaming hot path: a fresh process + TLS handshake per edit stalls
+/// the single-threaded loop and makes streaming slower than a buffered reply.
+async fn tg_send_message(api_base: &str, token: &str, chat_id: &str, text: &str) -> Option<String> {
+    let response: Value = shared_client()
+        .post(format!("{api_base}/bot{token}/sendMessage"))
+        .form(&[("chat_id", chat_id), ("text", text)])
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
         .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let response: Value = serde_json::from_slice(&output.stdout).ok()?;
     response
         .get("result")?
         .get("message_id")?
@@ -481,31 +480,29 @@ fn tg_send_message(api_base: &str, token: &str, chat_id: &str, text: &str) -> Op
 /// POST `editMessageText`. Returns an error so `Channel::send`'s finalize can
 /// fall back to a fresh message; a no-op "message is not modified" reply (the
 /// placeholder already shows the final text) counts as success.
-fn tg_edit_message(
+async fn tg_edit_message(
     api_base: &str,
     token: &str,
     chat_id: &str,
     message_id: &str,
     text: &str,
 ) -> Result<(), ChannelError> {
-    let output = Command::new("curl")
-        .args(["--silent", "--show-error", "--max-time", "10", "-X", "POST"])
-        .arg(format!("{api_base}/bot{token}/editMessageText"))
-        .args([
-            "-d",
-            &format!("chat_id={chat_id}"),
-            "-d",
-            &format!("message_id={message_id}"),
-            "--data-urlencode",
-            &format!("text={text}"),
+    // Pooled async client, same rationale as `tg_send_message`: this is the
+    // per-delta streaming edit and must not spawn a process or re-handshake TLS.
+    // A 4xx (e.g. "message is not modified") still returns a JSON body, so parse
+    // the response regardless of status — matching the prior `curl` behavior.
+    let response: Value = shared_client()
+        .post(format!("{api_base}/bot{token}/editMessageText"))
+        .form(&[
+            ("chat_id", chat_id),
+            ("message_id", message_id),
+            ("text", text),
         ])
-        .output()
-        .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(ChannelError::Backend(Arc::from(stderr.trim().to_owned())));
-    }
-    let response: Value = serde_json::from_slice(&output.stdout)
+        .send()
+        .await
+        .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?
+        .json()
+        .await
         .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
     if response.get("ok").and_then(Value::as_bool) == Some(true) {
         return Ok(());
