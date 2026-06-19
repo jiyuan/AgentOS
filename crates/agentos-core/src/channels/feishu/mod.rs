@@ -742,7 +742,18 @@ fn is_expected_disconnect(err: &ChannelError) -> bool {
 }
 
 fn reqwest_to_channel_err(err: reqwest::Error) -> ChannelError {
-    ChannelError::Backend(Arc::from(err.to_string()))
+    // reqwest's top-level Display is opaque (e.g. "error sending request for
+    // url (...)"); the actionable cause — TLS rejection, connection reset, DNS
+    // failure, timeout — lives in the `source()` chain. Flatten the whole chain
+    // so the gateway log shows *why* a request failed, not just that it did.
+    let mut message = err.to_string();
+    let mut source = std::error::Error::source(&err);
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    ChannelError::Backend(Arc::from(message))
 }
 
 fn unix_now() -> Result<u64, ChannelError> {
