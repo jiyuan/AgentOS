@@ -76,8 +76,10 @@ pub async fn complete(
 /// Stream a chat completion over SSE. Mirrors [`complete`]'s request with
 /// `stream: true` and usage in the final chunk; reasoning models' incremental
 /// `reasoning_content` is captured into message metadata, not surfaced as text.
-/// The non-stream reasoning-passback retry is intentionally not replicated — a
-/// streamed request cannot be safely resent once bytes have flowed.
+///
+/// The reasoning-passback rejection arrives as an HTTP 400 *before* any stream
+/// bytes flow (surfaced by `post_sse`, not mid-stream), so — like the buffered
+/// path — we can safely disable thinking and resend once.
 pub async fn complete_stream(
     model: &str,
     messages: &[Message],
@@ -105,7 +107,15 @@ pub async fn complete_stream(
         ("Authorization", format!("Bearer {api_key}")),
         ("Content-Type", "application/json".to_owned()),
     ];
-    let response = post_sse("deepseek", &url, &headers, &payload).await?;
+    let response = match post_sse("deepseek", &url, &headers, &payload).await {
+        Ok(response) => response,
+        Err(err) if is_reasoning_passback_text(&err.to_string()) => {
+            // Pre-stream HTTP 400 — no bytes flowed, so resending is safe.
+            payload["thinking"] = json!({ "type": "disabled" });
+            post_sse("deepseek", &url, &headers, &payload).await?
+        }
+        Err(err) => return Err(err),
+    };
     Ok(openai_compatible_stream(
         "deepseek",
         Arc::from(model),
@@ -294,6 +304,13 @@ fn is_reasoning_content_passback_error(error: &Value) -> bool {
         .get("message")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    is_reasoning_passback_text(message)
+}
+
+/// True when an error message is DeepSeek's thinking-mode reasoning-passback
+/// rejection. Used for both the structured buffered error object and the
+/// streaming [`ProviderError`]'s rendered detail (which embeds the same text).
+fn is_reasoning_passback_text(message: &str) -> bool {
     message.contains("reasoning_content") && message.contains("must be passed back")
 }
 
@@ -394,6 +411,19 @@ mod tests {
         assert!(!is_reasoning_content_passback_error(&json!({
             "message": "missing API key"
         })));
+    }
+
+    #[test]
+    fn detects_reasoning_passback_in_streaming_error_detail() {
+        // The streaming path matches on the rendered ProviderError detail, which
+        // embeds the error object's text plus an http_status suffix.
+        let detail = "deepseek streaming error: {\"code\":\"invalid_request_error\",\
+            \"message\":\"The `reasoning_content` in the thinking mode must be passed \
+            back to the API.\"}; http_status=400";
+        assert!(is_reasoning_passback_text(detail));
+        assert!(!is_reasoning_passback_text(
+            "deepseek streaming error: rate limited; http_status=429"
+        ));
     }
 
     #[test]
