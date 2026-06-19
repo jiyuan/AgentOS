@@ -44,6 +44,12 @@ pub struct FeishuChannel {
     /// Per-conversation edit-in-place state, shared with the `StreamEgress`
     /// handle so `send` can finalize a message the egress streamed.
     stream_state: Arc<Mutex<HashMap<String, FeishuEditState>>>,
+    /// Consecutive long-connection dial failures, reset on a successful
+    /// (re)connect. Drives the reconnect backoff window below.
+    reconnect_failures: u32,
+    /// Earliest instant the next dial is allowed. While set in the future,
+    /// `receive` waits quietly instead of re-dialing (and re-logging) every poll.
+    retry_not_before: Option<Instant>,
 }
 
 /// In-flight streamed reply for one chat: the placeholder message being edited,
@@ -57,6 +63,13 @@ struct FeishuEditState {
 
 /// Minimum gap between Feishu message edits per chat, to stay under rate limits.
 const FEISHU_EDIT_INTERVAL: Duration = Duration::from_millis(900);
+
+/// First reconnect backoff after a long-connection dial failure. Doubles on each
+/// consecutive failure up to `FEISHU_RECONNECT_BACKOFF_MAX`.
+const FEISHU_RECONNECT_BACKOFF_BASE: Duration = Duration::from_secs(1);
+/// Ceiling on the reconnect backoff window so a sustained outage retries at most
+/// once a minute instead of every poll.
+const FEISHU_RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug)]
 struct CachedTenantToken {
@@ -88,6 +101,8 @@ impl FeishuChannel {
             log_receive_errors: false,
             attachments: AttachmentStore::from_env("feishu"),
             stream_state: Arc::new(Mutex::new(HashMap::new())),
+            reconnect_failures: 0,
+            retry_not_before: None,
         })
     }
 
@@ -328,6 +343,10 @@ impl FeishuChannel {
         if self.long_connection.is_none() {
             let endpoint = self.websocket_endpoint().await?;
             self.long_connection = Some(FeishuLongConnection::connect(&endpoint).await?);
+            // Freshly connected — clear any outstanding reconnect backoff so the
+            // next transient failure starts its streak from the base delay.
+            self.reconnect_failures = 0;
+            self.retry_not_before = None;
         }
         Ok(self
             .long_connection
@@ -348,11 +367,25 @@ impl FeishuChannel {
     }
 
     async fn receive_long_connection(&mut self) -> Result<Option<Envelope>, ChannelError> {
+        // Honor an active reconnect backoff window: after a dial failure we wait
+        // (with exponential backoff) before re-dialing, so a sustained outage
+        // doesn't re-connect and re-log on every one-second poll.
+        if let Some(deadline) = self.retry_not_before {
+            if Instant::now() < deadline {
+                return Ok(None);
+            }
+        }
         let channel_id = self.id.clone();
         let allowed_source_ids = self.allowed_source_ids.clone();
         let receive_id_type = Arc::clone(&self.receive_id_type);
         let log_receive_errors = self.log_receive_errors;
-        let connection = self.long_connection().await?;
+        let connection = match self.long_connection().await {
+            Ok(connection) => connection,
+            Err(err) => {
+                self.note_connection_failure(&err);
+                return Ok(None);
+            }
+        };
         let parsed = match connection
             .receive_next_event(
                 &channel_id,
@@ -394,6 +427,37 @@ impl FeishuChannel {
             envelope.message.attachments = attachments;
         }
         Ok(Some(envelope))
+    }
+
+    /// Record a long-connection dial failure: grow the exponential backoff
+    /// window and log the failure only once per outage streak. Subsequent
+    /// failures within the same outage drop to `debug!` so the gateway log
+    /// isn't flooded while the endpoint is unreachable.
+    fn note_connection_failure(&mut self, err: &ChannelError) {
+        self.reconnect_failures = self.reconnect_failures.saturating_add(1);
+        // Cap the shift so `1 << exp` can't overflow; the delay is clamped to
+        // FEISHU_RECONNECT_BACKOFF_MAX well before then anyway.
+        let exp = self.reconnect_failures.saturating_sub(1).min(6);
+        let delay = FEISHU_RECONNECT_BACKOFF_BASE
+            .saturating_mul(1u32 << exp)
+            .min(FEISHU_RECONNECT_BACKOFF_MAX);
+        self.retry_not_before = Some(Instant::now() + delay);
+
+        if self.reconnect_failures == 1 {
+            if self.log_receive_errors {
+                eprintln!(
+                    "feishu long connection receive failed: {err} (retrying in {}s)",
+                    delay.as_secs()
+                );
+            }
+        } else {
+            debug!(
+                error = %err,
+                failures = self.reconnect_failures,
+                backoff_secs = delay.as_secs(),
+                "feishu long connection still unreachable; backing off"
+            );
+        }
     }
 }
 
@@ -694,6 +758,60 @@ mod tests {
 
     fn backend(message: &str) -> ChannelError {
         ChannelError::Backend(Arc::from(message))
+    }
+
+    fn test_channel() -> FeishuChannel {
+        FeishuChannel {
+            app_id: Arc::from("app"),
+            app_secret: Arc::from("secret"),
+            id: ChannelId::new("feishu"),
+            api_base: Arc::from(DEFAULT_API_BASE),
+            receive_id_type: Arc::from("chat_id"),
+            allowed_source_ids: Vec::new(),
+            tenant_token: Arc::new(Mutex::new(None)),
+            long_connection: None,
+            log_receive_errors: false,
+            attachments: AttachmentStore::new(std::env::temp_dir(), "feishu"),
+            stream_state: Arc::new(Mutex::new(HashMap::new())),
+            reconnect_failures: 0,
+            retry_not_before: None,
+        }
+    }
+
+    #[test]
+    fn reconnect_backoff_escalates_then_caps() {
+        let mut channel = test_channel();
+        let err = backend("error sending request for url (https://open.feishu.cn/...)");
+
+        channel.note_connection_failure(&err);
+        assert_eq!(channel.reconnect_failures, 1);
+        let first = channel
+            .retry_not_before
+            .expect("first failure arms a backoff window");
+        // The window is in the future, so the next poll waits instead of dialing.
+        assert!(first > Instant::now());
+
+        // Drive enough failures to reach and stay at the cap.
+        for _ in 0..10 {
+            channel.note_connection_failure(&err);
+        }
+        let capped = channel
+            .retry_not_before
+            .expect("repeated failures keep the window armed");
+        assert!(capped <= Instant::now() + FEISHU_RECONNECT_BACKOFF_MAX + Duration::from_secs(1));
+    }
+
+    #[test]
+    fn successful_reconnect_clears_backoff() {
+        let mut channel = test_channel();
+        channel.note_connection_failure(&backend("dial failed"));
+        assert!(channel.retry_not_before.is_some());
+
+        // Mirror the reset performed when `long_connection` dials successfully.
+        channel.reconnect_failures = 0;
+        channel.retry_not_before = None;
+        assert_eq!(channel.reconnect_failures, 0);
+        assert!(channel.retry_not_before.is_none());
     }
 
     #[test]
