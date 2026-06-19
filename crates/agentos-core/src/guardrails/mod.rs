@@ -183,12 +183,55 @@ impl ToolGuardrail for SkillBundleWriteGuardrail {
 }
 
 fn contains_email_like(input: &str) -> bool {
-    input.split_whitespace().any(|token| {
-        let Some((local, domain)) = token.split_once('@') else {
+    input.split_whitespace().any(is_email_like_token)
+}
+
+/// Heuristic email detection for one whitespace-delimited token. Tightened to
+/// avoid false positives on URLs and npm-style specs (e.g.
+/// `https://host/@scope/pkg@1.2.3/file.zip`), which also contain `@` and a dot:
+/// a token with a path separator is never an email, the local part must use only
+/// email-legal characters, and the domain must end in an alphabetic TLD.
+fn is_email_like_token(raw: &str) -> bool {
+    // Trim surrounding punctuation like "(a@b.com),"; emails start and end with
+    // an alphanumeric character.
+    let token = raw.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+    // URLs and filesystem paths contain '/' — never an email address. This is
+    // what rejects scheme-prefixed URLs and scoped-package paths.
+    if token.contains('/') {
+        return false;
+    }
+    let Some((local, domain)) = token.split_once('@') else {
+        return false;
+    };
+    if local.is_empty()
+        || !local
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '%' | '+' | '-'))
+    {
+        return false;
+    }
+    is_email_domain(domain)
+}
+
+/// A domain is email-like when it has at least two dot-separated labels, every
+/// label uses only `[A-Za-z0-9-]` (not leading/trailing `-`), and the final
+/// label (the TLD) is alphabetic and at least two characters — so `1.2.3` (a
+/// version) and `host/path` are rejected while `sub.example.com` is accepted.
+fn is_email_domain(domain: &str) -> bool {
+    let mut label_count = 0;
+    let mut tld = "";
+    for label in domain.split('.') {
+        if label.is_empty()
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
             return false;
-        };
-        !local.is_empty() && domain.contains('.') && !domain.starts_with('.')
-    })
+        }
+        label_count += 1;
+        tld = label;
+    }
+    label_count >= 2 && tld.len() >= 2 && tld.chars().all(|c| c.is_ascii_alphabetic())
 }
 
 fn contains_ssn_like(input: &str) -> bool {
@@ -236,6 +279,27 @@ mod tests {
         let ws = PathBuf::from("/ws");
         let skills = ws.join("workspace").join("skills");
         (ws, skills)
+    }
+
+    #[test]
+    fn email_heuristic_matches_real_addresses() {
+        assert!(contains_email_like(
+            "reach me at john.doe@example.com please"
+        ));
+        assert!(contains_email_like("a@b.co"));
+        assert!(contains_email_like("(jane_smith+tag@sub.example.org),"));
+    }
+
+    #[test]
+    fn email_heuristic_ignores_urls_and_package_specs() {
+        // The reported false positive: a scoped-package CDN URL.
+        assert!(!contains_email_like(
+            "https://unpkg.luckincoffeecdn.com/@luckin/my-coffee-skill@latest/dist/my-coffee-skill.zip"
+        ));
+        assert!(!contains_email_like("install @scope/pkg@1.2.3 now"));
+        assert!(!contains_email_like("see https://example.com/path@v2/file"));
+        // A version string with dots but no alphabetic TLD must not match.
+        assert!(!contains_email_like("bump to release@1.2.30"));
     }
 
     #[test]
