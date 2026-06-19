@@ -342,7 +342,7 @@ pub(crate) async fn post_sse(
         .send()
         .await
         .map_err(|err| ProviderError::Transport {
-            detail: format!("{err}; http_metadata=unavailable"),
+            detail: transport_detail(&err),
         })?;
     let status = response.status().as_u16();
     if (200..300).contains(&status) {
@@ -383,7 +383,7 @@ async fn send_once(
         .send()
         .await
         .map_err(|err| ProviderError::Transport {
-            detail: format!("{err}; http_metadata=unavailable"),
+            detail: transport_detail(&err),
         })?;
     let status = response.status().as_u16();
     let header_map = collect_headers(response.headers());
@@ -515,6 +515,22 @@ fn format_provider_error_with_hint(
             hint,
         ),
     }
+}
+
+/// Flatten a reqwest transport error and its `source()` chain into one detail
+/// string. reqwest's top-level Display (e.g. "error sending request for url
+/// (...)") hides the actionable cause — proxy DNS failure, connection reset,
+/// TLS rejection, timeout — in the source chain, which `{err}` alone discards.
+fn transport_detail(err: &reqwest::Error) -> String {
+    let mut detail = err.to_string();
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        detail.push_str(": ");
+        detail.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    detail.push_str("; http_metadata=unavailable");
+    detail
 }
 
 fn describe_http_response(status: Option<u16>, headers: &BTreeMap<String, String>) -> String {
