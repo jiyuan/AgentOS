@@ -64,6 +64,40 @@ impl Llm for MockStreamLlm {
     }
 }
 
+/// Emits one `Text` chunk and then a mid-stream `StreamTransport` error (no
+/// `Done`), simulating an SSE body cut by a flaky network/proxy. The buffered
+/// path returns a distinct marker so a test can prove the fallback ran.
+struct MockMidStreamFailLlm;
+
+#[async_trait]
+impl Llm for MockMidStreamFailLlm {
+    async fn complete(&self, _ctx: &RunContext<'_>) -> Result<Message, LlmError> {
+        Ok(Message::text(MessageRole::Assistant, "BUFFERED-FALLBACK"))
+    }
+
+    async fn complete_messages(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSpec],
+    ) -> Result<Message, LlmError> {
+        Ok(Message::text(MessageRole::Assistant, "BUFFERED-FALLBACK"))
+    }
+
+    async fn complete_messages_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSpec],
+    ) -> Result<CompletionStream, LlmError> {
+        let events: Vec<Result<CompletionEvent, LlmError>> = vec![
+            Ok(CompletionEvent::Text(Arc::from("partial"))),
+            Err(LlmError::StreamTransport(Arc::from(
+                "error decoding response body: connection reset by peer",
+            ))),
+        ];
+        Ok(stream::iter(events).boxed())
+    }
+}
+
 fn user_state(content: &str) -> RunState {
     let mut state = RunState::new(RunId::new("stream-run"), AgentId::new("stream-agent"));
     state.transcript = Transcript {
@@ -122,4 +156,36 @@ async fn min_orchestrator_uses_buffered_path_without_sink() {
     };
     // The buffered marker proves complete_messages (not the stream) was used.
     assert_eq!(message.content.as_ref(), "BUFFERED");
+}
+
+#[tokio::test]
+async fn mid_stream_transport_error_falls_back_to_buffered() {
+    let orchestrator = MinOrchestrator::new(Arc::new(MockMidStreamFailLlm));
+    let state = user_state("hi");
+    let mut ctx = RunContext::from_state(&state);
+
+    let deltas: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&deltas);
+    let sink: StreamSink = Arc::new(move |delta: &str| {
+        captured.lock().expect("sink lock").push(delta.to_owned());
+        Box::pin(std::future::ready(()))
+    });
+    ctx.stream_sink = Some(sink);
+
+    // The stream cuts out mid-flight, but the turn must still succeed by
+    // retrying the buffered completion instead of erroring.
+    let plan = orchestrator
+        .plan(&ctx)
+        .await
+        .expect("plan succeeds via fallback");
+    let Plan::Reply(message) = plan else {
+        panic!("expected Plan::Reply, got {plan:?}");
+    };
+    assert_eq!(message.content.as_ref(), "BUFFERED-FALLBACK");
+    // The partial chunk seen before the cut was still forwarded to the sink;
+    // edit-in-place channels replace it with the buffered final text on send.
+    assert_eq!(
+        *deltas.lock().expect("deltas lock"),
+        vec!["partial".to_owned()]
+    );
 }

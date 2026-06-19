@@ -32,6 +32,12 @@ pub enum LlmError {
     Provider(Arc<str>),
     #[error("llm is not configured for {0} tier")]
     Unconfigured(Arc<str>),
+    /// A transport failure that occurred *after* the streaming response began
+    /// (e.g. the SSE body was cut mid-stream). Distinct from [`LlmError::Provider`]
+    /// so callers can retry with a buffered completion instead of failing the
+    /// whole turn — a flaky stream shouldn't kill a recoverable request.
+    #[error("streaming transport error: {0}")]
+    StreamTransport(Arc<str>),
 }
 
 /// One event emitted while streaming a single LLM completion.
@@ -136,7 +142,18 @@ impl LlmOrchestrator {
 impl Orchestrator for LlmOrchestrator {
     async fn plan(&self, ctx: &RunContext<'_>) -> Result<Plan, OrchestratorError> {
         let response = if ctx.has_stream_sink() {
-            drain_reply_stream(self.llm.complete_stream(ctx).await, ctx).await
+            // Recover a stream cut mid-flight (flaky network/proxy) by retrying
+            // once buffered, rather than failing the turn.
+            match drain_reply_stream(self.llm.complete_stream(ctx).await, ctx).await {
+                Err(LlmError::StreamTransport(detail)) => {
+                    tracing::warn!(
+                        error = %detail,
+                        "llm stream failed mid-flight; retrying with a buffered completion"
+                    );
+                    self.llm.complete(ctx).await
+                }
+                other => other,
+            }
         } else {
             self.llm.complete(ctx).await
         }

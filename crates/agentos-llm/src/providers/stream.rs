@@ -120,12 +120,15 @@ where
                 }
                 Some(Err(err)) => {
                     // A transport failure mid-stream is terminal: surface the
-                    // error and stop without a spurious Done.
+                    // error and stop without a spurious Done. Flatten reqwest's
+                    // source() chain — its top-level Display ("error decoding
+                    // response body") hides the real cause (connection reset,
+                    // h2 stream error, incomplete message, proxy cutting SSE).
                     st.terminated = true;
                     return Some((
-                        Err(LlmError::Provider(Arc::from(format!(
-                            "streaming transport error: {err}"
-                        )))),
+                        Err(LlmError::StreamTransport(Arc::from(
+                            stream_transport_detail(&err),
+                        ))),
                         st,
                     ));
                 }
@@ -154,6 +157,23 @@ struct SseState<A> {
     sse_done: bool,
     /// Done (or a terminal error) has been emitted; the stream is exhausted.
     terminated: bool,
+}
+
+/// Flatten a mid-stream reqwest error and its `source()` chain into one detail
+/// string. The top-level Display ("error decoding response body") is opaque;
+/// the actionable cause — connection reset, HTTP/2 stream error, incomplete
+/// message, a proxy terminating the SSE response — lives in the source chain.
+/// The `LlmError::StreamTransport` Display adds the "streaming transport error:"
+/// prefix, so this returns just the flattened cause.
+fn stream_transport_detail(err: &reqwest::Error) -> String {
+    let mut detail = err.to_string();
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        detail.push_str(": ");
+        detail.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    detail
 }
 
 fn drain_sse_lines<A: SseAccumulator>(st: &mut SseState<A>) {
