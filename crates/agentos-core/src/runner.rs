@@ -478,6 +478,17 @@ fn persist_trace_records(
             source,
         })?;
 
+    // Wall-clock at persist time, stamped onto every record in this batch.
+    // Trace files are append-only per run_id, so long-lived gateway sessions
+    // accumulate weeks of records in one file; without a per-record timestamp
+    // any consumer windowing by file mtime (e.g. the audit skill) re-counts the
+    // whole history every run. One clock read per persist batch is negligible
+    // against the ≤2ms/turn budget.
+    let emitted_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+
     for (index, span) in state.trace_spans.iter().enumerate().skip(span_start) {
         let record = json!({
             "record_type": "span",
@@ -485,6 +496,7 @@ fn persist_trace_records(
             "run_id": state.run_id.as_str(),
             "active_agent": state.active_agent.as_str(),
             "index": index,
+            "emitted_unix": emitted_unix,
             "span": span,
         });
         write_trace_record(&mut file, &path, &record)?;
@@ -496,6 +508,7 @@ fn persist_trace_records(
             "run_id": state.run_id.as_str(),
             "active_agent": state.active_agent.as_str(),
             "index": index,
+            "emitted_unix": emitted_unix,
             "event": event,
         });
         write_trace_record(&mut file, &path, &record)?;
