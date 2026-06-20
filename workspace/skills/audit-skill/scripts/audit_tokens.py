@@ -11,6 +11,14 @@ layer for the same calls. The two emitters live in different layers, so
 `--cross-check` validates that they agree. Pure Python stdlib — no third-party
 deps.
 
+Both sources are windowed per *event*: gateway-log lines by their bracketed
+epoch, trace records by the `emitted_unix` field the core trace writer
+(`persist_trace_records`) stamps onto every record. This matters because trace
+files are append-only per run_id — a long-lived gateway session keeps weeks of
+records in one file, so windowing by file mtime (and folding the whole file)
+would re-count the entire history on every audit and diverge from the
+provider's billed numbers.
+
 Source-of-truth event fields:
     provider, model,
     input_tokens, output_tokens, total_tokens,
@@ -346,20 +354,32 @@ def emit_cross_check(report, log_totals, tolerance):
 
 
 def aggregate_from_traces(traces_dir, crons, cron_window_secs, cutoff):
-    """Read every in-window trace JSONL file and aggregate `llm_token_usage`
-    events. Returns a dict with totals + per-run/channel/subagent/cron buckets.
+    """Read in-window trace JSONL files and aggregate `llm_token_usage` events.
+    Returns a dict with totals + per-run/channel/subagent/cron buckets.
+
+    Windowing is per-*event*, keyed on each record's `emitted_unix` (the
+    wall-clock the core trace writer stamps onto every record). Trace files are
+    append-only per run_id, so a long-lived gateway session (`telegram-gateway`,
+    `feishu-gateway`) keeps weeks of records in a single file; windowing by file
+    mtime and then folding the whole file re-counts that entire history on every
+    audit, which is what made daily totals appear to compound and diverge from
+    the provider's billed (correctly windowed) numbers. File mtime is still used
+    only as a cheap skip — a file untouched in the window has no in-window
+    events. Records without `emitted_unix` (written before the field existed)
+    cannot be placed in time and are excluded, counted under
+    `events_without_timestamp`.
 
     Attribution:
-      - run_id, channel, subagent come from the file's records (canonical).
-      - cron is a best-effort overlay using file mtime as a proxy for run end:
-        if mtime falls in [fired, fired + cron_window_secs] for some cron, the
-        whole file's tokens are attributed to that cron in addition to its
-        channel bucket.
+      - run_id, channel, subagent come from the record (canonical).
+      - cron is a best-effort overlay using each event's `emitted_unix`: if it
+        falls in [fired, fired + cron_window_secs] for some cron, that event's
+        tokens are attributed to the cron in addition to its channel bucket.
     """
     result = {
         "files_scanned": 0,
         "files_in_window": 0,
         "events_found": 0,
+        "events_without_timestamp": 0,
         "run_started_count": 0,
         "totals": empty_bucket(),
         "by_run_id": {},
@@ -378,17 +398,6 @@ def aggregate_from_traces(traces_dir, crons, cron_window_secs, cutoff):
         if mtime < cutoff:
             continue
         result["files_in_window"] += 1
-        # Cron attribution by mtime (one match wins, closest).
-        cron_id = None
-        best_delta = cron_window_secs + 1
-        for c in crons:
-            fired = c["last_fired_unix"]
-            if fired <= 0:
-                continue
-            delta = mtime - fired
-            if 0 <= delta <= cron_window_secs and delta < best_delta:
-                cron_id = c["id"]
-                best_delta = delta
         try:
             with path.open("r", encoding="utf-8", errors="replace") as f:
                 for line in f:
@@ -400,6 +409,13 @@ def aggregate_from_traces(traces_dir, crons, cron_window_secs, cutoff):
                     except json.JSONDecodeError:
                         continue
                     if rec.get("record_type") != "event":
+                        continue
+                    # Window by the event's own emission time, not file mtime.
+                    emitted = rec.get("emitted_unix")
+                    if not isinstance(emitted, int):
+                        result["events_without_timestamp"] += 1
+                        continue
+                    if emitted < cutoff:
                         continue
                     event = rec.get("event") or {}
                     event_name = event.get("name")
@@ -420,6 +436,7 @@ def aggregate_from_traces(traces_dir, crons, cron_window_secs, cutoff):
                     if subagent:
                         result["by_subagent"].setdefault(subagent, empty_bucket())
                         fold_trace_event(result["by_subagent"][subagent], fields)
+                    cron_id = attribute_to_cron(emitted, crons, cron_window_secs)
                     if cron_id is not None:
                         fold_trace_event(result["by_cron"][cron_id], fields)
         except OSError:
@@ -665,6 +682,7 @@ def main():
         "channel_window_secs": args.channel_window_secs,
         "usage_lines_found": 0,
         "trace_events_found": 0,
+        "trace_events_without_timestamp": 0,
         "trace_files_in_window": 0,
         "user_facing_tasks": 0,
         "totals": empty_bucket(),
@@ -681,7 +699,16 @@ def main():
         trace_result = aggregate_from_traces(traces_dir, crons, args.cron_window_secs, cutoff)
         report["trace_files_in_window"] = trace_result["files_in_window"]
         report["trace_events_found"] = trace_result["events_found"]
+        report["trace_events_without_timestamp"] = trace_result["events_without_timestamp"]
         report["user_facing_tasks"] = trace_result["run_started_count"]
+        if trace_result["events_without_timestamp"]:
+            print(
+                "[audit_tokens] note: skipped "
+                f"{trace_result['events_without_timestamp']} trace event(s) lacking "
+                "an `emitted_unix` timestamp (written before per-event windowing "
+                "existed); they cannot be placed in the audit window and are excluded.",
+                file=sys.stderr,
+            )
         if trace_result["events_found"] > 0:
             report["source"] = "traces"
             report["totals"] = trace_result["totals"]
