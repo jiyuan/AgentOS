@@ -12,7 +12,15 @@
       "Bash(sed -n '495,525p' crates/agentos-core/src/runtime/mod.rs)",
       "Bash(sed -n '1,60p' crates/agentos-core/src/config/subagents.rs)",
       "Bash(sed -n '/fn subagent_policy/,/^}/p' crates/agentos-core/src/runtime/mod.rs)",
-      "Bash(sed -n '225,265p' crates/agentos-core/src/approve/mod.rs)"
+      "Bash(sed -n '225,265p' crates/agentos-core/src/approve/mod.rs)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(bash scripts/check-import-boundaries.sh --self-test)",
+      "Bash(bash scripts/check-import-boundaries.sh)",
+      "Bash(gh auth *)",
+      "Bash(git ls-remote *)",
+      "Bash(git push *)",
+      "Bash(git -C /workspace/agentos diff --stat)"
     ]
   }
 }

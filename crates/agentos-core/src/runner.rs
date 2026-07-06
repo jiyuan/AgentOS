@@ -14,7 +14,7 @@ use crate::tools::ToolRegistry;
 use crate::trace;
 use agentos_interfaces::orchestrator::{Orchestrator, StreamSink};
 use agentos_interfaces::run_state::InterruptionAction;
-use agentos_interfaces::session::{Item, Session, SessionError};
+use agentos_interfaces::session::{Item, Session, SessionError, Transcript};
 use agentos_interfaces::RunState;
 use agentos_proto::{
     AgentId, ChannelId, ConversationId, Envelope, InterruptionId, Message, MessageRole, RunId,
@@ -65,6 +65,21 @@ pub enum RunnerError {
     #[error("task workspace failed: {0}")]
     TaskWorkspace(#[from] TaskWorkspaceError),
 }
+
+/// Envelope metadata key that scopes how the runner sources and persists
+/// conversation history for a run. Absent means the default: load the full
+/// conversation transcript before the run and append the run's items back to
+/// it afterwards.
+pub const SESSION_SCOPE_KEY: &str = "session_scope";
+
+/// `session_scope` value for self-contained runs — cron ticks and other
+/// machine-generated envelopes whose prompt already carries everything the
+/// run needs. The run starts from an empty transcript and none of its items
+/// are written back to the conversation session, so recurring bulk output
+/// (fetched feeds, audit trace reads) can never ratchet a shared conversation
+/// past the LLM provider's context limit. Delivery is unaffected: the output
+/// envelope still targets the original `conversation_id`.
+pub const SESSION_SCOPE_EPHEMERAL: &str = "ephemeral";
 
 pub struct RunnerDeps<'a> {
     pub orchestrator: &'a dyn Orchestrator,
@@ -246,7 +261,16 @@ pub async fn run_envelope(
     run_id: RunId,
     deps: &RunnerDeps<'_>,
 ) -> Result<RunOutcome, RunnerError> {
-    let mut transcript = deps.session.load(&input.conversation_id).await?;
+    let ephemeral_session = input
+        .metadata
+        .get(SESSION_SCOPE_KEY)
+        .and_then(Value::as_str)
+        == Some(SESSION_SCOPE_EPHEMERAL);
+    let mut transcript = if ephemeral_session {
+        Transcript::default()
+    } else {
+        deps.session.load(&input.conversation_id).await?
+    };
     let persisted_len = transcript.items.len();
     let mut input_metadata = input.metadata.clone();
     input_metadata
@@ -316,10 +340,12 @@ pub async fn run_envelope(
                 return Ok(RunOutcome::Finished { state, output });
             }
             RunLoopState::Paused(state) => {
-                let append_items = state.transcript.items[persisted_len..].to_vec();
-                deps.session
-                    .append(&input.conversation_id, append_items)
-                    .await?;
+                if !ephemeral_session {
+                    let append_items = state.transcript.items[persisted_len..].to_vec();
+                    deps.session
+                        .append(&input.conversation_id, append_items)
+                        .await?;
+                }
                 persist_task_session_items(
                     task_session.as_ref(),
                     "paused",
@@ -572,8 +598,19 @@ async fn finish(
     state.transcript.items.push(output_item);
     record_run_finish(&mut state, deps.hooks);
 
-    let append_items = state.transcript.items[persisted_len..].to_vec();
-    deps.session.append(&conversation_id, append_items).await?;
+    // Session-ephemeral runs (cron ticks) deliver their output but leave the
+    // shared conversation history untouched. The marker sits on the input
+    // transcript item — item 0, since ephemeral runs start from an empty
+    // transcript — so it survives pause/resume round-trips through
+    // `PausedRun` serialization.
+    let ephemeral_session = state.transcript.items.first().is_some_and(|item| {
+        item.metadata.get(SESSION_SCOPE_KEY).and_then(Value::as_str)
+            == Some(SESSION_SCOPE_EPHEMERAL)
+    });
+    if !ephemeral_session {
+        let append_items = state.transcript.items[persisted_len..].to_vec();
+        deps.session.append(&conversation_id, append_items).await?;
+    }
     persist_task_session_items(
         active_task_session(&state, deps).as_ref(),
         "finished",
@@ -1004,6 +1041,107 @@ mod tests {
             tool_spans <= 3,
             "expected <= 3 tool turns, saw {tool_spans}"
         );
+    }
+
+    #[tokio::test]
+    async fn ephemeral_scoped_run_neither_loads_nor_persists_conversation_history() {
+        // Regression: cron ticks used to run inside the delivery
+        // conversation's session, replaying its entire accumulated history
+        // into every LLM request and appending their own bulky tool output
+        // back into it — until the shared conversation exceeded the provider
+        // context limit and every cron on it failed permanently.
+        let session = InMemorySession::default();
+        let conversation = ConversationId::new("chat-1");
+        session
+            .append(
+                &conversation,
+                vec![Item {
+                    message: Message::text(MessageRole::User, "prior chat history"),
+                    metadata: BTreeMap::new(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let orchestrator = HistoryCountingOrchestrator;
+        let deps = RunnerDeps {
+            orchestrator: &orchestrator,
+            session: &session,
+            memory_manager: None,
+            hooks: None,
+            max_turns: 4,
+            active_agent: AgentId::new("parent"),
+            tools: None,
+            trace_sink: None,
+            task_workspace: None,
+            policy: &Policy::default(),
+            subagents: None,
+            input_guardrails: &[],
+            output_guardrails: &[],
+            tool_guardrails: &[],
+            stream_sink: None,
+        };
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            Arc::from(SESSION_SCOPE_KEY),
+            Value::String(SESSION_SCOPE_EPHEMERAL.to_owned()),
+        );
+        let input = Envelope {
+            channel_id: ChannelId::new("telegram"),
+            conversation_id: conversation.clone(),
+            sender: Arc::from("cron:digest"),
+            message: Message::text(MessageRole::User, "run the digest"),
+            metadata,
+        };
+
+        let output = match run_envelope(input, RunId::new("cron-digest"), &deps)
+            .await
+            .expect("ephemeral run should finish")
+        {
+            RunOutcome::Finished { output, .. } => output,
+            RunOutcome::Paused(_) => panic!("expected finished run"),
+        };
+
+        // The orchestrator saw only the cron input, not the seeded history...
+        assert_eq!(output.message.content.as_ref(), "saw 1 items");
+        // ...output still delivers to the original conversation...
+        assert_eq!(output.conversation_id, conversation);
+        // ...and nothing was written back to the shared session.
+        let transcript = session.load(&conversation).await.unwrap();
+        assert_eq!(transcript.items.len(), 1, "ephemeral run polluted session");
+
+        // Contrast: the default scope still loads and persists history.
+        let input = Envelope {
+            channel_id: ChannelId::new("telegram"),
+            conversation_id: conversation.clone(),
+            sender: Arc::from("user"),
+            message: Message::text(MessageRole::User, "hello"),
+            metadata: BTreeMap::new(),
+        };
+        let output = match run_envelope(input, RunId::new("chat-run"), &deps)
+            .await
+            .expect("default-scoped run should finish")
+        {
+            RunOutcome::Finished { output, .. } => output,
+            RunOutcome::Paused(_) => panic!("expected finished run"),
+        };
+        assert_eq!(output.message.content.as_ref(), "saw 2 items");
+        let transcript = session.load(&conversation).await.unwrap();
+        assert_eq!(transcript.items.len(), 3, "seed + input + reply expected");
+    }
+
+    /// Replies with the number of transcript items visible to the planner, so
+    /// tests can assert exactly how much history a run was hydrated with.
+    struct HistoryCountingOrchestrator;
+
+    #[async_trait]
+    impl Orchestrator for HistoryCountingOrchestrator {
+        async fn plan(&self, ctx: &RunContext<'_>) -> Result<Plan, OrchestratorError> {
+            Ok(Plan::Reply(Message::text(
+                MessageRole::Assistant,
+                format!("saw {} items", ctx.state.transcript.items.len()),
+            )))
+        }
     }
 
     struct ParentDelegateOrchestrator;

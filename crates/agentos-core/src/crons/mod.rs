@@ -1,4 +1,5 @@
 use crate::memory::{MemoryManager, ReflectionParams, ReflectionReport};
+use crate::runner::{SESSION_SCOPE_EPHEMERAL, SESSION_SCOPE_KEY};
 use agentos_interfaces::memory::MemoryError;
 use agentos_proto::{AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole};
 use chrono::{DateTime, TimeZone, Utc};
@@ -190,6 +191,20 @@ impl CronTask {
                 Value::from(self.retry_state.consecutive_failures),
             );
         }
+        // A cron tick is a self-contained task: the execution directive plus
+        // the prompt carry everything the run needs, and incremental state
+        // ("only new items since last run") lives in the skill's own state
+        // files. Replaying the delivery conversation's history would leak
+        // unrelated chat context into the scheduled run and — worse — every
+        // tick would append its bulky tool output (fetched feeds, audit trace
+        // reads) back into that shared session, monotonically growing it
+        // until every request on the conversation exceeds the LLM provider's
+        // context limit. Ephemeral scope starts the run on a clean transcript
+        // and skips the write-back; delivery still targets `conversation_id`.
+        metadata.insert(
+            Arc::from(SESSION_SCOPE_KEY),
+            Value::String(SESSION_SCOPE_EPHEMERAL.to_owned()),
+        );
 
         Envelope {
             channel_id: self.channel_id.clone(),
@@ -558,6 +573,22 @@ mod tests {
         assert!(
             content.ends_with("hello"),
             "directive dropped the original prompt: {content}",
+        );
+    }
+
+    #[test]
+    fn envelope_requests_ephemeral_session_scope() {
+        let envelope = task("17 2 * * *").to_envelope();
+        // Cron ticks must not inherit or grow the delivery conversation's
+        // session: replaying megabytes of prior chat/tool output eventually
+        // exceeds the provider context limit, after which the cron can never
+        // succeed again (the history only grows between retries).
+        assert_eq!(
+            envelope
+                .metadata
+                .get(SESSION_SCOPE_KEY)
+                .and_then(Value::as_str),
+            Some(SESSION_SCOPE_EPHEMERAL),
         );
     }
 
