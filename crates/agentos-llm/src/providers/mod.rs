@@ -95,6 +95,9 @@ impl TokenUsage {
     ///   `usage.prompt_tokens_details.cached_tokens` for cache hits.
     /// - DeepSeek: as OpenAI, plus explicit
     ///   `usage.{prompt_cache_hit_tokens, prompt_cache_miss_tokens}`.
+    /// - OpenAI Responses: `usage.{input_tokens, output_tokens, total_tokens}`
+    ///   with `usage.input_tokens_details.cached_tokens` for cache hits, where
+    ///   `input_tokens` *includes* the cached portion.
     /// - Anthropic: `usage.{input_tokens, output_tokens,
     ///   cache_read_input_tokens, cache_creation_input_tokens}` where
     ///   `input_tokens` excludes cached/created tokens.
@@ -105,6 +108,27 @@ impl TokenUsage {
         let u = |v: &Value, key: &str| v.get(key).and_then(Value::as_u64);
 
         if let Some(usage) = body.get("usage") {
+            // OpenAI Responses: `input_tokens` already covers the whole prompt,
+            // cache hits included, so the hit count is subtracted out rather
+            // than added on the way to `input_tokens`.
+            if let Some(cached) = usage
+                .get("input_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+                .and_then(Value::as_u64)
+            {
+                let input = u(usage, "input_tokens").unwrap_or(0);
+                let output = u(usage, "output_tokens").unwrap_or(0);
+                let cache_read = cached.min(input);
+                return Some(Self {
+                    input_tokens: input,
+                    output_tokens: output,
+                    total_tokens: u(usage, "total_tokens").unwrap_or(input + output),
+                    cache_read_tokens: cache_read,
+                    cache_write_tokens: 0,
+                    cache_miss_tokens: input - cache_read,
+                });
+            }
+
             // Anthropic: no `prompt_tokens`; `input_tokens` is the uncached
             // remainder, with cache read/creation reported separately.
             if usage.get("prompt_tokens").is_none()
@@ -688,6 +712,31 @@ mod tests {
                 cache_read_tokens: 800,
                 cache_write_tokens: 1200,
                 cache_miss_tokens: 100,
+            })
+        );
+    }
+
+    #[test]
+    fn token_usage_parses_openai_responses_inclusive_input_tokens() {
+        // Unlike Anthropic's shape, `input_tokens` here already counts the
+        // cached prompt tokens, so the hit is carved out of it, not added to it.
+        let body = json!({
+            "usage": {
+                "input_tokens": 2100,
+                "output_tokens": 45,
+                "total_tokens": 2145,
+                "input_tokens_details": { "cached_tokens": 800 }
+            }
+        });
+        assert_eq!(
+            TokenUsage::from_response_body(&body),
+            Some(TokenUsage {
+                input_tokens: 2100,
+                output_tokens: 45,
+                total_tokens: 2145,
+                cache_read_tokens: 800,
+                cache_write_tokens: 0,
+                cache_miss_tokens: 1300,
             })
         );
     }

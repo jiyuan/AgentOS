@@ -64,6 +64,14 @@ If `AGENTOS_LLM_PROVIDER` is unset, the provider is inferred from whichever
 credential is present, in this order: OpenAI, Anthropic, DeepSeek, Ollama, then
 the `builtin.echo` offline fallback.
 
+The `openai` provider talks to the Responses API (`/v1/responses`) only, so an
+`AGENTOS_OPENAI_BASE_URL` override must point at a deployment that serves it —
+an OpenAI-compatible gateway offering only `/v1/chat/completions` should be
+configured as the `deepseek` or `ollama` provider instead. Responses are stored
+server-side so each turn continues the previous one instead of re-uploading the
+transcript; set `AGENTOS_OPENAI_STATEFUL=0` to disable that and keep every
+request self-contained.
+
 Telegram setup:
 
 ```env
