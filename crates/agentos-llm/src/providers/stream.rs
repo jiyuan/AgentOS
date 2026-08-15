@@ -2,7 +2,7 @@
 //!
 //! A shared driver ([`run_sse_stream`]) handles transport, `\n`-framed line
 //! buffering, and the terminal event; a provider-specific [`SseAccumulator`]
-//! decodes each `data:` chunk. Two shapes are supported:
+//! decodes each `data:` chunk. Two shapes live here:
 //!
 //! - **OpenAI / DeepSeek** — `chat.completion.chunk` objects terminated by a
 //!   `data: [DONE]` sentinel, content and tool-call fragments arriving
@@ -13,7 +13,10 @@
 //!   JSON `type` field, with usage split across `message_start` (input + cache)
 //!   and `message_delta` (output); the stream ends by connection close.
 //!
-//! Both are normalised to the provider-neutral [`CompletionStream`] contract —
+//! A third shape — the OpenAI Responses event stream — implements
+//! [`SseAccumulator`] next to its request builder in `providers::openai`.
+//!
+//! All are normalised to the provider-neutral [`CompletionStream`] contract —
 //! incremental [`CompletionEvent::Text`] chunks followed by one terminal
 //! [`CompletionEvent::Done`] carrying the assembled message, its tool calls, and
 //! `agentos.token_usage` logged identically to the buffered path.
@@ -74,12 +77,12 @@ pub(crate) fn anthropic_stream(model: Arc<str>, response: reqwest::Response) -> 
 }
 
 /// Pending events queued by an accumulator between network reads.
-type Pending = VecDeque<Result<CompletionEvent, LlmError>>;
+pub(crate) type Pending = VecDeque<Result<CompletionEvent, LlmError>>;
 
 /// Provider-specific assembly of an SSE event stream into the
 /// [`CompletionEvent`] contract. The driver handles transport, line framing,
 /// and the terminal `Done`; implementors decode each `data:` JSON chunk.
-trait SseAccumulator {
+pub(crate) trait SseAccumulator {
     /// Fold one decoded `data:` JSON chunk in, queueing any `Text` events.
     fn ingest(&mut self, chunk: &Value, pending: &mut Pending);
     /// Assemble the final assistant message once the stream ends. Takes
@@ -89,7 +92,7 @@ trait SseAccumulator {
 
 /// Shared driver: decode `response`'s byte stream into SSE lines and feed
 /// `acc`, emitting queued `Text` chunks then one terminal `Done`.
-fn run_sse_stream<A>(response: reqwest::Response, acc: A) -> CompletionStream
+pub(crate) fn run_sse_stream<A>(response: reqwest::Response, acc: A) -> CompletionStream
 where
     A: SseAccumulator + Send + 'static,
 {
@@ -219,11 +222,14 @@ struct OpenAiAccumulator {
     usage_body: Option<Value>,
 }
 
+/// One tool call under construction across stream fragments: identity arrives
+/// once, arguments accumulate as a JSON string. Shared by every accumulator,
+/// including the Responses one in `providers::openai`.
 #[derive(Default)]
-struct ToolCallBuilder {
-    id: Option<String>,
-    name: Option<String>,
-    args: String,
+pub(crate) struct ToolCallBuilder {
+    pub(crate) id: Option<String>,
+    pub(crate) name: Option<String>,
+    pub(crate) args: String,
 }
 
 impl SseAccumulator for OpenAiAccumulator {
@@ -308,8 +314,10 @@ fn merge_openai_tool_call(builders: &mut Vec<ToolCallBuilder>, call: &Value) {
 
 /// Finalize accumulated tool-call builders into [`ToolCall`]s, dropping any that
 /// never received both an id and a name and defaulting empty args to `{}`.
-/// Shared by both provider accumulators.
-fn tool_calls_from_builders(builders: impl IntoIterator<Item = ToolCallBuilder>) -> Vec<ToolCall> {
+/// Shared by every provider accumulator.
+pub(crate) fn tool_calls_from_builders(
+    builders: impl IntoIterator<Item = ToolCallBuilder>,
+) -> Vec<ToolCall> {
     builders
         .into_iter()
         .filter_map(|builder| {
