@@ -1311,6 +1311,7 @@ mod tests {
                 description: Arc::from("mock approval tool"),
                 input_schema: json!({"type": "object"}),
                 requires_isolation: false,
+                timeout_ms: None,
             }
         }
 

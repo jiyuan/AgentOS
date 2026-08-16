@@ -574,6 +574,12 @@ pub fn build_subagents(
         if subagent_memory_tool_enabled(subagent) {
             tools.register(MemoryTool::with_manager(memory_manager.clone()));
         }
+        // A sub-agent's tools run on the same machine under the same operator,
+        // so they are held to the same deadlines as the parent's.
+        let tools = tools.with_timeouts(
+            config.limits.tool_timeout(),
+            config.limits.tool_timeout_overrides(),
+        );
         // Capture the tool specs *before* moving `tools` into the definition,
         // so we can hand them to the orchestrator (which surfaces them as the
         // LLM's `tools` schema for function calling).
@@ -685,6 +691,7 @@ pub async fn register_configured_mcp(
                 description: Arc::clone(&tool.description),
                 input_schema: serde_json::json!({ "type": "object", "properties": {} }),
                 requires_isolation: tool.requires_isolation,
+                timeout_ms: None,
             },
             response: Arc::clone(&tool.response),
         }
@@ -694,10 +701,13 @@ pub async fn register_configured_mcp(
     for server in &config.mcp_servers {
         let client: Arc<dyn McpClient> =
             if server.endpoint.starts_with("stdio://") || server.endpoint.starts_with("stdio:") {
+                // Per-server override, else the deployment's tool deadline.
+                // The 10 s constant this replaces was the last hardcoded
+                // timeout in the runtime (roadmap D2 / review finding F15).
                 let timeout = server
                     .timeout_ms
                     .map(Duration::from_millis)
-                    .unwrap_or_else(|| Duration::from_secs(10));
+                    .unwrap_or_else(|| config.limits.tool_timeout());
                 Arc::new(StdioMcpClient::with_timeout(timeout))
             } else if config
                 .mcp_tools

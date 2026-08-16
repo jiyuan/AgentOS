@@ -396,6 +396,7 @@ mod tests {
             description: Arc::from("read or write"),
             input_schema: json!({"type":"object","properties":{}}),
             requires_isolation: false,
+            timeout_ms: None,
         };
         let value = anthropic_tool_spec(&spec);
         assert_eq!(value["name"], "file");

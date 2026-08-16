@@ -20,6 +20,20 @@ pub struct ToolSpec {
     pub input_schema: Value,
     #[serde(default)]
     pub requires_isolation: bool,
+    /// How long this tool may run before the registry gives up on it, in
+    /// milliseconds (roadmap item D2).
+    ///
+    /// The tool's *own* declaration: set it when a tool knows it is slow (a
+    /// build, a long fetch) and should not be held to the deployment's default.
+    /// `None` accepts that default. A deployment can override either through
+    /// `[limits].tool_timeout_overrides`, which wins over both.
+    ///
+    /// A deadline that expires produces a **failed `ToolResult`**, never an
+    /// error: the run loop already recovers from a failed result by letting the
+    /// model read it and replan, whereas an error would kill the run and every
+    /// parent above it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

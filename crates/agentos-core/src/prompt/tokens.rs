@@ -155,6 +155,7 @@ mod tests {
                 "properties": { "text": { "type": "string" } }
             }),
             requires_isolation: false,
+            timeout_ms: None,
         }];
         // Name, description, and schema all contribute; a dozen such tools is
         // a meaningful share of a small context window.

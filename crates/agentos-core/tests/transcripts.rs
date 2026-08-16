@@ -65,6 +65,7 @@ impl Tool for EchoTool {
                 "properties": { "text": { "type": "string" } }
             }),
             requires_isolation: false,
+            timeout_ms: None,
         }
     }
 
@@ -107,6 +108,7 @@ impl Tool for BulkTool {
                 "properties": { "lines": { "type": "integer" } }
             }),
             requires_isolation: false,
+            timeout_ms: None,
         }
     }
 

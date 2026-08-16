@@ -85,6 +85,15 @@ mode = "long_connection"
 # becomes a preview plus a pointer to that file, so oversized output is
 # summarised rather than destroyed. Minimum 512.
 tool_result_inline_bytes = 65536
+# How long a tool may run before it is stopped and reported as failed, in
+# milliseconds. A tool that declares its own deadline (the shell tool asks for
+# five minutes) keeps it unless overridden below. Minimum 100.
+tool_timeout_ms = 60000
+
+# Per-tool deadlines. These win over both the default above and a tool's own
+# declaration, so this is the last word on how long this machine will wait.
+[limits.tool_timeout_overrides]
+shell = 300000
 
 # When a conversation summarizes its own history. The session log is never
 # rewritten — a pass appends one checkpoint item and the projection folds the

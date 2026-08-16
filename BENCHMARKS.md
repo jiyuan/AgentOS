@@ -11,11 +11,11 @@ this machine; treat deltas inside that band as noise.
 
 | Bench | Mean | Verdict |
 |---|---|---|
-| `loop_overhead/reply_turn` | **1.46 µs** | ~1370× under the 2 ms ceiling. Up from 1.19 µs at roadmap D1 (+23%), which races the planning call against the run's cancellation token — see the note below. |
-| `loop_overhead/tool_turn_allow` | **3.93 µs** | Approve + tool dispatch + extra states add ~2.5 µs over a reply turn. 3.00 → 3.25 µs at C2 (a size check and a tool-name `Arc` clone per tool turn), then → 3.93 µs at D1 (a *second* cancellation race, around the tool call); ~510× under the ceiling. |
-| `loop_overhead/ask_user_pause_resume` | **8.46 µs** | Full interruption cycle: pause, JSON persist round-trip, approve, resume, finish. Up from 7.71 µs at D1, same cause. |
-| `loop_overhead/paused_state_json_round_trip` | **3.54 µs** | `RunState` serialize + deserialize alone — roughly half the pause/resume cycle. Unchanged by D1, which is the control: it touches no loop state, so its flatness confirms the other three moved for a real reason rather than machine drift. |
-| `loop_overhead/hydrated_memory_plan_turn` | **273.5 µs** | SQLite-backed hydration dominates the turn (~190× a reply turn) but stays ~7× under the ceiling. Unmoved by D1: the fixed cancellation cost disappears against the query. |
+| `loop_overhead/reply_turn` | **2.48 µs** | ~800× under the 2 ms ceiling. 1.19 → 1.46 µs at D1 (racing the planning call against the cancellation token), then → 2.48 µs at D2 — see both notes below. |
+| `loop_overhead/tool_turn_allow` | **6.50 µs** | Approve + tool dispatch + extra states add ~4 µs over a reply turn. 3.00 → 3.25 µs at C2, → 3.93 µs at D1, → 6.50 µs at D2; ~310× under the ceiling. |
+| `loop_overhead/ask_user_pause_resume` | **11.0 µs** | Full interruption cycle: pause, JSON persist round-trip, approve, resume, finish. 7.71 → 8.46 µs at D1, → 11.0 µs at D2. |
+| `loop_overhead/paused_state_json_round_trip` | **3.57 µs** | `RunState` serialize + deserialize alone. **The control**: it drives no loop state, and it has stayed at ~3.5 µs across C2, D1, and D2, so the other benches' movements are real rather than machine drift. |
+| `loop_overhead/hydrated_memory_plan_turn` | **278 µs** | SQLite-backed hydration dominates the turn but stays ~7× under the ceiling. Unmoved by D1 or D2: a fixed microsecond disappears against the query. |
 
 ### The D1 cancellation cost
 
@@ -31,6 +31,33 @@ that is thirty seconds into a response, which is the case users actually want
 stopped. The absolute figure — a quarter of a microsecond against a 2 ms
 budget — is the right trade. Recorded here so a future regression hunt does not
 re-derive it.
+
+### The D2 cost is codegen, not work
+
+D2 added ~1 µs to every loop bench, and it is worth being precise about where
+it does *not* come from. `reply_turn` calls no tool, builds its `LoopDeps` with
+`tools: None`, and touches neither `ToolRegistry` nor `ToolSpec` — yet it moved
+1.46 → 2.48 µs. Four measurements, all on the same machine in one session:
+
+| Tree | `reply_turn` |
+|---|---|
+| D1 (HEAD before D2) | 1.42 µs |
+| HEAD + only the `tokio` `process`/`time` features | 1.50 µs |
+| D2 with `tools/exec.rs` compiled but `registry`/`shell`/`mcp` reverted | 1.47 µs |
+| D2 complete | 2.48 µs |
+
+So it is not the new tokio features (+5%, inside the noise band), and not the
+executor module merely existing. It appears when the *call sites* land — the
+`tokio::time::timeout` wrapper in the registry and the async subprocess paths
+in `shell`/`mcp` — none of which execute on a reply turn. That leaves codegen:
+pulling the timer and process machinery into `agentos-core` alongside the loop
+changes what gets inlined around it.
+
+Not chased further. It is a fixed ~1 µs against a 2 ms budget, the alternative
+is a runtime with no tool deadlines at all, and the control bench confirms
+nothing is wrong with the measurement. If loop overhead ever becomes the
+binding constraint, the lead to pull is codegen-unit placement, not the
+deadline logic.
 
 Allocation counts (counting global allocator, 2000 iterations,
 deterministic). Phase 3 (interned telemetry field keys, gated log

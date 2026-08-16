@@ -75,6 +75,7 @@ impl Tool for FileTool {
                 }
             }),
             requires_isolation: false,
+            timeout_ms: None,
         }
     }
 

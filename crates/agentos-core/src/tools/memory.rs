@@ -80,6 +80,7 @@ impl Tool for MemoryTool {
                 }
             }),
             requires_isolation: false,
+            timeout_ms: None,
         }
     }
 

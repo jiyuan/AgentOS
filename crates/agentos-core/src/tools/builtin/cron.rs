@@ -86,6 +86,7 @@ impl Tool for CronCreatorTool {
                 }
             }),
             requires_isolation: false,
+            timeout_ms: None,
         }
     }
 
@@ -169,6 +170,7 @@ impl Tool for CronListTool {
                 "properties": {}
             }),
             requires_isolation: false,
+            timeout_ms: None,
         }
     }
 
@@ -245,6 +247,7 @@ impl Tool for CronRemoveTool {
                 }
             }),
             requires_isolation: false,
+            timeout_ms: None,
         }
     }
 

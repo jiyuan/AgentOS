@@ -1,13 +1,17 @@
 use super::common::{elapsed_ms, result_metadata, safe_workspace_path, workspace_root};
+use crate::tools::{Exec, ExecError, DEFAULT_MAX_OUTPUT_BYTES};
 use agentos_interfaces::tool::{Tool, ToolError, ToolSpec};
 use agentos_proto::{ToolCall, ToolResult, ToolStatus};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, value::RawValue, Value};
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// The shell tool's self-declared deadline: long enough for a build or a test
+/// suite, short enough that a wedged command does not sit there for an hour.
+const SHELL_TIMEOUT_MS: u64 = 5 * 60 * 1_000;
 
 #[derive(Default)]
 pub struct ShellTool;
@@ -38,6 +42,11 @@ impl Tool for ShellTool {
                 }
             }),
             requires_isolation: true,
+            // A shell command is the one built-in that legitimately runs for
+            // minutes — a build, a test suite. It declares its own deadline so
+            // an unconfigured deployment does not hold it to the default that
+            // suits an HTTP call. `[limits].tool_timeout_overrides` still wins.
+            timeout_ms: Some(SHELL_TIMEOUT_MS),
         }
     }
 
@@ -45,18 +54,48 @@ impl Tool for ShellTool {
         let parsed: ShellArgs = serde_json::from_str(args.get())
             .map_err(|err| ToolError::Failed(err.to_string().into()))?;
         let start = Instant::now();
-        let mut command = Command::new(&parsed.command);
-        command.args(&parsed.args);
-        if let Some(cwd) = parsed.cwd {
-            let safe = safe_workspace_path(&workspace_root(), &cwd)
-                .map_err(|err| ToolError::Failed(Arc::from(err)))?;
-            command.current_dir(safe);
-        }
+        let cwd = match parsed.cwd {
+            Some(cwd) => Some(
+                safe_workspace_path(&workspace_root(), &cwd)
+                    .map_err(|err| ToolError::Failed(Arc::from(err)))?,
+            ),
+            None => None,
+        };
 
-        let output = command
-            .output()
-            .map_err(|err| ToolError::Failed(err.to_string().into()))?;
+        // The registry already holds this call to a resolved deadline; this
+        // one is the belt to that brace, so a `ShellTool` used directly still
+        // cannot hang its caller.
+        let output = crate::tools::exec::run(Exec {
+            program: &parsed.command,
+            args: &parsed.args,
+            cwd,
+            stdin: None,
+            timeout: Duration::from_millis(SHELL_TIMEOUT_MS),
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+        })
+        .await;
+
         let duration_ms = elapsed_ms(start);
+        let output = match output {
+            Ok(output) => output,
+            // A command that overran, or one that could not be started, is the
+            // model's problem to work around rather than the run's to die on.
+            Err(error @ (ExecError::TimedOut { .. } | ExecError::Spawn { .. })) => {
+                let mut metadata = result_metadata(duration_ms, 0);
+                metadata.insert(
+                    Arc::from("timed_out"),
+                    Value::Bool(matches!(error, ExecError::TimedOut { .. })),
+                );
+                return Ok(ToolResult {
+                    call_id: call.id.clone(),
+                    status: ToolStatus::Failed,
+                    content: Arc::from(error.to_string()),
+                    metadata,
+                });
+            }
+            Err(error) => return Err(ToolError::Failed(error.to_string().into())),
+        };
+
         let mut content = String::from_utf8_lossy(&output.stdout).into_owned();
         if content.is_empty() {
             content = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -67,17 +106,19 @@ impl Tool for ShellTool {
             Arc::from("exit_code"),
             output
                 .status
-                .code()
                 .map_or(Value::Null, |code| Value::from(code as i64)),
         );
         metadata.insert(
             Arc::from("stderr_bytes"),
             Value::from(output.stderr.len() as u64),
         );
+        if output.truncated {
+            metadata.insert(Arc::from("output_truncated"), Value::Bool(true));
+        }
 
         Ok(ToolResult {
             call_id: call.id.clone(),
-            status: if output.status.success() {
+            status: if output.success {
                 ToolStatus::Succeeded
             } else {
                 ToolStatus::Failed

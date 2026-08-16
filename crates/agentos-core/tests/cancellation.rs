@@ -77,6 +77,7 @@ impl Tool for SlowTool {
             description: Arc::from("A tool that takes its time."),
             input_schema: serde_json::json!({"type": "object"}),
             requires_isolation: false,
+            timeout_ms: None,
         }
     }
 

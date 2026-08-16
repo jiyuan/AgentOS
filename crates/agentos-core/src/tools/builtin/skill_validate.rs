@@ -54,6 +54,7 @@ impl Tool for SkillValidateTool {
                 }
             }),
             requires_isolation: false,
+            timeout_ms: None,
         }
     }
 
