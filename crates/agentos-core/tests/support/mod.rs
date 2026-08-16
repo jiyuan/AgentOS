@@ -60,6 +60,11 @@ pub struct ScriptedLlm {
     requests: Mutex<Vec<RecordedRequest>>,
 }
 
+/// The context window every scripted run is measured against. Deliberately
+/// small so a golden's `pressure_percent` is a legible number rather than a
+/// rounding artifact of a 128k window.
+pub const SCRIPTED_CONTEXT_BUDGET: usize = 4_096;
+
 impl ScriptedLlm {
     pub fn new(responses: impl IntoIterator<Item = Message>) -> Self {
         Self {
@@ -104,6 +109,10 @@ impl ScriptedLlm {
 impl Llm for ScriptedLlm {
     fn describe(&self) -> String {
         "llm provider=scripted".to_owned()
+    }
+
+    fn context_budget_tokens(&self) -> Option<usize> {
+        Some(SCRIPTED_CONTEXT_BUDGET)
     }
 
     async fn complete(&self, ctx: &RunContext<'_>) -> Result<Message, LlmError> {

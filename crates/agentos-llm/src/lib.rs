@@ -74,6 +74,17 @@ pub trait Llm: Send + Sync {
         "llm provider=custom".to_owned()
     }
 
+    /// The context window of the model this adapter will call, in tokens.
+    ///
+    /// Only the provider adapter knows which model a request will reach, so
+    /// budget resolution belongs here rather than in a table inside the run
+    /// loop. `None` means unknown — a caller must then treat pressure as
+    /// unmeasurable rather than assume a default window and compact against a
+    /// number nobody chose.
+    fn context_budget_tokens(&self) -> Option<usize> {
+        None
+    }
+
     /// Complete a turn from the context's transcript alone.
     ///
     /// This crate cannot depend on `agentos-core`, so implementations here see
@@ -190,6 +201,63 @@ async fn drain_reply_stream(
         }
     }
     done.ok_or_else(|| LlmError::Provider(Arc::from("stream ended without a final message")))
+}
+
+/// Environment override for the resolved context window, in tokens.
+///
+/// A deployment pointing at a self-hosted or proxied model the table below
+/// does not know needs a way to state its window without a rebuild. Roadmap
+/// item X3 moves this to `agent.toml` alongside the compaction thresholds that
+/// will consume it; it is an env var here only because the whole LLM layer is
+/// env-configured today.
+pub const CONTEXT_BUDGET_ENV: &str = "AGENTOS_CONTEXT_BUDGET_TOKENS";
+
+/// Published context windows by model-id prefix, longest prefix first.
+///
+/// These are external facts about each model, not deployment policy, so they
+/// are a table rather than configuration — the override above covers the case
+/// where the table is wrong or incomplete. Values are the *total* window;
+/// output shares it, so a caller budgeting for input should leave headroom.
+const CONTEXT_BUDGETS: &[(&str, usize)] = &[
+    ("claude-haiku-4", 200_000),
+    ("claude-opus-4", 200_000),
+    ("claude-sonnet-4", 200_000),
+    ("claude-3-5", 200_000),
+    ("claude-3", 200_000),
+    ("deepseek-reasoner", 128_000),
+    ("deepseek-chat", 128_000),
+    ("gpt-4.1", 1_047_576),
+    ("gpt-4o", 128_000),
+    ("gpt-4-turbo", 128_000),
+    ("gpt-4", 8_192),
+    ("gpt-5", 400_000),
+    ("o1", 200_000),
+    ("o3", 200_000),
+    ("qwen", 32_768),
+    ("llama3", 8_192),
+];
+
+fn context_budget_override() -> Option<usize> {
+    std_env::var(CONTEXT_BUDGET_ENV)
+        .ok()?
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|tokens| *tokens > 0)
+}
+
+/// Resolve a model id to its context window by longest matching prefix.
+///
+/// Unknown models return `None` rather than a guess: a wrong window is worse
+/// than an absent one, because compaction would then run against a number
+/// nobody chose.
+pub fn context_budget_for_model(model: &str) -> Option<usize> {
+    let normalized = model.trim().to_ascii_lowercase();
+    CONTEXT_BUDGETS
+        .iter()
+        .filter(|(prefix, _)| normalized.starts_with(prefix))
+        .max_by_key(|(prefix, _)| prefix.len())
+        .map(|(_, budget)| *budget)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -324,6 +392,14 @@ impl Llm for EnvLlm {
             ),
             None => "llm provider=builtin.echo".to_owned(),
         }
+    }
+
+    fn context_budget_tokens(&self) -> Option<usize> {
+        if let Some(override_tokens) = context_budget_override() {
+            return Some(override_tokens);
+        }
+        let selection = self.current_selection()?;
+        context_budget_for_model(&selection.model)
     }
 
     async fn complete(&self, ctx: &RunContext<'_>) -> Result<Message, LlmError> {
@@ -527,6 +603,32 @@ fn env_presence(names: &[&str]) -> &'static str {
         "set"
     } else {
         "unset"
+    }
+}
+
+#[cfg(test)]
+mod context_budget_tests {
+    use super::*;
+
+    #[test]
+    fn a_longer_prefix_wins() {
+        // `gpt-4` and `gpt-4o` both match a gpt-4o id; the specific window
+        // must win, or a 128k model would be budgeted as an 8k one.
+        assert_eq!(context_budget_for_model("gpt-4o-2024-08-06"), Some(128_000));
+        assert_eq!(context_budget_for_model("gpt-4-0613"), Some(8_192));
+    }
+
+    #[test]
+    fn matching_ignores_case_and_surrounding_space() {
+        assert_eq!(context_budget_for_model("  DeepSeek-Chat  "), Some(128_000));
+    }
+
+    #[test]
+    fn an_unknown_model_resolves_to_nothing() {
+        // Not a default: compaction against an invented window is worse than
+        // no pressure signal at all.
+        assert_eq!(context_budget_for_model("some-self-hosted-model"), None);
+        assert_eq!(context_budget_for_model(""), None);
     }
 }
 

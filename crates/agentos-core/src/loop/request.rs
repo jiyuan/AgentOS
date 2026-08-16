@@ -41,6 +41,23 @@ pub(super) fn record_request_header(
     );
     fields.insert(field_key("total_chars"), Value::from(header.total_chars));
     fields.insert(
+        field_key("prompt_estimated_tokens"),
+        Value::from(header.total_tokens),
+    );
+    fields.insert(field_key("tool_tokens"), Value::from(header.tool_tokens));
+    if let Some(budget) = header.context_budget_tokens {
+        fields.insert(field_key("context_budget_tokens"), Value::from(budget));
+        // Integer percent, so a trace reader can threshold on it without
+        // float comparison. Saturates rather than wrapping on an oversized
+        // request, which is exactly when the number matters most.
+        let percent = header
+            .total_tokens
+            .saturating_mul(100)
+            .checked_div(budget)
+            .unwrap_or(0);
+        fields.insert(field_key("pressure_percent"), Value::from(percent));
+    }
+    fields.insert(
         field_key("sections"),
         Value::Array(header.sections.iter().map(section_value).collect()),
     );
@@ -52,6 +69,8 @@ pub(super) fn record_request_header(
         sections = header.sections.len(),
         total_messages = header.total_messages,
         total_chars = header.total_chars,
+        prompt_estimated_tokens = header.total_tokens,
+        context_budget_tokens = header.context_budget_tokens,
         "request_header"
     );
 }
@@ -61,6 +80,7 @@ fn section_value(section: &RequestSection) -> Value {
         "id": section.id.as_ref(),
         "messages": section.messages,
         "chars": section.chars,
+        "tokens": section.tokens,
     });
     if !section.sources.is_empty() {
         value["sources"] = Value::Array(section.sources.iter().map(source_value).collect());
@@ -96,12 +116,14 @@ mod tests {
                     id: Arc::from("skill_prelude"),
                     messages: 1,
                     chars: 40,
+                    tokens: 14,
                     sources: vec![RequestSource::Skill(Arc::from("deploy-notes"))],
                 },
                 RequestSection {
                     id: Arc::from("memory"),
                     messages: 1,
                     chars: 20,
+                    tokens: 9,
                     sources: vec![RequestSource::Memory {
                         namespace: Namespace::new("private/conversation/c/semantic/general"),
                         record_id: Some(Arc::from("rec-1")),
@@ -111,11 +133,15 @@ mod tests {
                     id: Arc::from("transcript"),
                     messages: 3,
                     chars: 60,
+                    tokens: 27,
                     sources: Vec::new(),
                 },
             ],
             total_messages: 5,
             total_chars: 120,
+            total_tokens: 60,
+            tool_tokens: 10,
+            context_budget_tokens: Some(1_000),
         }
     }
 
@@ -156,6 +182,54 @@ mod tests {
         let sections = traced_sections();
         assert_eq!(sections[2]["id"], json!("transcript"));
         assert!(sections[2].get("sources").is_none());
+    }
+
+    #[test]
+    fn pressure_is_traced_as_an_integer_percent() {
+        // C1's exit condition: every request traces its estimate and the
+        // window it is measured against, so pressure is observable before
+        // compaction exists to relieve it.
+        let mut state = RunState::new(RunId::new("r"), AgentId::new("a"));
+        record_request_header(&mut state, None, SpanId::new("span-1"), header());
+        let fields = &state
+            .trace_events
+            .iter()
+            .find(|event| event.name.as_ref() == "request_header")
+            .expect("the header is traced")
+            .fields;
+
+        assert_eq!(
+            fields.get(&field_key("prompt_estimated_tokens")),
+            Some(&Value::from(60usize))
+        );
+        assert_eq!(
+            fields.get(&field_key("context_budget_tokens")),
+            Some(&Value::from(1_000usize))
+        );
+        assert_eq!(
+            fields.get(&field_key("pressure_percent")),
+            Some(&Value::from(6usize))
+        );
+    }
+
+    #[test]
+    fn an_unknown_budget_traces_no_pressure_rather_than_a_guess() {
+        let mut state = RunState::new(RunId::new("r"), AgentId::new("a"));
+        let mut unknown = header();
+        unknown.context_budget_tokens = None;
+        record_request_header(&mut state, None, SpanId::new("span-1"), unknown);
+        let fields = &state
+            .trace_events
+            .iter()
+            .find(|event| event.name.as_ref() == "request_header")
+            .expect("the header is traced")
+            .fields;
+
+        // The estimate is still useful on its own; a pressure figure against
+        // an invented window would not be.
+        assert!(fields.contains_key(&field_key("prompt_estimated_tokens")));
+        assert!(!fields.contains_key(&field_key("pressure_percent")));
+        assert!(!fields.contains_key(&field_key("context_budget_tokens")));
     }
 
     #[test]

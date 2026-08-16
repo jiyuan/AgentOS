@@ -22,9 +22,23 @@ pub struct RequestHeader {
     pub sections: Vec<RequestSection>,
     /// Messages sent, across every section.
     pub total_messages: usize,
-    /// Characters sent, across every section. A size proxy until token
-    /// estimation lands.
+    /// Characters sent, across every section. A size proxy alongside the
+    /// token estimate, and the one figure that involves no heuristic.
     pub total_chars: usize,
+    /// Estimated tokens for the whole request, including
+    /// [`Self::tool_tokens`]. Heuristic, and deliberately biased high — see
+    /// `agentos_core::prompt::tokens`.
+    #[serde(default)]
+    pub total_tokens: usize,
+    /// Estimated tokens for the tool schemas sent alongside the messages.
+    /// Separate because they are not part of any section and are easy to
+    /// forget when reading a header.
+    #[serde(default)]
+    pub tool_tokens: usize,
+    /// The model's context window, when the provider could resolve one.
+    /// `total_tokens` against this is the pressure the request is under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_budget_tokens: Option<usize>,
 }
 
 /// One section's contribution to a request.
@@ -36,6 +50,9 @@ pub struct RequestSection {
     pub messages: usize,
     /// Characters this section contributed.
     pub chars: usize,
+    /// Estimated tokens this section contributed.
+    #[serde(default)]
+    pub tokens: usize,
     /// What the section's content can be re-derived from. Empty when the
     /// section *is* run state the trace already carries, as the transcript is.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
