@@ -290,6 +290,33 @@ compaction (C3) cheap instead of each being a bespoke mutation path.
   checkpoints returns the input unchanged (property test).
 - Exit: `Session` trait unmodified — no `semver-checks` entry; the projection is
   the only reader that decides model visibility.
+- **Status: done** (2026-08-15). `prompt/projection.rs` holds the fold;
+  `prompt::assemble` builds the transcript section from `visible()` rather than
+  the raw items. Both exit conditions machine-verified: the eight existing
+  goldens are byte-identical (the projection is the identity function until C3
+  writes a checkpoint), and `cargo semver-checks --baseline-rev HEAD` reports
+  no change to `agentos-interfaces`. Design notes for C3:
+  - **A checkpoint is an ordinary item carrying `agentos.transcript_shadow`**
+    (`{"start", "end"}`, inclusive positions). Positions are indices into the
+    loaded transcript, which is sound because the SQLite store appends with a
+    dense monotonic `ordinal` and loads `ORDER BY ordinal ASC`, so an existing
+    item's position never moves. No id had to be added to `Item`, so `Session`
+    and its data types are untouched.
+  - **Shadowing is monotonic.** Every checkpoint's range applies even when a
+    later checkpoint hides that checkpoint. Skipping a hidden checkpoint's range
+    could resurrect content an earlier compaction replaced, showing the model a
+    summary and its originals at once.
+  - **A malformed range is ignored, never clamped** — reversed, past the end, or
+    reaching the checkpoint's own position. The failure mode is duplicated
+    context (wasteful, correct) rather than hiding an unintended span, which
+    could separate a tool call from its result and make the request invalid.
+    C3 still owns keeping its ranges tool-pairing balanced; the projection will
+    not rescue a badly chosen one, it will only decline to apply an impossible
+    one.
+  - `prompt::checkpoint()` is the writer C3 should use, so the vocabulary has
+    one owner. A new golden, `compaction_checkpoint`, exercises the whole stack:
+    its `session_items` keeps all five items while its `requests` carries two,
+    which is the split this item exists to create.
 
 ---
 
