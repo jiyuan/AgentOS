@@ -9,12 +9,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod compaction;
 mod limits;
 mod memory;
 mod normalize;
 mod orchestrator;
 mod subagents;
 
+pub use compaction::CompactionConfig;
 pub use limits::LimitsConfig;
 pub use memory::{
     MemoryConfig, MemoryPolicyConfig, MemoryQdrantConfig, MemoryReflectionConfig,
@@ -46,6 +48,7 @@ pub struct WorkspaceConfig {
     pub orchestrator_templates: Vec<TemplateConfig>,
     pub task_workspace: TaskWorkspaceConfig,
     pub limits: LimitsConfig,
+    pub compaction: CompactionConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -261,6 +264,7 @@ impl WorkspaceConfig {
             .extend(load_suborch_files(config_dir)?);
         config.validate_policy().map_err(std::io::Error::other)?;
         limits::validate_limits(&config.limits).map_err(std::io::Error::other)?;
+        compaction::validate_compaction(&config.compaction).map_err(std::io::Error::other)?;
         config
             .validate_guardrails()
             .map_err(std::io::Error::other)?;

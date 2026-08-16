@@ -10,6 +10,7 @@ use crate::memory::{
 use crate::orchestrator::{
     EchoOrchestrator, MaxOrchestrator, MemoryHydrationSettings, MinOrchestrator,
 };
+use crate::prompt::Compaction;
 use crate::r#loop::{InputGuardrailEntry, OutputGuardrailEntry, ToolGuardrailEntry};
 use crate::runner::{JsonlTraceSink, RunnerDeps, TraceSink};
 use crate::skills::WorkspaceSkillCatalog;
@@ -22,7 +23,7 @@ use agentos_interfaces::orchestrator::{
     Orchestrator, OrchestratorError, Plan, ResourceIndex, RunContext,
 };
 use agentos_interfaces::tool::ToolSpec;
-use agentos_llm::{EnvLlm, LlmModelController, LlmModelTier};
+use agentos_llm::{EnvLlm, Llm, LlmModelController, LlmModelTier};
 use agentos_proto::AgentId;
 use async_trait::async_trait;
 use std::collections::BTreeSet;
@@ -168,6 +169,7 @@ pub struct AgentRuntime {
     shell_allowlist: ShellCommandAllowlist,
     spill: Option<Arc<SpillStore>>,
     tool_result_inline_bytes: usize,
+    summarizer: Arc<dyn Llm>,
 }
 
 impl AgentRuntime {
@@ -176,6 +178,18 @@ impl AgentRuntime {
         ContentLimits {
             tool_result_inline_bytes: self.tool_result_inline_bytes,
             spill: self.spill.as_deref(),
+        }
+    }
+
+    /// The summarizer and trigger every run in this runtime compacts with.
+    /// The run's own high-tier provider writes the summaries: routing a
+    /// separate `[compaction].model` is deferred to X3, and a summary written
+    /// by a weaker model than the conversation it replaces would quietly lower
+    /// the ceiling on every later turn.
+    pub fn compaction(&self) -> Compaction<'_> {
+        Compaction {
+            summarizer: Some(self.summarizer.as_ref()),
+            config: self.workspace_config.compaction,
         }
     }
 
@@ -257,7 +271,7 @@ impl AgentRuntime {
                 memory_manager.clone(),
                 workspace_config.memory.hydration_settings()?,
             );
-        let min_orchestrator = MinOrchestrator::new(high_llm).with_tools(tools.specs());
+        let min_orchestrator = MinOrchestrator::new(high_llm.clone()).with_tools(tools.specs());
         let orchestrator_strategy =
             OrchestratorStrategy::from_config(&workspace_config.agent.orchestrator)?;
         let orchestrator =
@@ -278,6 +292,7 @@ impl AgentRuntime {
                 .with_task_workspace(task_workspace.clone())
                 .with_session(session.clone())
                 .with_content_limits(spill.clone(), tool_result_inline_bytes)
+                .with_compaction(Some(high_llm.clone()), workspace_config.compaction)
         });
         let shell_allowlist =
             ShellCommandAllowlist::new(workspace_config.guardrails.shell_allowlist.iter().cloned());
@@ -300,6 +315,7 @@ impl AgentRuntime {
             shell_allowlist,
             spill,
             tool_result_inline_bytes,
+            summarizer: high_llm,
         })
     }
 
@@ -456,6 +472,7 @@ impl<'a> RuntimeDepsScope<'a> {
             tool_guardrails: &[],
             stream_sink: None,
             content_limits: self.runtime.content_limits(),
+            compaction: self.runtime.compaction(),
         }
     }
 
@@ -503,6 +520,7 @@ impl<'a> RuntimeDepsScope<'a> {
             tool_guardrails,
             stream_sink: None,
             content_limits: self.runtime.content_limits(),
+            compaction: self.runtime.compaction(),
         }
     }
 

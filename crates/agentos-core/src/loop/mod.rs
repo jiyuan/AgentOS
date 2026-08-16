@@ -1,5 +1,6 @@
 use crate::approve::Policy;
 use crate::hooks::Hooks;
+use crate::prompt::Compaction;
 use crate::spill::{ContentLimits, SpillRef, SpillSource};
 use crate::subagents::{SubAgentError, SubAgentRegistry};
 use crate::task_workspace::{TaskWorkspace, TaskWorkspaceError};
@@ -82,6 +83,9 @@ pub struct LoopDeps<'a> {
     pub stream_sink: Option<StreamSink>,
     /// Inline cap for tool output and where the overflow is persisted.
     pub content_limits: ContentLimits<'a>,
+    /// Who summarizes this run's history when it outgrows the window, and at
+    /// what pressure. Unset leaves compaction off.
+    pub compaction: Compaction<'a>,
 }
 
 pub struct InputGuardrailEntry<'a> {
@@ -253,6 +257,32 @@ async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunErro
         "plan_started",
         BTreeMap::new(),
     );
+
+    // Before hydration, so a compacted transcript is what recall and the
+    // orchestrator both see. One call, no new state: the trigger is the
+    // pressure C1 already recorded on the last request, and the result is one
+    // appended checkpoint that P2's projection folds out.
+    if let Some(compacted) = crate::prompt::compact(&mut state, &deps.compaction).await {
+        let mut fields = BTreeMap::new();
+        fields.insert(field_key("span_start"), Value::from(compacted.span.start));
+        fields.insert(field_key("span_end"), Value::from(compacted.span.end));
+        fields.insert(field_key("span_items"), Value::from(compacted.span.items));
+        fields.insert(
+            field_key("replaced_chars"),
+            Value::from(compacted.replaced_chars),
+        );
+        fields.insert(
+            field_key("summary_chars"),
+            Value::from(compacted.summary_chars),
+        );
+        trace::record_event(
+            &mut state,
+            deps.hooks,
+            plan_span_id.clone(),
+            "conversation_compacted",
+            fields,
+        );
+    }
 
     let hydrate_span_id = trace::record_span(
         &mut state,

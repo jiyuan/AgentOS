@@ -506,6 +506,79 @@ answer.
   retained on disk; resume-after-compaction produces the same trace.
 - Exit: a conversation can run indefinitely without exceeding the provider's
   context limit; the session log still contains every original item.
+- **Status: done, with the trigger provisional** (2026-08-16). Both exit
+  conditions are demonstrated by
+  `tests/compaction.rs::a_long_conversation_stays_within_the_window_and_keeps_its_log`:
+  200 turns against a 2 000-token window, 27 compactions, peak request 1 790
+  tokens, and the session log holds all 400 originals plus 27 checkpoints.
+  Notes:
+  - **The threshold is a reasoned default, not a measured one.** C1's ~15%
+    accuracy check still cannot run here — it needs a live provider call. The
+    trigger is therefore config (`[compaction].pressure_percent`, default 90)
+    and both the module docs and `agent.toml` say plainly that it is
+    provisional. 90 sits above C2's 80% elision trigger so free pruning always
+    goes first, and C1's estimator is biased high, so a run reading 90% is
+    likely below that in truth. **Tune this once the check has been run against
+    real traffic.**
+  - **Compaction is on by default.** The failure it prevents is a hard provider
+    400 that nothing recovers from until C4; the failure it risks is a
+    degraded answer on a conversation that was already near its limit. Given
+    that asymmetry, defaulting off would have left the exit condition unmet for
+    every deployment that never reads this file. `enabled = false` restores the
+    pre-C3 behaviour exactly, and C2's elision is unaffected either way.
+  - **The trigger reads the larger of two pressure figures**, and this was a
+    defect caught during implementation. Reading only the last `request_header`
+    (the exact, C1-measured figure) looked right and passed its unit test, but
+    the gateway starts a *fresh run per user message*, so the first — usually
+    only — plan of each run has no header of its own and a chat would never
+    have compacted at all. The transcript estimate is always available but low:
+    it omits the tool schemas and skill prelude the orchestrator contributes.
+    Taking `max` of the two never reads lower than either source says.
+  - **A span always starts at 0.** Each pass summarizes from the beginning, so
+    a second pass subsumes the first checkpoint along with the turns since,
+    leaving exactly one summary in the projection rather than a chain of them.
+    P2's monotonic shadowing is what makes re-covering an already-hidden range
+    a no-op.
+  - **The pairing rule is a property test**, not a spot check:
+    `every_selected_span_is_tool_pairing_balanced` generates arbitrary
+    histories — including calls whose results never arrive — and asserts no
+    selected span ever ends with a call outstanding. This is the one rule whose
+    violation is a hard 400.
+  - **The span is rendered as text, not replayed as messages.** A message list
+    carrying tool calls must satisfy every provider's pairing rules or the
+    compaction request itself 400s, which is precisely the failure compaction
+    exists to prevent. Oversized tool results are elided through C2's pruner
+    first, and the span is cut to fit half the window, so the summarization
+    call cannot itself overflow.
+  - **Recursion is impossible structurally, not by a flag.** `compact` calls
+    `Llm::complete_messages` directly, never the orchestrator, so it assembles
+    no prompt, pushes no request header, and records no pressure.
+  - **A summarizer failure is not a run failure.** An error or an empty summary
+    logs a warning and leaves the turn uncompacted, covered by
+    `a_failing_summarizer_leaves_the_run_uncompacted_rather_than_broken`.
+  - **The 200-turn replay is not a golden**, contrary to the Verify line above.
+    Pinning it would put a megabyte of filler in `tests/golden/`, and the
+    property worth asserting — every request fits — holds over all 200 requests
+    rather than the exact bytes of one. The test also asserts the peak request
+    actually approached the window, so it cannot go vacuous if the fixture
+    shrinks.
+  - **`[compaction].model` is not implemented.** Summaries are written by the
+    run's own high-tier provider. Routing a separate, cheaper model would let a
+    weaker summary lower the ceiling on every later turn, and the wiring
+    belongs with X3's other config work.
+  - **The D1 cancellation requirement is not met** — D1 does not exist yet, so
+    there is no token to respect. A compaction call is one non-streaming
+    round-trip at the start of a plan; when D1 lands it must be threaded
+    through here.
+  - **Cost on the hot path:** with a summarizer configured, every plan entry
+    estimates the visible transcript. That is the same scan prompt assembly
+    already performs, so it doubles an existing cost rather than adding a new
+    order of magnitude. Benchmarks are within noise
+    (`tool_turn_allow` 3.10 µs, `reply_turn` 1.20 µs); with no summarizer the
+    check short-circuits before touching the transcript.
+  - Interface impact, machine-verified with `--baseline-rev HEAD`:
+    `agentos-interfaces`, `agentos-proto`, and `agentos-llm` all report **no
+    semver update required**. C3 is contained entirely in `agentos-core`.
 
 ### C4. Context-overflow recovery (F2)
 
@@ -816,7 +889,7 @@ Land these together in X3 rather than piecemeal.
 | `[limits].tool_result_inline_bytes` | C2, X3 | Inline cap before spill. **Landed** in C2; default `64 KiB`, floor `512` |
 | `[limits].directory_list_entries` | X3 | Directory listing cap |
 | `[spill].root`, `[spill].retention_days` | C2 → X3 | Spill artifact storage. C2 fixed the root at `<workspace>/spill` and left retention unimplemented — nothing prunes old artifacts yet |
-| `[compaction].enabled`, `.pressure_ratio`, `.retain_tail_turns`, `.model` | C3 | Compaction policy and summarizer route |
+| `[compaction].enabled`, `.pressure_percent`, `.retain_tail_turns` | C3 | Compaction policy. **Landed** in C3; `.pressure_ratio` shipped as an integer `pressure_percent`, the unit C1 already traces. `.model` deferred to X3 — summaries use the run's own provider |
 | `[resources.tools].timeout_ms` (per tool, with a default) | D2 | Tool deadlines; replaces the MCP 10 s constant |
 | `[jobs].max_concurrent`, `.output_limit_bytes` | D3 | Job registry bounds |
 | `[gateway].shards`, `.inbox_capacity` | G1 | Conversation sharding |
@@ -833,6 +906,7 @@ the result in the PR.
 | P3 | `RunContext` gains `request_sink`; `agentos-proto` gains `RequestHeader` | **Verified**: interfaces major (`constructible_struct_adds_field`), proto additive |
 | C1 | `RequestHeader`/`RequestSection` gain token fields; `Llm` gains a defaulted `context_budget_tokens()` | **Verified**: proto major (`constructible_struct_adds_field`), interfaces and llm unchanged |
 | C2 | `RequestHeader` gains `elided_messages`/`elided_chars` | **Verified**: proto major (`constructible_struct_adds_field`), interfaces and llm unchanged |
+| C3 | None — compaction is entirely inside `agentos-core` | **Verified**: interfaces, proto, and llm all report no semver update required |
 | D1 | `RunContext` gains a cancellation field | Breaking; same pattern as `usage_sink`, `stream_sink`, `request_sink` |
 | D2 | `ToolSpec` gains `timeout_ms` (`#[serde(default)]`) | Breaking on struct literals; additive on wire |
 | X1 (b) | `Plan::CallTool` carries a batch | Breaking |

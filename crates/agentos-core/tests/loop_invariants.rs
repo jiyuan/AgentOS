@@ -124,6 +124,7 @@ fn deps<'a>(
         tool_guardrails: &[],
         stream_sink: None,
         content_limits: Default::default(),
+        compaction: Default::default(),
     }
 }
 

@@ -1,5 +1,7 @@
 use crate::approve::{Policy, PolicyError};
+use crate::config::CompactionConfig;
 use crate::memory::{InMemorySession, MemoryManager};
+use crate::prompt::Compaction;
 use crate::r#loop::{InputGuardrailEntry, OutputGuardrailEntry, ToolGuardrailEntry};
 use crate::runner::{
     resume_run, run_envelope, PausedRun, ResumeDecision, RunOutcome, RunnerDeps, TraceSink,
@@ -10,6 +12,7 @@ use crate::tools::ToolRegistry;
 use agentos_interfaces::guardrail::{InputGuardrail, OutputGuardrail, ToolGuardrail};
 use agentos_interfaces::orchestrator::{Orchestrator, SubAgentSpec};
 use agentos_interfaces::session::Session;
+use agentos_llm::Llm;
 use agentos_proto::{AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole, RunId};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -171,6 +174,8 @@ pub struct SubAgentInvocation {
     /// live inside the child's `LocalSet` task.
     spill: Option<Arc<SpillStore>>,
     tool_result_inline_bytes: usize,
+    summarizer: Option<Arc<dyn Llm>>,
+    compaction_config: CompactionConfig,
 }
 
 pub struct SubAgentRegistry {
@@ -181,6 +186,8 @@ pub struct SubAgentRegistry {
     session: Option<Arc<dyn Session>>,
     spill: Option<Arc<SpillStore>>,
     tool_result_inline_bytes: usize,
+    summarizer: Option<Arc<dyn Llm>>,
+    compaction_config: CompactionConfig,
 }
 
 impl Default for SubAgentRegistry {
@@ -198,6 +205,8 @@ impl SubAgentRegistry {
             task_workspace: None,
             spill: None,
             tool_result_inline_bytes: DEFAULT_TOOL_RESULT_INLINE_BYTES,
+            summarizer: None,
+            compaction_config: CompactionConfig::default(),
             session: None,
         }
     }
@@ -226,6 +235,19 @@ impl SubAgentRegistry {
     ) -> Self {
         self.spill = spill;
         self.tool_result_inline_bytes = tool_result_inline_bytes;
+        self
+    }
+
+    /// Give children the parent's summarizer and trigger. A sub-agent runs the
+    /// same loop against the same window, so it outgrows its context the same
+    /// way the parent does.
+    pub fn with_compaction(
+        mut self,
+        summarizer: Option<Arc<dyn Llm>>,
+        compaction_config: CompactionConfig,
+    ) -> Self {
+        self.summarizer = summarizer;
+        self.compaction_config = compaction_config;
         self
     }
 
@@ -275,6 +297,8 @@ impl SubAgentRegistry {
             session: self.session.clone(),
             spill: self.spill.clone(),
             tool_result_inline_bytes: self.tool_result_inline_bytes,
+            summarizer: self.summarizer.clone(),
+            compaction_config: self.compaction_config,
         })
     }
 }
@@ -297,6 +321,8 @@ impl SubAgentInvocation {
         let injected_session = self.session;
         let spill = self.spill;
         let tool_result_inline_bytes = self.tool_result_inline_bytes;
+        let summarizer = self.summarizer;
+        let compaction_config = self.compaction_config;
         let local = LocalSet::new();
         let handle = local.spawn_local(async move {
             let Some(input) = input_rx.recv().await else {
@@ -361,6 +387,10 @@ impl SubAgentInvocation {
                     tool_result_inline_bytes,
                     spill: spill.as_deref(),
                 },
+                compaction: Compaction {
+                    summarizer: summarizer.as_deref(),
+                    config: compaction_config,
+                },
                 // Sub-agents never stream to the parent's egress.
                 stream_sink: None,
             };
@@ -411,6 +441,8 @@ impl SubAgentInvocation {
         let injected_session = self.session;
         let spill = self.spill;
         let tool_result_inline_bytes = self.tool_result_inline_bytes;
+        let summarizer = self.summarizer;
+        let compaction_config = self.compaction_config;
         let child_approval_id = paused
             .state
             .pending_approvals
@@ -473,6 +505,10 @@ impl SubAgentInvocation {
                     content_limits: ContentLimits {
                         tool_result_inline_bytes,
                         spill: spill.as_deref(),
+                    },
+                    compaction: Compaction {
+                        summarizer: summarizer.as_deref(),
+                        config: compaction_config,
                     },
                 };
                 let paused_run = PausedRun {
