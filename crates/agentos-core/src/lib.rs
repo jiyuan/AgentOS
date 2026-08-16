@@ -18,6 +18,7 @@ pub mod prompt;
 pub mod runner;
 pub mod runtime;
 pub mod skills;
+pub mod spill;
 pub mod subagents;
 pub mod task_workspace;
 pub mod tools;

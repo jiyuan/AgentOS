@@ -12,7 +12,7 @@ this machine; treat deltas inside that band as noise.
 | Bench | Mean | Verdict |
 |---|---|---|
 | `loop_overhead/reply_turn` | **1.19 µs** | ~1690× under the 2 ms ceiling; unchanged through Phase 3 (within noise). |
-| `loop_overhead/tool_turn_allow` | **3.00 µs** | Approve + tool dispatch + extra states add ~1.8 µs over a reply turn. |
+| `loop_overhead/tool_turn_allow` | **3.25 µs** | Approve + tool dispatch + extra states add ~2.1 µs over a reply turn. Up from 3.00 µs at roadmap C2, which adds a size check and a tool-name `Arc` clone per tool turn; ~615× under the ceiling. |
 | `loop_overhead/ask_user_pause_resume` | **7.71 µs** | Full interruption cycle: pause, JSON persist round-trip, approve, resume, finish. |
 | `loop_overhead/paused_state_json_round_trip` | **3.55 µs** | `RunState` serialize + deserialize alone — roughly half the pause/resume cycle. |
 | `loop_overhead/hydrated_memory_plan_turn` | **273.6 µs** | SQLite-backed hydration dominates the turn (~230× a reply turn) but stays ~7× under the ceiling. |

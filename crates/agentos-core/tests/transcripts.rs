@@ -25,6 +25,7 @@ use agentos_core::runner::{
     resume_run, run_envelope, PausedRun, ResumeDecision, RunOutcome, SESSION_SCOPE_EPHEMERAL,
     SESSION_SCOPE_KEY,
 };
+use agentos_core::spill::{ContentLimits, SpillStore, SPILL_LOCATOR_KEY};
 use agentos_core::subagents::{SubAgentDefinition, SubAgentRegistry};
 use agentos_core::tools::ToolRegistry;
 use agentos_interfaces::orchestrator::{
@@ -76,6 +77,48 @@ impl Tool for EchoTool {
             call_id: call.id.clone(),
             status: ToolStatus::Succeeded,
             content: Arc::from(text),
+            metadata: BTreeMap::new(),
+        })
+    }
+}
+
+const BULK_TOOL: &str = "bulk";
+
+/// Deterministic numbered lines, so a spilled artifact is byte-identical run
+/// to run and the golden can pin the preview it produced.
+fn bulk_output(lines: usize) -> String {
+    (0..lines)
+        .map(|index| format!("line {index:04}: the quick brown fox jumps over the lazy dog\n"))
+        .collect()
+}
+
+/// A tool whose output exceeds any sane inline cap — the case C2 exists for.
+struct BulkTool;
+
+#[async_trait]
+impl Tool for BulkTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: Arc::from(BULK_TOOL),
+            description: Arc::from("Emit `lines` numbered lines of filler."),
+            input_schema: json!({
+                "type": "object",
+                "required": ["lines"],
+                "properties": { "lines": { "type": "integer" } }
+            }),
+            requires_isolation: false,
+        }
+    }
+
+    async fn call(&self, call: &ToolCall, args: &RawValue) -> Result<ToolResult, ToolError> {
+        let lines = serde_json::from_str::<Value>(args.get())
+            .ok()
+            .and_then(|value| value.get("lines").and_then(Value::as_u64))
+            .unwrap_or(0) as usize;
+        Ok(ToolResult {
+            call_id: call.id.clone(),
+            status: ToolStatus::Succeeded,
+            content: Arc::from(bulk_output(lines)),
             metadata: BTreeMap::new(),
         })
     }
@@ -549,6 +592,145 @@ async fn hydrated_memory_reaches_the_model() {
             .map(|message| message.content.as_ref())
             .collect::<Vec<_>>()
     );
+}
+
+// ---------------------------------------------------------------------------
+// 9. Oversized tool result: spilled, not destroyed
+// ---------------------------------------------------------------------------
+
+/// Roadmap item C2. Before it, output past the inline cap was cut and the
+/// remainder destroyed. Now the full text goes to the spill store and the
+/// transcript keeps a preview plus a locator, so the golden pins both what the
+/// model was told and — by reading the locator back — that nothing was lost.
+#[tokio::test]
+async fn golden_tool_result_spilled() {
+    let llm = Arc::new(ScriptedLlm::new([
+        tool_call_response("call-1", BULK_TOOL, r#"{"lines":128}"#),
+        assistant("Read the first lines; the rest is on disk."),
+    ]));
+    let mut tools = ToolRegistry::new();
+    tools.register(BulkTool);
+    let orchestrator = max_with(llm.clone(), vec![BulkTool.spec()]);
+    let session = InMemorySession::default();
+    let policy = tool_policy(&[BULK_TOOL], PolicyVerb::Allow);
+
+    let spill_root = support::temp_tree("spill");
+    let store = SpillStore::new(spill_root.path());
+    let mut deps = runner_deps(&orchestrator, &session, &policy, Some(&tools), None);
+    // A cap far below the default, so the scenario spills without a golden
+    // carrying 64 KiB of filler.
+    deps.content_limits = ContentLimits {
+        tool_result_inline_bytes: 512,
+        spill: Some(&store),
+    };
+
+    let outcome = run_envelope(
+        user_envelope("Dump the log for me."),
+        RunId::new("golden-spill"),
+        &deps,
+    )
+    .await
+    .expect("an oversized tool result finishes the run");
+
+    let transcript = session
+        .load(&ConversationId::new(CONVERSATION))
+        .await
+        .expect("session loads");
+
+    // The exit condition, end to end: the locator the model was handed names a
+    // file holding the output in full, not the preview it saw.
+    let locator = transcript
+        .items
+        .iter()
+        .find_map(|item| item.message.metadata.get(SPILL_LOCATOR_KEY))
+        .and_then(Value::as_str)
+        .expect("a spilled result records its locator");
+    let recovered = std::fs::read_to_string(locator).expect("the locator names a readable file");
+    assert_eq!(recovered, bulk_output(128));
+
+    // The locator is an absolute temp path, so it is redacted before pinning;
+    // the file *name* stays, because that is the part C2 derives.
+    let document = serde_json::to_string(&scenario(&llm, &transcript, &outcome))
+        .expect("scenario documents serialize")
+        .replace(&spill_root.path().to_string_lossy().to_string(), "<spill>");
+    support::assert_golden(
+        "tool_result_spilled",
+        &serde_json::from_str(&document).expect("redaction preserves valid JSON"),
+    );
+}
+
+/// The other half of C2, end to end: once a run is near its context window,
+/// the middle of an already-recorded tool result is elided from the *request*
+/// while the session log keeps what it always held.
+///
+/// Not a golden — pinning it would mean storing kilobytes of filler to assert
+/// one marker. `prompt::prune`'s unit tests cover the elision rules; this
+/// covers that they reach a provider.
+#[tokio::test]
+async fn elision_reaches_the_model_but_not_the_log() {
+    let llm = Arc::new(
+        ScriptedLlm::new([
+            tool_call_response("call-1", BULK_TOOL, r#"{"lines":128}"#),
+            assistant("Summarised from the head and tail."),
+        ])
+        // Small enough that one spilled result puts the run over the trigger.
+        .with_context_budget(1_024),
+    );
+    let mut tools = ToolRegistry::new();
+    tools.register(BulkTool);
+    let orchestrator = max_with(llm.clone(), vec![BulkTool.spec()]);
+    let session = InMemorySession::default();
+    let policy = tool_policy(&[BULK_TOOL], PolicyVerb::Allow);
+
+    let spill_root = support::temp_tree("elision");
+    let store = SpillStore::new(spill_root.path());
+    let mut deps = runner_deps(&orchestrator, &session, &policy, Some(&tools), None);
+    deps.content_limits = ContentLimits {
+        tool_result_inline_bytes: 4_096,
+        spill: Some(&store),
+    };
+
+    run_envelope(
+        user_envelope("Dump the log for me."),
+        RunId::new("c2-elision"),
+        &deps,
+    )
+    .await
+    .expect("a run under pressure still finishes");
+
+    let requests = llm.requests();
+    let second = requests.get(1).expect("the tool result is planned on");
+    let tool_message = second
+        .messages
+        .iter()
+        .find(|message| message.role == MessageRole::Tool)
+        .expect("the request carries the tool result");
+    assert!(
+        tool_message
+            .content
+            .contains("bytes elided from the middle"),
+        "the request should have been elided; got {} bytes",
+        tool_message.content.len()
+    );
+    // Elided, not destroyed: the marker names the file holding the rest.
+    assert!(tool_message.content.contains("bulk-call_1.txt"));
+
+    // The log is untouched. Elision is a view over it, recomputed each turn,
+    // so a later compaction could still show these bytes in full.
+    let transcript = session
+        .load(&ConversationId::new(CONVERSATION))
+        .await
+        .expect("session loads");
+    let logged = transcript
+        .items
+        .iter()
+        .find(|item| item.message.role == MessageRole::Tool)
+        .expect("the log carries the tool result");
+    assert!(!logged
+        .message
+        .content
+        .contains("bytes elided from the middle"));
+    assert!(logged.message.content.len() > tool_message.content.len());
 }
 
 // ---------------------------------------------------------------------------

@@ -123,6 +123,7 @@ fn deps<'a>(
         output_guardrails: &[],
         tool_guardrails: &[],
         stream_sink: None,
+        content_limits: Default::default(),
     }
 }
 

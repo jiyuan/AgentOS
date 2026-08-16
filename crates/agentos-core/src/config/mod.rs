@@ -9,11 +9,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod limits;
 mod memory;
 mod normalize;
 mod orchestrator;
 mod subagents;
 
+pub use limits::LimitsConfig;
 pub use memory::{
     MemoryConfig, MemoryPolicyConfig, MemoryQdrantConfig, MemoryReflectionConfig,
     MemoryRetentionConfig, MemorySharedDomainConfig, MemorySqliteVecConfig,
@@ -43,6 +45,7 @@ pub struct WorkspaceConfig {
     pub routing: RoutingConfig,
     pub orchestrator_templates: Vec<TemplateConfig>,
     pub task_workspace: TaskWorkspaceConfig,
+    pub limits: LimitsConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -257,6 +260,7 @@ impl WorkspaceConfig {
             .orchestrator_templates
             .extend(load_suborch_files(config_dir)?);
         config.validate_policy().map_err(std::io::Error::other)?;
+        limits::validate_limits(&config.limits).map_err(std::io::Error::other)?;
         config
             .validate_guardrails()
             .map_err(std::io::Error::other)?;

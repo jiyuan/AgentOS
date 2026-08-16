@@ -4,6 +4,7 @@ use crate::r#loop::{InputGuardrailEntry, OutputGuardrailEntry, ToolGuardrailEntr
 use crate::runner::{
     resume_run, run_envelope, PausedRun, ResumeDecision, RunOutcome, RunnerDeps, TraceSink,
 };
+use crate::spill::{ContentLimits, SpillStore, DEFAULT_TOOL_RESULT_INLINE_BYTES};
 use crate::task_workspace::TaskWorkspace;
 use crate::tools::ToolRegistry;
 use agentos_interfaces::guardrail::{InputGuardrail, OutputGuardrail, ToolGuardrail};
@@ -166,6 +167,10 @@ pub struct SubAgentInvocation {
     trace_sink: Option<Arc<dyn TraceSink>>,
     task_workspace: Option<Arc<TaskWorkspace>>,
     session: Option<Arc<dyn Session>>,
+    /// Owned so a child's borrowed `ContentLimits` can outlive this call and
+    /// live inside the child's `LocalSet` task.
+    spill: Option<Arc<SpillStore>>,
+    tool_result_inline_bytes: usize,
 }
 
 pub struct SubAgentRegistry {
@@ -174,6 +179,8 @@ pub struct SubAgentRegistry {
     trace_sink: Option<Arc<dyn TraceSink>>,
     task_workspace: Option<Arc<TaskWorkspace>>,
     session: Option<Arc<dyn Session>>,
+    spill: Option<Arc<SpillStore>>,
+    tool_result_inline_bytes: usize,
 }
 
 impl Default for SubAgentRegistry {
@@ -189,6 +196,8 @@ impl SubAgentRegistry {
             channel_capacity: 1,
             trace_sink: None,
             task_workspace: None,
+            spill: None,
+            tool_result_inline_bytes: DEFAULT_TOOL_RESULT_INLINE_BYTES,
             session: None,
         }
     }
@@ -205,6 +214,18 @@ impl SubAgentRegistry {
 
     pub fn with_task_workspace(mut self, task_workspace: Arc<TaskWorkspace>) -> Self {
         self.task_workspace = Some(task_workspace);
+        self
+    }
+
+    /// Give children the parent's spill store and inline cap, so a sub-agent's
+    /// oversized tool output is as recoverable as the parent's.
+    pub fn with_content_limits(
+        mut self,
+        spill: Option<Arc<SpillStore>>,
+        tool_result_inline_bytes: usize,
+    ) -> Self {
+        self.spill = spill;
+        self.tool_result_inline_bytes = tool_result_inline_bytes;
         self
     }
 
@@ -252,6 +273,8 @@ impl SubAgentRegistry {
             trace_sink: self.trace_sink.clone(),
             task_workspace: self.task_workspace.clone(),
             session: self.session.clone(),
+            spill: self.spill.clone(),
+            tool_result_inline_bytes: self.tool_result_inline_bytes,
         })
     }
 }
@@ -272,6 +295,8 @@ impl SubAgentInvocation {
         let trace_sink = self.trace_sink;
         let task_workspace = self.task_workspace;
         let injected_session = self.session;
+        let spill = self.spill;
+        let tool_result_inline_bytes = self.tool_result_inline_bytes;
         let local = LocalSet::new();
         let handle = local.spawn_local(async move {
             let Some(input) = input_rx.recv().await else {
@@ -332,6 +357,10 @@ impl SubAgentInvocation {
                 input_guardrails: &input_guardrails,
                 output_guardrails: &output_guardrails,
                 tool_guardrails: &tool_guardrails,
+                content_limits: ContentLimits {
+                    tool_result_inline_bytes,
+                    spill: spill.as_deref(),
+                },
                 // Sub-agents never stream to the parent's egress.
                 stream_sink: None,
             };
@@ -380,6 +409,8 @@ impl SubAgentInvocation {
         let trace_sink = self.trace_sink;
         let task_workspace = self.task_workspace;
         let injected_session = self.session;
+        let spill = self.spill;
+        let tool_result_inline_bytes = self.tool_result_inline_bytes;
         let child_approval_id = paused
             .state
             .pending_approvals
@@ -439,6 +470,10 @@ impl SubAgentInvocation {
                     output_guardrails: &output_guardrails,
                     tool_guardrails: &tool_guardrails,
                     stream_sink: None,
+                    content_limits: ContentLimits {
+                        tool_result_inline_bytes,
+                        spill: spill.as_deref(),
+                    },
                 };
                 let paused_run = PausedRun {
                     channel_id: paused.channel_id.clone(),

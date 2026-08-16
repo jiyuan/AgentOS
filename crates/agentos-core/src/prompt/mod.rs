@@ -20,10 +20,12 @@
 //! a stored fact steer routing. Keep it separate.
 
 mod projection;
+mod prune;
 mod sections;
 mod tokens;
 
 pub use projection::{checkpoint, visible, TRANSCRIPT_SHADOW_KEY};
+pub use prune::{Elision, ELIDED_BYTES_KEY, PRUNE_TRIGGER_RATIO};
 pub use sections::{SectionId, SkillPrelude};
 pub use tokens::{estimate_message, estimate_text, estimate_tool_specs};
 
@@ -69,6 +71,9 @@ pub struct PromptManifest {
     pub tool_tokens: usize,
     /// The model's context window, when the provider resolved one.
     pub context_budget_tokens: Option<usize>,
+    /// What elision removed from the transcript to fit that window. Zero on
+    /// every request that was already under the trigger ratio.
+    pub elided: Elision,
 }
 
 impl PromptManifest {
@@ -123,6 +128,8 @@ impl PromptManifest {
             total_tokens: self.total_tokens(),
             tool_tokens: self.tool_tokens,
             context_budget_tokens: self.context_budget_tokens,
+            elided_messages: self.elided.messages,
+            elided_chars: self.elided.chars,
         }
     }
 }
@@ -171,20 +178,35 @@ pub fn assemble(ctx: &RunContext<'_>, input: &Assembly<'_>) -> Prompt {
         );
     }
 
+    manifest.tool_tokens = tokens::estimate_tool_specs(input.tools);
+    manifest.context_budget_tokens = input.context_budget_tokens;
+
     // The projected view, not the raw log: a checkpoint written by compaction
     // hides the span it summarizes without anything having been deleted.
+    let mut transcript: Vec<Message> = projection::visible(&ctx.state.transcript)
+        .into_iter()
+        .map(|item| item.message.clone())
+        .collect();
+
+    // Elision runs before the section is measured, so the manifest describes
+    // what the provider was actually sent rather than what the log holds. It
+    // is a property of this request alone — recomputed every turn, never
+    // written back (see `prune`).
+    manifest.elided = prune::to_fit(
+        &mut transcript,
+        &prune::Budget {
+            context_budget_tokens: input.context_budget_tokens,
+            reserved_tokens: manifest.total_tokens(),
+        },
+    );
+
     push_section(
         &mut messages,
         &mut manifest,
         SectionId::Transcript,
         Vec::new(),
-        projection::visible(&ctx.state.transcript)
-            .into_iter()
-            .map(|item| item.message.clone()),
+        transcript,
     );
-
-    manifest.tool_tokens = tokens::estimate_tool_specs(input.tools);
-    manifest.context_budget_tokens = input.context_budget_tokens;
 
     // Durable record of what this request was made of, drained by the loop
     // into a `request_header` trace event after `plan()` returns.
@@ -202,6 +224,8 @@ pub fn assemble(ctx: &RunContext<'_>, input: &Assembly<'_>) -> Prompt {
         total_chars = manifest.total_chars(),
         total_tokens = manifest.total_tokens(),
         tool_tokens = manifest.tool_tokens,
+        elided_messages = manifest.elided.messages,
+        elided_chars = manifest.elided.chars,
         "prompt assembled"
     );
 

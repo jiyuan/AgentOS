@@ -1,0 +1,107 @@
+{
+  "outcome": {
+    "conversation_id": "golden-conversation",
+    "kind": "finished",
+    "reply": "Read the first lines; the rest is on disk."
+  },
+  "request_headers": [
+    {
+      "context_budget_tokens": 4096,
+      "pressure_percent": 0,
+      "prompt_estimated_tokens": 40,
+      "sections": [
+        {
+          "chars": 20,
+          "id": "transcript",
+          "messages": 1,
+          "tokens": 9
+        }
+      ],
+      "tool_tokens": 31,
+      "total_chars": 20,
+      "total_messages": 1
+    },
+    {
+      "context_budget_tokens": 4096,
+      "pressure_percent": 6,
+      "prompt_estimated_tokens": 248,
+      "sections": [
+        {
+          "chars": 792,
+          "id": "transcript",
+          "messages": 3,
+          "tokens": 217
+        }
+      ],
+      "tool_tokens": 31,
+      "total_chars": 792,
+      "total_messages": 3
+    }
+  ],
+  "requests": [
+    {
+      "messages": [
+        {
+          "content": "Dump the log for me.",
+          "role": "user"
+        }
+      ],
+      "tools": [
+        "bulk"
+      ]
+    },
+    {
+      "messages": [
+        {
+          "content": "Dump the log for me.",
+          "role": "user"
+        },
+        {
+          "content": "",
+          "role": "assistant",
+          "tool_calls": [
+            {
+              "args": "{\"lines\":128}",
+              "id": "call-1",
+              "name": "bulk"
+            }
+          ]
+        },
+        {
+          "content": "line 0000: the quick brown fox jumps over the lazy dog\nline 0001: the quick brown fox jumps over the lazy dog\nline 0002: the quick brown fox jumps over the lazy dog\nline 0003: the quick brown fox jumps over the lazy dog\nline 0004: the quick brown fox jumps over the lazy dog\nline 0005: the quick brown fox jumps over the lazy dog\nline 0006: the quick brown fox jumps over the lazy dog\nline 0007: the quick brown fox jumps over the lazy dog\nline 0008: the quick brown fox jumps over the lazy dog\nline 0009: the qu\n\n[tool result truncated inline: showing 512 of 7040 bytes. The full output was saved to <spill>/golden_spill/bulk-call_1.txt. Read it with the `file` tool (use `offset`/`tail` for a slice) instead of re-running the command.]",
+          "role": "tool",
+          "tool_call_id": "call-1"
+        }
+      ],
+      "tools": [
+        "bulk"
+      ]
+    }
+  ],
+  "session_items": [
+    {
+      "content": "Dump the log for me.",
+      "role": "user"
+    },
+    {
+      "content": "",
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "args": "{\"lines\":128}",
+          "id": "call-1",
+          "name": "bulk"
+        }
+      ]
+    },
+    {
+      "content": "line 0000: the quick brown fox jumps over the lazy dog\nline 0001: the quick brown fox jumps over the lazy dog\nline 0002: the quick brown fox jumps over the lazy dog\nline 0003: the quick brown fox jumps over the lazy dog\nline 0004: the quick brown fox jumps over the lazy dog\nline 0005: the quick brown fox jumps over the lazy dog\nline 0006: the quick brown fox jumps over the lazy dog\nline 0007: the quick brown fox jumps over the lazy dog\nline 0008: the quick brown fox jumps over the lazy dog\nline 0009: the qu\n\n[tool result truncated inline: showing 512 of 7040 bytes. The full output was saved to <spill>/golden_spill/bulk-call_1.txt. Read it with the `file` tool (use `offset`/`tail` for a slice) instead of re-running the command.]",
+      "role": "tool",
+      "tool_call_id": "call-1"
+    },
+    {
+      "content": "Read the first lines; the rest is on disk.",
+      "role": "assistant"
+    }
+  ]
+}

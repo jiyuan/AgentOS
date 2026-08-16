@@ -39,6 +39,23 @@ pub struct RequestHeader {
     /// `total_tokens` against this is the pressure the request is under.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_budget_tokens: Option<usize>,
+    /// Tool results whose middle was elided to fit the window.
+    ///
+    /// Elision is deterministic in the visible transcript and the window, so
+    /// the reconstruction standard above still holds without recording which
+    /// messages were cut — but a reader of a trace should not have to re-run
+    /// the pruner to learn that it fired.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub elided_messages: usize,
+    /// Characters those elisions removed. The gap between this and
+    /// [`Self::total_chars`] is what the session log holds and the model did
+    /// not see.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub elided_chars: usize,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 /// One section's contribution to a request.

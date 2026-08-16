@@ -413,6 +413,72 @@ and the remainder is destroyed (`loop/items.rs:10`).
   preview + locator.
 - Exit: no tool output is unrecoverable; `MAX_TOOL_RESULT_CONTENT_BYTES` is a
   config field (see X3).
+- **Status: done** (2026-08-16). Both exit conditions hold. With a store
+  configured, output past the cap is written to
+  `workspace/spill/<run id>/<tool>-<call id>.txt` and the inline text becomes a
+  preview plus the locator and a retrieval hint;
+  `[limits].tool_result_inline_bytes` replaces the constant and is validated at
+  load. `golden/tool_result_spilled.json` pins the preview and locator in both
+  the session log and the assembled request, and the test reads the locator
+  back and asserts it equals the tool's full output. Notes:
+  - **Spills are scoped by run id, not by a conversation hash.** The roadmap
+    said `<conversation-hash>`, but `RunState` carries no conversation id — it
+    reaches the loop on the `Envelope`, not the state — so hashing one would
+    have meant a breaking `agentos-interfaces` change for a directory name.
+    The run id is on the state, is already the unit a trace is read by, and
+    gives the same containment.
+  - **Sanitization replaces the hash.** Every path segment is built by
+    `safe_segment`: characters outside `[A-Za-z0-9_]` become `_`, capped at 64.
+    `..`, `/`, and `\` cannot survive it, so a model- or channel-supplied id
+    can only ever name a child of the root. This avoids adding a `sha2`
+    dependency for what was a path-escape defence, not a collision defence.
+    Files are created `O_EXCL | 0600` inside `0700` directories, so a planted
+    symlink fails the write rather than redirecting it — asserted by
+    `a_planted_symlink_is_rejected_not_followed`.
+  - **Spilling is best effort and never fails a run.** No store, a full disk, a
+    permission error: `spill_oversized` logs a warning and returns `None`, and
+    the result degrades to the pre-C2 truncation notice. A storage fault must
+    not turn a successful tool call into a failed run.
+  - **Pruning is a view, not a rewrite** — the one design decision worth
+    recording. `prompt::prune::to_fit` elides at assembly time on cloned
+    messages; the session log keeps the full preview. This is the opposite
+    reasoning from P2: compaction must be durable because it is expensive and
+    non-deterministic, whereas elision is a pure function of the visible
+    transcript and the window, so freezing it would throw bytes away that a
+    later compaction could have afforded to show again.
+  - **Elision only runs against a resolved context window.** No budget means no
+    pruning — inventing one would silently discard output on models that had
+    room for it. It triggers above `PRUNE_TRIGGER_RATIO` (0.8), keeps 2 KiB of
+    head and 1 KiB of tail, walks oldest-first so the result the model just
+    asked for is the last to lose its middle, and stops as soon as the request
+    fits. Results under 5 KiB are left whole: the marker would replace a span
+    barely larger than itself.
+  - **The elision test is not a golden.** Pinning it would mean storing
+    kilobytes of filler to assert one marker, so
+    `elision_reaches_the_model_but_not_the_log` asserts the marker reaches the
+    provider and does *not* reach the log. Both it and the spill golden were
+    checked against a deliberately broken implementation before acceptance.
+  - **`temp_tree` hashes its discriminator.** The first recording of
+    `tool_result_spilled` was unstable: the golden redacts the temp path but
+    still pins the `chars` count of the text that carried it, and a `ThreadId`
+    rendering as one digit on one run and two on the next moved that count. The
+    discriminator is now a fixed-width hash; the golden was verified stable
+    across five consecutive runs.
+  - **Nothing prunes spilled artifacts — deliberately deferred.** The config
+    table listed `[spill].root` and `[spill].retention_days`; C2 implements
+    neither. The root is fixed at `<workspace>/spill`, and artifacts accumulate
+    for the life of the workspace. That is the right trade for now — losing a
+    referenced artifact mid-run is worse than disk use — but a long-lived
+    deployment needs retention, and it belongs with X3's other bounds rather
+    than bolted onto this item.
+  - **Benchmark impact:** `loop_overhead/tool_turn_allow` 3.00 µs → 3.25 µs
+    (size check plus a tool-name `Arc` clone per tool turn), ~615× under the
+    2 ms ceiling. Other benches within noise. `BENCHMARKS.md` updated.
+  - Interface impact, machine-verified with `--baseline-rev HEAD`:
+    `agentos-interfaces` and `agentos-llm` unchanged; `agentos-proto` reports
+    one major (`constructible_struct_adds_field`) for `elided_messages` and
+    `elided_chars` on `RequestHeader` — the same P3-introduced type C1 extended,
+    with no consumers outside this workspace.
 
 ### C3. Span summarization (F2)
 
@@ -747,9 +813,9 @@ Land these together in X3 rather than piecemeal.
 
 | Key | Item | Purpose |
 |---|---|---|
-| `[limits].tool_result_inline_bytes` | C2, X3 | Inline cap before spill (today `64 KiB`, hardcoded) |
+| `[limits].tool_result_inline_bytes` | C2, X3 | Inline cap before spill. **Landed** in C2; default `64 KiB`, floor `512` |
 | `[limits].directory_list_entries` | X3 | Directory listing cap |
-| `[spill].root`, `[spill].retention_days` | C2 | Spill artifact storage |
+| `[spill].root`, `[spill].retention_days` | C2 → X3 | Spill artifact storage. C2 fixed the root at `<workspace>/spill` and left retention unimplemented — nothing prunes old artifacts yet |
 | `[compaction].enabled`, `.pressure_ratio`, `.retain_tail_turns`, `.model` | C3 | Compaction policy and summarizer route |
 | `[resources.tools].timeout_ms` (per tool, with a default) | D2 | Tool deadlines; replaces the MCP 10 s constant |
 | `[jobs].max_concurrent`, `.output_limit_bytes` | D3 | Job registry bounds |
@@ -766,6 +832,7 @@ the result in the PR.
 |---|---|---|
 | P3 | `RunContext` gains `request_sink`; `agentos-proto` gains `RequestHeader` | **Verified**: interfaces major (`constructible_struct_adds_field`), proto additive |
 | C1 | `RequestHeader`/`RequestSection` gain token fields; `Llm` gains a defaulted `context_budget_tokens()` | **Verified**: proto major (`constructible_struct_adds_field`), interfaces and llm unchanged |
+| C2 | `RequestHeader` gains `elided_messages`/`elided_chars` | **Verified**: proto major (`constructible_struct_adds_field`), interfaces and llm unchanged |
 | D1 | `RunContext` gains a cancellation field | Breaking; same pattern as `usage_sink`, `stream_sink`, `request_sink` |
 | D2 | `ToolSpec` gains `timeout_ms` (`#[serde(default)]`) | Breaking on struct literals; additive on wire |
 | X1 (b) | `Plan::CallTool` carries a batch | Breaking |
