@@ -61,7 +61,7 @@ impl Orchestrator for MinOrchestrator {
         let response =
             super::streaming::complete_message(&*self.llm, ctx, &prompt.messages, &self.tool_specs)
                 .await
-                .map_err(|err| OrchestratorError::Backend(Arc::from(err.to_string())))?;
+                .map_err(super::planning_error)?;
         ctx.push_llm_usage_from_message(&response);
         if let Some(first) = response.tool_calls.first().cloned() {
             return Ok(Plan::CallTool(first));

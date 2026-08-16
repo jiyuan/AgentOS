@@ -5,6 +5,7 @@ pub mod ollama;
 pub mod openai;
 pub(crate) mod stream;
 
+use crate::LlmError;
 use agentos_proto::{Message, TOKEN_USAGE_METADATA_KEY};
 use bytes::Bytes;
 use rand::Rng;
@@ -61,9 +62,40 @@ pub enum ProviderError {
         status: Option<u16>,
         detail: String,
     },
+    /// The provider rejected the request because it was too long for the
+    /// model's context window.
+    ///
+    /// Split out of [`Self::Api`] because it is the one provider error a run
+    /// can *act* on: roadmap item C4 compacts the conversation and retries,
+    /// rather than surfacing a failure the operator has to fix. It renders
+    /// identically to `Api`, so the streaming paths that match on a rendered
+    /// detail are unaffected.
+    #[error("{detail}")]
+    ContextLength {
+        provider: Arc<str>,
+        status: Option<u16>,
+        detail: String,
+    },
     /// Configuration names a provider this build does not support.
     #[error("unknown LLM provider: {0}")]
     UnknownProvider(Arc<str>),
+}
+
+impl ProviderError {
+    /// Project into the error the `Llm` trait boundary exposes.
+    ///
+    /// Every class but one collapses into [`LlmError::Provider`] text, as it
+    /// always has. Context-length rejection stays typed because the run loop
+    /// branches on it — matching a substring of a provider's prose there is
+    /// exactly what this crate's typed-error convention exists to avoid.
+    pub fn into_llm_error(self) -> LlmError {
+        match self {
+            Self::ContextLength { detail, .. } => {
+                LlmError::ContextLengthExceeded(Arc::from(detail))
+            }
+            other => LlmError::Provider(Arc::from(other.to_string())),
+        }
+    }
 }
 
 /// Tokens consumed by a single LLM call, normalised across providers.
@@ -529,16 +561,57 @@ fn format_provider_error_with_hint(
     error: &Value,
     hint: &str,
 ) -> ProviderError {
+    let detail = format!(
+        "{provider} error: {}; {}; hint={}",
+        error,
+        describe_http_response(response.status, &response.headers),
+        hint,
+    );
+    if is_context_length_error(error) {
+        return ProviderError::ContextLength {
+            provider: Arc::from(provider),
+            status: response.status,
+            detail,
+        };
+    }
     ProviderError::Api {
         provider: Arc::from(provider),
         status: response.status,
-        detail: format!(
-            "{provider} error: {}; {}; hint={}",
-            error,
-            describe_http_response(response.status, &response.headers),
-            hint,
-        ),
+        detail,
     }
+}
+
+/// Phrases that identify a context-length rejection in a provider's prose.
+///
+/// Only OpenAI and its compatibles set a machine-readable code; Anthropic and
+/// Ollama say it in the message and nowhere else, so prose is all there is.
+/// Each entry is a phrase its provider emits verbatim, and each is long enough
+/// that an unrelated failure cannot match it — a false positive here costs a
+/// pointless summarization call and a retry of a request that was never too
+/// long.
+const CONTEXT_LENGTH_PHRASES: &[&str] = &[
+    // OpenAI, DeepSeek, and OpenAI-compatible proxies.
+    "maximum context length",
+    "context_length_exceeded",
+    // Anthropic: "prompt is too long: 250000 tokens > 200000 maximum".
+    "prompt is too long",
+    // Ollama and several self-hosted runtimes.
+    "exceeds the context window",
+    "too many tokens",
+];
+
+/// Whether a provider's error object is a rejection for request length.
+fn is_context_length_error(error: &Value) -> bool {
+    if error.get("code").and_then(Value::as_str) == Some("context_length_exceeded") {
+        return true;
+    }
+    // The whole object rather than `message` alone: providers nest the text
+    // differently, and proxies that drop the structured `code` still echo it
+    // in their prose.
+    let rendered = error.to_string().to_ascii_lowercase();
+    CONTEXT_LENGTH_PHRASES
+        .iter()
+        .any(|phrase| rendered.contains(phrase))
 }
 
 /// Flatten a reqwest transport error and its `source()` chain into one detail
@@ -887,5 +960,81 @@ mod provider_error_tests {
             variable: "OPENAI_API_KEY",
         };
         assert_eq!(error.to_string(), "missing OPENAI_API_KEY");
+    }
+
+    fn rejected(error: serde_json::Value) -> ProviderError {
+        let response = JsonHttpResponse {
+            status: Some(400),
+            headers: BTreeMap::new(),
+            body: json!({}),
+        };
+        super::format_provider_error("Test", &response, &error)
+    }
+
+    #[test]
+    fn every_provider_shape_of_a_length_rejection_is_classified() {
+        // Roadmap C4: the run loop recovers from this class and only this
+        // class, so each provider's actual wording has to be recognised. These
+        // are the shapes the four supported providers return.
+        for (label, error) in [
+            (
+                "openai structured",
+                json!({"code": "context_length_exceeded", "message": "…"}),
+            ),
+            (
+                "openai prose",
+                json!({"message": "This model's maximum context length is 8192 tokens, however you requested 9000."}),
+            ),
+            (
+                "anthropic",
+                json!({"type": "invalid_request_error", "message": "prompt is too long: 250000 tokens > 200000 maximum"}),
+            ),
+            (
+                "deepseek",
+                json!({"message": "This model's maximum context length is 65536 tokens."}),
+            ),
+            (
+                "self-hosted",
+                json!({"error": "input exceeds the context window for this model"}),
+            ),
+        ] {
+            assert!(
+                matches!(rejected(error), ProviderError::ContextLength { .. }),
+                "{label} was not classified as a length rejection"
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_failures_stay_unrecoverable() {
+        // A false positive costs a pointless summarization call and a retry of
+        // a request that was never too long, so the phrase list must not be
+        // greedy.
+        for error in [
+            json!({"code": "insufficient_quota", "message": "You exceeded your current quota."}),
+            json!({"code": "rate_limit_exceeded", "message": "Rate limit reached for requests."}),
+            json!({"message": "Invalid API key provided."}),
+            json!({"message": "max_tokens must be less than the model's output limit."}),
+        ] {
+            assert!(
+                matches!(rejected(error.clone()), ProviderError::Api { .. }),
+                "{error} should not be treated as recoverable"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_length_class_survives_the_trait_boundary_typed() {
+        use crate::LlmError;
+
+        let recovered = rejected(json!({"code": "context_length_exceeded"})).into_llm_error();
+        assert!(matches!(recovered, LlmError::ContextLengthExceeded(_)));
+
+        let opaque = rejected(json!({"code": "insufficient_quota"})).into_llm_error();
+        let LlmError::Provider(detail) = opaque else {
+            panic!("every other class stays opaque text");
+        };
+        // The operator diagnostics survive the collapse, as they always have.
+        assert!(detail.contains("http_status=400"));
     }
 }

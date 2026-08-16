@@ -82,6 +82,53 @@ impl Llm for StubSummarizer {
     }
 }
 
+/// A provider that rejects its first `rejections` planning calls for length,
+/// exactly as OpenAI does, then answers.
+struct OverflowingLlm {
+    rejections: usize,
+    calls: AtomicUsize,
+}
+
+impl OverflowingLlm {
+    fn new(rejections: usize) -> Self {
+        Self {
+            rejections,
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::Relaxed)
+    }
+}
+
+#[async_trait]
+impl Llm for OverflowingLlm {
+    fn context_budget_tokens(&self) -> Option<usize> {
+        Some(WINDOW)
+    }
+
+    async fn complete(&self, _ctx: &RunContext<'_>) -> Result<Message, LlmError> {
+        Err(LlmError::Unconfigured(Arc::from("complete")))
+    }
+
+    async fn complete_messages(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSpec],
+    ) -> Result<Message, LlmError> {
+        let call = self.calls.fetch_add(1, Ordering::Relaxed);
+        // Only reject once the conversation is long enough to be worth
+        // compacting, so the seeding turns above complete normally.
+        if call >= 40 && call - 40 < self.rejections {
+            return Err(LlmError::ContextLengthExceeded(Arc::from(
+                "openai error: this model's maximum context length is 8192 tokens",
+            )));
+        }
+        Ok(Message::text(MessageRole::Assistant, "recovered"))
+    }
+}
+
 /// A summarizer that always fails, to prove compaction degrades rather than
 /// taking the run down with it.
 struct FailingSummarizer;
@@ -303,6 +350,120 @@ async fn a_failing_summarizer_leaves_the_run_uncompacted_rather_than_broken() {
         .expect("session loads");
     assert!(!transcript.items.iter().any(is_checkpoint));
     assert_eq!(transcript.items.len(), TURNS * 2);
+}
+
+/// Roadmap C4, end to end: a provider that rejects the request for length is
+/// recovered from without an operator, through the real orchestrator.
+///
+/// The unit tests in `loop::planning` stub the orchestrator. This one stubs
+/// the *provider*, so it also covers the link they skip: `MaxOrchestrator`
+/// mapping `LlmError::ContextLengthExceeded` to the typed orchestrator error
+/// instead of folding it into `Backend`.
+#[tokio::test]
+async fn a_provider_length_rejection_compacts_and_retries_once() {
+    const TURNS: usize = 40;
+
+    let llm = Arc::new(OverflowingLlm::new(1));
+    let summarizer = StubSummarizer::new();
+    let orchestrator = MaxOrchestrator::new().with_llm(llm.clone());
+    let session = InMemorySession::default();
+    let policy = Policy::default();
+    let mut deps = runner_deps(&orchestrator, &session, &policy, None, None);
+    deps.compaction = Compaction {
+        summarizer: Some(&summarizer),
+        // Pressure well above anything this conversation reaches, so only the
+        // provider rejection can trigger compaction.
+        config: CompactionConfig {
+            pressure_percent: 100,
+            ..Default::default()
+        },
+    };
+
+    // Seed a conversation long enough to have a span worth summarizing.
+    for turn in 0..TURNS {
+        run_envelope(
+            user_envelope(&format!("Question {turn}: what did we decide?")),
+            RunId::new(format!("c4-seed-{turn}")),
+            &deps,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("seed turn {turn} failed: {error}"));
+    }
+    assert_eq!(summarizer.calls(), 0, "pressure alone must not have fired");
+
+    // The next turn is the one the provider rejects.
+    let before = llm.calls();
+    let outcome = run_envelope(
+        user_envelope("And the one that overflows?"),
+        RunId::new("c4-overflow"),
+        &deps,
+    )
+    .await
+    .expect("a length rejection is recovered, not surfaced");
+
+    let RunOutcome::Finished { state, output } = outcome else {
+        panic!("the recovered turn should finish");
+    };
+    assert_eq!(output.message.content.as_ref(), "recovered");
+    assert_eq!(llm.calls() - before, 2, "one rejection, one retry");
+    assert_eq!(summarizer.calls(), 1, "exactly one forced compaction");
+    assert!(state
+        .trace_events
+        .iter()
+        .any(|event| event.name.as_ref() == "conversation_compacted"));
+
+    // The rejected request still left its header in the trace: two requests
+    // were assembled for this one turn.
+    assert_eq!(request_sizes(&[state]).len(), 2);
+}
+
+/// A conversation that cannot be made to fit answers rather than failing.
+#[tokio::test]
+async fn an_unrecoverable_overflow_answers_with_a_truncation_notice() {
+    const TURNS: usize = 40;
+
+    let llm = Arc::new(OverflowingLlm::new(usize::MAX));
+    let summarizer = StubSummarizer::new();
+    let orchestrator = MaxOrchestrator::new().with_llm(llm.clone());
+    let session = InMemorySession::default();
+    let policy = Policy::default();
+    let mut deps = runner_deps(&orchestrator, &session, &policy, None, None);
+    deps.compaction = Compaction {
+        summarizer: Some(&summarizer),
+        config: CompactionConfig {
+            pressure_percent: 100,
+            ..Default::default()
+        },
+    };
+
+    for turn in 0..TURNS {
+        let _ = run_envelope(
+            user_envelope(&format!("Question {turn}")),
+            RunId::new(format!("c4-hopeless-{turn}")),
+            &deps,
+        )
+        .await;
+    }
+
+    let outcome = run_envelope(
+        user_envelope("Anything at all?"),
+        RunId::new("c4-hopeless-final"),
+        &deps,
+    )
+    .await
+    .expect("an unrecoverable overflow answers rather than failing the run");
+
+    let RunOutcome::Finished { state, output } = outcome else {
+        panic!("the turn should finish");
+    };
+    assert!(output
+        .message
+        .content
+        .contains("too long for the model's context window"));
+    assert!(state
+        .trace_events
+        .iter()
+        .any(|event| event.name.as_ref() == "context_overflow_unrecovered"));
 }
 
 /// With compaction off, nothing changes — the C2-and-earlier behaviour.

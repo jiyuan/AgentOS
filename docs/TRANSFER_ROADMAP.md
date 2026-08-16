@@ -594,6 +594,58 @@ compaction pass and retry the step exactly once.
   compaction, one retry, and a successful turn; a second consecutive overflow
   finishes the run with a truncation notice rather than looping.
 - Exit: a context-length rejection is recoverable without operator intervention.
+- **Status: done** (2026-08-16). Both Verify cases hold end to end in
+  `tests/compaction.rs`: a stubbed provider returning a length rejection
+  produces one forced compaction, one retry, and a finished turn; a provider
+  that rejects every attempt finishes with a truncation notice and exactly two
+  attempts. Notes:
+  - **The class stays typed the whole way.** `LlmError::ContextLengthExceeded`
+    and `OrchestratorError::ContextLengthExceeded` are new variants, and
+    `ProviderError::ContextLength` is split out of `Api`. The loop branches on
+    a type, never on a substring of a provider's prose — which is what this
+    project's typed-error convention is for. `orchestrator::planning_error` is
+    the single shared conversion, because collapsing the class into `Backend`
+    is an omission the compiler cannot catch.
+  - **Classification is prose matching, and that is unavoidable.** Only OpenAI
+    and its compatibles set `code = "context_length_exceeded"`; Anthropic and
+    self-hosted runtimes say it in the message and nowhere else. The phrase
+    list is deliberately narrow and each entry is a phrase its provider emits
+    verbatim, because a false positive costs a pointless summarization call and
+    a retry of a request that was never too long.
+    `unrelated_failures_stay_unrecoverable` pins quota, rate-limit, auth, and
+    `max_tokens` errors as *not* recoverable.
+  - **The routing classifier is deliberately excluded.** Its prompt is two
+    fixed messages carrying none of the conversation, so compaction could not
+    shorten it; it keeps mapping to `Backend`. Marking it recoverable would
+    spend a summarizer call and a retry on a request that fails identically.
+  - **Giving up returns a `Plan::Reply`, not an error or a `Finish`.** The
+    truncation notice therefore goes through the loop's normal reply handling,
+    so the output guardrails still run on it — the alternative,
+    `budget_exhausted_finish`'s shape, had to re-implement that check inline.
+    The notice is fixed text with no model call: asking the provider that just
+    rejected the request to write the apology would fail the same way.
+  - **`compact_now` respects `[compaction].enabled`.** An operator who turned
+    summarization off did not ask for it back on a bad turn; such a deployment
+    answers with the notice instead. It does bypass the *pressure* check, which
+    is the whole point — the provider's rejection is the one trigger that is
+    never an estimate.
+  - **No retry when there is no span.** A conversation shorter than the
+    retained tail has nothing to summarize, so the loop answers immediately
+    rather than re-sending an identical request.
+  - **`plan()` shrank rather than grew.** The roadmap's constraint forbids
+    extending `loop/mod.rs`, so the attempt, both compaction triggers, and the
+    give-up path moved into a new `loop/planning.rs` (509 LOC) and C3's inline
+    compaction block moved with them. `loop/mod.rs` is 725 LOC, under the
+    ceiling.
+  - **Incidental fix:** a hydration failure now closes its `orchestrator.plan`
+    span and drains the request sink before propagating. Previously it used
+    `?` and left the span open, so a failed hydrate produced a trace with no
+    `hydrate_finished` event.
+  - Interface impact, machine-verified with `--baseline-rev HEAD`:
+    `agentos-interfaces` major (`enum_variant_added` on `OrchestratorError`),
+    `agentos-llm` major (same, on `LlmError` and `ProviderError`),
+    `agentos-proto` unchanged. Both enums are matched exhaustively inside this
+    workspace only.
 
 ---
 
@@ -907,6 +959,7 @@ the result in the PR.
 | C1 | `RequestHeader`/`RequestSection` gain token fields; `Llm` gains a defaulted `context_budget_tokens()` | **Verified**: proto major (`constructible_struct_adds_field`), interfaces and llm unchanged |
 | C2 | `RequestHeader` gains `elided_messages`/`elided_chars` | **Verified**: proto major (`constructible_struct_adds_field`), interfaces and llm unchanged |
 | C3 | None — compaction is entirely inside `agentos-core` | **Verified**: interfaces, proto, and llm all report no semver update required |
+| C4 | `OrchestratorError` and `LlmError` gain a `ContextLengthExceeded` variant; `ProviderError` gains `ContextLength` | **Verified**: interfaces and llm major (`enum_variant_added`), proto unchanged |
 | D1 | `RunContext` gains a cancellation field | Breaking; same pattern as `usage_sink`, `stream_sink`, `request_sink` |
 | D2 | `ToolSpec` gains `timeout_ms` (`#[serde(default)]`) | Breaking on struct literals; additive on wire |
 | X1 (b) | `Plan::CallTool` carries a batch | Breaking |

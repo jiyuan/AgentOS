@@ -113,18 +113,26 @@ pub struct Compacted {
 /// summarizer call. A compaction failure must never fail a run: the turn then
 /// proceeds at its original pressure, which is where it would have been anyway.
 pub async fn compact(state: &mut RunState, compaction: &Compaction<'_>) -> Option<Compacted> {
-    if !compaction.config.enabled {
-        return None;
-    }
-    let summarizer = compaction.summarizer?;
-    // Without a resolved window there is no pressure reading to trigger on,
-    // and no budget to size the span against.
+    let summarizer = enabled_summarizer(compaction)?;
     let window = summarizer.context_budget_tokens()?;
-
-    let pressure = pressure_percent(state, window);
-    if pressure < compaction.config.pressure_percent {
+    if pressure_percent(state, window) < compaction.config.pressure_percent {
         return None;
     }
+    compact_now(state, compaction).await
+}
+
+/// Summarize regardless of the measured pressure.
+///
+/// The trigger for this one is not an estimate: the provider rejected the
+/// request for length (roadmap item C4), so the conversation is definitively
+/// too long however the estimator reads it. `[compaction].enabled = false`
+/// still suppresses it — an operator who turned summarization off did not ask
+/// for it back on a bad turn — in which case the loop answers with a
+/// truncation notice instead.
+pub async fn compact_now(state: &mut RunState, compaction: &Compaction<'_>) -> Option<Compacted> {
+    let summarizer = enabled_summarizer(compaction)?;
+    // Without a resolved window there is no budget to size the span against.
+    let window = summarizer.context_budget_tokens()?;
 
     let span_budget = (window as f64 * SPAN_SHARE_OF_WINDOW) as usize;
     let span = select_span(
@@ -174,7 +182,6 @@ pub async fn compact(state: &mut RunState, compaction: &Compaction<'_>) -> Optio
         span_items = span.items,
         replaced_chars = rendered.replaced_chars,
         summary_chars,
-        pressure_percent = pressure,
         "conversation compacted"
     );
 
@@ -183,6 +190,11 @@ pub async fn compact(state: &mut RunState, compaction: &Compaction<'_>) -> Optio
         replaced_chars: rendered.replaced_chars,
         summary_chars,
     })
+}
+
+/// The summarizer, if a deployment has one and has not turned compaction off.
+fn enabled_summarizer<'a>(compaction: &Compaction<'a>) -> Option<&'a dyn Llm> {
+    compaction.config.enabled.then_some(compaction.summarizer)?
 }
 
 /// Wrap a summary as the message a checkpoint carries.

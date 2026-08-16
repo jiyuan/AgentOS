@@ -38,6 +38,16 @@ pub enum LlmError {
     /// whole turn — a flaky stream shouldn't kill a recoverable request.
     #[error("streaming transport error: {0}")]
     StreamTransport(Arc<str>),
+    /// The provider rejected the request for exceeding the model's context
+    /// window.
+    ///
+    /// The one provider failure a run can recover from on its own, and the one
+    /// pressure trigger that is never a guess — the model itself said no.
+    /// Roadmap item C4 compacts the conversation and retries the turn once.
+    /// Distinct from [`LlmError::Provider`] so the run loop branches on a type
+    /// rather than on a substring of a provider's prose.
+    #[error("context length exceeded: {0}")]
+    ContextLengthExceeded(Arc<str>),
 }
 
 /// One event emitted while streaming a single LLM completion.
@@ -178,7 +188,13 @@ impl Orchestrator for LlmOrchestrator {
         } else {
             self.llm.complete(ctx).await
         }
-        .map_err(|err| OrchestratorError::Backend(Arc::from(err.to_string())))?;
+        .map_err(|err| match err {
+            // Keep the recoverable class typed all the way to the run loop.
+            LlmError::ContextLengthExceeded(detail) => {
+                OrchestratorError::ContextLengthExceeded(detail)
+            }
+            other => OrchestratorError::Backend(Arc::from(other.to_string())),
+        })?;
         ctx.push_llm_usage_from_message(&response);
         Ok(Plan::Reply(response))
     }
@@ -429,7 +445,7 @@ impl Llm for EnvLlm {
             "ollama" => providers::ollama::complete(&selection.model, messages, tools).await,
             other => Err(ProviderError::UnknownProvider(Arc::from(other))),
         }
-        .map_err(|err| LlmError::Provider(Arc::from(err.to_string())))?;
+        .map_err(ProviderError::into_llm_error)?;
         // Belt-and-braces: providers may forget to set the role; force Assistant.
         let mut message = message;
         message.role = MessageRole::Assistant;
@@ -475,7 +491,7 @@ impl Llm for EnvLlm {
                 ))
             }
         };
-        stream.map_err(|err| LlmError::Provider(Arc::from(err.to_string())))
+        stream.map_err(ProviderError::into_llm_error)
     }
 }
 

@@ -16,6 +16,17 @@ use thiserror::Error;
 pub enum OrchestratorError {
     #[error("orchestrator backend failed: {0}")]
     Backend(Arc<str>),
+    /// The model rejected the assembled request for exceeding its context
+    /// window.
+    ///
+    /// Separate from [`Self::Backend`] because it is the one planning failure
+    /// a run can recover from without an operator: the loop compacts the
+    /// conversation and retries the turn once (roadmap item C4). An
+    /// implementation that reaches a model **must** surface this class rather
+    /// than folding it into `Backend`, or the run will fail where it could
+    /// have continued.
+    #[error("context length exceeded: {0}")]
+    ContextLengthExceeded(Arc<str>),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
