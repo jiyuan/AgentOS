@@ -57,6 +57,18 @@ pub fn checkpoint(summary: Message, start: usize, end: usize) -> Item {
 ///   but correct — rather than hiding an unintended span, which could separate
 ///   a tool call from its result and make the request invalid.
 pub fn visible(transcript: &Transcript) -> Vec<&Item> {
+    visible_positions(transcript)
+        .into_iter()
+        .map(|position| &transcript.items[position])
+        .collect()
+}
+
+/// The positions [`visible`] keeps, in transcript order.
+///
+/// Compaction (C3) works in positions rather than items: the checkpoint it
+/// writes names the range it hides, and that range is meaningless without the
+/// index each surviving item sits at.
+pub fn visible_positions(transcript: &Transcript) -> Vec<usize> {
     let len = transcript.items.len();
     let mut shadowed = vec![false; len];
     for (position, item) in transcript.items.iter().enumerate() {
@@ -71,13 +83,7 @@ pub fn visible(transcript: &Transcript) -> Vec<&Item> {
             *hidden = true;
         }
     }
-    transcript
-        .items
-        .iter()
-        .enumerate()
-        .filter(|(position, _)| !shadowed[*position])
-        .map(|(_, item)| item)
-        .collect()
+    (0..len).filter(|position| !shadowed[*position]).collect()
 }
 
 fn shadow_range(item: &Item) -> Option<(usize, usize)> {

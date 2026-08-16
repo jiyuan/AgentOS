@@ -19,12 +19,14 @@
 //! and recalled memory on a question that has no use for either, and would let
 //! a stored fact steer routing. Keep it separate.
 
+mod compact;
 mod projection;
 mod prune;
 mod sections;
 mod tokens;
 
-pub use projection::{checkpoint, visible, TRANSCRIPT_SHADOW_KEY};
+pub use compact::{compact, is_checkpoint, select_span, Compacted, Compaction, Span};
+pub use projection::{checkpoint, visible, visible_positions, TRANSCRIPT_SHADOW_KEY};
 pub use prune::{Elision, ELIDED_BYTES_KEY, PRUNE_TRIGGER_RATIO};
 pub use sections::{SectionId, SkillPrelude};
 pub use tokens::{estimate_message, estimate_text, estimate_tool_specs};

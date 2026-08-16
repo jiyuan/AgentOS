@@ -86,6 +86,20 @@ mode = "long_connection"
 # summarised rather than destroyed. Minimum 512.
 tool_result_inline_bytes = 65536
 
+# When a conversation summarizes its own history. The session log is never
+# rewritten — a pass appends one checkpoint item and the projection folds the
+# range it covers out of what the model sees, so the full history stays on disk.
+[compaction]
+enabled = true
+# Percent of the model's context window above which the next turn summarizes
+# its oldest turns first. Above the 80% at which oversized tool output is
+# elided for free, so pruning always gets the first attempt. Provisional: the
+# token estimator's accuracy has not yet been checked against a live provider
+# (see docs/TRANSFER_ROADMAP.md C1), so tune this once it has.
+pressure_percent = 90
+# Conversation items kept verbatim after the checkpoint. Minimum 2.
+retain_tail_turns = 8
+
 [isolation]
 worker_path_env = "AGENTOS_TOOL_WORKER_PATH"
 

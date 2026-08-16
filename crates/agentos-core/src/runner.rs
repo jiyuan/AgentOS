@@ -4,6 +4,7 @@ mod episodes;
 mod task_session;
 
 use crate::memory::MemoryManager;
+use crate::prompt::Compaction;
 use crate::r#loop::{
     resume_approved, FinalOutput, InputGuardrailEntry, LoopDeps, OutputGuardrailEntry, RunError,
     RunLoopState, StartCtx, ToolGuardrailEntry,
@@ -105,6 +106,8 @@ pub struct RunnerDeps<'a> {
     /// Inline cap for tool output and where the overflow is persisted.
     /// `Default::default()` reproduces the pre-spill behavior exactly.
     pub content_limits: ContentLimits<'a>,
+    /// Who summarizes a run's history under pressure, and at what threshold.
+    pub compaction: Compaction<'a>,
 }
 
 pub trait TraceSink: Send + Sync {
@@ -319,6 +322,7 @@ pub async fn run_envelope(
         tool_guardrails: deps.tool_guardrails,
         stream_sink: deps.stream_sink.clone(),
         content_limits: deps.content_limits,
+        compaction: deps.compaction,
     };
     let mut current = RunLoopState::Start(StartCtx { state });
 
@@ -403,6 +407,7 @@ pub async fn resume_run(
         tool_guardrails: deps.tool_guardrails,
         stream_sink: deps.stream_sink.clone(),
         content_limits: deps.content_limits,
+        compaction: deps.compaction,
     };
     let mut current = match resume_approved(paused.state) {
         Ok(current) => current,
@@ -752,6 +757,7 @@ mod tests {
             tool_guardrails: &[],
             stream_sink: None,
             content_limits: Default::default(),
+            compaction: Default::default(),
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),
@@ -851,6 +857,7 @@ mod tests {
             tool_guardrails: &[],
             stream_sink: None,
             content_limits: Default::default(),
+            compaction: Default::default(),
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),
@@ -901,6 +908,7 @@ mod tests {
             tool_guardrails: &guardrails,
             stream_sink: None,
             content_limits: Default::default(),
+            compaction: Default::default(),
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),
@@ -952,6 +960,7 @@ mod tests {
             tool_guardrails: &[],
             stream_sink: None,
             content_limits: Default::default(),
+            compaction: Default::default(),
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),
@@ -1016,6 +1025,7 @@ mod tests {
             tool_guardrails: &[],
             stream_sink: None,
             content_limits: Default::default(),
+            compaction: Default::default(),
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),
@@ -1092,6 +1102,7 @@ mod tests {
             tool_guardrails: &[],
             stream_sink: None,
             content_limits: Default::default(),
+            compaction: Default::default(),
         };
         let mut metadata = BTreeMap::new();
         metadata.insert(
@@ -1378,6 +1389,7 @@ mod tests {
             tool_guardrails: &[],
             stream_sink: None,
             content_limits: Default::default(),
+            compaction: Default::default(),
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),

@@ -14,6 +14,10 @@
 //! AGENTOS_GOLDEN=record cargo test -p agentos-core --test transcripts
 //! ```
 
+// Shared by several test binaries; each uses a different subset, so the
+// unused-in-this-binary warnings are noise rather than dead code.
+#![allow(dead_code)]
+
 use agentos_core::approve::{Policy, PolicyAction, PolicyRule, PolicyVerb};
 use agentos_core::memory::InMemorySession;
 use agentos_core::runner::{RunOutcome, RunnerDeps};
@@ -282,6 +286,7 @@ pub fn runner_deps<'a>(
         tool_guardrails: &[],
         stream_sink: None,
         content_limits: Default::default(),
+        compaction: Default::default(),
     }
 }
 
