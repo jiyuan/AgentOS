@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod compaction;
+mod jobs;
 mod limits;
 mod memory;
 mod normalize;
@@ -17,6 +18,7 @@ mod orchestrator;
 mod subagents;
 
 pub use compaction::CompactionConfig;
+pub use jobs::JobsConfig;
 pub use limits::LimitsConfig;
 pub use memory::{
     MemoryConfig, MemoryPolicyConfig, MemoryQdrantConfig, MemoryReflectionConfig,
@@ -49,6 +51,7 @@ pub struct WorkspaceConfig {
     pub task_workspace: TaskWorkspaceConfig,
     pub limits: LimitsConfig,
     pub compaction: CompactionConfig,
+    pub jobs: JobsConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -265,6 +268,7 @@ impl WorkspaceConfig {
         config.validate_policy().map_err(std::io::Error::other)?;
         limits::validate_limits(&config.limits).map_err(std::io::Error::other)?;
         compaction::validate_compaction(&config.compaction).map_err(std::io::Error::other)?;
+        jobs::validate_jobs(&config.jobs).map_err(std::io::Error::other)?;
         config
             .validate_guardrails()
             .map_err(std::io::Error::other)?;
@@ -365,7 +369,7 @@ impl WorkspaceConfig {
         for tool in &self.resources.tools.enabled {
             match tool.as_ref() {
                 "shell" | "http" | "file" | "memory" | "skill_validate" | "cron_create"
-                | "cron_list" | "cron_remove" => {}
+                | "cron_list" | "cron_remove" | "job_status" | "job_output" | "job_kill" => {}
                 other => return Err(format!("unknown resources.tools.enabled entry '{other}'")),
             }
         }
@@ -782,6 +786,9 @@ stages = [
                 Arc::from("cron_create"),
                 Arc::from("cron_list"),
                 Arc::from("cron_remove"),
+                Arc::from("job_status"),
+                Arc::from("job_output"),
+                Arc::from("job_kill"),
             ]
         );
         assert_eq!(config.resources.mcp.enabled, vec![Arc::from("remote_echo")]);

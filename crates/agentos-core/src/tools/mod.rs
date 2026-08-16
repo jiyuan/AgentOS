@@ -6,7 +6,8 @@ mod registry;
 
 pub(crate) use builtin::{safe_workspace_path, skills_dir, workspace_root};
 pub use builtin::{
-    CronCreatorTool, CronListTool, CronRemoveTool, FileTool, HttpTool, ShellTool, SkillValidateTool,
+    CronCreatorTool, CronListTool, CronRemoveTool, FileTool, HttpTool, JobKillTool, JobOutputTool,
+    JobStatusTool, ShellTool, SkillValidateTool,
 };
 pub use exec::{Exec, ExecError, ExecOutput, DEFAULT_MAX_OUTPUT_BYTES};
 pub use mcp::{McpTool, StaticMcpClient, StaticMcpTool, StdioMcpClient};

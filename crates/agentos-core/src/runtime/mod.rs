@@ -3,6 +3,7 @@ use crate::config::{SubAgentConfig, WorkspaceConfig};
 use crate::guardrails::{
     MaxOutputLength, PiiFilter, ShellCommandAllowlist, SkillBundleWriteGuardrail,
 };
+use crate::jobs::JobRegistry;
 use crate::memory::{
     InMemoryMemory, MemoryManager, QdrantSemanticIndex, SemanticIndex, SqliteStore,
     SqliteVecSemanticIndex,
@@ -17,24 +18,22 @@ use crate::skills::WorkspaceSkillCatalog;
 use crate::spill::{ContentLimits, SpillStore};
 use crate::subagents::{SubAgentDefinition, SubAgentRegistry};
 use crate::task_workspace::TaskWorkspace;
-use crate::tools::{MemoryTool, StaticMcpClient, StaticMcpTool, StdioMcpClient, ToolRegistry};
-use agentos_interfaces::mcp::{McpClient, McpServer};
+use crate::tools::{MemoryTool, ToolRegistry};
 use agentos_interfaces::orchestrator::{
     Orchestrator, OrchestratorError, Plan, ResourceIndex, RunContext,
 };
-use agentos_interfaces::tool::ToolSpec;
 use agentos_llm::{EnvLlm, Llm, LlmModelController, LlmModelTier};
 use agentos_proto::AgentId;
 use async_trait::async_trait;
-use std::collections::BTreeSet;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+mod mcp_config;
+pub use mcp_config::register_configured_mcp;
 mod tools_config;
 
 use tools_config::{build_parent_tools, subagent_memory_tool_enabled, subagent_policy};
@@ -172,6 +171,7 @@ pub struct AgentRuntime {
     tool_result_inline_bytes: usize,
     summarizer: Arc<dyn Llm>,
     cancel: CancellationToken,
+    jobs: Arc<JobRegistry>,
 }
 
 impl AgentRuntime {
@@ -181,6 +181,15 @@ impl AgentRuntime {
             tool_result_inline_bytes: self.tool_result_inline_bytes,
             spill: self.spill.as_deref(),
         }
+    }
+
+    /// This runtime's background jobs (roadmap item D3).
+    ///
+    /// Exposed so a caller that knows a conversation has ended can call
+    /// [`JobRegistry::dispose_conversation`]. Nothing does yet — the runtime
+    /// has no notion of a conversation ending until G1.
+    pub fn jobs(&self) -> &Arc<JobRegistry> {
+        &self.jobs
     }
 
     /// This runtime's root cancellation token (roadmap item D1).
@@ -231,7 +240,15 @@ impl AgentRuntime {
         );
         let memory_manager =
             build_memory_manager(&workspace_config, session.clone(), semantic_factory)?;
-        let mut tools = build_parent_tools(&workspace_config, memory_manager.clone())?;
+        // One registry for the whole runtime, keyed by conversation. Jobs
+        // outlive a run, so nothing narrower can own them until G1 introduces
+        // the conversation actor that should.
+        let jobs = Arc::new(JobRegistry::new(
+            workspace_config.jobs.max_concurrent,
+            workspace_config.jobs.output_limit_bytes,
+        ));
+        let mut tools =
+            build_parent_tools(&workspace_config, memory_manager.clone(), jobs.clone())?;
         if let Some(path) = isolation_worker_path(&workspace_config) {
             tools = tools.with_subprocess_isolation(path);
         }
@@ -329,6 +346,7 @@ impl AgentRuntime {
             tool_result_inline_bytes,
             summarizer: high_llm,
             cancel: CancellationToken::new(),
+            jobs,
         })
     }
 
@@ -666,88 +684,6 @@ pub fn isolation_worker_path(config: &WorkspaceConfig) -> Option<PathBuf> {
                 .map(PathBuf::from)
         })
         .or_else(|| config.isolation.worker_path.clone())
-}
-
-pub async fn register_configured_mcp(
-    tools: &mut ToolRegistry,
-    config: &WorkspaceConfig,
-) -> Result<Vec<ToolSpec>, String> {
-    if config.mcp_servers.is_empty() || config.resources.mcp.enabled.is_empty() {
-        return Ok(Vec::new());
-    }
-    let enabled_mcp = config
-        .resources
-        .mcp
-        .enabled
-        .iter()
-        .map(Arc::clone)
-        .collect::<BTreeSet<_>>();
-
-    let static_client = Arc::new(StaticMcpClient::new(config.mcp_tools.iter().map(|tool| {
-        StaticMcpTool {
-            server_id: Arc::clone(&tool.server_id),
-            spec: ToolSpec {
-                name: Arc::clone(&tool.name),
-                description: Arc::clone(&tool.description),
-                input_schema: serde_json::json!({ "type": "object", "properties": {} }),
-                requires_isolation: tool.requires_isolation,
-                timeout_ms: None,
-            },
-            response: Arc::clone(&tool.response),
-        }
-    })));
-
-    let mut specs = Vec::new();
-    for server in &config.mcp_servers {
-        let client: Arc<dyn McpClient> =
-            if server.endpoint.starts_with("stdio://") || server.endpoint.starts_with("stdio:") {
-                // Per-server override, else the deployment's tool deadline.
-                // The 10 s constant this replaces was the last hardcoded
-                // timeout in the runtime (roadmap D2 / review finding F15).
-                let timeout = server
-                    .timeout_ms
-                    .map(Duration::from_millis)
-                    .unwrap_or_else(|| config.limits.tool_timeout());
-                Arc::new(StdioMcpClient::with_timeout(timeout))
-            } else if config
-                .mcp_tools
-                .iter()
-                .any(|tool| tool.server_id == server.id)
-                || server.endpoint.starts_with("static://")
-            {
-                static_client.clone()
-            } else {
-                return Err(format!("unsupported MCP endpoint: {}", server.endpoint));
-            };
-        specs.extend(
-            tools
-                .register_mcp_server_filtered(
-                    McpServer {
-                        id: Arc::clone(&server.id),
-                        endpoint: Arc::clone(&server.endpoint),
-                    },
-                    client,
-                    |spec| enabled_mcp.contains(&spec.name),
-                )
-                .await
-                .map_err(|err| format!("failed to register MCP server {}: {err}", server.id))?,
-        );
-    }
-    let registered = specs
-        .iter()
-        .map(|spec| Arc::clone(&spec.name))
-        .collect::<BTreeSet<_>>();
-    let missing = enabled_mcp
-        .difference(&registered)
-        .map(|name| name.as_ref())
-        .collect::<Vec<_>>();
-    if !missing.is_empty() {
-        return Err(format!(
-            "resources.mcp.enabled references unavailable MCP tool(s): {}",
-            missing.join(", ")
-        ));
-    }
-    Ok(specs)
 }
 
 fn subagent_orchestrator(
