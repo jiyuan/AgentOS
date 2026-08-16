@@ -1,0 +1,28 @@
+{
+  "outcome": {
+    "conversation_id": "golden-conversation",
+    "kind": "finished",
+    "reply": "Noted."
+  },
+  "requests": [
+    {
+      "messages": [
+        {
+          "content": "How often does the deploy key rotate?",
+          "role": "user"
+        }
+      ],
+      "tools": []
+    }
+  ],
+  "session_items": [
+    {
+      "content": "How often does the deploy key rotate?",
+      "role": "user"
+    },
+    {
+      "content": "Noted.",
+      "role": "assistant"
+    }
+  ]
+}

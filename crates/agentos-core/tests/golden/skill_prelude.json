@@ -1,0 +1,32 @@
+{
+  "outcome": {
+    "conversation_id": "golden-conversation",
+    "kind": "finished",
+    "reply": "Understood."
+  },
+  "requests": [
+    {
+      "messages": [
+        {
+          "content": "# Available workspace skills\n\nThe following workspace skills are enabled for this run. Read each skill's instructions before deciding whether to invoke its tools — the SKILL.md body is the contract the skill expects you to follow.\n\n---\n## skill: deploy-notes\n\nAlways confirm the target environment before deploying.\n",
+          "role": "system"
+        },
+        {
+          "content": "What should I check before a release?",
+          "role": "user"
+        }
+      ],
+      "tools": []
+    }
+  ],
+  "session_items": [
+    {
+      "content": "What should I check before a release?",
+      "role": "user"
+    },
+    {
+      "content": "Understood.",
+      "role": "assistant"
+    }
+  ]
+}

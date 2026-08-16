@@ -1,0 +1,32 @@
+{
+  "child_requests": [
+    {
+      "messages": [
+        {
+          "content": "Please hand this to the child.",
+          "role": "user"
+        }
+      ],
+      "tools": []
+    }
+  ],
+  "outcome": {
+    "conversation_id": "golden-conversation",
+    "kind": "finished",
+    "reply": "child said: Child handled the request."
+  },
+  "parent_session_items": [
+    {
+      "content": "Please hand this to the child.",
+      "role": "user"
+    },
+    {
+      "content": "Child handled the request.",
+      "role": "tool"
+    },
+    {
+      "content": "child said: Child handled the request.",
+      "role": "assistant"
+    }
+  ]
+}

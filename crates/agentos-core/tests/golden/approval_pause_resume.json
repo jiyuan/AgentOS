@@ -1,0 +1,91 @@
+{
+  "after_resume": {
+    "outcome": {
+      "conversation_id": "golden-conversation",
+      "kind": "finished",
+      "reply": "Ran it after you approved."
+    },
+    "requests": [
+      {
+        "messages": [
+          {
+            "content": "Echo approved for me.",
+            "role": "user"
+          }
+        ],
+        "tools": [
+          "echo"
+        ]
+      },
+      {
+        "messages": [
+          {
+            "content": "Echo approved for me.",
+            "role": "user"
+          },
+          {
+            "content": "",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "args": "{\"text\":\"approved\"}",
+                "id": "call-gated",
+                "name": "echo"
+              }
+            ]
+          },
+          {
+            "content": "approved",
+            "role": "tool",
+            "tool_call_id": "call-gated"
+          }
+        ],
+        "tools": [
+          "echo"
+        ]
+      }
+    ],
+    "session_items": [
+      {
+        "content": "Echo approved for me.",
+        "role": "user"
+      },
+      {
+        "content": "",
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "args": "{\"text\":\"approved\"}",
+            "id": "call-gated",
+            "name": "echo"
+          }
+        ]
+      },
+      {
+        "content": "approved",
+        "role": "tool",
+        "tool_call_id": "call-gated"
+      },
+      {
+        "content": "Ran it after you approved.",
+        "role": "assistant"
+      }
+    ]
+  },
+  "paused_approvals": [
+    {
+      "action": {
+        "kind": "tool_call",
+        "value": {
+          "args": {
+            "text": "approved"
+          },
+          "id": "call-gated",
+          "name": "echo"
+        }
+      },
+      "id": "approval-call-gated",
+      "status": "pending"
+    }
+  ]
+}
