@@ -4,6 +4,19 @@
     "kind": "finished",
     "reply": "Paris is the capital of France."
   },
+  "request_headers": [
+    {
+      "sections": [
+        {
+          "chars": 30,
+          "id": "transcript",
+          "messages": 1
+        }
+      ],
+      "total_chars": 30,
+      "total_messages": 1
+    }
+  ],
   "requests": [
     {
       "messages": [

@@ -5,6 +5,30 @@
       "kind": "finished",
       "reply": "Ran it after you approved."
     },
+    "request_headers": [
+      {
+        "sections": [
+          {
+            "chars": 21,
+            "id": "transcript",
+            "messages": 1
+          }
+        ],
+        "total_chars": 21,
+        "total_messages": 1
+      },
+      {
+        "sections": [
+          {
+            "chars": 29,
+            "id": "transcript",
+            "messages": 3
+          }
+        ],
+        "total_chars": 29,
+        "total_messages": 3
+      }
+    ],
     "requests": [
       {
         "messages": [

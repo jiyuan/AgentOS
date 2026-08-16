@@ -21,10 +21,11 @@
 
 mod sections;
 
-pub use sections::SectionId;
+pub use sections::{SectionId, SkillPrelude};
 
 use agentos_interfaces::orchestrator::RunContext;
-use agentos_proto::Message;
+use agentos_proto::{Message, RequestHeader, RequestSection, RequestSource};
+use std::sync::Arc;
 use tracing::info;
 
 /// One assembled provider request, plus the record of what went into it.
@@ -37,7 +38,7 @@ pub struct Prompt {
 }
 
 /// What one section contributed to a request.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SectionEntry {
     pub id: SectionId,
     /// Messages this section added.
@@ -45,6 +46,9 @@ pub struct SectionEntry {
     /// Characters this section added, as a size proxy. Token estimation is
     /// roadmap item C1 and lands on this same manifest.
     pub chars: usize,
+    /// Where this section's content can be re-derived from. Empty for the
+    /// transcript, which the run state already carries.
+    pub sources: Vec<RequestSource>,
 }
 
 /// The sections that contributed to one request, in assembly order.
@@ -72,6 +76,24 @@ impl PromptManifest {
             .find(|section| section.id == id)
             .map_or(0, |section| section.messages)
     }
+
+    /// Project this manifest into the durable header the loop traces.
+    pub fn header(&self) -> RequestHeader {
+        RequestHeader {
+            sections: self
+                .sections
+                .iter()
+                .map(|section| RequestSection {
+                    id: Arc::from(section.id.as_str()),
+                    messages: section.messages,
+                    chars: section.chars,
+                    sources: section.sources.clone(),
+                })
+                .collect(),
+            total_messages: self.total_messages(),
+            total_chars: self.total_chars(),
+        }
+    }
 }
 
 /// Assemble the messages for one provider request.
@@ -80,7 +102,7 @@ impl PromptManifest {
 /// orchestrator owns the catalog, so it renders that section and hands it in.
 /// Everything else comes from `ctx`: hydrated memory first, then the
 /// conversation, so the request still ends on the latest turn.
-pub fn assemble(ctx: &RunContext<'_>, skill_prelude: Option<&Message>) -> Prompt {
+pub fn assemble(ctx: &RunContext<'_>, skill_prelude: Option<&SkillPrelude>) -> Prompt {
     let mut messages = Vec::with_capacity(ctx.state.transcript.items.len().saturating_add(2));
     let mut manifest = PromptManifest::default();
 
@@ -89,24 +111,36 @@ pub fn assemble(ctx: &RunContext<'_>, skill_prelude: Option<&Message>) -> Prompt
             &mut messages,
             &mut manifest,
             SectionId::SkillPrelude,
-            [prelude.clone()],
+            prelude.sources(),
+            [prelude.message.clone()],
         );
     }
 
     if let Some(memory) = sections::memory_message(&ctx.memory_fragments) {
-        push_section(&mut messages, &mut manifest, SectionId::Memory, [memory]);
+        push_section(
+            &mut messages,
+            &mut manifest,
+            SectionId::Memory,
+            sections::memory_sources(&ctx.memory_fragments),
+            [memory],
+        );
     }
 
     push_section(
         &mut messages,
         &mut manifest,
         SectionId::Transcript,
+        Vec::new(),
         ctx.state
             .transcript
             .items
             .iter()
             .map(|item| item.message.clone()),
     );
+
+    // Durable record of what this request was made of, drained by the loop
+    // into a `request_header` trace event after `plan()` returns.
+    ctx.push_request_header(manifest.header());
 
     info!(
         operation = "prompt_assembly",
@@ -131,6 +165,7 @@ fn push_section(
     messages: &mut Vec<Message>,
     manifest: &mut PromptManifest,
     id: SectionId,
+    sources: Vec<RequestSource>,
     rendered: impl IntoIterator<Item = Message>,
 ) {
     let mut count = 0;
@@ -145,6 +180,7 @@ fn push_section(
             id,
             messages: count,
             chars,
+            sources,
         });
     }
 }
@@ -218,7 +254,10 @@ mod tests {
         let state = state_with(vec!["the user turn"]);
         let mut ctx = RunContext::from_state(&state);
         ctx.memory_fragments.push(fragment("a recalled fact"));
-        let prelude = Message::text(MessageRole::System, "the prelude");
+        let prelude = SkillPrelude {
+            message: Message::text(MessageRole::System, "the prelude"),
+            skills: vec![Arc::from("deploy-notes")],
+        };
 
         let prompt = assemble(&ctx, Some(&prelude));
 
@@ -251,11 +290,61 @@ mod tests {
     }
 
     #[test]
+    fn assembly_pushes_a_header_naming_its_sources() {
+        // P3: every assembled request leaves a record the loop can trace, and
+        // that record names where each section came from rather than copying
+        // it — no memory body reaches the header.
+        let state = state_with(vec!["the user turn"]);
+        let mut ctx = RunContext::from_state(&state);
+        ctx.memory_fragments.push(MemoryFragment {
+            id: Some(agentos_proto::RecordId::new("rec-7")),
+            namespace: Namespace::new("private/conversation/c/semantic/general"),
+            body: json!({ "fact": "a recalled fact" }),
+            metadata: BTreeMap::new(),
+        });
+        let prelude = SkillPrelude {
+            message: Message::text(MessageRole::System, "the prelude"),
+            skills: vec![Arc::from("deploy-notes")],
+        };
+
+        assemble(&ctx, Some(&prelude));
+
+        let headers = std::mem::take(
+            &mut *ctx
+                .request_sink
+                .lock()
+                .expect("the sink is never poisoned in tests"),
+        );
+        let [header] = headers.as_slice() else {
+            panic!("one assembly pushes exactly one header, got {headers:?}");
+        };
+        assert_eq!(header.total_messages, 3);
+        assert_eq!(
+            header.sections[0].sources,
+            vec![RequestSource::Skill(Arc::from("deploy-notes"))]
+        );
+        assert_eq!(
+            header.sections[1].sources,
+            vec![RequestSource::Memory {
+                namespace: Namespace::new("private/conversation/c/semantic/general"),
+                record_id: Some(Arc::from("rec-7")),
+            }]
+        );
+        assert!(header.sections[2].sources.is_empty());
+        // The fact itself is in the request, never in the header.
+        let rendered = serde_json::to_string(header).expect("headers serialize");
+        assert!(!rendered.contains("a recalled fact"));
+    }
+
+    #[test]
     fn manifest_totals_cover_every_contributed_message() {
         let state = state_with(vec!["a", "bb"]);
         let mut ctx = RunContext::from_state(&state);
         ctx.memory_fragments.push(fragment("f"));
-        let prelude = Message::text(MessageRole::System, "p");
+        let prelude = SkillPrelude {
+            message: Message::text(MessageRole::System, "p"),
+            skills: vec![Arc::from("s")],
+        };
 
         let prompt = assemble(&ctx, Some(&prelude));
 

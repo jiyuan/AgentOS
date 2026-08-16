@@ -7,7 +7,7 @@ use super::routing::{
 use crate::memory::{
     memory_caller_from_context, HydrationRequest, MemoryManager, MemoryStore, RetrievalStrategy,
 };
-use crate::prompt;
+use crate::prompt::{self, SkillPrelude};
 use crate::skills::{
     builtin_skill_planners, is_skill_authoring_request, SkillPlanner, WorkspaceSkillCatalog,
 };
@@ -43,9 +43,11 @@ pub struct MaxOrchestrator {
     /// Classifier domain catalog JSON, precomputed by
     /// [`Self::with_routing_table`] — the table is fixed per orchestrator.
     routing_domains_json: Arc<str>,
-    /// Concatenated SKILL.md prelude, precomputed by
-    /// [`Self::with_skill_catalog`] — the catalog is fixed per orchestrator.
-    skill_prelude: Option<Message>,
+    /// Concatenated SKILL.md prelude plus the skill names it was built from,
+    /// precomputed by [`Self::with_skill_catalog`] — the catalog is fixed per
+    /// orchestrator. The names travel with the message so the request header
+    /// can record where the section came from without copying its body.
+    skill_prelude: Option<SkillPrelude>,
 }
 
 impl Default for MaxOrchestrator {
@@ -554,11 +556,12 @@ impl MaxOrchestrator {
     }
 }
 
-fn build_skill_prelude(catalog: &WorkspaceSkillCatalog) -> Option<Message> {
+fn build_skill_prelude(catalog: &WorkspaceSkillCatalog) -> Option<SkillPrelude> {
     let skills = catalog.skills().collect::<Vec<_>>();
     if skills.is_empty() {
         return None;
     }
+    let names = skills.iter().map(|skill| Arc::clone(&skill.name)).collect();
     let mut body = String::from(
         "# Available workspace skills\n\n\
          The following workspace skills are enabled for this run. Read \
@@ -575,7 +578,10 @@ fn build_skill_prelude(catalog: &WorkspaceSkillCatalog) -> Option<Message> {
             body.push('\n');
         }
     }
-    Some(Message::text(MessageRole::System, body))
+    Some(SkillPrelude {
+        message: Message::text(MessageRole::System, body),
+        skills: names,
+    })
 }
 
 fn resource_index_from_tools(tools: &[ToolSpec]) -> ResourceIndex {
@@ -626,7 +632,7 @@ mod tests {
             },
         ]);
         let orch = MaxOrchestrator::default().with_skill_catalog(catalog);
-        let prelude = orch.skill_prelude.expect("prelude expected");
+        let prelude = orch.skill_prelude.expect("prelude expected").message;
         assert_eq!(prelude.role, MessageRole::System);
         let body = prelude.content.as_ref();
         assert!(body.contains("## skill: skill-creator"));

@@ -4,6 +4,19 @@
     "kind": "finished",
     "reply": "Digest complete."
   },
+  "request_headers": [
+    {
+      "sections": [
+        {
+          "chars": 25,
+          "id": "transcript",
+          "messages": 1
+        }
+      ],
+      "total_chars": 25,
+      "total_messages": 1
+    }
+  ],
   "requests": [
     {
       "messages": [
