@@ -20,6 +20,7 @@ serde_json.workspace = true
 sqlite-vec.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "fs"] }
+tokio-util.workspace = true
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 toml.workspace = true
 tracing.workspace = true

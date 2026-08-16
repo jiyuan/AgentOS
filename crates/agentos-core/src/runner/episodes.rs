@@ -144,7 +144,12 @@ pub(super) async fn record_error_episode(
         | RunError::Guardrail(_)
         | RunError::GuardrailTripped { .. }
         | RunError::TaskWorkspace(_)
-        | RunError::SubAgent(_) => EpisodeOutcome::Failed,
+        | RunError::SubAgent(_)
+        // Unreachable by construction: `act` turns cancellation into a
+        // terminal stop notice, so it never propagates this far. Classified
+        // rather than `unreachable!()` because an episode record is not worth
+        // a panic if a future path ever does surface it.
+        | RunError::Cancelled => EpisodeOutcome::Failed,
     };
     let mut metadata = BTreeMap::new();
     metadata.insert(Arc::from("error"), Value::String(err.to_string()));

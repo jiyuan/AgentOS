@@ -90,14 +90,27 @@ pub(super) async fn compact_under_pressure(
     deps: &LoopDeps<'_>,
     plan_span_id: &SpanId,
 ) {
-    let compacted = crate::prompt::compact(state, &deps.compaction).await;
+    // Racing the token here is C3's outstanding promise: summarization is an
+    // LLM round-trip inside the planning path, so a run cancelled while it is
+    // in flight must drop it rather than pay for a summary nobody will read.
+    let compacted = super::unless_cancelled(
+        &deps.cancel,
+        crate::prompt::compact(state, &deps.compaction),
+    )
+    .await
+    .flatten();
     record_compaction(state, deps, plan_span_id, compacted, "pressure");
 }
 
 /// Summarize regardless of the measured pressure. `false` when there was
 /// nothing to summarize.
 async fn compact_now(state: &mut RunState, deps: &LoopDeps<'_>, plan_span_id: &SpanId) -> bool {
-    let compacted = crate::prompt::compact_now(state, &deps.compaction).await;
+    let compacted = super::unless_cancelled(
+        &deps.cancel,
+        crate::prompt::compact_now(state, &deps.compaction),
+    )
+    .await
+    .flatten();
     let did = compacted.is_some();
     record_compaction(state, deps, plan_span_id, compacted, "overflow");
     did
@@ -161,6 +174,7 @@ async fn attempt(
 
     let mut run_ctx = RunContext::from_state(state);
     run_ctx.stream_sink = deps.stream_sink.clone();
+    run_ctx.cancel = deps.cancel.clone();
     let hydrated = deps.orchestrator.hydrate(&mut run_ctx).await;
 
     let mut hydrate_fields = BTreeMap::new();
@@ -361,6 +375,7 @@ mod tests {
             tool_guardrails: &[],
             stream_sink: None,
             content_limits: Default::default(),
+            cancel: Default::default(),
             compaction: Compaction {
                 summarizer,
                 config: CompactionConfig::default(),

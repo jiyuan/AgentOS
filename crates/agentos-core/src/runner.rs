@@ -36,6 +36,7 @@ use task_session::{
     persist_items as persist_task_session_items, task_id_for_state,
 };
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 #[derive(Debug, Error)]
@@ -108,6 +109,9 @@ pub struct RunnerDeps<'a> {
     pub content_limits: ContentLimits<'a>,
     /// Who summarizes a run's history under pressure, and at what threshold.
     pub compaction: Compaction<'a>,
+    /// Cancels this run. Clone it before starting the run to keep a handle;
+    /// a default token is never cancelled.
+    pub cancel: CancellationToken,
 }
 
 pub trait TraceSink: Send + Sync {
@@ -323,6 +327,7 @@ pub async fn run_envelope(
         stream_sink: deps.stream_sink.clone(),
         content_limits: deps.content_limits,
         compaction: deps.compaction,
+        cancel: deps.cancel.clone(),
     };
     let mut current = RunLoopState::Start(StartCtx { state });
 
@@ -408,6 +413,7 @@ pub async fn resume_run(
         stream_sink: deps.stream_sink.clone(),
         content_limits: deps.content_limits,
         compaction: deps.compaction,
+        cancel: deps.cancel.clone(),
     };
     let mut current = match resume_approved(paused.state) {
         Ok(current) => current,
@@ -758,6 +764,7 @@ mod tests {
             stream_sink: None,
             content_limits: Default::default(),
             compaction: Default::default(),
+            cancel: Default::default(),
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),
@@ -858,6 +865,7 @@ mod tests {
             stream_sink: None,
             content_limits: Default::default(),
             compaction: Default::default(),
+            cancel: Default::default(),
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),
@@ -909,6 +917,7 @@ mod tests {
             stream_sink: None,
             content_limits: Default::default(),
             compaction: Default::default(),
+            cancel: Default::default(),
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),
@@ -961,6 +970,7 @@ mod tests {
             stream_sink: None,
             content_limits: Default::default(),
             compaction: Default::default(),
+            cancel: Default::default(),
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),
@@ -1026,6 +1036,7 @@ mod tests {
             stream_sink: None,
             content_limits: Default::default(),
             compaction: Default::default(),
+            cancel: Default::default(),
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),
@@ -1103,6 +1114,7 @@ mod tests {
             stream_sink: None,
             content_limits: Default::default(),
             compaction: Default::default(),
+            cancel: Default::default(),
         };
         let mut metadata = BTreeMap::new();
         metadata.insert(
@@ -1390,6 +1402,7 @@ mod tests {
             stream_sink: None,
             content_limits: Default::default(),
             compaction: Default::default(),
+            cancel: Default::default(),
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),

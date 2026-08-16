@@ -84,7 +84,10 @@ pub(super) async fn execute_delegate(
             return Err(error.into());
         }
     };
-    let invocation = match subagents.prepare(spec, deps.policy, input, run_id) {
+    let invocation = match subagents
+        .prepare(spec, deps.policy, input, run_id)
+        .map(|invocation| invocation.with_cancel(&deps.cancel))
+    {
         Ok(invocation) => invocation,
         Err(error) => {
             record_subagent_failure(state, deps, span_id, spec, "subagent_create_failed", &error);
@@ -183,7 +186,9 @@ pub(super) async fn execute_resume_delegate(
         message: Message::text(MessageRole::User, ""),
         metadata: BTreeMap::new(),
     };
-    let invocation = subagents.prepare(spec, deps.policy, input, paused.state.run_id.clone())?;
+    let invocation = subagents
+        .prepare(spec, deps.policy, input, paused.state.run_id.clone())?
+        .with_cancel(&deps.cancel);
     match Box::pin(invocation.resume(paused, ResumeDecision::Approve)).await? {
         SubAgentRun::Finished(result) => {
             let parent_id = trace::run_span_id(state);

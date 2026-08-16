@@ -674,6 +674,59 @@ delegation needs.
   outcome and the child process is reaped; cancelling a parent cancels its
   sub-agent.
 - Exit: every blocking call in a run observes one token.
+- **Status: done, except the subprocess half of the Verify** (2026-08-16). One
+  `tokio_util::sync::CancellationToken` per run, carried on `RunnerDeps` →
+  `LoopDeps` → every `RunContext` the loop builds, with a child token per
+  delegation. `tests/cancellation.rs` covers the four cases end to end. Notes:
+  - **Cancellation finishes the run; it does not fail it.** The same choice
+    `max_turns` and C4 already make, but it matters more here: the runner only
+    appends a run's new transcript items to the session on the success path, so
+    returning `Err` would have discarded the tool results the run had already
+    produced — exactly the work a user who pressed stop most wants kept.
+    `cancelling_mid_tool_stops_the_run_and_keeps_its_work` asserts the earlier
+    tool output survives in the session.
+  - **The race is `biased`.** Without it `select!` polls a ready branch at
+    random, so an already-cancelled run could still dispatch one more tool call.
+    `an_already_cancelled_token_never_starts_the_work` pins it.
+  - **Sub-agents get a child token, not the parent's.** Cancelling a parent
+    stops the whole delegation tree; a sub-agent stopping itself leaves the
+    parent free to use what it got. Both directions are asserted.
+  - **C3's outstanding promise is now kept.** The summarizer call is an LLM
+    round-trip inside the planning path, and it is raced against the token, so
+    a run cancelled mid-summarization drops it rather than paying for a summary
+    nobody will read.
+  - **The `Tool` trait did not need to change**, contrary to the Files list
+    above. `call_with_context` already hands tools a `RunContext`, so putting
+    the token there gives every tool a path to observe it without breaking a
+    single implementation. `RunContext::is_cancelled()` is the cooperative
+    check for tools that do several units of work per call.
+  - **`RunError::Cancelled` never reaches a caller.** It exists only to carry
+    cancellation up from the tool path, which is several frames deep; `act`
+    converts it into the terminal stop notice.
+  - **The subprocess half of the Verify is NOT met.** "the child process is
+    reaped" cannot hold yet: `ShellTool` and the isolation worker both block a
+    Tokio worker on `std::process`, so `select!` never gets to poll the
+    cancellation branch until they return. Cancellation is real for anything
+    that *awaits* — an HTTP request, a `tokio::process` child — and inert for
+    anything that blocks. That is precisely what **D2** (async subprocess
+    execution) exists to fix, and D2 now has a token to hang off. The test
+    suite uses an awaiting tool for this reason, and `loop/cancel.rs` documents
+    the limitation where someone debugging it would look.
+  - **Benchmark impact is real and was not optimised away:** `reply_turn`
+    1.19 → 1.46 µs (+23%), `tool_turn_allow` 3.25 → 3.93 µs (+21%),
+    `ask_user_pause_resume` 7.71 → 8.46 µs. `paused_state_json_round_trip` is
+    flat at 3.54 µs, which is the control — it touches no loop state, so its
+    flatness confirms the others moved for a real reason. The cost is ~270 ns
+    per raced await, from `CancellationToken::cancelled()` registering a waker.
+    A cancellation that only takes effect *between* awaits cannot stop an LLM
+    call thirty seconds into a response, which is the case users actually want
+    stopped, so the race stays. `BENCHMARKS.md` records the figures and the
+    reasoning.
+  - Interface impact, machine-verified with `--baseline-rev HEAD`:
+    `agentos-interfaces` major (`constructible_struct_adds_field` for
+    `RunContext.cancel`) — the same pattern as `usage_sink`, `stream_sink`, and
+    `request_sink`, exactly as the Risk line predicted. `agentos-proto` and
+    `agentos-llm` unchanged.
 
 ### D2. Tool deadlines and async subprocess execution (F3)
 
@@ -960,7 +1013,7 @@ the result in the PR.
 | C2 | `RequestHeader` gains `elided_messages`/`elided_chars` | **Verified**: proto major (`constructible_struct_adds_field`), interfaces and llm unchanged |
 | C3 | None — compaction is entirely inside `agentos-core` | **Verified**: interfaces, proto, and llm all report no semver update required |
 | C4 | `OrchestratorError` and `LlmError` gain a `ContextLengthExceeded` variant; `ProviderError` gains `ContextLength` | **Verified**: interfaces and llm major (`enum_variant_added`), proto unchanged |
-| D1 | `RunContext` gains a cancellation field | Breaking; same pattern as `usage_sink`, `stream_sink`, `request_sink` |
+| D1 | `RunContext` gains a cancellation field | **Verified**: interfaces major (`constructible_struct_adds_field`), proto and llm unchanged. `Tool` was *not* changed — `call_with_context` already carries the context |
 | D2 | `ToolSpec` gains `timeout_ms` (`#[serde(default)]`) | Breaking on struct literals; additive on wire |
 | X1 (b) | `Plan::CallTool` carries a batch | Breaking |
 | X2 | `ToolSpec.requires_isolation` → sandbox mode | Breaking |

@@ -204,6 +204,7 @@ fn runner_deps<'a>(
         stream_sink: None,
         content_limits: Default::default(),
         compaction: Default::default(),
+        cancel: Default::default(),
     }
 }
 

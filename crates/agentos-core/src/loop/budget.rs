@@ -102,7 +102,8 @@ pub(super) async fn budget_exhausted_finish(
 
     let message = budget_exhausted_message(&state, deps.max_turns);
     let guardrail_tripped = {
-        let run_ctx = RunContext::from_state(&state);
+        let mut run_ctx = RunContext::from_state(&state);
+        run_ctx.cancel = deps.cancel.clone();
         let mut tripped = false;
         for entry in deps.output_guardrails {
             match entry.guardrail.check(&message, &run_ctx).await {
