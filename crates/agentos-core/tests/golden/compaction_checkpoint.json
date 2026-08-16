@@ -1,0 +1,57 @@
+{
+  "outcome": {
+    "conversation_id": "golden-conversation",
+    "kind": "finished",
+    "reply": "Following up on that."
+  },
+  "request_headers": [
+    {
+      "sections": [
+        {
+          "chars": 71,
+          "id": "transcript",
+          "messages": 2
+        }
+      ],
+      "total_chars": 71,
+      "total_messages": 2
+    }
+  ],
+  "requests": [
+    {
+      "messages": [
+        {
+          "content": "[summary: we discussed the first topic]",
+          "role": "user"
+        },
+        {
+          "content": "and what about the second topic?",
+          "role": "user"
+        }
+      ],
+      "tools": []
+    }
+  ],
+  "session_items": [
+    {
+      "content": "first question",
+      "role": "user"
+    },
+    {
+      "content": "first answer",
+      "role": "assistant"
+    },
+    {
+      "content": "[summary: we discussed the first topic]",
+      "role": "user"
+    },
+    {
+      "content": "and what about the second topic?",
+      "role": "user"
+    },
+    {
+      "content": "Following up on that.",
+      "role": "assistant"
+    }
+  ]
+}

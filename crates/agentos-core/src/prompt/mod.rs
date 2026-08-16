@@ -19,8 +19,10 @@
 //! and recalled memory on a question that has no use for either, and would let
 //! a stored fact steer routing. Keep it separate.
 
+mod projection;
 mod sections;
 
+pub use projection::{checkpoint, visible, TRANSCRIPT_SHADOW_KEY};
 pub use sections::{SectionId, SkillPrelude};
 
 use agentos_interfaces::orchestrator::RunContext;
@@ -126,15 +128,15 @@ pub fn assemble(ctx: &RunContext<'_>, skill_prelude: Option<&SkillPrelude>) -> P
         );
     }
 
+    // The projected view, not the raw log: a checkpoint written by compaction
+    // hides the span it summarizes without anything having been deleted.
     push_section(
         &mut messages,
         &mut manifest,
         SectionId::Transcript,
         Vec::new(),
-        ctx.state
-            .transcript
-            .items
-            .iter()
+        projection::visible(&ctx.state.transcript)
+            .into_iter()
             .map(|item| item.message.clone()),
     );
 

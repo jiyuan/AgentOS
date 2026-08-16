@@ -388,7 +388,58 @@ async fn golden_cron_ephemeral_scope() {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Hydrated memory
+// 7. Compaction checkpoint
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn golden_compaction_checkpoint() {
+    // The P2 split, end to end: the session log keeps every item, while the
+    // request carries only the projected view. A checkpoint summarizing the
+    // first two turns hides them from the model without anything having been
+    // deleted — the shape compaction (C3) will write.
+    let session = InMemorySession::default();
+    let conversation = ConversationId::new(CONVERSATION);
+    session
+        .append(
+            &conversation,
+            vec![
+                Item {
+                    message: Message::text(MessageRole::User, "first question"),
+                    metadata: BTreeMap::new(),
+                },
+                Item {
+                    message: Message::text(MessageRole::Assistant, "first answer"),
+                    metadata: BTreeMap::new(),
+                },
+                agentos_core::prompt::checkpoint(
+                    Message::text(MessageRole::User, "[summary: we discussed the first topic]"),
+                    0,
+                    1,
+                ),
+            ],
+        )
+        .await
+        .expect("seeding the session succeeds");
+
+    let llm = Arc::new(ScriptedLlm::new([assistant("Following up on that.")]));
+    let orchestrator = max_with(llm.clone(), Vec::new());
+    let policy = Policy::default();
+    let deps = runner_deps(&orchestrator, &session, &policy, None, None);
+
+    let outcome = run_envelope(
+        user_envelope("and what about the second topic?"),
+        RunId::new("golden-checkpoint"),
+        &deps,
+    )
+    .await
+    .expect("a checkpointed run finishes");
+
+    let transcript = session.load(&conversation).await.expect("session loads");
+    scenario_golden("compaction_checkpoint", &llm, &transcript, &outcome);
+}
+
+// ---------------------------------------------------------------------------
+// 8. Hydrated memory
 // ---------------------------------------------------------------------------
 
 /// Build a manager holding one semantic fact in the run's conversation scope.
