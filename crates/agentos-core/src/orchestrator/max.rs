@@ -242,7 +242,7 @@ impl MaxOrchestrator {
                 &self.available_tools,
             )
             .await
-            .map_err(|err| OrchestratorError::Backend(Arc::from(err.to_string())))?;
+            .map_err(super::planning_error)?;
             ctx.push_llm_usage_from_message(&response);
             if let Some(first) = response.tool_calls.first().cloned() {
                 return Ok(Plan::CallTool(first));
@@ -296,6 +296,11 @@ impl MaxOrchestrator {
         input: &str,
     ) -> Result<Option<&RoutingRule>, OrchestratorError> {
         let messages = routing_classifier_messages(input, &self.routing_domains_json);
+        // Deliberately not `planning_error`: the classifier prompt is two
+        // fixed messages that carry none of the conversation, so compacting
+        // the transcript could not shorten it. Surfacing this as recoverable
+        // would spend a summarization call and a retry on a request that will
+        // fail identically.
         let response = llm
             .complete_messages(&messages, &[])
             .await

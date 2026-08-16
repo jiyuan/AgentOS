@@ -23,6 +23,7 @@ mod budget;
 mod delegate;
 mod escalate;
 mod items;
+mod planning;
 mod request;
 mod telemetry;
 
@@ -258,91 +259,26 @@ async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunErro
         BTreeMap::new(),
     );
 
-    // Before hydration, so a compacted transcript is what recall and the
-    // orchestrator both see. One call, no new state: the trigger is the
-    // pressure C1 already recorded on the last request, and the result is one
-    // appended checkpoint that P2's projection folds out.
-    if let Some(compacted) = crate::prompt::compact(&mut state, &deps.compaction).await {
-        let mut fields = BTreeMap::new();
-        fields.insert(field_key("span_start"), Value::from(compacted.span.start));
-        fields.insert(field_key("span_end"), Value::from(compacted.span.end));
-        fields.insert(field_key("span_items"), Value::from(compacted.span.items));
-        fields.insert(
-            field_key("replaced_chars"),
-            Value::from(compacted.replaced_chars),
-        );
-        fields.insert(
-            field_key("summary_chars"),
-            Value::from(compacted.summary_chars),
-        );
-        trace::record_event(
-            &mut state,
-            deps.hooks,
-            plan_span_id.clone(),
-            "conversation_compacted",
-            fields,
-        );
-    }
+    // C3: summarize the oldest span if the run is already over the configured
+    // pressure, before hydration so recall and the orchestrator both see the
+    // compacted transcript.
+    planning::compact_under_pressure(&mut state, deps, &plan_span_id).await;
 
-    let hydrate_span_id = trace::record_span(
+    // C4: one attempt, and if the provider rejects it for length, one forced
+    // compaction and one retry. A second rejection comes back as a plan
+    // carrying a truncation notice, which the reply arm below then takes
+    // through the output guardrails like any other answer.
+    let mut pending_usage = Vec::new();
+    let mut pending_requests = Vec::new();
+    let plan = planning::plan_with_overflow_recovery(
         &mut state,
-        Some(plan_span_id.clone()),
-        SpanKind::State,
-        "orchestrator.hydrate",
-        BTreeMap::new(),
-    );
-    trace::record_event(
-        &mut state,
-        deps.hooks,
-        hydrate_span_id.clone(),
-        "hydrate_started",
-        BTreeMap::new(),
-    );
-    let mut run_ctx = RunContext::from_state(&state);
-    run_ctx.stream_sink = deps.stream_sink.clone();
-    deps.orchestrator.hydrate(&mut run_ctx).await?;
-    let mut hydrate_fields = BTreeMap::new();
-    hydrate_fields.insert(
-        field_key("memory_fragments"),
-        Value::from(run_ctx.memory_fragments.len()),
-    );
-    hydrate_fields.insert(
-        field_key("resources"),
-        Value::from(run_ctx.resource_index.entries.len()),
-    );
-    for key in [
-        "memory_hydration_candidate_count",
-        "memory_hydration_selected_count",
-        "memory_hydration_namespace_count",
-    ] {
-        if let Some(value) = run_ctx.system.metadata.get(key) {
-            hydrate_fields.insert(Arc::from(key), value.clone());
-        }
-    }
-    let plan = deps.orchestrator.plan(&run_ctx).await?;
-    // The sink is append-only, so even a poisoned guard (an orchestrator
-    // panicked mid-push) holds a structurally valid Vec — recover it rather
-    // than propagating the panic into the run loop.
-    let pending_usage = std::mem::take(
-        &mut *run_ctx
-            .usage_sink
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-    );
-    let pending_requests = std::mem::take(
-        &mut *run_ctx
-            .request_sink
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-    );
-    drop(run_ctx);
-    trace::record_event(
-        &mut state,
-        deps.hooks,
-        hydrate_span_id,
-        "hydrate_finished",
-        hydrate_fields,
-    );
+        deps,
+        &plan_span_id,
+        &mut pending_usage,
+        &mut pending_requests,
+    )
+    .await?;
+
     trace::record_span(
         &mut state,
         Some(plan_span_id.clone()),

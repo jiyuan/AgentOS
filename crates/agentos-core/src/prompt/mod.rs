@@ -25,7 +25,7 @@ mod prune;
 mod sections;
 mod tokens;
 
-pub use compact::{compact, is_checkpoint, select_span, Compacted, Compaction, Span};
+pub use compact::{compact, compact_now, is_checkpoint, select_span, Compacted, Compaction, Span};
 pub use projection::{checkpoint, visible, visible_positions, TRANSCRIPT_SHADOW_KEY};
 pub use prune::{Elision, ELIDED_BYTES_KEY, PRUNE_TRIGGER_RATIO};
 pub use sections::{SectionId, SkillPrelude};
