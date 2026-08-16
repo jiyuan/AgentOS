@@ -1,3 +1,4 @@
+use crate::prompt;
 use agentos_interfaces::orchestrator::{Orchestrator, OrchestratorError, Plan, RunContext};
 use agentos_interfaces::tool::ToolSpec;
 use agentos_llm::Llm;
@@ -46,15 +47,12 @@ impl MinOrchestrator {
 #[async_trait]
 impl Orchestrator for MinOrchestrator {
     async fn plan(&self, ctx: &RunContext<'_>) -> Result<Plan, OrchestratorError> {
-        let messages = ctx
-            .state
-            .transcript
-            .items
-            .iter()
-            .map(|item| item.message.clone())
-            .collect::<Vec<_>>();
+        // `Min` carries no skill catalog, but it still assembles through the
+        // one authority — so hydrated memory reaches it too, and a section
+        // added later needs no change here.
+        let prompt = prompt::assemble(ctx, None);
         let response =
-            super::streaming::complete_message(&*self.llm, ctx, &messages, &self.tool_specs)
+            super::streaming::complete_message(&*self.llm, ctx, &prompt.messages, &self.tool_specs)
                 .await
                 .map_err(|err| OrchestratorError::Backend(Arc::from(err.to_string())))?;
         ctx.push_llm_usage_from_message(&response);

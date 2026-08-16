@@ -1,0 +1,28 @@
+{
+  "outcome": {
+    "conversation_id": "golden-conversation",
+    "kind": "finished",
+    "reply": "Digest complete."
+  },
+  "requests": [
+    {
+      "messages": [
+        {
+          "content": "Run the scheduled digest.",
+          "role": "user"
+        }
+      ],
+      "tools": []
+    }
+  ],
+  "session_items": [
+    {
+      "content": "earlier chat message",
+      "role": "user"
+    },
+    {
+      "content": "earlier assistant reply",
+      "role": "assistant"
+    }
+  ]
+}

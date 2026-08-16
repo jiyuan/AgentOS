@@ -1,0 +1,73 @@
+{
+  "outcome": {
+    "conversation_id": "golden-conversation",
+    "kind": "finished",
+    "reply": "The tool said: pong"
+  },
+  "requests": [
+    {
+      "messages": [
+        {
+          "content": "Echo pong for me.",
+          "role": "user"
+        }
+      ],
+      "tools": [
+        "echo"
+      ]
+    },
+    {
+      "messages": [
+        {
+          "content": "Echo pong for me.",
+          "role": "user"
+        },
+        {
+          "content": "",
+          "role": "assistant",
+          "tool_calls": [
+            {
+              "args": "{\"text\":\"pong\"}",
+              "id": "call-1",
+              "name": "echo"
+            }
+          ]
+        },
+        {
+          "content": "pong",
+          "role": "tool",
+          "tool_call_id": "call-1"
+        }
+      ],
+      "tools": [
+        "echo"
+      ]
+    }
+  ],
+  "session_items": [
+    {
+      "content": "Echo pong for me.",
+      "role": "user"
+    },
+    {
+      "content": "",
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "args": "{\"text\":\"pong\"}",
+          "id": "call-1",
+          "name": "echo"
+        }
+      ]
+    },
+    {
+      "content": "pong",
+      "role": "tool",
+      "tool_call_id": "call-1"
+    },
+    {
+      "content": "The tool said: pong",
+      "role": "assistant"
+    }
+  ]
+}

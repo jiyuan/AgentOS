@@ -7,6 +7,7 @@ use super::routing::{
 use crate::memory::{
     memory_caller_from_context, HydrationRequest, MemoryManager, MemoryStore, RetrievalStrategy,
 };
+use crate::prompt;
 use crate::skills::{
     builtin_skill_planners, is_skill_authoring_request, SkillPlanner, WorkspaceSkillCatalog,
 };
@@ -218,30 +219,17 @@ impl MaxOrchestrator {
             // `llm.complete(ctx)` default sends no `tools` field, so models
             // reply with "I can't modify files" even when tools are registered.
             //
-            // Prepend the enabled skills' SKILL.md bodies as a system message
-            // so the LLM has the "how to use this skill" guidance — not just
-            // the one-line description that lives in the resource index.
-            // Without this, a sub-agent with `skills = ["skill-creator"]`
-            // sees only generic file / validation tools and never reads the
-            // SKILL.md workflow that says to plan the bundle, write support
-            // resources before SKILL.md, validate, then inspect the validator
-            // inventory before the final response.
-            let mut messages: Vec<Message> =
-                Vec::with_capacity(ctx.state.transcript.items.len() + 1);
-            if let Some(prelude) = self.skill_prelude_message() {
-                messages.push(prelude);
-            }
-            messages.extend(
-                ctx.state
-                    .transcript
-                    .items
-                    .iter()
-                    .map(|item| item.message.clone()),
-            );
+            // `prompt::assemble` is the only path to a provider request: it
+            // prepends the enabled skills' SKILL.md bodies (the "how to use
+            // this skill" guidance, not just the one-line resource-index
+            // description) and the memory fragments `hydrate()` selected, then
+            // the conversation. Building a message vector here instead is what
+            // let hydrated memory be computed and dropped (finding F1).
+            let prompt = prompt::assemble(ctx, self.skill_prelude.as_ref());
             let response = super::streaming::complete_message(
                 llm.as_ref(),
                 ctx,
-                &messages,
+                &prompt.messages,
                 &self.available_tools,
             )
             .await
@@ -259,12 +247,6 @@ impl MaxOrchestrator {
             return Ok(max_plan);
         }
         self.plan_internal(ctx, true).await
-    }
-
-    fn skill_prelude_message(&self) -> Option<Message> {
-        // Precomputed by `with_skill_catalog`: the catalog is fixed per
-        // orchestrator, and this clone is Arc-backed and cheap.
-        self.skill_prelude.clone()
     }
 
     async fn route_user_text_with_llm(
@@ -644,7 +626,7 @@ mod tests {
             },
         ]);
         let orch = MaxOrchestrator::default().with_skill_catalog(catalog);
-        let prelude = orch.skill_prelude_message().expect("prelude expected");
+        let prelude = orch.skill_prelude.expect("prelude expected");
         assert_eq!(prelude.role, MessageRole::System);
         let body = prelude.content.as_ref();
         assert!(body.contains("## skill: skill-creator"));
@@ -656,7 +638,7 @@ mod tests {
     #[test]
     fn skill_prelude_message_is_none_when_catalog_empty() {
         let orch = MaxOrchestrator::default();
-        assert!(orch.skill_prelude_message().is_none());
+        assert!(orch.skill_prelude.is_none());
     }
 
     #[test]

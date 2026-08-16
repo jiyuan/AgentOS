@@ -14,6 +14,7 @@ pub(crate) mod http;
 pub mod r#loop;
 pub mod memory;
 pub mod orchestrator;
+pub mod prompt;
 pub mod runner;
 pub mod runtime;
 pub mod skills;
