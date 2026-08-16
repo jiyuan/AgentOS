@@ -6,13 +6,18 @@
   },
   "request_headers": [
     {
+      "context_budget_tokens": 4096,
+      "pressure_percent": 0,
+      "prompt_estimated_tokens": 12,
       "sections": [
         {
           "chars": 30,
           "id": "transcript",
-          "messages": 1
+          "messages": 1,
+          "tokens": 12
         }
       ],
+      "tool_tokens": 0,
       "total_chars": 30,
       "total_messages": 1
     }

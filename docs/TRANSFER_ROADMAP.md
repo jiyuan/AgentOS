@@ -342,6 +342,50 @@ otherwise be guessing at.
 - Verify: `cargo test -p agentos-core prompt::tokens`; estimate is within ~15% of
   a provider-reported `Usage.prompt_tokens` on a recorded run.
 - Exit: every turn traces `prompt_estimated_tokens` and `context_budget_tokens`.
+- **Status: done, with the accuracy check outstanding** (2026-08-15). The exit
+  condition holds: every golden's `request_headers` now carries
+  `prompt_estimated_tokens`, `context_budget_tokens`, `tool_tokens`, and an
+  integer `pressure_percent`, and each section carries its own token estimate.
+  Notes:
+  - **The estimator uses two rates, not one.** Four ASCII characters per token,
+    but one token per non-ASCII character. The usual 4:1 rule describes English
+    and under-counts Chinese by about four times — and this deployment runs
+    Feishu and Telegram against DeepSeek, so mixed CJK traffic is the normal
+    case. A single divisor would have made the pressure signal useless for the
+    traffic it was built for.
+  - **It is deliberately biased high.** One token per wide character
+    over-estimates some scripts by up to half. That is the safe direction: an
+    over-estimate compacts early, an under-estimate lets a request hit the
+    provider's hard limit with no compaction attempted, which is the failure C4
+    exists to recover from.
+  - **Tool schemas are counted.** They carry no messages but occupy the same
+    window, and they are not marginal: in `golden/tool_call_allowed.json` one
+    `echo` tool costs 31 tokens against a 40-token first request. A section-only
+    estimate would have been badly low for any tool-enabled agent.
+  - **An unknown model resolves to no budget, never a default.** Budget
+    resolution is a new defaulted `Llm::context_budget_tokens()` — only the
+    provider adapter knows which model a request reaches — backed by a
+    prefix-matched table of published windows in `agentos-llm`, longest prefix
+    winning so `gpt-4o` is not budgeted as `gpt-4`. Compaction against an
+    invented window would be worse than no pressure signal, so unknown models
+    trace an estimate and no pressure. `AGENTOS_CONTEXT_BUDGET_TOKENS`
+    overrides the table for self-hosted or proxied models; X3 should move it
+    into `agent.toml` beside the compaction thresholds.
+  - **The ~15% accuracy check is NOT done and cannot be done from here.** It
+    needs a live provider call, which this environment has no key for. The
+    mechanism to run it exists and is documented in `prompt/tokens.rs`: a
+    request's estimate is on its `request_header` event and the provider's own
+    `input_tokens` is on the `llm_token_usage` event under the same plan span,
+    so comparing them across a deployment's traces measures the true error rate.
+    Pair by span, not by position — a routing classifier round-trip records
+    usage with no header. **C3 must not pick thresholds until this has been run
+    against real traffic**, which was the entire argument for shipping C1 alone.
+  - Interface impact, machine-verified with `--baseline-rev HEAD`:
+    `agentos-interfaces` and `agentos-llm` unchanged (a defaulted trait method
+    is additive); `agentos-proto` reports one major
+    (`constructible_struct_adds_field`) for the token fields on `RequestHeader`
+    and `RequestSection` — types introduced by P3 one commit earlier, with no
+    consumers outside this workspace.
 
 ### C2. Tool-result pruning and output spill (F2, F6)
 
@@ -721,6 +765,7 @@ the result in the PR.
 | Item | Change | Expected |
 |---|---|---|
 | P3 | `RunContext` gains `request_sink`; `agentos-proto` gains `RequestHeader` | **Verified**: interfaces major (`constructible_struct_adds_field`), proto additive |
+| C1 | `RequestHeader`/`RequestSection` gain token fields; `Llm` gains a defaulted `context_budget_tokens()` | **Verified**: proto major (`constructible_struct_adds_field`), interfaces and llm unchanged |
 | D1 | `RunContext` gains a cancellation field | Breaking; same pattern as `usage_sink`, `stream_sink`, `request_sink` |
 | D2 | `ToolSpec` gains `timeout_ms` (`#[serde(default)]`) | Breaking on struct literals; additive on wire |
 | X1 (b) | `Plan::CallTool` carries a batch | Breaking |

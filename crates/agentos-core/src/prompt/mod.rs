@@ -21,11 +21,14 @@
 
 mod projection;
 mod sections;
+mod tokens;
 
 pub use projection::{checkpoint, visible, TRANSCRIPT_SHADOW_KEY};
 pub use sections::{SectionId, SkillPrelude};
+pub use tokens::{estimate_message, estimate_text, estimate_tool_specs};
 
 use agentos_interfaces::orchestrator::RunContext;
+use agentos_interfaces::tool::ToolSpec;
 use agentos_proto::{Message, RequestHeader, RequestSection, RequestSource};
 use std::sync::Arc;
 use tracing::info;
@@ -45,9 +48,10 @@ pub struct SectionEntry {
     pub id: SectionId,
     /// Messages this section added.
     pub messages: usize,
-    /// Characters this section added, as a size proxy. Token estimation is
-    /// roadmap item C1 and lands on this same manifest.
+    /// Characters this section added — the one figure with no heuristic in it.
     pub chars: usize,
+    /// Estimated tokens this section added.
+    pub tokens: usize,
     /// Where this section's content can be re-derived from. Empty for the
     /// transcript, which the run state already carries.
     pub sources: Vec<RequestSource>,
@@ -60,6 +64,11 @@ pub struct SectionEntry {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PromptManifest {
     pub sections: Vec<SectionEntry>,
+    /// Estimated tokens for the tool schemas sent with the request. Not a
+    /// section — they carry no messages — but they occupy the same window.
+    pub tool_tokens: usize,
+    /// The model's context window, when the provider resolved one.
+    pub context_budget_tokens: Option<usize>,
 }
 
 impl PromptManifest {
@@ -69,6 +78,22 @@ impl PromptManifest {
 
     pub fn total_chars(&self) -> usize {
         self.sections.iter().map(|section| section.chars).sum()
+    }
+
+    /// Estimated tokens for the whole request, tool schemas included.
+    pub fn total_tokens(&self) -> usize {
+        self.sections
+            .iter()
+            .map(|section| section.tokens)
+            .sum::<usize>()
+            + self.tool_tokens
+    }
+
+    /// Share of the model's context window this request occupies, as a
+    /// fraction. `None` when the provider could not resolve a budget.
+    pub fn pressure(&self) -> Option<f64> {
+        let budget = self.context_budget_tokens.filter(|budget| *budget > 0)?;
+        Some(self.total_tokens() as f64 / budget as f64)
     }
 
     /// Messages contributed by one section, or 0 when it contributed nothing.
@@ -89,22 +114,40 @@ impl PromptManifest {
                     id: Arc::from(section.id.as_str()),
                     messages: section.messages,
                     chars: section.chars,
+                    tokens: section.tokens,
                     sources: section.sources.clone(),
                 })
                 .collect(),
             total_messages: self.total_messages(),
             total_chars: self.total_chars(),
+            total_tokens: self.total_tokens(),
+            tool_tokens: self.tool_tokens,
+            context_budget_tokens: self.context_budget_tokens,
         }
     }
 }
 
+/// What the caller contributes to an assembly, beyond the run context.
+///
+/// The orchestrator owns its skill catalog, its tool set, and its provider, so
+/// it supplies those three; everything else comes from `ctx`.
+#[derive(Default)]
+pub struct Assembly<'a> {
+    /// The precomputed workspace-skill message and the skills behind it.
+    pub skill_prelude: Option<&'a SkillPrelude>,
+    /// Tool schemas sent alongside the messages. They carry no messages but
+    /// occupy the same context window, so they are estimated with them.
+    pub tools: &'a [ToolSpec],
+    /// The model's context window, when the provider can resolve one.
+    pub context_budget_tokens: Option<usize>,
+}
+
 /// Assemble the messages for one provider request.
 ///
-/// `skill_prelude` is the caller's precomputed workspace-skill message — the
-/// orchestrator owns the catalog, so it renders that section and hands it in.
-/// Everything else comes from `ctx`: hydrated memory first, then the
-/// conversation, so the request still ends on the latest turn.
-pub fn assemble(ctx: &RunContext<'_>, skill_prelude: Option<&SkillPrelude>) -> Prompt {
+/// Hydrated memory comes first, then the projected conversation, so the request
+/// still ends on the latest turn.
+pub fn assemble(ctx: &RunContext<'_>, input: &Assembly<'_>) -> Prompt {
+    let skill_prelude = input.skill_prelude;
     let mut messages = Vec::with_capacity(ctx.state.transcript.items.len().saturating_add(2));
     let mut manifest = PromptManifest::default();
 
@@ -140,6 +183,9 @@ pub fn assemble(ctx: &RunContext<'_>, skill_prelude: Option<&SkillPrelude>) -> P
             .map(|item| item.message.clone()),
     );
 
+    manifest.tool_tokens = tokens::estimate_tool_specs(input.tools);
+    manifest.context_budget_tokens = input.context_budget_tokens;
+
     // Durable record of what this request was made of, drained by the loop
     // into a `request_header` trace event after `plan()` returns.
     ctx.push_request_header(manifest.header());
@@ -154,6 +200,8 @@ pub fn assemble(ctx: &RunContext<'_>, skill_prelude: Option<&SkillPrelude>) -> P
         transcript_messages = manifest.messages_in(SectionId::Transcript),
         total_messages = manifest.total_messages(),
         total_chars = manifest.total_chars(),
+        total_tokens = manifest.total_tokens(),
+        tool_tokens = manifest.tool_tokens,
         "prompt assembled"
     );
 
@@ -172,8 +220,10 @@ fn push_section(
 ) {
     let mut count = 0;
     let mut chars = 0;
+    let mut tokens = 0;
     for message in rendered {
         chars += message.content.len();
+        tokens += tokens::estimate_message(&message);
         count += 1;
         messages.push(message);
     }
@@ -182,6 +232,7 @@ fn push_section(
             id,
             messages: count,
             chars,
+            tokens,
             sources,
         });
     }
@@ -224,7 +275,7 @@ mod tests {
         // by hand before this module existed.
         let state = state_with(vec!["one", "two"]);
         let ctx = RunContext::from_state(&state);
-        let prompt = assemble(&ctx, None);
+        let prompt = assemble(&ctx, &Assembly::default());
 
         assert_eq!(prompt.messages.len(), 2);
         assert_eq!(prompt.messages[0].content.as_ref(), "one");
@@ -242,7 +293,7 @@ mod tests {
         ctx.memory_fragments
             .push(fragment("keys rotate every 90 days"));
 
-        let prompt = assemble(&ctx, None);
+        let prompt = assemble(&ctx, &Assembly::default());
 
         assert_eq!(prompt.manifest.messages_in(SectionId::Memory), 1);
         assert!(prompt
@@ -261,7 +312,13 @@ mod tests {
             skills: vec![Arc::from("deploy-notes")],
         };
 
-        let prompt = assemble(&ctx, Some(&prelude));
+        let prompt = assemble(
+            &ctx,
+            &Assembly {
+                skill_prelude: Some(&prelude),
+                ..Default::default()
+            },
+        );
 
         let ids: Vec<SectionId> = prompt
             .manifest
@@ -309,7 +366,13 @@ mod tests {
             skills: vec![Arc::from("deploy-notes")],
         };
 
-        assemble(&ctx, Some(&prelude));
+        assemble(
+            &ctx,
+            &Assembly {
+                skill_prelude: Some(&prelude),
+                ..Default::default()
+            },
+        );
 
         let headers = std::mem::take(
             &mut *ctx
@@ -348,7 +411,13 @@ mod tests {
             skills: vec![Arc::from("s")],
         };
 
-        let prompt = assemble(&ctx, Some(&prelude));
+        let prompt = assemble(
+            &ctx,
+            &Assembly {
+                skill_prelude: Some(&prelude),
+                ..Default::default()
+            },
+        );
 
         assert_eq!(prompt.manifest.total_messages(), prompt.messages.len());
         let chars: usize = prompt

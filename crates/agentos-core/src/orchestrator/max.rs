@@ -227,7 +227,14 @@ impl MaxOrchestrator {
             // description) and the memory fragments `hydrate()` selected, then
             // the conversation. Building a message vector here instead is what
             // let hydrated memory be computed and dropped (finding F1).
-            let prompt = prompt::assemble(ctx, self.skill_prelude.as_ref());
+            let prompt = prompt::assemble(
+                ctx,
+                &prompt::Assembly {
+                    skill_prelude: self.skill_prelude.as_ref(),
+                    tools: &self.available_tools,
+                    context_budget_tokens: llm.context_budget_tokens(),
+                },
+            );
             let response = super::streaming::complete_message(
                 llm.as_ref(),
                 ctx,

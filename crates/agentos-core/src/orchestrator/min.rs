@@ -50,7 +50,14 @@ impl Orchestrator for MinOrchestrator {
         // `Min` carries no skill catalog, but it still assembles through the
         // one authority — so hydrated memory reaches it too, and a section
         // added later needs no change here.
-        let prompt = prompt::assemble(ctx, None);
+        let prompt = prompt::assemble(
+            ctx,
+            &prompt::Assembly {
+                tools: &self.tool_specs,
+                context_budget_tokens: self.llm.context_budget_tokens(),
+                ..Default::default()
+            },
+        );
         let response =
             super::streaming::complete_message(&*self.llm, ctx, &prompt.messages, &self.tool_specs)
                 .await

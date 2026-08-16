@@ -7,24 +7,34 @@
     },
     "request_headers": [
       {
+        "context_budget_tokens": 4096,
+        "pressure_percent": 1,
+        "prompt_estimated_tokens": 41,
         "sections": [
           {
             "chars": 21,
             "id": "transcript",
-            "messages": 1
+            "messages": 1,
+            "tokens": 10
           }
         ],
+        "tool_tokens": 31,
         "total_chars": 21,
         "total_messages": 1
       },
       {
+        "context_budget_tokens": 4096,
+        "pressure_percent": 1,
+        "prompt_estimated_tokens": 60,
         "sections": [
           {
             "chars": 29,
             "id": "transcript",
-            "messages": 3
+            "messages": 3,
+            "tokens": 29
           }
         ],
+        "tool_tokens": 31,
         "total_chars": 29,
         "total_messages": 3
       }
