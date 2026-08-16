@@ -751,6 +751,67 @@ the parent run and, today, the gateway.
   sees the failure; no `std::process` call remains inside an `async fn`
   (`grep -rn "std::process::Command" crates/agentos-core/src`).
 - Exit: no tool call can occupy a worker thread indefinitely.
+- **Status: done, with one documented exception to the Verify grep**
+  (2026-08-16). Every tool call now runs under a resolved deadline, and a
+  deadline that expires produces a failed `ToolResult` the model reads and
+  replans around. Notes:
+  - **Deadline resolution is most-specific-wins**, and the tool gets a say.
+    `[limits].tool_timeout_overrides.<tool>` beats `ToolSpec::timeout_ms` beats
+    `[limits].tool_timeout_ms` (default 60 s). The middle term is the one the
+    roadmap did not spell out and is worth having: `ShellTool` declares five
+    minutes because a build or a test suite legitimately takes that, and an
+    unconfigured deployment should not hold it to a budget that suits an HTTP
+    call. An operator who disagrees still has the last word.
+  - **The deadline is enforced in the registry, not per tool**, so it covers
+    MCP tools and any third-party `Tool` impl without their cooperation.
+    `ShellTool` keeps its own inner deadline as a belt to that brace, so using
+    it directly still cannot hang a caller.
+  - **Capping output is not the same as not reading it** — this was a real bug
+    caught by its own test. The first `exec::capped` stopped reading at the cap;
+    the child's pipe then filled, it blocked in `write`, and it never exited, so
+    a chatty-but-healthy tool came back as a *deadline failure* instead of a
+    truncated success. It now keeps the first `max_output_bytes` and drains the
+    rest to EOF.
+  - **Reaping is `kill_on_drop` and nothing else.** Both ways a child outlives
+    its usefulness end in a dropped future — the deadline drops it, and D1's
+    cancellation drops the whole call — so there is no path where a caller must
+    remember to clean up. Disabling `kill_on_drop` turns exactly one test red.
+  - **The orphan test checks a pid, not `ps` output.** The first version grepped
+    `ps -eo args` for a nonce, which matched *itself*: the checking pipeline
+    necessarily contains the pattern it looks for. It now has the child record
+    its pid and polls `kill -0`.
+  - **D1's limitation is lifted.** `loop/cancel.rs` documented that cancellation
+    was inert against `ShellTool` and the isolation worker because they blocked
+    the thread. Both are `tokio::process` now, so a cancelled run really does
+    drop the future and kill the child.
+  - **The Verify grep does not come back empty, deliberately.**
+    `tools/mcp.rs` still holds `std::process::{Child, Command, Stdio}` for the
+    *persistent* stdio MCP worker. What remains there is a `spawn` — a one-off
+    syscall that returns as soon as the child is forked — and the blocking
+    request/response loop runs on a dedicated OS thread, never on a Tokio
+    worker. The per-call wait that *did* block a Tokio worker (a
+    `recv_timeout` of up to 10 s) is now behind `spawn_blocking`, and its
+    hardcoded 10 s is now `[limits].tool_timeout_ms`. Rebuilding the whole
+    persistent worker on `tokio::process` is a change with its own risk and no
+    benefit to the exit condition, so it was not attempted.
+  - **`test_support.rs` was split** because these changes pushed it to 801 LOC,
+    one over the ceiling. `MockMemory` and `MockSession` moved to
+    `test_support/storage.rs` with their tests — they are the two mocks that
+    are real stores rather than canned responses, so they were the natural cut.
+  - **Benchmark impact is large and is codegen, not work:** `reply_turn`
+    1.46 → 2.48 µs, `tool_turn_allow` 3.93 → 6.50 µs,
+    `ask_user_pause_resume` 8.46 → 11.0 µs, with the JSON round-trip control
+    flat at 3.57 µs. A reply turn calls no tool and touches neither
+    `ToolRegistry` nor `ToolSpec`, and a tree with `exec.rs` compiled but the
+    call sites reverted measures 1.47 µs — so the cost appears when the
+    `tokio::time`/`tokio::process` machinery lands next to the loop, not from
+    anything the loop now does. `BENCHMARKS.md` records all four measurements.
+    Still ~800× under the 2 ms ceiling, and the alternative is a runtime with
+    no tool deadlines at all.
+  - Interface impact, machine-verified with `--baseline-rev HEAD`:
+    `agentos-interfaces` major (`constructible_struct_adds_field` for
+    `ToolSpec.timeout_ms`), `agentos-proto` and `agentos-llm` unchanged. The
+    field is `#[serde(default)]`, so the wire form is additive.
 
 ### D3. Background job registry (F9)
 
@@ -995,7 +1056,7 @@ Land these together in X3 rather than piecemeal.
 | `[limits].directory_list_entries` | X3 | Directory listing cap |
 | `[spill].root`, `[spill].retention_days` | C2 → X3 | Spill artifact storage. C2 fixed the root at `<workspace>/spill` and left retention unimplemented — nothing prunes old artifacts yet |
 | `[compaction].enabled`, `.pressure_percent`, `.retain_tail_turns` | C3 | Compaction policy. **Landed** in C3; `.pressure_ratio` shipped as an integer `pressure_percent`, the unit C1 already traces. `.model` deferred to X3 — summaries use the run's own provider |
-| `[resources.tools].timeout_ms` (per tool, with a default) | D2 | Tool deadlines; replaces the MCP 10 s constant |
+| `[limits].tool_timeout_ms`, `[limits].tool_timeout_overrides` | D2 | Tool deadlines. **Landed** in D2, in `[limits]` rather than `[resources.tools]`: that section says *which* tools are enabled, and `ResourceSection` is shared with skills/mcp/llm where a timeout is meaningless. Replaces the MCP 10 s constant |
 | `[jobs].max_concurrent`, `.output_limit_bytes` | D3 | Job registry bounds |
 | `[gateway].shards`, `.inbox_capacity` | G1 | Conversation sharding |
 | `[approval].expiry_seconds` | G2 | Approval prompt expiry |
@@ -1014,7 +1075,7 @@ the result in the PR.
 | C3 | None — compaction is entirely inside `agentos-core` | **Verified**: interfaces, proto, and llm all report no semver update required |
 | C4 | `OrchestratorError` and `LlmError` gain a `ContextLengthExceeded` variant; `ProviderError` gains `ContextLength` | **Verified**: interfaces and llm major (`enum_variant_added`), proto unchanged |
 | D1 | `RunContext` gains a cancellation field | **Verified**: interfaces major (`constructible_struct_adds_field`), proto and llm unchanged. `Tool` was *not* changed — `call_with_context` already carries the context |
-| D2 | `ToolSpec` gains `timeout_ms` (`#[serde(default)]`) | Breaking on struct literals; additive on wire |
+| D2 | `ToolSpec` gains `timeout_ms` (`#[serde(default)]`) | **Verified**: interfaces major (`constructible_struct_adds_field`), proto and llm unchanged; additive on wire |
 | X1 (b) | `Plan::CallTool` carries a batch | Breaking |
 | X2 | `ToolSpec.requires_isolation` → sandbox mode | Breaking |
 | X6 | `Session::fork` as a defaulted method | Additive |

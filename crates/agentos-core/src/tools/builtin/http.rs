@@ -34,6 +34,7 @@ impl Tool for HttpTool {
                 }
             }),
             requires_isolation: false,
+            timeout_ms: None,
         }
     }
 

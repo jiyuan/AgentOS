@@ -28,11 +28,14 @@
 //! in-flight future, which for an `async` call (an HTTP request, a
 //! `tokio::process` child) really does abort the work.
 //!
-//! It cannot interrupt work that **blocks the thread instead of awaiting**.
-//! `ShellTool` and the isolation subprocess both block on `std::process`
-//! today, so a `select!` never gets to poll the cancellation branch until they
-//! return. That is not a gap in this item — it is exactly what D2 (async
-//! subprocess execution) exists to fix, and D1 is what D2 will hang off.
+//! It cannot interrupt work that **blocks the thread instead of awaiting**: a
+//! `select!` never gets to poll the cancellation branch until blocking work
+//! returns. When D1 landed, `ShellTool` and the isolation worker were both in
+//! that category. D2 moved them onto `tokio::process`, so cancelling a run now
+//! drops the future and `kill_on_drop` takes the child with it. A third-party
+//! `Tool` that blocks is still immune — nothing can interrupt it, including
+//! its deadline — which is why `tools::exec` exists for anything that shells
+//! out.
 
 use super::telemetry::field_key;
 use super::{FinalOutput, LoopDeps};

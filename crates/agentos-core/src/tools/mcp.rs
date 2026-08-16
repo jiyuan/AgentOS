@@ -131,35 +131,39 @@ impl McpClient for StaticMcpClient {
 #[async_trait]
 impl McpClient for StdioMcpClient {
     async fn list_tools(&self, server: &McpServer) -> Result<Vec<ToolSpec>, McpError> {
-        let result: StdioListToolsResult = self.call_stdio_mcp(
-            server,
-            json!({
-                "jsonrpc": "2.0",
-                "id": "agentos-list-tools",
-                "method": "tools/list",
-                "params": {
-                    "server_id": server.id,
-                },
-            }),
-        )?;
+        let result: StdioListToolsResult = self
+            .call_stdio_mcp(
+                server,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "agentos-list-tools",
+                    "method": "tools/list",
+                    "params": {
+                        "server_id": server.id,
+                    },
+                }),
+            )
+            .await?;
         Ok(result.tools)
     }
 
     async fn call_tool(&self, server: &McpServer, call: &ToolCall) -> Result<ToolResult, McpError> {
         let call_value = serde_json::to_value(call)
             .map_err(|err| McpError::Failed(Arc::from(err.to_string())))?;
-        let mut result: ToolResult = self.call_stdio_mcp(
-            server,
-            json!({
-                "jsonrpc": "2.0",
-                "id": format!("agentos-call-{}", call.id.as_str()),
-                "method": "tools/call",
-                "params": {
-                    "server_id": server.id,
-                    "call": call_value,
-                },
-            }),
-        )?;
+        let mut result: ToolResult = self
+            .call_stdio_mcp(
+                server,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": format!("agentos-call-{}", call.id.as_str()),
+                    "method": "tools/call",
+                    "params": {
+                        "server_id": server.id,
+                        "call": call_value,
+                    },
+                }),
+            )
+            .await?;
         result
             .metadata
             .insert(Arc::from("stdio_mcp"), Value::String("true".to_owned()));
@@ -172,7 +176,19 @@ impl McpClient for StdioMcpClient {
 }
 
 impl StdioMcpClient {
-    fn call_stdio_mcp<T>(&self, server: &McpServer, request: Value) -> Result<T, McpError>
+    /// Send one JSON-RPC request to the managed stdio worker and wait for its
+    /// reply.
+    ///
+    /// Async since roadmap D2. The wait is a blocking `recv_timeout` on a
+    /// std channel — the worker owns its child on a dedicated thread, so there
+    /// is no async receiver to await — and running it inline held a Tokio
+    /// worker thread for up to the full deadline. `spawn_blocking` moves it
+    /// onto the blocking pool where a long wait costs nothing but a thread
+    /// that exists for exactly this.
+    ///
+    /// `managed_server` still spawns the child inline on first use. That is a
+    /// bounded, one-off cost rather than a per-call one, so it is left alone.
+    async fn call_stdio_mcp<T>(&self, server: &McpServer, request: Value) -> Result<T, McpError>
     where
         T: DeserializeOwned,
     {
@@ -191,7 +207,11 @@ impl StdioMcpClient {
                 McpError::Failed(Arc::from("stdio MCP worker request channel closed"))
             })?;
 
-        let response = match response_rx.recv_timeout(self.timeout) {
+        let timeout = self.timeout;
+        let received = tokio::task::spawn_blocking(move || response_rx.recv_timeout(timeout))
+            .await
+            .map_err(|err| McpError::Failed(Arc::from(err.to_string())))?;
+        let response = match received {
             Ok(Ok(response)) => response,
             Ok(Err(message)) => {
                 self.remove_managed_server(&server.endpoint);
@@ -202,7 +222,7 @@ impl StdioMcpClient {
                 self.remove_managed_server(&server.endpoint);
                 return Err(McpError::Failed(Arc::from(format!(
                     "stdio MCP worker timed out after {} ms",
-                    self.timeout.as_millis()
+                    timeout.as_millis()
                 ))));
             }
             Err(std_mpsc::RecvTimeoutError::Disconnected) => {
@@ -243,6 +263,14 @@ impl StdioMcpClient {
     }
 }
 
+/// Start one persistent stdio MCP worker.
+///
+/// This is the one `std::process` call D2 deliberately left alone. It only
+/// *spawns* — the blocking request/response loop runs on the dedicated thread
+/// below, never on a Tokio worker — and a `spawn` is a one-off syscall that
+/// returns as soon as the child is forked, so it cannot occupy a thread. The
+/// alternative, rebuilding the whole persistent worker on `tokio::process`, is
+/// a change with its own risk and no benefit to the exit condition.
 fn spawn_managed_stdio_server(endpoint: &str) -> Result<ManagedStdioServer, McpError> {
     let program = stdio_program(endpoint)?;
     let mut child = Command::new(program)

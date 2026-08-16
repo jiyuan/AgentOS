@@ -500,6 +500,7 @@ mod tests {
             description: Arc::from("read or write"),
             input_schema: json!({"type":"object","properties":{}}),
             requires_isolation: false,
+            timeout_ms: None,
         };
         assert_eq!(
             tool_to_function(&spec),

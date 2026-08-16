@@ -91,6 +91,7 @@ impl Tool for CountingTool {
             description: Arc::from("invariant test tool"),
             input_schema: serde_json::json!({"type": "object"}),
             requires_isolation: false,
+            timeout_ms: None,
         }
     }
 

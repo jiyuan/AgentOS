@@ -725,6 +725,7 @@ mod tests {
             description: Arc::from("read and write files"),
             input_schema: json!({"type": "object"}),
             requires_isolation: false,
+            timeout_ms: None,
         }])
         .with_skill_catalog(catalog)
         .with_routing_table(RoutingTable {
@@ -786,6 +787,7 @@ mod tests {
             description: Arc::from("read and write files"),
             input_schema: json!({"type": "object"}),
             requires_isolation: false,
+            timeout_ms: None,
         }])
         .with_skill_catalog(catalog)
         .with_routing_table(RoutingTable {
@@ -844,6 +846,7 @@ mod tests {
             description: Arc::from("read and write files"),
             input_schema: json!({"type": "object"}),
             requires_isolation: false,
+            timeout_ms: None,
         }])
         .with_skill_catalog(catalog)
         .with_routing_table(RoutingTable {
@@ -898,6 +901,7 @@ mod tests {
             description: Arc::from("read and write files"),
             input_schema: json!({"type": "object"}),
             requires_isolation: false,
+            timeout_ms: None,
         }])
         .with_routing_table(RoutingTable {
             rules: vec![RoutingRule {
@@ -958,6 +962,7 @@ mod tests {
             description: Arc::from("read and write files"),
             input_schema: json!({"type": "object"}),
             requires_isolation: false,
+            timeout_ms: None,
         }])
         .with_skill_catalog(catalog)
         .with_llm(llm.clone());

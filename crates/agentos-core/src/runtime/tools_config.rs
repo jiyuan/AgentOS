@@ -22,7 +22,10 @@ pub(super) fn build_parent_tools(
             register_builtin_tool(&mut tools, tool)?;
         }
     }
-    Ok(tools)
+    Ok(tools.with_timeouts(
+        config.limits.tool_timeout(),
+        config.limits.tool_timeout_overrides(),
+    ))
 }
 
 pub fn phase5_policy(config: &WorkspaceConfig, mcp_specs: &[ToolSpec]) -> Policy {
