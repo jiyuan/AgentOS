@@ -11,11 +11,26 @@ this machine; treat deltas inside that band as noise.
 
 | Bench | Mean | Verdict |
 |---|---|---|
-| `loop_overhead/reply_turn` | **1.19 µs** | ~1690× under the 2 ms ceiling; unchanged through Phase 3 (within noise). |
-| `loop_overhead/tool_turn_allow` | **3.25 µs** | Approve + tool dispatch + extra states add ~2.1 µs over a reply turn. Up from 3.00 µs at roadmap C2, which adds a size check and a tool-name `Arc` clone per tool turn; ~615× under the ceiling. |
-| `loop_overhead/ask_user_pause_resume` | **7.71 µs** | Full interruption cycle: pause, JSON persist round-trip, approve, resume, finish. |
-| `loop_overhead/paused_state_json_round_trip` | **3.55 µs** | `RunState` serialize + deserialize alone — roughly half the pause/resume cycle. |
-| `loop_overhead/hydrated_memory_plan_turn` | **273.6 µs** | SQLite-backed hydration dominates the turn (~230× a reply turn) but stays ~7× under the ceiling. |
+| `loop_overhead/reply_turn` | **1.46 µs** | ~1370× under the 2 ms ceiling. Up from 1.19 µs at roadmap D1 (+23%), which races the planning call against the run's cancellation token — see the note below. |
+| `loop_overhead/tool_turn_allow` | **3.93 µs** | Approve + tool dispatch + extra states add ~2.5 µs over a reply turn. 3.00 → 3.25 µs at C2 (a size check and a tool-name `Arc` clone per tool turn), then → 3.93 µs at D1 (a *second* cancellation race, around the tool call); ~510× under the ceiling. |
+| `loop_overhead/ask_user_pause_resume` | **8.46 µs** | Full interruption cycle: pause, JSON persist round-trip, approve, resume, finish. Up from 7.71 µs at D1, same cause. |
+| `loop_overhead/paused_state_json_round_trip` | **3.54 µs** | `RunState` serialize + deserialize alone — roughly half the pause/resume cycle. Unchanged by D1, which is the control: it touches no loop state, so its flatness confirms the other three moved for a real reason rather than machine drift. |
+| `loop_overhead/hydrated_memory_plan_turn` | **273.5 µs** | SQLite-backed hydration dominates the turn (~190× a reply turn) but stays ~7× under the ceiling. Unmoved by D1: the fixed cancellation cost disappears against the query. |
+
+### The D1 cancellation cost
+
+Roadmap item D1 added ~270 ns per raced await. Each
+`tokio_util::sync::CancellationToken::cancelled()` future registers a waker in
+the token's intrusive wait list on first poll, and the loop creates one per
+planning call and one per tool call. `RunContext` also carries a token now, so
+each context the loop builds costs one `Arc` clone.
+
+Not optimised away, and not optimisable without giving up the feature: a
+cancellation that only takes effect *between* awaits cannot stop an LLM call
+that is thirty seconds into a response, which is the case users actually want
+stopped. The absolute figure — a quarter of a microsecond against a 2 ms
+budget — is the right trade. Recorded here so a future regression hunt does not
+re-derive it.
 
 Allocation counts (counting global allocator, 2000 iterations,
 deterministic). Phase 3 (interned telemetry field keys, gated log

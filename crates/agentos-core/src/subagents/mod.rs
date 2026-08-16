@@ -20,6 +20,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::task::LocalSet;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Error)]
 pub enum SubAgentError {
@@ -176,6 +177,11 @@ pub struct SubAgentInvocation {
     tool_result_inline_bytes: usize,
     summarizer: Option<Arc<dyn Llm>>,
     compaction_config: CompactionConfig,
+    /// Cancels this child run. Set by [`SubAgentInvocation::with_cancel`] to a
+    /// *child* of the parent run's token, so stopping the parent stops the
+    /// whole delegation tree while a child stopping itself leaves the parent
+    /// free to use whatever it produced.
+    cancel: CancellationToken,
 }
 
 pub struct SubAgentRegistry {
@@ -299,11 +305,20 @@ impl SubAgentRegistry {
             tool_result_inline_bytes: self.tool_result_inline_bytes,
             summarizer: self.summarizer.clone(),
             compaction_config: self.compaction_config,
+            // A fresh token until the caller links it to a parent run; the
+            // loop always does.
+            cancel: CancellationToken::new(),
         })
     }
 }
 
 impl SubAgentInvocation {
+    /// Tie this child run to `parent`, so cancelling the parent cancels it.
+    pub fn with_cancel(mut self, parent: &CancellationToken) -> Self {
+        self.cancel = parent.child_token();
+        self
+    }
+
     pub async fn run(self) -> Result<SubAgentRun, SubAgentError> {
         let (input_tx, mut input_rx) = mpsc::channel(self.channel_capacity);
         let (output_tx, mut output_rx) = mpsc::channel(self.channel_capacity);
@@ -323,6 +338,7 @@ impl SubAgentInvocation {
         let tool_result_inline_bytes = self.tool_result_inline_bytes;
         let summarizer = self.summarizer;
         let compaction_config = self.compaction_config;
+        let cancel = self.cancel;
         let local = LocalSet::new();
         let handle = local.spawn_local(async move {
             let Some(input) = input_rx.recv().await else {
@@ -391,6 +407,7 @@ impl SubAgentInvocation {
                     summarizer: summarizer.as_deref(),
                     config: compaction_config,
                 },
+                cancel: cancel.clone(),
                 // Sub-agents never stream to the parent's egress.
                 stream_sink: None,
             };
@@ -443,6 +460,7 @@ impl SubAgentInvocation {
         let tool_result_inline_bytes = self.tool_result_inline_bytes;
         let summarizer = self.summarizer;
         let compaction_config = self.compaction_config;
+        let cancel = self.cancel;
         let child_approval_id = paused
             .state
             .pending_approvals
@@ -510,6 +528,7 @@ impl SubAgentInvocation {
                         summarizer: summarizer.as_deref(),
                         config: compaction_config,
                     },
+                    cancel: cancel.clone(),
                 };
                 let paused_run = PausedRun {
                     channel_id: paused.channel_id.clone(),

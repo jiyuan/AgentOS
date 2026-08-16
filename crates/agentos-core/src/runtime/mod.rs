@@ -33,6 +33,7 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
 mod tools_config;
 
@@ -170,6 +171,7 @@ pub struct AgentRuntime {
     spill: Option<Arc<SpillStore>>,
     tool_result_inline_bytes: usize,
     summarizer: Arc<dyn Llm>,
+    cancel: CancellationToken,
 }
 
 impl AgentRuntime {
@@ -179,6 +181,16 @@ impl AgentRuntime {
             tool_result_inline_bytes: self.tool_result_inline_bytes,
             spill: self.spill.as_deref(),
         }
+    }
+
+    /// This runtime's root cancellation token (roadmap item D1).
+    ///
+    /// Every run started through [`RuntimeDepsScope::deps`] gets a *child* of
+    /// it, so cancelling this stops all of them — the shutdown path. To stop
+    /// one run instead, overwrite `RunnerDeps::cancel` with your own child
+    /// token before starting it and keep the handle.
+    pub fn cancellation(&self) -> &CancellationToken {
+        &self.cancel
     }
 
     /// The summarizer and trigger every run in this runtime compacts with.
@@ -316,6 +328,7 @@ impl AgentRuntime {
             spill,
             tool_result_inline_bytes,
             summarizer: high_llm,
+            cancel: CancellationToken::new(),
         })
     }
 
@@ -473,6 +486,7 @@ impl<'a> RuntimeDepsScope<'a> {
             stream_sink: None,
             content_limits: self.runtime.content_limits(),
             compaction: self.runtime.compaction(),
+            cancel: self.runtime.cancel.child_token(),
         }
     }
 
@@ -521,6 +535,7 @@ impl<'a> RuntimeDepsScope<'a> {
             stream_sink: None,
             content_limits: self.runtime.content_limits(),
             compaction: self.runtime.compaction(),
+            cancel: self.runtime.cancel.child_token(),
         }
     }
 

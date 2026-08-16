@@ -16,10 +16,12 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 mod approval;
 mod budget;
+mod cancel;
 mod delegate;
 mod escalate;
 mod items;
@@ -29,6 +31,7 @@ mod telemetry;
 
 use approval::{approve_transition, ApproveTransition};
 use budget::{budget_exhausted_finish, record_llm_usage};
+use cancel::{cancelled_finish, unless_cancelled};
 use delegate::{execute_delegate, execute_resume_delegate, DelegateOutcome};
 use escalate::{execute_escalate, EscalateOutcome};
 use items::{
@@ -65,6 +68,13 @@ pub enum RunError {
     ApprovalDenied { reason: Arc<str> },
     #[error("approval cannot pause this action yet: {reason}")]
     ApprovalUnsupported { reason: Arc<str> },
+    /// The run's cancellation token fired mid-call.
+    ///
+    /// Internal to the loop: `act` converts it into a terminal stop notice, so
+    /// it never reaches a caller of `run_envelope`. It exists because the tool
+    /// path is several frames deep and needs a typed way back up.
+    #[error("run cancelled")]
+    Cancelled,
 }
 
 pub struct LoopDeps<'a> {
@@ -87,6 +97,9 @@ pub struct LoopDeps<'a> {
     /// Who summarizes this run's history when it outgrows the window, and at
     /// what pressure. Unset leaves compaction off.
     pub compaction: Compaction<'a>,
+    /// The run's cancellation token. A default token is never cancelled, so a
+    /// caller that does not want to stop runs can ignore this field.
+    pub cancel: CancellationToken,
 }
 
 pub struct InputGuardrailEntry<'a> {
@@ -213,7 +226,8 @@ async fn start(ctx: StartCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunEr
         "run_loop_start"
     );
     if let Some(item) = ctx.state.transcript.items.last() {
-        let run_ctx = RunContext::from_state(&ctx.state);
+        let mut run_ctx = RunContext::from_state(&ctx.state);
+        run_ctx.cancel = deps.cancel.clone();
         let input = Input {
             message: item.message.clone(),
         };
@@ -246,6 +260,17 @@ async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunErro
         ));
     }
 
+    // Beside the turn budget, and for the same reason: a stop condition, not
+    // an error. Checked before any work so a run cancelled between turns costs
+    // nothing further.
+    if deps.cancel.is_cancelled() {
+        return Ok(RunLoopState::Finish(cancelled_finish(
+            ctx.state,
+            deps,
+            "between_turns",
+        )));
+    }
+
     let mut state = ctx.state;
     let mut fields = BTreeMap::new();
     fields.insert(field_key("turn"), Value::from(ctx.turns));
@@ -270,14 +295,22 @@ async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunErro
     // through the output guardrails like any other answer.
     let mut pending_usage = Vec::new();
     let mut pending_requests = Vec::new();
-    let plan = planning::plan_with_overflow_recovery(
-        &mut state,
-        deps,
-        &plan_span_id,
-        &mut pending_usage,
-        &mut pending_requests,
+    let planned = unless_cancelled(
+        &deps.cancel,
+        planning::plan_with_overflow_recovery(
+            &mut state,
+            deps,
+            &plan_span_id,
+            &mut pending_usage,
+            &mut pending_requests,
+        ),
     )
-    .await?;
+    .await;
+    let Some(plan) = planned.transpose()? else {
+        return Ok(RunLoopState::Finish(cancelled_finish(
+            state, deps, "planning",
+        )));
+    };
 
     trace::record_span(
         &mut state,
@@ -318,7 +351,8 @@ async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunErro
 
     match plan {
         Plan::Reply(message) => {
-            let run_ctx = RunContext::from_state(&state);
+            let mut run_ctx = RunContext::from_state(&state);
+            run_ctx.cancel = deps.cancel.clone();
             for entry in deps.output_guardrails {
                 let outcome = entry.guardrail.check(&message, &run_ctx).await?;
                 ensure_guardrail_passed(&entry.name, outcome)?;
@@ -391,7 +425,17 @@ async fn act(ctx: ActCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunError>
             // aborting the run (and the sub-agent / gateway above it).
             let result = match denied {
                 Some(reason) => denied_tool_result(&mut state, deps, &call, reason),
-                None => execute_tool(&mut state, deps, call).await?,
+                None => match execute_tool(&mut state, deps, call).await {
+                    Ok(result) => result,
+                    Err(RunError::Cancelled) => {
+                        return Ok(RunLoopState::Finish(cancelled_finish(
+                            state,
+                            deps,
+                            "tool_call",
+                        )))
+                    }
+                    Err(other) => return Err(other),
+                },
             };
             let spilled = spill_oversized(&state, deps, &tool_name, &result).await;
             state.transcript.items.push(tool_result_item(
@@ -599,7 +643,8 @@ async fn execute_tool(
     );
 
     let preflight_guardrail_result = {
-        let run_ctx = RunContext::from_state(state);
+        let mut run_ctx = RunContext::from_state(state);
+        run_ctx.cancel = deps.cancel.clone();
         let mut failure = None;
         for entry in deps.tool_guardrails {
             let outcome = entry.guardrail.check_call(&call, &run_ctx).await?;
@@ -622,8 +667,15 @@ async fn execute_tool(
         // error in the next turn and self-correct (e.g. create the missing dir
         // and retry). Unknown-tool / isolation errors still bubble up — those
         // indicate a misconfigured runtime, not a recoverable model mistake.
-        let run_ctx = RunContext::from_state(state);
-        match tools.call_with_context(&call, &run_ctx).await {
+        let mut run_ctx = RunContext::from_state(state);
+        run_ctx.cancel = deps.cancel.clone();
+        // A tool that awaits is dropped mid-flight when the run is cancelled.
+        // A tool that blocks the thread is not — see `cancel`'s module docs.
+        let called = unless_cancelled(&deps.cancel, tools.call_with_context(&call, &run_ctx)).await;
+        let Some(called) = called else {
+            return Err(RunError::Cancelled);
+        };
+        match called {
             Ok(result) => result,
             Err(ToolRegistryError::Tool(tool_err)) => ToolResult {
                 call_id: call.id.clone(),
@@ -636,7 +688,8 @@ async fn execute_tool(
     };
 
     {
-        let run_ctx = RunContext::from_state(state);
+        let mut run_ctx = RunContext::from_state(state);
+        run_ctx.cancel = deps.cancel.clone();
         for entry in deps.tool_guardrails {
             let outcome = entry.guardrail.check_result(&result, &run_ctx).await?;
             ensure_guardrail_passed(&entry.name, outcome)?;

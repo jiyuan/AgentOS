@@ -11,6 +11,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Error)]
 pub enum OrchestratorError {
@@ -206,6 +207,22 @@ pub struct RunContext<'a> {
     /// supports streaming pushes each text chunk through
     /// [`RunContext::emit_stream_delta`].
     pub stream_sink: Option<StreamSink>,
+    /// The run's cancellation token (roadmap item D1).
+    ///
+    /// One token per run, installed by the loop on every context it builds —
+    /// for planning, for tool calls, for guardrails. A sub-agent receives a
+    /// *child* of its parent's token, so cancelling a parent cancels the whole
+    /// delegation tree while a sub-agent's own cancellation stays local.
+    ///
+    /// The loop already races this against planning and tool execution and
+    /// stops the run when it fires, so an implementation that ignores it is
+    /// still cancellable at those boundaries. Observe it anyway if you do
+    /// anything long-running *inside* one call — a multi-page fetch, a retry
+    /// loop, a batch of sub-requests — with `tokio::select!` on
+    /// [`CancellationToken::cancelled`] or an `is_cancelled()` check between
+    /// units of work. Work that blocks the thread rather than awaiting cannot
+    /// be interrupted by anyone, including the loop.
+    pub cancel: CancellationToken,
 }
 
 impl std::fmt::Debug for RunContext<'_> {
@@ -220,6 +237,7 @@ impl std::fmt::Debug for RunContext<'_> {
             .field("request_sink", &self.request_sink)
             // `StreamSink` is a closure (no Debug); report only its presence.
             .field("stream_sink", &self.stream_sink.is_some())
+            .field("cancelled", &self.cancel.is_cancelled())
             .finish()
     }
 }
@@ -250,7 +268,16 @@ impl<'a> RunContext<'a> {
             usage_sink: Arc::new(Mutex::new(Vec::new())),
             request_sink: Arc::new(Mutex::new(Vec::new())),
             stream_sink: None,
+            // A fresh token is never cancelled, so a context built outside a
+            // run behaves exactly as it did before this field existed.
+            cancel: CancellationToken::new(),
         }
+    }
+
+    /// Whether the run has been cancelled. Cheap; call it between units of
+    /// work in a long-running tool or orchestrator.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
     }
 
     pub fn with_resource_index(mut self, resource_index: ResourceIndex) -> Self {
