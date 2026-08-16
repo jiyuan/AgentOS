@@ -832,6 +832,74 @@ its D2 deadline is **promoted** to a job rather than lost.
   reports output incrementally, is killable, and is cancelled when its owning
   conversation is disposed; a job owned by conversation A is not visible to B.
 - Exit: long work is observable and cancellable instead of blocking or failing.
+- **Status: done, with `job_start` deliberately omitted** (2026-08-16). An
+  owner-fenced registry, three model-facing tools, and promotion from D2's
+  deadline. `tests/jobs.rs` covers the exit condition end to end: a tool that
+  outruns its deadline keeps running after the run returns, and the model is
+  told where it went. Notes:
+  - **Promotion starts the job first and waits inline, rather than racing a
+    call and promoting on expiry.** Racing cannot work: the loser of a
+    `timeout` is *dropped*, so there would be nothing left to promote and the
+    work would have to be restarted — for a tool with side effects, done twice.
+    Starting as a job makes the deadline a question of how long to wait inline,
+    and a call that finishes in time is indistinguishable from one that never
+    involved a job (`a_promotable_tool_that_finishes_in_time_looks_like_an_ordinary_call`).
+  - **Promotion is an operator allowlist** (`[jobs].promotable`, default
+    `["shell"]`), not automatic. A promoted call is re-issued through
+    `Tool::call` rather than `call_with_context`, because the job outlives the
+    borrow the context is built from. Only `MemoryTool` uses that context
+    today, but silently dropping caller identity for a *third-party* tool that
+    authorises on it would be a security bug rather than a degraded result, so
+    the substitution is named rather than inferred.
+  - **There is no `job_start`, and the reason is an invariant.** A `job_start`
+    that runs another tool would dispatch that inner call from inside the tool
+    layer — below the point where the loop applies tool guardrails and the
+    approval engine — so `job_start {tool: "shell", …}` would be a way to run a
+    shell command the shell guardrail never sees. That is the same shortcut
+    `ARCHITECTURE.md` forbids for MCP-originated calls, which must re-enter the
+    loop at `Approve`. Starting a job safely means re-entering the loop, which
+    is a planning concern (a new `Plan` variant) rather than a tool one.
+    Promotion delivers the same capability with none of the risk: the call has
+    already passed guardrails and approval as an ordinary tool call. **If a
+    future item wants an explicit `job_start`, it belongs with G1 or as a
+    `Plan` variant, not here.**
+  - **Fencing does not distinguish "missing" from "not yours."** Both are
+    `JobError::Unknown`, because saying which one it is tells a caller that
+    another conversation's job exists. The conversation is resolved through the
+    *same* helper the memory tool uses — `conversation_id_from_context`, moved
+    to one definition — since two copies of a security boundary are two chances
+    to drift.
+  - **A job cancelled before its first poll never runs at all.** `start` queues
+    work on the executor rather than running it, so killing a job in the turn
+    that started it means the work never executed a line. Pinned by
+    `a_job_cancelled_before_its_first_poll_never_runs`: it is the difference
+    between "stopped early" and "never happened", which a producer with side
+    effects needs to know.
+  - **Work may be dropped at any await point.** Cancellation races the future
+    and drops it, because that is the only way to stop arbitrary async work.
+    Code after an await in a job is not guaranteed to run; anything that must
+    happen on the way out belongs in a `Drop` impl, which is how `tools::exec`
+    reaps its child. The first version of the disposal test asserted cleanup
+    *after* `cancelled().await` and failed for exactly this reason.
+  - **A full job table degrades to D2 rather than refusing.** Out of slots, the
+    call runs inline under its deadline. A busy conversation gets the previous
+    behaviour instead of losing the tool.
+  - **The concurrency cap is per conversation**, not per process: the failure
+    it prevents is one model spawning work in a loop, and a global cap would
+    let that starve every *other* conversation instead of only its own.
+  - **`dispose_conversation` exists, is tested, and has no caller.** The
+    roadmap's Risk line is real — jobs belong to the conversation actor, and G1
+    does not exist — so the registry is runtime-owned and keyed by
+    conversation, which is the fallback the item sanctions. **G1 must call
+    `AgentRuntime::jobs().dispose_conversation()` when a conversation ends**, or
+    a long-lived gateway leaks cancelled-but-unreaped job entries.
+  - **`runtime/mod.rs` was split**: the job registry pushed it to 813 LOC, so
+    MCP registration moved to `runtime/mcp_config.rs` — the most self-contained
+    thing in the file, reading one config section and producing tool specs.
+  - Interface impact, machine-verified with `--baseline-rev HEAD`:
+    `agentos-interfaces`, `agentos-proto`, and `agentos-llm` all report **no
+    semver update required**. D3 is contained entirely in `agentos-core`.
+    Benchmarks within noise (`reply_turn` 2.42 µs, `tool_turn_allow` 6.17 µs).
 
 ---
 
@@ -1057,7 +1125,7 @@ Land these together in X3 rather than piecemeal.
 | `[spill].root`, `[spill].retention_days` | C2 → X3 | Spill artifact storage. C2 fixed the root at `<workspace>/spill` and left retention unimplemented — nothing prunes old artifacts yet |
 | `[compaction].enabled`, `.pressure_percent`, `.retain_tail_turns` | C3 | Compaction policy. **Landed** in C3; `.pressure_ratio` shipped as an integer `pressure_percent`, the unit C1 already traces. `.model` deferred to X3 — summaries use the run's own provider |
 | `[limits].tool_timeout_ms`, `[limits].tool_timeout_overrides` | D2 | Tool deadlines. **Landed** in D2, in `[limits]` rather than `[resources.tools]`: that section says *which* tools are enabled, and `ResourceSection` is shared with skills/mcp/llm where a timeout is meaningless. Replaces the MCP 10 s constant |
-| `[jobs].max_concurrent`, `.output_limit_bytes` | D3 | Job registry bounds |
+| `[jobs].max_concurrent`, `.output_limit_bytes`, `.promotable` | D3 | Job registry bounds. **Landed** in D3; `.promotable` added — the allowlist of tools that become a job instead of failing at their deadline |
 | `[gateway].shards`, `.inbox_capacity` | G1 | Conversation sharding |
 | `[approval].expiry_seconds` | G2 | Approval prompt expiry |
 | `[memory].hydrate_*` | X3 | Already config; move the remaining constants beside them |
@@ -1076,6 +1144,7 @@ the result in the PR.
 | C4 | `OrchestratorError` and `LlmError` gain a `ContextLengthExceeded` variant; `ProviderError` gains `ContextLength` | **Verified**: interfaces and llm major (`enum_variant_added`), proto unchanged |
 | D1 | `RunContext` gains a cancellation field | **Verified**: interfaces major (`constructible_struct_adds_field`), proto and llm unchanged. `Tool` was *not* changed — `call_with_context` already carries the context |
 | D2 | `ToolSpec` gains `timeout_ms` (`#[serde(default)]`) | **Verified**: interfaces major (`constructible_struct_adds_field`), proto and llm unchanged; additive on wire |
+| D3 | None — the job registry is entirely inside `agentos-core` | **Verified**: interfaces, proto, and llm all report no semver update required |
 | X1 (b) | `Plan::CallTool` carries a batch | Breaking |
 | X2 | `ToolSpec.requires_isolation` → sandbox mode | Breaking |
 | X6 | `Session::fork` as a defaulted method | Additive |

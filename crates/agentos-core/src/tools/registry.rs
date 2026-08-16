@@ -1,16 +1,20 @@
 use super::McpTool;
+use crate::jobs::{JobId, JobRegistry, JobSnapshot, JobSpec, JobState};
+use crate::memory::conversation_id_from_context;
 use crate::tools::exec::{Exec, DEFAULT_MAX_OUTPUT_BYTES};
 use agentos_interfaces::mcp::{McpClient, McpError, McpServer};
 use agentos_interfaces::orchestrator::RunContext;
 use agentos_interfaces::tool::{Tool, ToolError, ToolSpec};
+use agentos_proto::ConversationId;
 use agentos_proto::{ToolCall, ToolResult, ToolStatus};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::time::timeout;
+use tracing::warn;
 
 #[derive(Debug, Error)]
 pub enum ToolRegistryError {
@@ -33,6 +37,8 @@ pub struct ToolRegistry {
     isolation_runner: Option<PathBuf>,
     default_timeout: Duration,
     timeout_overrides: BTreeMap<Arc<str>, Duration>,
+    jobs: Option<Arc<JobRegistry>>,
+    promotable: BTreeSet<Arc<str>>,
 }
 
 impl Default for ToolRegistry {
@@ -42,6 +48,8 @@ impl Default for ToolRegistry {
             isolation_runner: None,
             default_timeout: Duration::from_millis(DEFAULT_TOOL_TIMEOUT_MS),
             timeout_overrides: BTreeMap::new(),
+            jobs: None,
+            promotable: BTreeSet::new(),
         }
     }
 }
@@ -60,6 +68,18 @@ impl ToolRegistry {
     ) -> Self {
         self.default_timeout = default_timeout;
         self.timeout_overrides = overrides;
+        self
+    }
+
+    /// Let the listed tools become background jobs instead of failing when
+    /// they exceed their deadline (roadmap item D3).
+    pub fn with_jobs(
+        mut self,
+        jobs: Arc<JobRegistry>,
+        promotable: impl IntoIterator<Item = Arc<str>>,
+    ) -> Self {
+        self.jobs = Some(jobs);
+        self.promotable = promotable.into_iter().collect();
         self
     }
 
@@ -157,10 +177,149 @@ impl ToolRegistry {
                 return Ok(call_isolated_subprocess(runner, call, deadline).await?);
             }
         }
+        if let Some(promoted) = self.call_promotable(tool, call, ctx, deadline).await {
+            return promoted;
+        }
         match timeout(deadline, tool.call_with_context(call, &call.args, ctx)).await {
             Ok(result) => Ok(result?),
             Err(_elapsed) => Ok(timed_out_result(call, deadline)),
         }
+    }
+
+    /// Run a promotable tool as a background job, waiting out its deadline
+    /// inline.
+    ///
+    /// The job is started *first* and awaited for the deadline, rather than
+    /// racing a plain call and promoting on expiry. Racing cannot work: the
+    /// loser of a `timeout` is dropped, so there would be nothing left to
+    /// promote — the work would have to be restarted, which for a tool with
+    /// side effects means doing it twice. Starting as a job makes the deadline
+    /// a question of *how long to wait inline*, and a call that finishes in
+    /// time is indistinguishable from one that never involved a job.
+    ///
+    /// `None` when this call is not a promotion candidate, so the caller falls
+    /// through to the ordinary path.
+    async fn call_promotable(
+        &self,
+        tool: &Arc<dyn Tool>,
+        call: &ToolCall,
+        ctx: &RunContext<'_>,
+        deadline: Duration,
+    ) -> Option<Result<ToolResult, ToolRegistryError>> {
+        let jobs = self.jobs.as_ref()?;
+        if !self.promotable.contains(&call.name) {
+            return None;
+        }
+        // A job belongs to a conversation, and there is no safe default owner:
+        // guessing one would put a job somewhere another conversation might
+        // reach it. Without an owner, this call is simply not promotable.
+        let conversation_id = conversation_id_from_context(ctx)?;
+
+        // Deliberately `Tool::call`, not `call_with_context`: the job outlives
+        // the borrow the context is built from. `[jobs].promotable` is an
+        // operator allowlist precisely so this substitution is a decision
+        // rather than a surprise.
+        let owned_tool = Arc::clone(tool);
+        let owned_call = call.clone();
+        let spec = JobSpec {
+            kind: Arc::from("tool"),
+            label: Arc::clone(&call.name),
+            conversation_id: conversation_id.clone(),
+            output_limit_bytes: None,
+        };
+        let id = match jobs.start(spec, move |sink, _cancel| async move {
+            match owned_tool.call(&owned_call, &owned_call.args).await {
+                Ok(result) => {
+                    sink.append(&result.content);
+                    Ok(result.content)
+                }
+                Err(error) => Err(Arc::from(error.to_string())),
+            }
+        }) {
+            Ok(id) => id,
+            // Out of job slots: fall through and run it inline, where the
+            // deadline still bounds it. A busy conversation degrades to D2's
+            // behaviour rather than refusing to run the tool at all.
+            Err(error) => {
+                warn!(
+                    tool = call.name.as_ref(),
+                    error = %error,
+                    "tool not promoted to a job; running inline under its deadline"
+                );
+                return None;
+            }
+        };
+
+        match jobs.wait_for(&conversation_id, &id, deadline).await {
+            Ok(Some(snapshot)) => Some(Ok(finished_job_result(
+                call,
+                jobs,
+                &conversation_id,
+                &snapshot,
+            ))),
+            Ok(None) => Some(Ok(promoted_result(call, &id, deadline))),
+            // The job vanished mid-wait, which only disposal does.
+            Err(error) => Some(Ok(ToolResult {
+                call_id: call.id.clone(),
+                status: ToolStatus::Failed,
+                content: Arc::from(error.to_string()),
+                metadata: BTreeMap::new(),
+            })),
+        }
+    }
+}
+
+/// A promoted job's result, as the model sees it: not a failure, an invitation
+/// to come back for it.
+fn promoted_result(call: &ToolCall, id: &JobId, deadline: Duration) -> ToolResult {
+    let mut metadata = BTreeMap::new();
+    metadata.insert(Arc::from("job_id"), Value::String(id.to_string()));
+    metadata.insert(Arc::from("promoted"), Value::Bool(true));
+    ToolResult {
+        call_id: call.id.clone(),
+        status: ToolStatus::Succeeded,
+        content: Arc::from(format!(
+            "The `{}` tool is still running after {} ms, so it is now background job `{id}`. \
+             Use `job_status` to check on it, `job_output` to read what it has produced, and \
+             `job_kill` to stop it. Carry on with something else in the meantime.",
+            call.name,
+            deadline.as_millis()
+        )),
+        metadata,
+    }
+}
+
+/// A job that finished inside its deadline, unwrapped back into an ordinary
+/// tool result. The model is never told a job existed.
+fn finished_job_result(
+    call: &ToolCall,
+    jobs: &JobRegistry,
+    conversation_id: &ConversationId,
+    snapshot: &JobSnapshot,
+) -> ToolResult {
+    let content = jobs
+        .output(conversation_id, &snapshot.id, 0)
+        .unwrap_or_default();
+    let mut metadata = BTreeMap::new();
+    if snapshot.output_truncated {
+        metadata.insert(Arc::from("output_truncated"), Value::Bool(true));
+    }
+    match snapshot.state {
+        JobState::Succeeded => ToolResult {
+            call_id: call.id.clone(),
+            status: ToolStatus::Succeeded,
+            content: Arc::from(content),
+            metadata,
+        },
+        _ => ToolResult {
+            call_id: call.id.clone(),
+            status: ToolStatus::Failed,
+            content: snapshot
+                .detail
+                .clone()
+                .unwrap_or_else(|| Arc::from("the tool did not finish")),
+            metadata,
+        },
     }
 }
 

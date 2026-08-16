@@ -665,10 +665,7 @@ pub fn memory_caller_from_context(
     allowed_shared_domains: Vec<Arc<str>>,
 ) -> MemoryCaller {
     let metadata = caller_metadata_from_context(ctx);
-    let conversation_id = metadata
-        .get("conversation_id")
-        .and_then(Value::as_str)
-        .map(ConversationId::new)
+    let conversation_id = conversation_id_from_context(ctx)
         .unwrap_or_else(|| ConversationId::new(ctx.state.run_id.as_str()));
     let user_id_key = if metadata
         .get("kind")
@@ -710,6 +707,23 @@ pub fn memory_caller_from_context(
         allowed_shared_domains,
         audit_read_access: audit_read_access_from_context(ctx),
     }
+}
+
+/// The conversation a run belongs to, if the transcript records one.
+///
+/// `RunState` does not carry a conversation id — it arrives on the `Envelope`
+/// and is stamped onto the input item's metadata — so this is the one place
+/// that resolution lives. Shared with the job registry (roadmap D3) rather than
+/// duplicated: both use it to fence one conversation's data off from another's,
+/// and two copies of a security boundary are two chances to drift.
+///
+/// `None` when nothing in the transcript names one, which callers must treat as
+/// "no owner" rather than substituting a default.
+pub fn conversation_id_from_context(ctx: &RunContext<'_>) -> Option<ConversationId> {
+    caller_metadata_from_context(ctx)
+        .get("conversation_id")
+        .and_then(Value::as_str)
+        .map(ConversationId::new)
 }
 
 fn caller_metadata_from_context<'a>(ctx: &'a RunContext<'_>) -> &'a BTreeMap<Arc<str>, Value> {

@@ -6,7 +6,7 @@ max_turns = 256
 
 [policy]
 default = "deny"
-allowlist = ["shell", "file", "cron_create", "cron_remove", "memory"]
+allowlist = ["shell", "file", "cron_create", "cron_remove", "memory", "job_status", "job_output", "job_kill"]
 
 # Programs the shell tool guardrail accepts in a call's `command` field.
 # The first eight are read-only inspection commands (the built-in default);
@@ -109,6 +109,22 @@ pressure_percent = 90
 # Conversation items kept verbatim after the checkpoint. Minimum 2.
 retain_tail_turns = 8
 
+# Background work. A tool that outlives its deadline becomes a job instead of
+# being killed, and the model follows it with job_status / job_output / job_kill.
+[jobs]
+# Jobs one conversation may have running at once. Per conversation, not per
+# process, so one runaway model starves only itself. Minimum 1 — to turn jobs
+# off, drop the job_* tools from [resources.tools] instead.
+max_concurrent = 4
+# Bytes of output a job retains before discarding the rest. Minimum 1024.
+output_limit_bytes = 262144
+# Tools that become a job rather than failing when they exceed their deadline.
+# An allowlist because a promoted call is re-issued without the run context: no
+# built-in tool but `memory` uses that context, but a third-party tool might,
+# and dropping caller identity for a tool that authorises on it would be a
+# security bug rather than a degraded result.
+promotable = ["shell"]
+
 [isolation]
 worker_path_env = "AGENTOS_TOOL_WORKER_PATH"
 
@@ -119,7 +135,7 @@ priority = ["skills", "tools", "mcp", "llm"]
 enabled = ["skill-creator", "web-research", "audit-skill", "email-digest", "rss-digest", "fetch-arxiv-paper-list"]
 
 [resources.tools]
-enabled = ["file", "http", "memory", "shell", "skill_validate", "cron_create", "cron_list", "cron_remove"]
+enabled = ["file", "http", "memory", "shell", "skill_validate", "cron_create", "cron_list", "cron_remove", "job_status", "job_output", "job_kill"]
 
 [resources.mcp]
 enabled = ["remote_echo"]

@@ -1,9 +1,10 @@
 use crate::approve::{Policy, PolicyAction, PolicyRule, PolicyVerb};
 use crate::config::{SubAgentConfig, WorkspaceConfig};
+use crate::jobs::JobRegistry;
 use crate::memory::MemoryManager;
 use crate::tools::{
-    CronCreatorTool, CronListTool, CronRemoveTool, FileTool, HttpTool, MemoryTool, ShellTool,
-    SkillValidateTool, ToolRegistry,
+    CronCreatorTool, CronListTool, CronRemoveTool, FileTool, HttpTool, JobKillTool, JobOutputTool,
+    JobStatusTool, MemoryTool, ShellTool, SkillValidateTool, ToolRegistry,
 };
 use agentos_interfaces::tool::ToolSpec;
 use serde_json::Value;
@@ -13,19 +14,26 @@ use std::sync::Arc;
 pub(super) fn build_parent_tools(
     config: &WorkspaceConfig,
     memory_manager: Arc<MemoryManager>,
+    jobs: Arc<JobRegistry>,
 ) -> Result<ToolRegistry, String> {
     let mut tools = ToolRegistry::new();
     for tool in &config.resources.tools.enabled {
-        if tool.as_ref() == "memory" {
-            tools.register(MemoryTool::with_manager(memory_manager.clone()));
-        } else {
-            register_builtin_tool(&mut tools, tool)?;
+        match tool.as_ref() {
+            // Both of these need a runtime-owned handle rather than just a
+            // name, so they cannot go through `register_builtin_tool`.
+            "memory" => tools.register(MemoryTool::with_manager(memory_manager.clone())),
+            "job_status" => tools.register(JobStatusTool::new(jobs.clone())),
+            "job_output" => tools.register(JobOutputTool::new(jobs.clone())),
+            "job_kill" => tools.register(JobKillTool::new(jobs.clone())),
+            _ => register_builtin_tool(&mut tools, tool)?,
         }
     }
-    Ok(tools.with_timeouts(
-        config.limits.tool_timeout(),
-        config.limits.tool_timeout_overrides(),
-    ))
+    Ok(tools
+        .with_timeouts(
+            config.limits.tool_timeout(),
+            config.limits.tool_timeout_overrides(),
+        )
+        .with_jobs(jobs, config.jobs.promotable.iter().cloned()))
 }
 
 pub fn phase5_policy(config: &WorkspaceConfig, mcp_specs: &[ToolSpec]) -> Policy {
@@ -169,7 +177,12 @@ fn add_builtin_tool_policy(policy: &mut Policy, tool: &str) {
             None,
             "shell tool requires user approval",
         ),
-        "http" | "skill_validate" => allow_tool_once(policy, Arc::from(tool)),
+        // Reading and stopping *this conversation's own* jobs. The registry
+        // fences every lookup by conversation, so there is nothing here to
+        // gate that the fence does not already deny.
+        "http" | "skill_validate" | "job_status" | "job_output" | "job_kill" => {
+            allow_tool_once(policy, Arc::from(tool))
+        }
         "file" => {
             allow_tool_operation(policy, "file", "read");
             ask_tool_operation(policy, "file", "write", "file write requires user approval");
@@ -454,8 +467,12 @@ mod tests {
     #[test]
     fn parent_tools_follow_resources_tools_enabled() {
         let memory = Arc::new(MemoryManager::new(Arc::new(InMemoryMemory::default())));
-        let tools = build_parent_tools(&config_with_parent_tools(&["http"]), memory)
-            .expect("configured tools build");
+        let tools = build_parent_tools(
+            &config_with_parent_tools(&["http"]),
+            memory,
+            Arc::new(JobRegistry::default()),
+        )
+        .expect("configured tools build");
 
         assert!(tools.contains("http"));
         assert!(!tools.contains("file"));
