@@ -74,6 +74,16 @@ pub trait Llm: Send + Sync {
         "llm provider=custom".to_owned()
     }
 
+    /// Complete a turn from the context's transcript alone.
+    ///
+    /// This crate cannot depend on `agentos-core`, so implementations here see
+    /// only [`RunContext::state`] — not the skill prelude or the memory
+    /// fragments an orchestrator contributes. **An orchestrator must not build
+    /// a conversation request this way**: assemble through
+    /// `agentos_core::prompt::assemble` and call [`Llm::complete_messages`], or
+    /// every section but the transcript is silently dropped (the F1 defect
+    /// roadmap item P1 fixed). This method remains for LLM-only callers that
+    /// have no sections to contribute.
     async fn complete(&self, ctx: &RunContext<'_>) -> Result<Message, LlmError>;
 
     async fn complete_messages(

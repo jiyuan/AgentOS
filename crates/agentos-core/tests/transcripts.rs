@@ -459,12 +459,11 @@ async fn golden_memory_hydration() {
     scenario_golden("memory_hydration", &llm, &transcript, &outcome);
 }
 
-/// The P1 target. Hydrated fragments must appear in the assembled request;
-/// today they are written to `RunContext::memory_fragments`, counted in
-/// telemetry, and dropped before the request is built. Un-ignore this when
-/// roadmap item P1 lands — it is the acceptance test for that item.
+/// The F1 acceptance test, landed by roadmap item P1: hydrated fragments must
+/// appear in the assembled request. Before P1 they were written to
+/// `RunContext::memory_fragments`, counted in telemetry, and dropped before the
+/// request was built.
 #[tokio::test]
-#[ignore = "F1: hydrated memory never reaches the request; un-ignore with roadmap item P1"]
 async fn hydrated_memory_reaches_the_model() {
     let fact = "The deploy key rotates every 90 days.";
     let manager = manager_with_fact(fact).await;

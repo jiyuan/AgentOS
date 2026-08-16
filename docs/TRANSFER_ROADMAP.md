@@ -170,6 +170,79 @@ assembles a message vector by hand afterwards.
   `golden/skill_prelude.json` currently shows reaching the model without
   appearing in the session; `grep` finds no remaining hand-built message vector
   outside `prompt/`.
+- **Status: done, with one exit criterion not met** (2026-08-15).
+  `crates/agentos-core/src/prompt/{mod,sections}.rs` own assembly; `Max` and
+  `Min` both call `prompt::assemble`. `hydrated_memory_reaches_the_model` is
+  un-ignored and passing, the `memory_hydration` golden now shows the recalled
+  fact entering the request as a framed system message, and the other six
+  goldens were **byte-identical** across the change — the pre-record run failed
+  exactly one scenario — so the no-hydration path is provably unchanged.
+  `cargo test --workspace` green across 24 targets, clippy clean, boundary and
+  module-size checks pass. Notes and deviations:
+  - **Reconstructability is NOT delivered.** A request is not byte-reproducible
+    from `PromptManifest` + `RunState`: the manifest records which sections
+    contributed and how much, not their content, and `memory_fragments` live
+    only on the transient `RunContext`. Closing this needs a decision the
+    implementation cannot make on its own — [`ARCHITECTURE.md §14`](ARCHITECTURE.md)
+    forbids full memory bodies in traces, so "model-visible ⟺ logged" has to
+    land in the session rather than the trace, which changes every golden and
+    interacts with C3's compaction. Tracked as P3 below.
+  - **The manifest records `chars`, not tokens.** Token estimation is C1's job
+    and lands on this same struct; two estimators would have disagreed.
+  - **No `agentos-interfaces` change.** The plan said the loop records the
+    manifest as a trace event, which would have needed a `RunContext` sink field
+    (the `usage_sink` pattern) and put P1 in the interface ledger. `assemble`
+    emits one structured `tracing` event instead — same observability, no
+    breaking change, ledger unchanged.
+  - **Two LLM calls are deliberately excluded**, both documented at the code:
+    the routing classifier's domain round-trip (`orchestrator/routing.rs`),
+    which must not carry skills, memory, or the transcript; and
+    `Llm::complete(ctx)` in `agentos-llm`, which cannot see sections because
+    that crate cannot depend on core. `Llm::complete`'s doc comment now says an
+    orchestrator must not build a conversation request through it. Its only
+    caller, `LlmOrchestrator`, is unreferenced outside its own crate and is a
+    deletion candidate.
+  - Persona and task-workspace sections were not added: neither exists as a
+    contribution today, so they would have been empty variants.
+
+### P3. Log what the model saw (F1, deferred from P1)
+
+P1 made assembly single-authority but not reconstructable. Decide where the
+assembled non-transcript sections are recorded so a past request can be rebuilt:
+in the session (the harness's rule, and what fork/resume/compaction need) or in
+the trace (cheaper, but [`ARCHITECTURE.md §14`](ARCHITECTURE.md) forbids full
+memory bodies there). Resolve that tension before C3, which rewrites the history
+any reconstruction would read.
+
+- Files: `crates/agentos-core/src/prompt/`, `loop/mod.rs`, whichever sink is
+  chosen; every golden in `crates/agentos-core/tests/golden/` re-records.
+- Effort: M. Depends: P1, and a decision on §14.
+- Verify: a golden's `requests` are derivable from its `session_items` alone.
+- Exit: `golden/skill_prelude.json` no longer shows a system message that
+  reaches the model without appearing in the session.
+
+### P2. Transcript projection (F2 groundwork, F10)
+
+Split "what is in the session log" from "what the model sees". A projection
+function folds the log into the model-visible item list, skipping items shadowed
+by a later checkpoint. Today it is the identity function; P2 exists so C3 can
+land without touching the `Session` trait.
+
+This is the harness's core structural bet — durable state is append-only and
+every view is a fold — and it is what makes plan/todo state (X7), fork (X6), and
+compaction (C3) cheap instead of each being a bespoke mutation path.
+
+- Files: new `crates/agentos-core/src/prompt/projection.rs`; consumed by
+  `prompt/mod.rs`; `runner.rs` keeps loading the full transcript unchanged.
+- Effort: S.
+- Depends: P1.
+- Verify: `cargo test -p agentos-core prompt`; projection over a log with no
+  checkpoints returns the input unchanged (property test).
+- Exit: `Session` trait unmodified — no `semver-checks` entry; the projection is
+  the only reader that decides model visibility.
+
+---
+
 ## Phase 2 — Bounding a conversation's lifetime
 
 Ordered by cost: measure, then prune for free, then spend a model call. A
@@ -519,6 +592,7 @@ resume, fork, and having its history compacted; a live mirror does not.
 
 ```text
 T1 ──┬─> P1 ──┬─> P2 ──> C3 ──> C4
+     │        ├─> P3 ──────┘
      │        ├─> C1 ──> C2 ──┘
      │        └─> X5
      └─> D1 ──> D2 ──┬─> D3
@@ -526,6 +600,9 @@ T1 ──┬─> P1 ──┬─> P2 ──> C3 ──> C4
                      └─> X2
 P2 ──> X6, X7        X3 ──> X4
 ```
+
+P3 lands before C3: compaction rewrites the history that any reconstruction
+reads, so decide what is logged before deciding what may be shadowed.
 
 Three tracks run in parallel after T1: the **request track** (P1, P2, C1–C4), the
 **control track** (D1, D2, D3), and the **hygiene track** (X1, X3, X4, X5). They
