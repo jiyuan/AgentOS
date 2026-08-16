@@ -4,6 +4,30 @@
     "kind": "finished",
     "reply": "The tool said: pong"
   },
+  "request_headers": [
+    {
+      "sections": [
+        {
+          "chars": 17,
+          "id": "transcript",
+          "messages": 1
+        }
+      ],
+      "total_chars": 17,
+      "total_messages": 1
+    },
+    {
+      "sections": [
+        {
+          "chars": 21,
+          "id": "transcript",
+          "messages": 3
+        }
+      ],
+      "total_chars": 21,
+      "total_messages": 3
+    }
+  ],
   "requests": [
     {
       "messages": [

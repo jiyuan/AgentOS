@@ -1,6 +1,8 @@
 use crate::run_state::RunState;
 use crate::session::Transcript;
-use agentos_proto::{AgentId, Message, Namespace, RecordId, TaskId, ToolCall, Usage};
+use agentos_proto::{
+    AgentId, Message, Namespace, RecordId, RequestHeader, TaskId, ToolCall, Usage,
+};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -180,6 +182,14 @@ pub struct RunContext<'a> {
     /// response `Message` is consumed by `Plan::CallTool` and never reaches
     /// the loop) would have their token usage silently dropped.
     pub usage_sink: Arc<Mutex<Vec<Usage>>>,
+    /// Per-call record of what each assembled provider request was made of.
+    /// The orchestrator pushes one header per LLM round-trip; the loop drains
+    /// the sink after `plan()` returns and records each as a `request_header`
+    /// trace event, so a past request is reconstructable from the trace plus
+    /// the workspace and memory records it names. Mirrors [`Self::usage_sink`],
+    /// and for the same reason: a request assembled inside `plan()` never
+    /// otherwise reaches the loop.
+    pub request_sink: Arc<Mutex<Vec<RequestHeader>>>,
     /// Optional sink for incremental assistant text (see [`StreamSink`]). The
     /// loop installs it on the context before `plan()`; an orchestrator that
     /// supports streaming pushes each text chunk through
@@ -196,6 +206,7 @@ impl std::fmt::Debug for RunContext<'_> {
             .field("memory_fragments", &self.memory_fragments)
             .field("resource_index", &self.resource_index)
             .field("usage_sink", &self.usage_sink)
+            .field("request_sink", &self.request_sink)
             // `StreamSink` is a closure (no Debug); report only its presence.
             .field("stream_sink", &self.stream_sink.is_some())
             .finish()
@@ -226,6 +237,7 @@ impl<'a> RunContext<'a> {
             memory_fragments: Vec::new(),
             resource_index: ResourceIndex::default(),
             usage_sink: Arc::new(Mutex::new(Vec::new())),
+            request_sink: Arc::new(Mutex::new(Vec::new())),
             stream_sink: None,
         }
     }
@@ -254,6 +266,15 @@ impl<'a> RunContext<'a> {
     /// must call this once per LLM round-trip — including rounds that resolve
     /// to `Plan::CallTool`, where the response `Message` (which carries
     /// `TOKEN_USAGE_METADATA_KEY`) is otherwise discarded.
+    /// Record what one assembled request was made of, so the loop can emit it
+    /// as a `request_header` trace event after `plan()` returns. Callers that
+    /// assemble through `agentos_core::prompt` get this for free.
+    pub fn push_request_header(&self, header: RequestHeader) {
+        if let Ok(mut guard) = self.request_sink.lock() {
+            guard.push(header);
+        }
+    }
+
     pub fn push_llm_usage(&self, usage: Usage) {
         if let Ok(mut guard) = self.usage_sink.lock() {
             guard.push(usage);

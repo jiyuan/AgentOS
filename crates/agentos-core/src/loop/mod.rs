@@ -21,6 +21,7 @@ mod budget;
 mod delegate;
 mod escalate;
 mod items;
+mod request;
 mod telemetry;
 
 use approval::{approve_transition, ApproveTransition};
@@ -31,6 +32,7 @@ use items::{
     assistant_tool_call_item, metadata_value, subagent_result_item, suborchestrator_result_item,
     tool_result_item, tool_status_name,
 };
+use request::record_request_header;
 use telemetry::{field_key, plan_assignment_fields, record_telemetry_event};
 
 #[derive(Debug, Error)]
@@ -294,6 +296,12 @@ async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunErro
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
     );
+    let pending_requests = std::mem::take(
+        &mut *run_ctx
+            .request_sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
     drop(run_ctx);
     trace::record_event(
         &mut state,
@@ -317,6 +325,11 @@ async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunErro
         "orchestrator_task_assigned",
         assignment_fields,
     );
+    // Before the usage events: the header describes the request that produced
+    // the usage, so a trace reads request-then-cost.
+    for header in pending_requests {
+        record_request_header(&mut state, deps.hooks, plan_span_id.clone(), header);
+    }
     for usage in pending_usage {
         record_llm_usage(&mut state, deps, plan_span_id.clone(), usage);
     }

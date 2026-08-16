@@ -386,11 +386,37 @@ pub fn assert_golden(name: &str, actual: &Value) {
     }
 }
 
+/// The `request_header` trace events a finished run recorded — the durable
+/// answer to "what was this request made of", pinned alongside the request
+/// itself so a golden proves the two agree.
+pub fn normalize_request_headers(state: &RunState) -> Value {
+    Value::Array(
+        state
+            .trace_events
+            .iter()
+            .filter(|event| event.name.as_ref() == "request_header")
+            .map(|event| {
+                Value::Object(
+                    event
+                        .fields
+                        .iter()
+                        .map(|(key, value)| (key.as_ref().to_owned(), value.clone()))
+                        .collect(),
+                )
+            })
+            .collect(),
+    )
+}
+
 /// Assemble the standard golden document for one scenario.
 pub fn scenario(llm: &ScriptedLlm, transcript: &Transcript, outcome: &RunOutcome) -> Value {
-    json!({
+    let mut document = json!({
         "requests": normalize_requests(&llm.requests()),
         "session_items": normalize_transcript(transcript),
         "outcome": normalize_outcome(outcome),
-    })
+    });
+    if let RunOutcome::Finished { state, .. } = outcome {
+        document["request_headers"] = normalize_request_headers(state);
+    }
+    document
 }

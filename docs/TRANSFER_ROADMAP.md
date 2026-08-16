@@ -65,8 +65,10 @@ These apply to every item; they are not repeated per-item.
 - **`Approve` stays concrete.** F8 adds enforcement of a decision the policy
   engine already made; it does not add a policy trait.
 - Changes to `agentos-interfaces` run
-  `cargo semver-checks check-release -p agentos-interfaces` and note the result
-  in the PR. The interface-change ledger at the end of this document lists every
+  `cargo semver-checks check-release -p agentos-interfaces --baseline-rev <rev>`
+  and note the result in the PR. The `--baseline-rev` form compares against a
+  git revision, so it works even though these crates are unpublished (which
+  [`FEATURE_ROADMAP.md`](FEATURE_ROADMAP.md) A3 had recorded as a blocker). The interface-change ledger at the end of this document lists every
   item that touches it.
 - Every item that adds a deployment-varying value adds it to `agent.toml` with
   loader validation, never a `DEFAULT_*` constant (F15). The consolidated config
@@ -214,12 +216,60 @@ the trace (cheaper, but [`ARCHITECTURE.md §14`](ARCHITECTURE.md) forbids full
 memory bodies there). Resolve that tension before C3, which rewrites the history
 any reconstruction would read.
 
-- Files: `crates/agentos-core/src/prompt/`, `loop/mod.rs`, whichever sink is
-  chosen; every golden in `crates/agentos-core/tests/golden/` re-records.
+- Files: `crates/agentos-proto/src/request.rs`,
+  `crates/agentos-interfaces/src/orchestrator.rs`,
+  `crates/agentos-core/src/prompt/`, `crates/agentos-core/src/loop/request.rs`;
+  every golden in `crates/agentos-core/tests/golden/` re-records.
 - Effort: M. Depends: P1, and a decision on §14.
-- Verify: a golden's `requests` are derivable from its `session_items` alone.
-- Exit: `golden/skill_prelude.json` no longer shows a system message that
-  reaches the model without appearing in the session.
+- Verify: every golden carries a `request_headers` entry per LLM round-trip
+  naming that request's sources; no memory body appears in a header.
+- Exit: the answer to "what was this request made of" is durable, and §14 still
+  holds.
+- **Status: done** (2026-08-15). The decision, and what changed because of it:
+  - **The record goes to the run trace, not the session, and it names sources
+    rather than copying them.** The standard adopted is the harness's actual
+    one — *reconstructable from log + code*, not "the log holds a verbatim
+    copy". A `request_header` trace event per LLM round-trip records each
+    section's id, message count, char count, and its `RequestSource`s: skills by
+    name, memory records by namespace and record id. The bodies stay where they
+    already live — the workspace `SKILL.md` files, the memory store, and
+    `RunState`'s transcript.
+  - **Why not the session.** Appending prelude and memory items to the
+    conversation would replay them as history next turn, or would need the
+    surface/log-only split that P2 has not built yet; and the prelude is
+    identical every turn, so a months-long conversation would accumulate
+    hundreds of copies of it — the exact growth F2 exists to stop. These are
+    per-*run* derived inputs, so they belong to the run record.
+  - **Why this satisfies §14.** The prohibition is on memory *bodies* in traces.
+    A namespace plus record id is an address, not content, and
+    `no_memory_body_reaches_the_trace` asserts it. Nothing was weakened to fit.
+  - **The stated exit criterion was wrong and is restated above.**
+    `golden/skill_prelude.json` still shows a system message that reaches the
+    model without appearing in `session_items`, and under this decision it
+    always will. The criterion assumed the session was the answer; the analysis
+    says otherwise. What the golden now carries instead is a `request_headers`
+    block naming `deploy-notes` as that message's source, which is the
+    reconstructability the item was actually for. If a later item needs
+    verbatim session-side logging — fork replaying a request exactly, say — it
+    needs P2's surface split first and should be raised on its own merits.
+  - **Interface change, machine-verified.** `RunContext` gains `request_sink`,
+    mirroring `usage_sink` for the same reason: something assembled inside
+    `plan()` must reach the loop. `agentos-proto` gains `RequestHeader` /
+    `RequestSection` / `RequestSource`, purely additive.
+  - **`cargo semver-checks` does work on this repo.**
+    [`FEATURE_ROADMAP.md`](FEATURE_ROADMAP.md) A3 recorded that it cannot run
+    because the crates are unpublished. `--baseline-rev <rev>` compares against
+    a git revision instead of crates.io and needs no publishing:
+    `cargo semver-checks check-release -p agentos-interfaces --baseline-rev HEAD`
+    reports the one expected major break (`constructible_struct_adds_field` on
+    `RunContext.request_sink`) and `agentos-proto` as additive-only. Use this
+    form for every future interface change rather than noting breaks by hand.
+  - **Unplanned benefit for C1.** Each header carries `total_messages` and
+    `total_chars`, so request growth is already visible per turn in the trace —
+    `golden/tool_call_allowed.json` shows a run going from 1 message to 3 across
+    its two round-trips. C1 can calibrate pressure thresholds against real
+    recorded traffic instead of guessing, and should extend this header rather
+    than introduce a parallel measurement.
 
 ### P2. Transcript projection (F2 groundwork, F10)
 
@@ -643,7 +693,8 @@ the result in the PR.
 
 | Item | Change | Expected |
 |---|---|---|
-| D1 | `RunContext` gains a cancellation field | Breaking; same pattern as `usage_sink`, `stream_sink` |
+| P3 | `RunContext` gains `request_sink`; `agentos-proto` gains `RequestHeader` | **Verified**: interfaces major (`constructible_struct_adds_field`), proto additive |
+| D1 | `RunContext` gains a cancellation field | Breaking; same pattern as `usage_sink`, `stream_sink`, `request_sink` |
 | D2 | `ToolSpec` gains `timeout_ms` (`#[serde(default)]`) | Breaking on struct literals; additive on wire |
 | X1 (b) | `Plan::CallTool` carries a batch | Breaking |
 | X2 | `ToolSpec.requires_isolation` → sandbox mode | Breaking |

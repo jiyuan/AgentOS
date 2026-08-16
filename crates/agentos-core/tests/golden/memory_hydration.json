@@ -4,6 +4,27 @@
     "kind": "finished",
     "reply": "Noted."
   },
+  "request_headers": [
+    {
+      "sections": [
+        {
+          "chars": 240,
+          "id": "memory",
+          "messages": 1,
+          "sources": [
+            "private/conversation/golden-conversation/semantic/general/record-1"
+          ]
+        },
+        {
+          "chars": 37,
+          "id": "transcript",
+          "messages": 1
+        }
+      ],
+      "total_chars": 277,
+      "total_messages": 2
+    }
+  ],
   "requests": [
     {
       "messages": [

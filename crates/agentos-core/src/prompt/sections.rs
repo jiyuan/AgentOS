@@ -6,8 +6,9 @@
 //! entry in a golden transcript.
 
 use agentos_interfaces::orchestrator::MemoryFragment;
-use agentos_proto::{Message, MessageRole};
+use agentos_proto::{Message, MessageRole, RequestSource};
 use serde_json::Value;
+use std::sync::Arc;
 
 /// Identifies one contribution to an assembled request.
 ///
@@ -33,6 +34,41 @@ impl SectionId {
             Self::Transcript => "transcript",
         }
     }
+}
+
+/// The workspace-skill section: the rendered message plus the skills it was
+/// built from.
+///
+/// The names travel with the message because the request header records where
+/// a section's content came from, and only the catalog owner knows that. The
+/// message body is derivable from these names plus the workspace `SKILL.md`
+/// files, so the header never copies it.
+#[derive(Clone, Debug)]
+pub struct SkillPrelude {
+    pub message: Message,
+    pub skills: Vec<Arc<str>>,
+}
+
+impl SkillPrelude {
+    pub(super) fn sources(&self) -> Vec<RequestSource> {
+        self.skills
+            .iter()
+            .map(|name| RequestSource::Skill(Arc::clone(name)))
+            .collect()
+    }
+}
+
+/// What the memory section was built from: the record each fragment came from,
+/// never the fragment body ([`ARCHITECTURE.md` §14](../../../../docs/ARCHITECTURE.md)
+/// keeps memory bodies out of traces).
+pub(super) fn memory_sources(fragments: &[MemoryFragment]) -> Vec<RequestSource> {
+    fragments
+        .iter()
+        .map(|fragment| RequestSource::Memory {
+            namespace: fragment.namespace.clone(),
+            record_id: fragment.id.as_ref().map(|id| Arc::from(id.as_str())),
+        })
+        .collect()
 }
 
 /// Keys a memory body may use for its human-readable text, in preference
