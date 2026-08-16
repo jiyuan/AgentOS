@@ -57,6 +57,15 @@ pub(super) fn record_request_header(
             .unwrap_or(0);
         fields.insert(field_key("pressure_percent"), Value::from(percent));
     }
+    // Absent rather than zero on the overwhelming majority of requests, so a
+    // trace search for elision returns only the requests that had some.
+    if header.elided_messages > 0 {
+        fields.insert(
+            field_key("elided_messages"),
+            Value::from(header.elided_messages),
+        );
+        fields.insert(field_key("elided_chars"), Value::from(header.elided_chars));
+    }
     fields.insert(
         field_key("sections"),
         Value::Array(header.sections.iter().map(section_value).collect()),
@@ -142,6 +151,8 @@ mod tests {
             total_tokens: 60,
             tool_tokens: 10,
             context_budget_tokens: Some(1_000),
+            elided_messages: 0,
+            elided_chars: 0,
         }
     }
 

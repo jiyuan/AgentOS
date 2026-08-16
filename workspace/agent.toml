@@ -77,6 +77,15 @@ mode = "poll_once"
 enabled = false
 mode = "long_connection"
 
+# Sizes a deployment has real reason to change. Omit the section to keep the
+# defaults; every key here is optional and an unknown key fails the load.
+[limits]
+# Bytes of a tool result kept inline in the transcript. Anything past this is
+# written to workspace/spill/<run id>/<tool>-<call id>.txt and the inline text
+# becomes a preview plus a pointer to that file, so oversized output is
+# summarised rather than destroyed. Minimum 512.
+tool_result_inline_bytes = 65536
+
 [isolation]
 worker_path_env = "AGENTOS_TOOL_WORKER_PATH"
 

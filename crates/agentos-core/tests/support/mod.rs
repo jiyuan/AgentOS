@@ -30,8 +30,10 @@ use agentos_proto::{
 };
 use async_trait::async_trait;
 use serde_json::{json, value::RawValue, Value};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, VecDeque};
-use std::path::PathBuf;
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
@@ -58,6 +60,7 @@ pub struct RecordedRequest {
 pub struct ScriptedLlm {
     responses: Mutex<VecDeque<Message>>,
     requests: Mutex<Vec<RecordedRequest>>,
+    context_budget: usize,
 }
 
 /// The context window every scripted run is measured against. Deliberately
@@ -70,7 +73,15 @@ impl ScriptedLlm {
         Self {
             responses: Mutex::new(responses.into_iter().collect()),
             requests: Mutex::new(Vec::new()),
+            context_budget: SCRIPTED_CONTEXT_BUDGET,
         }
+    }
+
+    /// Shrink the window this provider reports, so a scenario can reach the
+    /// pressure that triggers elision without a transcript of filler.
+    pub fn with_context_budget(mut self, tokens: usize) -> Self {
+        self.context_budget = tokens;
+        self
     }
 
     /// Every request received so far, in call order.
@@ -112,7 +123,7 @@ impl Llm for ScriptedLlm {
     }
 
     fn context_budget_tokens(&self) -> Option<usize> {
-        Some(SCRIPTED_CONTEXT_BUDGET)
+        Some(self.context_budget)
     }
 
     async fn complete(&self, ctx: &RunContext<'_>) -> Result<Message, LlmError> {
@@ -189,14 +200,36 @@ pub fn tool_policy(tools: &[&str], verb: PolicyVerb) -> Policy {
 }
 
 /// A directory removed when the guard drops, so a failing test cannot leave
-/// a skill tree behind in the system temp dir.
+/// a tree behind in the system temp dir.
 pub struct TempTree(PathBuf);
+
+impl TempTree {
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
 
 impl Drop for TempTree {
     fn drop(&mut self) {
         // Best effort: a cleanup failure must not mask the test's own result.
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// An empty directory unique to this process and thread, so scenarios running
+/// in parallel cannot collide on one path.
+///
+/// The discriminator is a fixed-width hash rather than the ids themselves: a
+/// golden that redacts this path still pins the *character count* of the
+/// content that carried it, and a `ThreadId` that renders as one digit on one
+/// run and two on the next would make that count depend on test scheduling.
+pub fn temp_tree(label: &str) -> TempTree {
+    let mut hasher = DefaultHasher::new();
+    (std::process::id(), std::thread::current().id()).hash(&mut hasher);
+    let root =
+        std::env::temp_dir().join(format!("agentos-golden-{label}-{:016x}", hasher.finish()));
+    std::fs::create_dir_all(&root).expect("a temp tree is creatable");
+    TempTree(root)
 }
 
 /// Write a one-skill workspace tree and load it as a catalog.
@@ -210,11 +243,8 @@ pub fn skill_catalog(
     description: &str,
     instructions: &str,
 ) -> (WorkspaceSkillCatalog, TempTree) {
-    let root = std::env::temp_dir().join(format!(
-        "agentos-golden-{label}-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
+    let tree = temp_tree(label);
+    let root = tree.path().to_path_buf();
     let skill_dir = root.join(name);
     std::fs::create_dir_all(&skill_dir).expect("skill directory is creatable");
     std::fs::write(
@@ -225,7 +255,7 @@ pub fn skill_catalog(
 
     let catalog = WorkspaceSkillCatalog::load_enabled(&root, &[Arc::from(name)])
         .expect("the written skill tree is valid");
-    (catalog, TempTree(root))
+    (catalog, tree)
 }
 
 pub fn runner_deps<'a>(
@@ -251,6 +281,7 @@ pub fn runner_deps<'a>(
         output_guardrails: &[],
         tool_guardrails: &[],
         stream_sink: None,
+        content_limits: Default::default(),
     }
 }
 

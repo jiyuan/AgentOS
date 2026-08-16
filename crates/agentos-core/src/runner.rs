@@ -8,6 +8,7 @@ use crate::r#loop::{
     resume_approved, FinalOutput, InputGuardrailEntry, LoopDeps, OutputGuardrailEntry, RunError,
     RunLoopState, StartCtx, ToolGuardrailEntry,
 };
+use crate::spill::ContentLimits;
 use crate::subagents::SubAgentRegistry;
 use crate::task_workspace::{TaskWorkspace, TaskWorkspaceError};
 use crate::tools::ToolRegistry;
@@ -101,6 +102,9 @@ pub struct RunnerDeps<'a> {
     /// set it; everything else leaves it `None` for buffered, byte-identical
     /// behavior.
     pub stream_sink: Option<StreamSink>,
+    /// Inline cap for tool output and where the overflow is persisted.
+    /// `Default::default()` reproduces the pre-spill behavior exactly.
+    pub content_limits: ContentLimits<'a>,
 }
 
 pub trait TraceSink: Send + Sync {
@@ -314,6 +318,7 @@ pub async fn run_envelope(
         output_guardrails: deps.output_guardrails,
         tool_guardrails: deps.tool_guardrails,
         stream_sink: deps.stream_sink.clone(),
+        content_limits: deps.content_limits,
     };
     let mut current = RunLoopState::Start(StartCtx { state });
 
@@ -397,6 +402,7 @@ pub async fn resume_run(
         output_guardrails: deps.output_guardrails,
         tool_guardrails: deps.tool_guardrails,
         stream_sink: deps.stream_sink.clone(),
+        content_limits: deps.content_limits,
     };
     let mut current = match resume_approved(paused.state) {
         Ok(current) => current,
@@ -745,6 +751,7 @@ mod tests {
             output_guardrails: &[],
             tool_guardrails: &[],
             stream_sink: None,
+            content_limits: Default::default(),
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),
@@ -843,6 +850,7 @@ mod tests {
             output_guardrails: &[],
             tool_guardrails: &[],
             stream_sink: None,
+            content_limits: Default::default(),
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),
@@ -892,6 +900,7 @@ mod tests {
             output_guardrails: &[],
             tool_guardrails: &guardrails,
             stream_sink: None,
+            content_limits: Default::default(),
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),
@@ -942,6 +951,7 @@ mod tests {
             output_guardrails: &[],
             tool_guardrails: &[],
             stream_sink: None,
+            content_limits: Default::default(),
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),
@@ -1005,6 +1015,7 @@ mod tests {
             output_guardrails: &[],
             tool_guardrails: &[],
             stream_sink: None,
+            content_limits: Default::default(),
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),
@@ -1080,6 +1091,7 @@ mod tests {
             output_guardrails: &[],
             tool_guardrails: &[],
             stream_sink: None,
+            content_limits: Default::default(),
         };
         let mut metadata = BTreeMap::new();
         metadata.insert(
@@ -1365,6 +1377,7 @@ mod tests {
             output_guardrails: &[],
             tool_guardrails: &[],
             stream_sink: None,
+            content_limits: Default::default(),
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),

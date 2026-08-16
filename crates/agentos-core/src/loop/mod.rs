@@ -1,5 +1,6 @@
 use crate::approve::Policy;
 use crate::hooks::Hooks;
+use crate::spill::{ContentLimits, SpillRef, SpillSource};
 use crate::subagents::{SubAgentError, SubAgentRegistry};
 use crate::task_workspace::{TaskWorkspace, TaskWorkspaceError};
 use crate::tools::{ToolRegistry, ToolRegistryError};
@@ -79,6 +80,8 @@ pub struct LoopDeps<'a> {
     /// it on each plan's [`RunContext`] so a streaming-capable orchestrator can
     /// emit tokens as they arrive. `None` keeps planning buffered.
     pub stream_sink: Option<StreamSink>,
+    /// Inline cap for tool output and where the overflow is persisted.
+    pub content_limits: ContentLimits<'a>,
 }
 
 pub struct InputGuardrailEntry<'a> {
@@ -414,6 +417,9 @@ async fn act(ctx: ActCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunError>
             // arrives without a preceding assistant turn carrying that
             // tool_call's id.
             state.transcript.items.push(assistant_tool_call_item(&call));
+            // Kept for the spill filename: `execute_tool` consumes the call,
+            // and a `ToolResult` carries only the call id.
+            let tool_name = Arc::clone(&call.name);
             // A policy denial short-circuits execution: surface it as a denied
             // `ToolResult` the model can read and recover from, rather than
             // aborting the run (and the sub-agent / gateway above it).
@@ -421,7 +427,12 @@ async fn act(ctx: ActCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunError>
                 Some(reason) => denied_tool_result(&mut state, deps, &call, reason),
                 None => execute_tool(&mut state, deps, call).await?,
             };
-            state.transcript.items.push(tool_result_item(result));
+            let spilled = spill_oversized(&state, deps, &tool_name, &result).await;
+            state.transcript.items.push(tool_result_item(
+                result,
+                deps.content_limits.tool_result_inline_bytes,
+                spilled,
+            ));
         }
         Plan::Delegate(spec) => match execute_delegate(&mut state, deps, &spec).await? {
             DelegateOutcome::Finished(result) => {
@@ -551,6 +562,50 @@ async fn observe(ctx: ObserveCtx) -> Result<RunLoopState, RunError> {
         state: ctx.state,
         turns: ctx.turns,
     }))
+}
+
+/// Persist an oversized tool result, returning the reference to cite inline.
+///
+/// Best effort by design: with no store configured, a result within the cap,
+/// or a storage failure, this yields `None` and the caller degrades to a plain
+/// truncation notice. A full disk must not turn a successful tool call into a
+/// failed run.
+async fn spill_oversized(
+    state: &RunState,
+    deps: &LoopDeps<'_>,
+    tool_name: &str,
+    result: &ToolResult,
+) -> Option<SpillRef> {
+    let store = deps.content_limits.spill?;
+    if result.content.len() <= deps.content_limits.tool_result_inline_bytes {
+        return None;
+    }
+    let source = SpillSource {
+        run_id: &state.run_id,
+        tool_name,
+        call_id: &result.call_id,
+    };
+    match store.save_text(&source, &result.content).await {
+        Ok(saved) => {
+            info!(
+                run_id = state.run_id.as_str(),
+                tool_call_id = result.call_id.as_str(),
+                bytes = saved.bytes,
+                locator = saved.locator.as_str(),
+                "tool output spilled"
+            );
+            Some(saved)
+        }
+        Err(error) => {
+            tracing::warn!(
+                run_id = state.run_id.as_str(),
+                tool_call_id = result.call_id.as_str(),
+                error = %error,
+                "tool output spill failed; falling back to truncation"
+            );
+            None
+        }
+    }
 }
 
 async fn execute_tool(

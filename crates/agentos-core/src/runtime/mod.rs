@@ -13,6 +13,7 @@ use crate::orchestrator::{
 use crate::r#loop::{InputGuardrailEntry, OutputGuardrailEntry, ToolGuardrailEntry};
 use crate::runner::{JsonlTraceSink, RunnerDeps, TraceSink};
 use crate::skills::WorkspaceSkillCatalog;
+use crate::spill::{ContentLimits, SpillStore};
 use crate::subagents::{SubAgentDefinition, SubAgentRegistry};
 use crate::task_workspace::TaskWorkspace;
 use crate::tools::{MemoryTool, StaticMcpClient, StaticMcpTool, StdioMcpClient, ToolRegistry};
@@ -165,9 +166,19 @@ pub struct AgentRuntime {
     pii_filter: PiiFilter,
     max_output_length: MaxOutputLength,
     shell_allowlist: ShellCommandAllowlist,
+    spill: Option<Arc<SpillStore>>,
+    tool_result_inline_bytes: usize,
 }
 
 impl AgentRuntime {
+    /// The inline cap and spill store every run in this runtime uses.
+    pub fn content_limits(&self) -> ContentLimits<'_> {
+        ContentLimits {
+            tool_result_inline_bytes: self.tool_result_inline_bytes,
+            spill: self.spill.as_deref(),
+        }
+    }
+
     pub async fn build(paths: RuntimePaths) -> Result<Self, String> {
         Self::build_with(paths, &|_| None).await
     }
@@ -256,11 +267,17 @@ impl AgentRuntime {
         let task_workspace = Arc::new(TaskWorkspace::new(
             workspace_config.task_workspace.root.clone(),
         ));
+        // Spill artifacts live beside the other workspace-owned runtime state.
+        let spill = Some(Arc::new(SpillStore::new(
+            resolved_workspace_root.join("spill"),
+        )));
+        let tool_result_inline_bytes = workspace_config.limits.tool_result_inline_bytes;
         let subagents = subagents.map(|registry| {
             registry
                 .with_trace_sink(trace_sink.clone())
                 .with_task_workspace(task_workspace.clone())
                 .with_session(session.clone())
+                .with_content_limits(spill.clone(), tool_result_inline_bytes)
         });
         let shell_allowlist =
             ShellCommandAllowlist::new(workspace_config.guardrails.shell_allowlist.iter().cloned());
@@ -281,6 +298,8 @@ impl AgentRuntime {
             pii_filter: PiiFilter,
             max_output_length: MaxOutputLength::new(64_000),
             shell_allowlist,
+            spill,
+            tool_result_inline_bytes,
         })
     }
 
@@ -436,6 +455,7 @@ impl<'a> RuntimeDepsScope<'a> {
             output_guardrails: &[],
             tool_guardrails: &[],
             stream_sink: None,
+            content_limits: self.runtime.content_limits(),
         }
     }
 
@@ -482,6 +502,7 @@ impl<'a> RuntimeDepsScope<'a> {
             output_guardrails,
             tool_guardrails,
             stream_sink: None,
+            content_limits: self.runtime.content_limits(),
         }
     }
 
