@@ -1,0 +1,71 @@
+{
+  "provider": "openai",
+  "model": "gpt-5.4-mini",
+  "recorded_at": "2026-08-17",
+  "samples": [
+    {
+      "case": "minimal",
+      "chars": 4,
+      "messages": 1,
+      "tools": 0,
+      "estimated_tokens": 5,
+      "actual_tokens": 7
+    },
+    {
+      "case": "english_prose",
+      "chars": 636,
+      "messages": 1,
+      "tools": 0,
+      "estimated_tokens": 163,
+      "actual_tokens": 134
+    },
+    {
+      "case": "chinese_prose",
+      "chars": 201,
+      "messages": 1,
+      "tools": 0,
+      "estimated_tokens": 185,
+      "actual_tokens": 140
+    },
+    {
+      "case": "mixed_scripts",
+      "chars": 175,
+      "messages": 1,
+      "tools": 0,
+      "estimated_tokens": 95,
+      "actual_tokens": 82
+    },
+    {
+      "case": "code_block",
+      "chars": 428,
+      "messages": 1,
+      "tools": 0,
+      "estimated_tokens": 112,
+      "actual_tokens": 138
+    },
+    {
+      "case": "multi_turn",
+      "chars": 197,
+      "messages": 5,
+      "tools": 0,
+      "estimated_tokens": 81,
+      "actual_tokens": 76
+    },
+    {
+      "case": "tool_schemas",
+      "chars": 66,
+      "messages": 1,
+      "tools": 2,
+      "estimated_tokens": 236,
+      "actual_tokens": 171
+    },
+    {
+      "case": "tool_round_trip",
+      "chars": 315,
+      "messages": 3,
+      "tools": 1,
+      "estimated_tokens": 238,
+      "actual_tokens": 236
+    }
+  ]
+}

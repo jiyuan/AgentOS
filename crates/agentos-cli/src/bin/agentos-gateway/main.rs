@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod calibrate;
 mod catalog;
 mod shard;
 
@@ -183,6 +184,19 @@ fn run() -> Result<(), String> {
             let check = env::args().any(|arg| arg == "--check");
             catalog::run(&root, check)
         }
+        "calibrate" => {
+            // Same reasoning as `catalog`: the record is checked-in
+            // documentation, so it is located in the source tree rather than
+            // under $AGENTOS_HOME. The provider, though, comes from the
+            // deployment's own environment — the point is to measure the model
+            // this machine actually calls.
+            let root = env::args()
+                .skip(2)
+                .find_map(|arg| arg.strip_prefix("--root=").map(PathBuf::from))
+                .unwrap_or_else(calibrate::default_root);
+            let check = env::args().any(|arg| arg == "--check");
+            calibrate::run(&root, check)
+        }
         "serve" => serve(&config),
         "-h" | "--help" | "help" => {
             usage();
@@ -195,7 +209,7 @@ fn run() -> Result<(), String> {
 fn usage() {
     eprintln!(
         "\
-Usage: agentos-gateway <start|stop|restart|status|config|catalog> [OPTIONS]
+Usage: agentos-gateway <start|stop|restart|status|config|catalog|calibrate> [OPTIONS]
 
 Manage the AgentOS gateway as a persistent background service.
 
@@ -208,6 +222,10 @@ Subcommands:
   catalog    Regenerate docs/config-catalog.md and docs/tool-catalog.md from
              the code. `--check` verifies they are current without writing,
              which is what CI runs; `--root=PATH` names the repository.
+  calibrate  Measure the token estimator against the configured provider's own
+             counts and record the result (roadmap C1). Spends real requests.
+             `--check` re-scores today's estimator against the recorded counts
+             offline, spending nothing; `--root=PATH` names the repository.
 
 All workspace paths derive from $AGENTOS_HOME (set in .env or the process env).
 If unset, $AGENTOS_HOME defaults to the parent dir of the loaded .env file,
@@ -256,8 +274,9 @@ where
             }
             option if option.starts_with("--env-file=") => {}
             "--no-env-override" => {}
-            // `catalog`'s own options. Parsed by that subcommand from the raw
-            // argv, since they name a source tree rather than a runtime path.
+            // `catalog`'s and `calibrate`'s own options. Parsed by those
+            // subcommands from the raw argv, since they name a source tree
+            // rather than a runtime path.
             "--check" => {}
             option if option.starts_with("--root=") => {}
             "-h" | "--help" => {

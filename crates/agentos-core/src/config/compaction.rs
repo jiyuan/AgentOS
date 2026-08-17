@@ -5,16 +5,26 @@
 //! then does this spend a model call to replace the oldest span of a
 //! conversation with a summary.
 //!
-//! # On the default trigger
+//! # Where the default trigger comes from
 //!
-//! `pressure_percent` is **provisional**. C1 shipped with its ~15% accuracy
-//! check outstanding — it needs a live provider call to compare the estimate
-//! against a reported `input_tokens` — and until that has been run against real
-//! traffic, 90 is a reasoned choice rather than a measured one. It sits
-//! deliberately above C2's 80% elision trigger so free pruning always gets the
-//! first attempt, and the estimator is biased high, so a run reaching an
-//! estimated 90% is very likely below that in truth. Tune this once the check
-//! has run.
+//! 84 is measured, not chosen. C1's accuracy check (`docs/token-calibration.md`,
+//! regenerate with `agentos-gateway calibrate`) found the estimator's worst
+//! meaningful **under**-estimate to be 18.8%, on a request made almost entirely
+//! of code — symbol-dense ASCII tokenizes worse than the 4:1 rate `prompt::tokens`
+//! applies to it. An under-estimate is the dangerous direction: it is the case
+//! where a request is larger than the runtime believes, so the trigger has to
+//! fire early enough that the true request is still inside the window.
+//!
+//! `100 / 1.188 = 84.2`, floored to **84**: an estimate reading 84% of the window
+//! is at most 100% of it in truth, so compaction is always attempted before the
+//! provider can reject the request. It remains above C2's 80% elision trigger,
+//! so free pruning still gets the first attempt — the two constraints leave a
+//! four-point window, and this is the top of it.
+//!
+//! This was 90 while the check was outstanding. 90 survived the measurement's
+//! *typical* case and failed its worst one: at the measured error a request
+//! estimated at 90% could be at 107% of the window, which is a provider
+//! rejection that C4 then has to recover from.
 //!
 //! It is an integer percent, not a ratio, because that is the unit C1 already
 //! traces on every request. A float here would have to be compared against that
@@ -36,6 +46,8 @@ pub struct CompactionConfig {
     /// disable C2's elision — pruning is free and always applies.
     pub enabled: bool,
     /// Percent of the context window above which the next turn compacts first.
+    /// Derived from C1's measured estimator error — see this module's header
+    /// before changing it, and re-derive it if the estimator changes.
     pub pressure_percent: usize,
     /// Conversation items kept verbatim after the checkpoint. The summary
     /// covers everything before them.
@@ -61,7 +73,7 @@ impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            pressure_percent: 90,
+            pressure_percent: 84,
             retain_tail_turns: 8,
             model: LlmModelTier::High,
         }

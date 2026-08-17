@@ -342,7 +342,7 @@ otherwise be guessing at.
 - Verify: `cargo test -p agentos-core prompt::tokens`; estimate is within ~15% of
   a provider-reported `Usage.prompt_tokens` on a recorded run.
 - Exit: every turn traces `prompt_estimated_tokens` and `context_budget_tokens`.
-- **Status: done, with the accuracy check outstanding** (2026-08-15). The exit
+- **Status: done** (2026-08-15; accuracy check run 2026-08-17). The exit
   condition holds: every golden's `request_headers` now carries
   `prompt_estimated_tokens`, `context_budget_tokens`, `tool_tokens`, and an
   integer `pressure_percent`, and each section carries its own token estimate.
@@ -371,15 +371,54 @@ otherwise be guessing at.
     trace an estimate and no pressure. `AGENTOS_CONTEXT_BUDGET_TOKENS`
     overrides the table for self-hosted or proxied models; X3 should move it
     into `agent.toml` beside the compaction thresholds.
-  - **The ~15% accuracy check is NOT done and cannot be done from here.** It
-    needs a live provider call, which this environment has no key for. The
-    mechanism to run it exists and is documented in `prompt/tokens.rs`: a
-    request's estimate is on its `request_header` event and the provider's own
-    `input_tokens` is on the `llm_token_usage` event under the same plan span,
-    so comparing them across a deployment's traces measures the true error rate.
-    Pair by span, not by position — a routing classifier round-trip records
-    usage with no header. **C3 must not pick thresholds until this has been run
-    against real traffic**, which was the entire argument for shipping C1 alone.
+  - **The accuracy check has now been run** (2026-08-17), against
+    `openai:gpt-5.4-mini`. `agentos-gateway calibrate` sends the fixed corpus in
+    `prompt::calibration` through the ordinary `Llm::complete_messages` path and
+    records the provider's own `input_tokens` per case; the result is
+    `docs/token-calibration.md` and `tests/golden/token_calibration.json`.
+    Measured error, estimate against provider count:
+
+    | Class | Error |
+    |---|---|
+    | Chinese prose | **+32%** |
+    | Tool schemas (JSON) | **+38%** |
+    | English prose | **+22%** |
+    | Symbol-dense ASCII (code) | **−19%** |
+    | Realistic mixed requests | **+1% to +16%** |
+
+    Two findings, and neither is what C1 predicted:
+
+    - **The estimator is not safe by construction.** `prompt/tokens.rs` claimed
+      it was "never dangerously low". It is: code tokenizes at ~3.2 characters
+      per token, not 4, so a request made mostly of code reads 19% *under* the
+      truth. The claim has been removed and replaced with the measurements.
+    - **No single divisor fixes it.** Code is denser than 4:1 while JSON schemas
+      are sparser, and both are "symbol-heavy ASCII" to any character-class
+      rule. Fitting a more elaborate heuristic to one provider's tokenizer would
+      buy accuracy on that provider and unknown behaviour elsewhere, so the
+      error is carried by the threshold instead — see C3's status.
+
+    Only 2 of 8 cases fall inside the ~15% target this item asked for, so on
+    the letter of the Verify line the estimator fails it. On the cases that
+    decide anything it passes: a request large enough to matter for pressure is
+    a transcript, not one character class, and the three composite cases land at
+    +1%, +7%, and +16%. The single-class figures are the ingredient bounds. The
+    `minimal` case's −29% is the provider's fixed per-request framing (two
+    tokens) and means nothing at scale.
+  - **This is one tokenizer, and not the deployment's.** The .env in this
+    checkout points at OpenAI; the machine described in `[channels]` runs
+    DeepSeek, whose key is not here, so the CJK figure in particular is
+    unverified for the traffic that motivated the two-rate design. **Re-run
+    `agentos-gateway calibrate` on the deployment.** The offline half
+    (`tests/token_calibration.rs`, `calibrate --check`) then re-scores the
+    estimator against whatever that run recorded, spending nothing.
+  - **The passive trace-pairing route is weaker than C1 assumed.** A request's
+    estimate is on its `request_header` event and the provider's `input_tokens`
+    on `llm_token_usage` under the same plan span, but the two sinks are drained
+    separately (`loop/planning.rs`), so their interleaving is lost. A span whose
+    plan made several calls — the routing classifier records usage with no
+    header — cannot be paired at all. Usable only for spans holding exactly one
+    of each, which is why the corpus route exists.
   - Interface impact, machine-verified with `--baseline-rev HEAD`:
     `agentos-interfaces` and `agentos-llm` unchanged (a defaulted trait method
     is additive); `agentos-proto` reports one major
@@ -506,20 +545,27 @@ answer.
   retained on disk; resume-after-compaction produces the same trace.
 - Exit: a conversation can run indefinitely without exceeding the provider's
   context limit; the session log still contains every original item.
-- **Status: done, with the trigger provisional** (2026-08-16). Both exit
+- **Status: done** (2026-08-16; trigger measured 2026-08-17). Both exit
   conditions are demonstrated by
   `tests/compaction.rs::a_long_conversation_stays_within_the_window_and_keeps_its_log`:
   200 turns against a 2 000-token window, 27 compactions, peak request 1 790
   tokens, and the session log holds all 400 originals plus 27 checkpoints.
   Notes:
-  - **The threshold is a reasoned default, not a measured one.** C1's ~15%
-    accuracy check still cannot run here — it needs a live provider call. The
-    trigger is therefore config (`[compaction].pressure_percent`, default 90)
-    and both the module docs and `agent.toml` say plainly that it is
-    provisional. 90 sits above C2's 80% elision trigger so free pruning always
-    goes first, and C1's estimator is biased high, so a run reading 90% is
-    likely below that in truth. **Tune this once the check has been run against
-    real traffic.**
+  - **The threshold is now measured, and it moved: 90 → 84.** C3 shipped with a
+    reasoned 90 because C1's accuracy check had not been run; it has now been
+    run (see C1's status), and 90 does not survive it. The estimator's worst
+    meaningful under-estimate is 18.8%, so a request estimated at 90% of the
+    window is at 107% of it in truth — a provider rejection that C4 then has to
+    recover from, on exactly the conversations compaction exists to protect.
+    `100 / 1.188 = 84.2`, floored to **84**: the largest trigger at which a
+    request that reads as under the window still is one. It stays above C2's 80%
+    elision trigger, so the ladder is intact — the two constraints leave a
+    four-point window and this is the top of it. The arithmetic is enforced by
+    `tests/token_calibration.rs::the_default_pressure_threshold_leaves_room_for_the_measured_error`,
+    which fails with the correct value named if either the estimator or the
+    threshold moves. **This figure is derived from an OpenAI-family tokenizer;
+    a deployment on another provider should re-run `agentos-gateway calibrate`,
+    and that test will then tell it what its own threshold should be.**
   - **Compaction is on by default.** The failure it prevents is a hard provider
     400 that nothing recovers from until C4; the failure it risks is a
     degraded answer on a conversation that was already near its limit. Given

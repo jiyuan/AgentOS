@@ -19,6 +19,7 @@
 //! and recalled memory on a question that has no use for either, and would let
 //! a stored fact steer routing. Keep it separate.
 
+pub mod calibration;
 mod compact;
 mod projection;
 mod prune;

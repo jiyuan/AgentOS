@@ -119,10 +119,13 @@ shell = 300000
 enabled = true
 # Percent of the model's context window above which the next turn summarizes
 # its oldest turns first. Above the 80% at which oversized tool output is
-# elided for free, so pruning always gets the first attempt. Provisional: the
-# token estimator's accuracy has not yet been checked against a live provider
-# (see docs/TRANSFER_ROADMAP.md C1), so tune this once it has.
-pressure_percent = 90
+# elided for free, so pruning always gets the first attempt. 84 is measured,
+# not chosen: the token estimator's worst under-estimate is 18.8%
+# (docs/token-calibration.md), and 100 / 1.188 = 84, so a request estimated at
+# 84% of the window is at most 100% of it in truth. Re-derive it with
+# `agentos-gateway calibrate` if this machine changes provider — the figure
+# above was measured against an OpenAI-family tokenizer.
+pressure_percent = 84
 # Conversation items kept verbatim after the checkpoint. Minimum 2.
 retain_tail_turns = 8
 # Which model tier writes the summaries: "high", "medium", or "low", chosen the

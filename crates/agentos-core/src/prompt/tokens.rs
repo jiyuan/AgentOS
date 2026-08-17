@@ -15,22 +15,50 @@
 //!
 //! # Which way it errs
 //!
-//! Deliberately high. Counting every non-ASCII character as a full token
-//! over-estimates some scripts by up to half. That is the safe direction: an
-//! over-estimate compacts earlier than strictly necessary, while an
-//! under-estimate lets a request hit the provider's hard context limit with no
-//! compaction attempted — the failure C4 exists to recover from. A cheap
-//! estimator that is never dangerously low beats an accurate one that
-//! sometimes is.
+//! Usually high, but not always, and the difference matters. An over-estimate
+//! compacts earlier than strictly necessary; an under-estimate lets a request
+//! hit the provider's hard context limit with no compaction attempted, which is
+//! the failure C4 exists to recover from.
+//!
+//! This module used to claim it was never dangerously low. **It is.** C1's
+//! accuracy check measured it against a live provider
+//! (`docs/token-calibration.md`) and found:
+//!
+//! - Chinese prose **+32%** — one token per wide character is well above what a
+//!   byte-pair encoder actually charges for CJK. Safe, and the single largest
+//!   reason a pressure reading runs high.
+//! - Tool schemas **+38%** — JSON packs far better than 4:1 under BPE.
+//! - English prose **+22%**.
+//! - Symbol-dense ASCII (code) **−19%** — the 4:1 rate is derived from prose,
+//!   and code tokenizes at closer to 3.2 characters per token.
+//! - Realistic mixed requests — a transcript with prose, CJK, a tool call and
+//!   its output — land between **+1% and +16%**.
+//!
+//! No single divisor fixes the last two together: code is denser than 4:1 while
+//! JSON is sparser, and both are "symbol-heavy ASCII" to any character-class
+//! rule. Rather than fit a more elaborate heuristic to one provider's
+//! tokenizer, the under-estimate is carried by the threshold instead:
+//! `[compaction].pressure_percent` defaults to 84 so that a request reading 84%
+//! of the window is at most 100% of it at the measured error. See
+//! `config::compaction` for that derivation.
 //!
 //! # Checking it against reality
 //!
-//! Every assembled request traces its estimate on `request_header`, and every
-//! completed call traces the provider's own `input_tokens` on
-//! `llm_token_usage`, both under the same plan span. Comparing the two across a
-//! deployment's traces measures the real error rate. Note that a routing
-//! classifier round-trip records usage without a header, so pair by span rather
-//! than by position.
+//! `agentos-gateway calibrate` sends a fixed corpus to the configured provider
+//! and records what it counted; `--check` re-scores this estimator against
+//! those recorded counts offline. `prompt::calibration` holds the corpus and
+//! the arithmetic, and `tests/token_calibration.rs` keeps the checked-in
+//! figures honest. Re-run it when the deployment changes provider — a
+//! tokenizer is a per-provider fact, and the numbers above are one family's.
+//!
+//! There is a second, passive source: every assembled request traces its
+//! estimate on `request_header`, and every completed call traces the provider's
+//! own `input_tokens` on `llm_token_usage`, both under the same plan span. That
+//! measures real traffic rather than a corpus, at the cost of being ambiguous
+//! where a plan span holds several calls — a routing classifier round-trip
+//! records usage with no header of its own, and the two sinks are drained
+//! separately, so their interleaving is not recoverable from the trace. Pair by
+//! span, and only trust spans holding exactly one of each.
 
 use agentos_interfaces::tool::ToolSpec;
 use agentos_proto::Message;
