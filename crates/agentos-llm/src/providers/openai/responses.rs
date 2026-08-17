@@ -18,6 +18,7 @@ use crate::providers::content::{
     append_descriptors, document_mime, format_text_document, image_mime, read_base64,
     read_text_document,
 };
+use crate::providers::reply::record_reply_outcome;
 use crate::providers::{
     attach_token_usage, format_openai_error, log_token_usage, raw_args_from_json_str, ProviderError,
 };
@@ -45,15 +46,9 @@ pub(super) async fn complete(
     if let Some(error) = api_error(&response.body) {
         return Err(format_openai_error(&response, error));
     }
-    let output = response
-        .body
-        .get("output")
-        .and_then(Value::as_array)
-        .ok_or_else(|| ProviderError::MalformedResponse {
-            detail: format!("OpenAI Responses reply missing output: {}", response.body),
-        })?;
+    // Logged before the reply is validated: the tokens were spent either way.
     let token_usage = log_token_usage("openai", model, &response.body);
-    let mut message = assistant_message_from_output(output);
+    let mut message = reply_from_body(&response.body)?;
     stamp_session(
         &mut message,
         response.body.get("id").and_then(Value::as_str),
@@ -295,6 +290,69 @@ fn content_part_for(attachment: &Attachment) -> Option<Value> {
     }
 }
 
+/// Assemble and validate the assistant turn from a buffered Responses body —
+/// the buffered counterpart of the streaming accumulator's `finalize`, applying
+/// the same [`record_reply_outcome`] rules to the same fields.
+fn reply_from_body(body: &Value) -> Result<Message, ProviderError> {
+    let output = body
+        .get("output")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ProviderError::MalformedResponse {
+            detail: format!("OpenAI Responses reply missing output: {body}"),
+        })?;
+    // Counted before parsing, because parsing is where a truncated call is lost:
+    // `assistant_message_from_output` skips any `function_call` item whose
+    // arguments stopped mid-object, since they cannot become a `RawValue`.
+    let announced = output
+        .iter()
+        .filter(|item| {
+            item.get("type").and_then(Value::as_str) == Some("function_call")
+                && item.get("call_id").and_then(Value::as_str).is_some()
+                && item.get("name").and_then(Value::as_str).is_some()
+        })
+        .count();
+    // A buffered reply always reports its own terminal state; `incomplete` is
+    // this shape's spelling of Chat Completions' `length`.
+    let reason = match body.get("status").and_then(Value::as_str) {
+        Some("incomplete") => incomplete_reason(Some(body)),
+        // Responses has no separate "stopped in order to call tools" state, so a
+        // tool-call turn arrives as `completed` like any other. A reply that
+        // reports no status at all is taken as normal rather than flagged: an
+        // abnormal stop is something to observe, not to assume.
+        Some("completed") | None => "stop",
+        Some(other) => other,
+    };
+    let mut message = assistant_message_from_output(output);
+    // `produced_reasoning` is always false here. Responses keeps reasoning
+    // server-side and returns no reasoning text, so unlike DeepSeek's
+    // `reasoning_content` there is never a reasoning channel for an otherwise
+    // empty reply to count as output — a reply with no message and no
+    // function_call item has nothing in it that the run loop can act on.
+    record_reply_outcome("openai", &mut message, Some(reason), announced, false).map_err(
+        |defect| ProviderError::MalformedResponse {
+            detail: defect.to_string(),
+        },
+    )?;
+    Ok(message)
+}
+
+/// Which limit ended an `incomplete` Responses reply, in the vocabulary
+/// [`STOP_REASON_METADATA_KEY`](crate::providers::reply::STOP_REASON_METADATA_KEY)
+/// uses. `max_output_tokens` is this shape's spelling of Chat Completions'
+/// `length` — the reply was cut mid-sentence. Shared with the streaming path,
+/// which learns the same fact from a `response.incomplete` event.
+pub(super) fn incomplete_reason(response: Option<&Value>) -> &str {
+    match response
+        .and_then(|response| response.get("incomplete_details"))
+        .and_then(|details| details.get("reason"))
+        .and_then(Value::as_str)
+    {
+        Some("max_output_tokens") => "length",
+        Some(other) => other,
+        None => "incomplete",
+    }
+}
+
 /// Assemble the assistant turn from the response's `output` items. Text lives
 /// in `message` items' `output_text` parts; tool calls are top-level
 /// `function_call` items. `reasoning` items carry no assistant-visible text and
@@ -453,6 +511,7 @@ fn is_stale_session(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::reply::STOP_REASON_METADATA_KEY;
     use agentos_interfaces::tool::SandboxMode;
     use serde_json::value::RawValue;
     use std::fs;
@@ -700,6 +759,118 @@ mod tests {
 
     /// A transcript whose last assistant turn was stamped by a request built
     /// from `prefix_len` messages.
+    #[test]
+    fn a_buffered_reply_cut_off_mid_tool_call_is_rejected() {
+        // `max_output_tokens` truncates the argument JSON. Parsing drops the
+        // item, and a dropped call is a turn that asked for nothing — the run
+        // loop would finish as if the model had chosen to stop.
+        let body = json!({
+            "status": "incomplete",
+            "incomplete_details": { "reason": "max_output_tokens" },
+            "output": [{
+                "type": "function_call", "call_id": "call_1", "name": "file",
+                "arguments": "{\"path\":\"/etc/ho"
+            }]
+        });
+
+        let error = reply_from_body(&body).expect_err("a lost tool call is not a valid reply");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("announced 1 tool call(s)"), "{rendered}");
+        assert!(rendered.contains("finish_reason=length"), "{rendered}");
+    }
+
+    #[test]
+    fn a_buffered_reply_with_nothing_in_it_is_rejected() {
+        // A reasoning item and nothing else: every output token went server-side.
+        let body = json!({
+            "status": "completed",
+            "output": [{ "type": "reasoning", "id": "rs_1", "summary": [] }]
+        });
+
+        let error = reply_from_body(&body).expect_err("an empty reply is not a finished turn");
+
+        assert!(error.to_string().contains("no content"), "{error}");
+    }
+
+    #[test]
+    fn a_buffered_reply_truncated_after_its_text_keeps_the_text_and_the_reason() {
+        let body = json!({
+            "status": "incomplete",
+            "incomplete_details": { "reason": "max_output_tokens" },
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "the answer is fo" }]
+            }]
+        });
+
+        let message = reply_from_body(&body).expect("truncated text is still usable");
+
+        assert_eq!(message.content.as_ref(), "the answer is fo");
+        assert_eq!(
+            message
+                .metadata
+                .get(STOP_REASON_METADATA_KEY)
+                .and_then(Value::as_str),
+            Some("length")
+        );
+    }
+
+    #[test]
+    fn an_ordinary_buffered_reply_gains_no_stop_reason() {
+        let body = json!({
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "the answer is four" }]
+            }]
+        });
+
+        let message = reply_from_body(&body).expect("an ordinary reply is not a defect");
+
+        assert!(!message.metadata.contains_key(STOP_REASON_METADATA_KEY));
+    }
+
+    #[test]
+    fn a_tool_call_turn_is_normal_even_though_responses_calls_it_completed() {
+        // Responses has no `tool_calls` status, so a tool-call turn arrives as
+        // `completed`. It must not be recorded as an abnormal stop.
+        let body = json!({
+            "status": "completed",
+            "output": [{
+                "type": "function_call", "call_id": "call_1", "name": "file",
+                "arguments": "{\"path\":\"a.txt\"}"
+            }]
+        });
+
+        let message = reply_from_body(&body).expect("a tool-call turn is not a defect");
+
+        assert_eq!(message.tool_calls.len(), 1);
+        assert!(!message.metadata.contains_key(STOP_REASON_METADATA_KEY));
+    }
+
+    #[test]
+    fn an_unrecognised_incomplete_reason_is_recorded_rather_than_guessed_at() {
+        let body = json!({
+            "status": "incomplete",
+            "incomplete_details": { "reason": "content_filter" },
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "blocked" }]
+            }]
+        });
+
+        let message = reply_from_body(&body).expect("an unusual finish is not itself a defect");
+
+        assert_eq!(
+            message
+                .metadata
+                .get(STOP_REASON_METADATA_KEY)
+                .and_then(Value::as_str),
+            Some("content_filter")
+        );
+    }
+
     fn stamped(model: &str, prefix_len: usize) -> Message {
         let mut message = Message::text(MessageRole::Assistant, "on it");
         stamp_session(&mut message, Some("resp_1"), model, prefix_len);

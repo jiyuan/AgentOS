@@ -1,5 +1,5 @@
-use crate::providers::chat_completions::record_reply_outcome;
 use crate::providers::content::append_descriptors;
+use crate::providers::reply::record_reply_outcome;
 use crate::providers::stream::openai_compatible_stream;
 use crate::providers::{
     attach_token_usage, format_provider_error, log_token_usage, post_json, post_sse,
@@ -377,7 +377,7 @@ fn is_reasoning_passback_text(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::chat_completions::STOP_REASON_METADATA_KEY;
+    use crate::providers::reply::STOP_REASON_METADATA_KEY;
     use serde_json::value::RawValue;
 
     fn raw_args(s: &str) -> Box<RawValue> {

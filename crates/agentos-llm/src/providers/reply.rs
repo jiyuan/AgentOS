@@ -1,46 +1,65 @@
-//! The parts of an OpenAI-style chat-completions *reply* that are easy to
-//! accept and wrong to accept.
+//! The parts of an assembled provider *reply* that are easy to accept and wrong
+//! to accept.
 //!
-//! Both DeepSeek paths — the buffered [`super::deepseek::complete`] and the SSE
-//! [`super::stream::openai_compatible_stream`] — assemble the same assistant
-//! message out of the same wire shape, and both can assemble one that looks
-//! successful while having quietly lost information:
+//! Every provider path ends the same way: fold a wire response into one
+//! assistant [`Message`] and hand it to the run loop. Two of the ways that can
+//! go wrong are invisible at the point where they happen, because what comes out
+//! is a perfectly well-formed message:
 //!
 //! - **A tool call whose arguments did not parse.** Truncation cuts the
-//!   argument JSON mid-object. Both paths build tool calls through
-//!   `RawValue::from_string`, which validates, and both then drop the call on
-//!   the floor. What reaches the run loop is a turn that asked for nothing, so
-//!   the agent stops instead of acting — indistinguishable from a model that
-//!   chose to stop.
-//! - **A reply with nothing in it.** No content, no tool calls, no reasoning.
-//!   The loop treats it as a finished turn and the operator sees the agent
+//!   argument JSON mid-object. Every path builds tool calls through
+//!   `RawValue::from_string`, which validates, and every path then drops the
+//!   call on the floor. What reaches the run loop is a turn that asked for
+//!   nothing, so the agent stops instead of acting — indistinguishable from a
+//!   model that chose to stop.
+//! - **A reply with nothing in it.** No content, no tool calls, no reasoning
+//!   text. The loop treats it as a finished turn and the operator sees the agent
 //!   answer with silence.
 //!
-//! Neither is recoverable here, so both become errors: a failure naming
-//! `finish_reason` is strictly more useful than a turn that ends for no stated
-//! reason. `finish_reason` itself is recorded on the message when it is
-//! *abnormal*, so a persisted transcript keeps the evidence.
+//! Neither is recoverable here, so both become errors: a failure naming the stop
+//! reason is strictly more useful than a turn that ends for no stated reason.
+//!
+//! # One vocabulary
+//!
+//! Each wire shape spells the stop reason differently — Chat Completions
+//! `finish_reason: "length"`, Responses `status: "incomplete"` with
+//! `incomplete_details.reason: "max_output_tokens"`, Anthropic
+//! `stop_reason: "max_tokens"`. Providers translate into the Chat Completions
+//! vocabulary before calling in, so [`STOP_REASON_METADATA_KEY`] means the same
+//! thing in a session log regardless of which provider wrote it. The reason is
+//! recorded only when it is *abnormal*, so its presence is itself the signal.
+//!
+//! Wired into the two Chat Completions paths (buffered
+//! [`super::deepseek::complete`], streamed
+//! [`super::stream::openai_compatible_stream`]) and the two Responses paths
+//! (`openai::responses` and `openai::events`). Anthropic still assembles its
+//! reply without these checks.
 
 use agentos_proto::Message;
 use serde_json::Value;
 use std::sync::Arc;
 use thiserror::Error;
 
-/// Message-metadata key carrying the provider's `finish_reason`, present only
-/// when the model stopped for a reason worth keeping (see
+/// Message-metadata key carrying why the model stopped, in the Chat Completions
+/// vocabulary, present only when that reason is worth keeping (see
 /// [`record_reply_outcome`]). Nothing in the run loop branches on it today; it
 /// exists so a truncated turn is still identifiable in a session log written
 /// hours earlier.
 pub(crate) const STOP_REASON_METADATA_KEY: &str = "agentos.stop_reason";
+
+/// The stop reasons that mean "the model finished normally" and are therefore
+/// not worth recording: a plain completion and a completion that ended in order
+/// to call tools.
+const NORMAL_REASONS: [&str; 2] = ["stop", "tool_calls"];
 
 /// Stand-in reason for a reply that never reported one. Streams that end
 /// without a terminal chunk and buffered bodies missing the field both land
 /// here, so an error message always names something.
 const UNREPORTED: &str = "unreported";
 
-/// The two reasons a chat-completions reply is rejected after it has already
-/// been assembled. Both mean the reply parsed but is missing something the
-/// model said it produced.
+/// The two reasons a reply is rejected after it has already been assembled.
+/// Both mean the reply parsed but is missing something the model said it
+/// produced.
 #[derive(Debug, Error)]
 pub(crate) enum ReplyDefect {
     #[error(
@@ -100,7 +119,7 @@ pub(crate) fn record_reply_outcome(
             reason: Arc::from(reason),
         });
     }
-    if reason == "stop" || reason == "tool_calls" {
+    if NORMAL_REASONS.contains(&reason) {
         return Ok(());
     }
     if reason == "length" {

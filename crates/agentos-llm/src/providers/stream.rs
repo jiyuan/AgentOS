@@ -21,7 +21,7 @@
 //! [`CompletionEvent::Done`] carrying the assembled message, its tool calls, and
 //! `agentos.token_usage` logged identically to the buffered path.
 
-use crate::providers::chat_completions::record_reply_outcome;
+use crate::providers::reply::record_reply_outcome;
 use crate::providers::{attach_token_usage, log_token_usage};
 use crate::{CompletionEvent, CompletionStream, LlmError};
 use agentos_proto::{Message, MessageRole, ToolCall, ToolCallId};
@@ -700,7 +700,7 @@ mod tests {
         assert_eq!(
             message
                 .metadata
-                .get(crate::providers::chat_completions::STOP_REASON_METADATA_KEY)
+                .get(crate::providers::reply::STOP_REASON_METADATA_KEY)
                 .and_then(Value::as_str),
             Some("length")
         );
