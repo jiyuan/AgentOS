@@ -21,7 +21,7 @@ pub async fn complete(
     tools: &[ToolSpec],
 ) -> Result<Message, ProviderError> {
     let (url, headers) = endpoint_and_headers()?;
-    let payload = base_payload(model, messages, tools);
+    let payload = base_payload(model, messages, tools, false);
     let response = post_json("llm", &url, &headers, &payload).await?;
     // Logged before the reply is validated: the tokens were spent either way.
     let token_usage = log_token_usage("anthropic", model, &response.body);
@@ -136,7 +136,7 @@ pub async fn complete_stream(
     tools: &[ToolSpec],
 ) -> Result<CompletionStream, ProviderError> {
     let (url, headers) = endpoint_and_headers()?;
-    let mut payload = base_payload(model, messages, tools);
+    let mut payload = base_payload(model, messages, tools, true);
     payload["stream"] = json!(true);
     let response = post_sse("anthropic", &url, &headers, &payload).await?;
     Ok(anthropic_stream(Arc::from(model), response))
@@ -163,7 +163,69 @@ fn endpoint_and_headers() -> Result<Endpoint, ProviderError> {
     ))
 }
 
-fn base_payload(model: &str, messages: &[Message], tools: &[ToolSpec]) -> Value {
+/// Overrides the resolved output cap for every Anthropic request. For a model
+/// this build's table does not know, or knows wrongly, without a rebuild. The
+/// buffered path still clamps it — see [`BUFFERED_MAX_OUTPUT_TOKENS`], which is
+/// an API constraint rather than a preference.
+pub const MAX_OUTPUT_TOKENS_ENV: &str = "AGENTOS_ANTHROPIC_MAX_OUTPUT_TOKENS";
+
+/// Published maximum output tokens by model-id prefix, longest prefix first.
+///
+/// Unlike the other providers here, the Messages API *requires* `max_tokens`:
+/// there is no "let the server decide" option, so some number is always sent and
+/// whatever it is becomes a hard ceiling on every reply. These are external facts
+/// about each model rather than deployment policy, so they are a table for the
+/// same reason `CONTEXT_BUDGETS` is one, with [`MAX_OUTPUT_TOKENS_ENV`] covering
+/// a model the table has wrong or has never heard of.
+const MAX_OUTPUT_TOKENS: &[(&str, usize)] = &[
+    ("claude-haiku-4", 64_000),
+    ("claude-opus-4", 32_000),
+    ("claude-sonnet-4", 64_000),
+    ("claude-3-7", 64_000),
+    ("claude-3-5", 8_192),
+    ("claude-3", 4_096),
+];
+
+/// Cap for a model the table does not list. The smallest limit any Claude model
+/// has published, so it is always accepted. A floor rather than `None` — unlike
+/// `context_budget_for_model`, which may decline to guess, this field is
+/// required and *something* has to be sent.
+const DEFAULT_MAX_OUTPUT_TOKENS: usize = 4_096;
+
+/// Ceiling on buffered (non-streaming) requests. Anthropic refuses a
+/// non-streaming request whose `max_tokens` implies a reply that could exceed
+/// its ten-minute limit, so the buffered path cannot ask for a model's full
+/// output cap the way the streaming path can. If this is more conservative than
+/// the real threshold the only cost is a lower buffered cap than necessary,
+/// which is the safe direction to be wrong in.
+const BUFFERED_MAX_OUTPUT_TOKENS: usize = 8_192;
+
+/// The `max_tokens` to send for one request. `streaming` selects between a
+/// model's full published cap and the buffered ceiling.
+fn max_output_tokens(model: &str, streaming: bool) -> usize {
+    let requested = env::var(MAX_OUTPUT_TOKENS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|tokens| *tokens > 0)
+        .unwrap_or_else(|| published_max_output_tokens(model));
+    if streaming {
+        requested
+    } else {
+        requested.min(BUFFERED_MAX_OUTPUT_TOKENS)
+    }
+}
+
+/// Resolve a model id to its published output cap by longest matching prefix.
+fn published_max_output_tokens(model: &str) -> usize {
+    let normalized = model.trim().to_ascii_lowercase();
+    MAX_OUTPUT_TOKENS
+        .iter()
+        .filter(|(prefix, _)| normalized.starts_with(prefix))
+        .max_by_key(|(prefix, _)| prefix.len())
+        .map_or(DEFAULT_MAX_OUTPUT_TOKENS, |(_, cap)| *cap)
+}
+
+fn base_payload(model: &str, messages: &[Message], tools: &[ToolSpec], streaming: bool) -> Value {
     let serialized = messages
         .iter()
         .filter(|message| message.role != MessageRole::System)
@@ -171,7 +233,7 @@ fn base_payload(model: &str, messages: &[Message], tools: &[ToolSpec]) -> Value 
         .collect::<Vec<_>>();
     let mut payload = json!({
         "model": model,
-        "max_tokens": 1024,
+        "max_tokens": max_output_tokens(model, streaming),
         "messages": serialized,
     });
     if !tools.is_empty() {
@@ -438,6 +500,67 @@ mod tests {
 
     fn raw_args(s: &str) -> Box<RawValue> {
         RawValue::from_string(s.to_owned()).unwrap()
+    }
+
+    #[test]
+    fn output_caps_resolve_by_longest_matching_prefix() {
+        assert_eq!(published_max_output_tokens("claude-sonnet-4-5"), 64_000);
+        assert_eq!(published_max_output_tokens("claude-opus-4-1"), 32_000);
+        assert_eq!(published_max_output_tokens("claude-haiku-4-5"), 64_000);
+        // `claude-3-5` must win over the shorter `claude-3`.
+        assert_eq!(
+            published_max_output_tokens("claude-3-5-sonnet-latest"),
+            8_192
+        );
+        assert_eq!(published_max_output_tokens("claude-3-opus-20240229"), 4_096);
+        assert_eq!(published_max_output_tokens("  Claude-Sonnet-4-5  "), 64_000);
+    }
+
+    #[test]
+    fn the_table_never_shadows_a_longer_prefix_with_a_shorter_one() {
+        // `published_max_output_tokens` takes the longest match, so this ordering
+        // is belt-and-braces rather than load-bearing — swapping it for a plain
+        // first-match today changes no answer. It is asserted anyway because that
+        // equivalence is exactly what a later edit can quietly destroy: append
+        // `claude-3-5-haiku` after `claude-3-5` and the two disagree.
+        for (index, (prefix, _)) in MAX_OUTPUT_TOKENS.iter().enumerate() {
+            for (later, _) in &MAX_OUTPUT_TOKENS[index + 1..] {
+                assert!(
+                    !later.starts_with(prefix),
+                    "{later:?} extends {prefix:?} but is listed after it, so a \
+                     first-match reading of the table would never reach it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_unlisted_model_gets_the_floor_rather_than_no_answer() {
+        // The field is required, so declining to guess is not an option; 4,096 is
+        // the smallest cap any Claude model publishes and is always accepted.
+        assert_eq!(published_max_output_tokens("claude-9-ultra"), 4_096);
+        assert_eq!(published_max_output_tokens(""), 4_096);
+    }
+
+    #[test]
+    fn the_buffered_path_clamps_where_the_streaming_path_does_not() {
+        // Anthropic refuses a non-streaming request that could run past its
+        // ten-minute limit, so the buffered path cannot ask for the full cap.
+        assert_eq!(max_output_tokens("claude-sonnet-4-5", true), 64_000);
+        assert_eq!(max_output_tokens("claude-sonnet-4-5", false), 8_192);
+        // A model whose published cap is already under the ceiling is unaffected.
+        assert_eq!(max_output_tokens("claude-3-opus-20240229", false), 4_096);
+    }
+
+    #[test]
+    fn the_request_carries_the_resolved_cap_not_a_fixed_one() {
+        let messages = [Message::text(MessageRole::User, "hello")];
+
+        let streamed = base_payload("claude-sonnet-4-5", &messages, &[], true);
+        let buffered = base_payload("claude-sonnet-4-5", &messages, &[], false);
+
+        assert_eq!(streamed["max_tokens"], 64_000);
+        assert_eq!(buffered["max_tokens"], 8_192);
     }
 
     #[test]
