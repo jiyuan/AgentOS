@@ -470,12 +470,7 @@ impl WorkspaceConfig {
             .subagents
             .iter()
             .find(|subagent| subagent.id == *agent_id && subagent.policy_id == *policy_id)
-            .ok_or_else(|| {
-                format!(
-                    "unknown subagent '{}' with policy '{}'",
-                    agent_id, policy_id
-                )
-            })?;
+            .ok_or_else(|| format!("unknown subagent '{agent_id}' with policy '{policy_id}'"))?;
         subagent_metadata(subagent)
     }
 

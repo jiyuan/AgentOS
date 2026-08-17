@@ -447,7 +447,7 @@ fn yaml_scalar(input: &str) -> String {
     }) {
         input.to_owned()
     } else {
-        format!("{:?}", input)
+        format!("{input:?}")
     }
 }
 
