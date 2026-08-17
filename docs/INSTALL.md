@@ -72,6 +72,15 @@ server-side so each turn continues the previous one instead of re-uploading the
 transcript; set `AGENTOS_OPENAI_STATEFUL=0` to disable that and keep every
 request self-contained.
 
+The `anthropic` provider must send a `max_tokens` on every request — the
+Messages API requires it — so a reply is always capped. The cap comes from a
+table of each model's published output limit, and a truncated reply is recorded
+on the message as `agentos.stop_reason: "length"`. Set
+`AGENTOS_ANTHROPIC_MAX_OUTPUT_TOKENS` for a model the table has wrong or has
+never heard of. Buffered (non-streaming) requests are additionally clamped to
+8,192, because Anthropic refuses a non-streaming request that could run past its
+ten-minute limit; streaming requests use the full cap.
+
 Telegram setup:
 
 ```env

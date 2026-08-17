@@ -21,6 +21,8 @@
 //! [`CompletionEvent::Done`] carrying the assembled message, its tool calls, and
 //! `agentos.token_usage` logged identically to the buffered path.
 
+use crate::providers::anthropic::canonical_stop_reason;
+use crate::providers::reply::record_reply_outcome;
 use crate::providers::{attach_token_usage, log_token_usage};
 use crate::{CompletionEvent, CompletionStream, LlmError};
 use agentos_proto::{Message, MessageRole, ToolCall, ToolCallId};
@@ -52,6 +54,7 @@ pub(crate) fn openai_compatible_stream(
             reasoning: String::new(),
             tool_calls: Vec::new(),
             usage_body: None,
+            finish_reason: None,
         },
     )
 }
@@ -72,6 +75,8 @@ pub(crate) fn anthropic_stream(model: Arc<str>, response: reqwest::Response) -> 
             tool_calls: BTreeMap::new(),
             usage_input: None,
             output_tokens: None,
+            stop_reason: None,
+            saw_message_stop: false,
         },
     )
 }
@@ -87,7 +92,17 @@ pub(crate) trait SseAccumulator {
     fn ingest(&mut self, chunk: &Value, pending: &mut Pending);
     /// Assemble the final assistant message once the stream ends. Takes
     /// `&mut self` (draining buffers) so the driver can keep its state value.
-    fn finalize(&mut self) -> Message;
+    ///
+    /// `saw_sentinel` reports whether the wire's own end-of-stream marker
+    /// arrived, distinguishing "the provider finished" from "the connection
+    /// stopped producing bytes". Only shapes that *have* such a marker can tell
+    /// the difference, which is why the decision belongs to the accumulator and
+    /// not the driver: `[DONE]` is required by the chat-completions shape, and
+    /// Anthropic's stream legitimately ends by connection close.
+    ///
+    /// Returning `Err` rejects a reply the accumulator built but does not
+    /// trust; the driver emits it in place of the terminal `Done`.
+    fn finalize(&mut self, saw_sentinel: bool) -> Result<Message, LlmError>;
 }
 
 /// Shared driver: decode `response`'s byte stream into SSE lines and feed
@@ -102,6 +117,7 @@ where
         pending: VecDeque::new(),
         acc,
         sse_done: false,
+        saw_sentinel: false,
         terminated: false,
     };
     stream::unfold(state, |mut st| async move {
@@ -114,7 +130,8 @@ where
             }
             if st.sse_done {
                 st.terminated = true;
-                return Some((Ok(CompletionEvent::Done(st.acc.finalize())), st));
+                let saw_sentinel = st.saw_sentinel;
+                return Some((st.acc.finalize(saw_sentinel).map(CompletionEvent::Done), st));
             }
             match st.bytes.next().await {
                 Some(Ok(chunk)) => {
@@ -136,8 +153,10 @@ where
                     ));
                 }
                 None => {
-                    // Connection closed (Anthropic) or an explicit [DONE]
-                    // (OpenAI); assemble whatever we accumulated.
+                    // Connection closed. For Anthropic that *is* the end of
+                    // the stream; for the chat-completions shape it means the
+                    // bytes stopped before `[DONE]`, which the accumulator
+                    // rejects. Either way, stop reading and let it decide.
                     st.sse_done = true;
                 }
             }
@@ -158,6 +177,10 @@ struct SseState<A> {
     acc: A,
     /// Saw `[DONE]` or end of stream; the Done event is emitted next.
     sse_done: bool,
+    /// Saw the wire's own terminal marker (`[DONE]`) rather than reaching it by
+    /// the byte stream ending. Passed to [`SseAccumulator::finalize`] so shapes
+    /// that promise a marker can tell a finished reply from a cut one.
+    saw_sentinel: bool,
     /// Done (or a terminal error) has been emitted; the stream is exhausted.
     terminated: bool,
 }
@@ -198,6 +221,7 @@ fn process_sse_line<A: SseAccumulator>(st: &mut SseState<A>, line: &str) {
     let data = data.trim();
     if data == "[DONE]" {
         st.sse_done = true;
+        st.saw_sentinel = true;
         return;
     }
     match serde_json::from_str::<Value>(data) {
@@ -220,6 +244,10 @@ struct OpenAiAccumulator {
     /// The raw chunk that carried `usage`, kept so the Done step logs and
     /// attaches it through the same path as the buffered response.
     usage_body: Option<Value>,
+    /// Latest non-null `choices[0].finish_reason`. Arrives on the terminal
+    /// content chunk, which is not the last chunk of the stream — a usage-only
+    /// chunk and `[DONE]` follow it.
+    finish_reason: Option<String>,
 }
 
 /// One tool call under construction across stream fragments: identity arrives
@@ -237,12 +265,17 @@ impl SseAccumulator for OpenAiAccumulator {
         if chunk.get("usage").is_some_and(|usage| !usage.is_null()) {
             self.usage_body = Some(chunk.clone());
         }
-        let Some(delta) = chunk
+        let Some(choice) = chunk
             .get("choices")
             .and_then(Value::as_array)
             .and_then(|choices| choices.first())
-            .and_then(|choice| choice.get("delta"))
         else {
+            return;
+        };
+        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+            self.finish_reason = Some(reason.to_owned());
+        }
+        let Some(delta) = choice.get("delta") else {
             return;
         };
         if let Some(text) = delta.get("content").and_then(Value::as_str) {
@@ -261,29 +294,57 @@ impl SseAccumulator for OpenAiAccumulator {
         }
     }
 
-    fn finalize(&mut self) -> Message {
+    fn finalize(&mut self, saw_sentinel: bool) -> Result<Message, LlmError> {
+        if !saw_sentinel {
+            // The chat-completions shape always ends with `data: [DONE]`.
+            // Reaching the end of the byte stream without it means the response
+            // was cut — by a proxy, a dropped connection, a killed upstream —
+            // and everything accumulated so far is a partial answer. Reported
+            // as a transport failure so the caller retries buffered rather than
+            // handing the run a truncated turn it cannot detect.
+            return Err(LlmError::StreamTransport(Arc::from(format!(
+                "{} stream ended without the [DONE] sentinel after {} content byte(s); the \
+                 response was cut short",
+                self.provider,
+                self.content.len()
+            ))));
+        }
+        let builders = std::mem::take(&mut self.tool_calls);
+        let announced = builders
+            .iter()
+            .filter(|builder| builder.id.is_some() && builder.name.is_some())
+            .count();
         let mut message = Message {
             role: MessageRole::Assistant,
             content: Arc::from(std::mem::take(&mut self.content)),
             attachments: Vec::new(),
-            tool_calls: tool_calls_from_builders(std::mem::take(&mut self.tool_calls)),
+            tool_calls: tool_calls_from_builders(builders),
             tool_call_id: None,
             metadata: Default::default(),
         };
         let reasoning = std::mem::take(&mut self.reasoning);
-        if !reasoning.is_empty() {
+        let produced_reasoning = !reasoning.is_empty();
+        if produced_reasoning {
             if let Some(key) = self.reasoning_key {
                 message
                     .metadata
                     .insert(Arc::from(key), Value::String(reasoning));
             }
         }
+        record_reply_outcome(
+            self.provider,
+            &mut message,
+            self.finish_reason.as_deref(),
+            announced,
+            produced_reasoning,
+        )
+        .map_err(|defect| LlmError::Provider(Arc::from(defect.to_string())))?;
         if let Some(body) = self.usage_body.take() {
             if let Some(usage) = log_token_usage(self.provider, self.model.as_ref(), &body) {
                 attach_token_usage(&mut message, usage);
             }
         }
-        message
+        Ok(message)
     }
 }
 
@@ -352,6 +413,13 @@ struct AnthropicAccumulator {
     usage_input: Option<Value>,
     /// Final cumulative output tokens from `message_delta`.
     output_tokens: Option<u64>,
+    /// Raw `delta.stop_reason` from `message_delta`, translated by
+    /// [`canonical_stop_reason`] when the reply is assembled.
+    stop_reason: Option<String>,
+    /// Whether the stream's own terminal event arrived. Anthropic has no
+    /// `[DONE]`, but `message_stop` is always its last event, so reaching the end
+    /// of the byte stream without one means the response was cut.
+    saw_message_stop: bool,
 }
 
 impl SseAccumulator for AnthropicAccumulator {
@@ -410,23 +478,72 @@ impl SseAccumulator for AnthropicAccumulator {
                     .get("usage")
                     .and_then(|usage| usage.get("output_tokens"))
                     .and_then(Value::as_u64);
+                if let Some(reason) = chunk
+                    .get("delta")
+                    .and_then(|delta| delta.get("stop_reason"))
+                    .and_then(Value::as_str)
+                {
+                    self.stop_reason = Some(reason.to_owned());
+                }
             }
-            // ping, content_block_stop, message_stop: no state to fold.
+            Some("message_stop") => self.saw_message_stop = true,
+            Some("error") => {
+                // Anthropic can report a mid-stream failure (overloaded, billing)
+                // as an `error` event and then simply stop sending. Surfacing it
+                // here keeps the provider's own diagnosis, which the cut-stream
+                // error raised at assembly time would otherwise replace with a
+                // generic one.
+                let error = chunk.get("error").unwrap_or(chunk);
+                pending.push_back(Err(LlmError::Provider(Arc::from(format!(
+                    "anthropic stream failed: {error}"
+                )))));
+            }
+            // ping, content_block_stop: no state to fold.
             _ => {}
         }
     }
 
-    fn finalize(&mut self) -> Message {
+    fn finalize(&mut self, _saw_sentinel: bool) -> Result<Message, LlmError> {
+        // Anthropic's Messages stream has no `[DONE]`, so the driver's
+        // `saw_sentinel` says nothing here. What plays the same role is
+        // `message_stop`, always the stream's last event: reaching the end of the
+        // byte stream without it means the response was cut, and everything
+        // accumulated so far is a partial answer. Reported as a transport failure
+        // so the caller retries buffered rather than handing the run a truncated
+        // turn it cannot detect. A stream that reported an `error` event already
+        // queued that cause ahead of this one, so the provider's own diagnosis
+        // still wins.
+        if !self.saw_message_stop {
+            return Err(LlmError::StreamTransport(Arc::from(format!(
+                "anthropic stream ended without a message_stop event after {} content byte(s); \
+                 the response was cut short",
+                self.content.len()
+            ))));
+        }
+        let builders = std::mem::take(&mut self.tool_calls);
+        let announced = builders
+            .values()
+            .filter(|builder| builder.id.is_some() && builder.name.is_some())
+            .count();
         let mut message = Message {
             role: MessageRole::Assistant,
             content: Arc::from(std::mem::take(&mut self.content)),
             attachments: Vec::new(),
-            tool_calls: tool_calls_from_builders(
-                std::mem::take(&mut self.tool_calls).into_values(),
-            ),
+            tool_calls: tool_calls_from_builders(builders.into_values()),
             tool_call_id: None,
             metadata: Default::default(),
         };
+        // `produced_reasoning` is always false: `thinking` blocks are neither
+        // requested nor captured by this provider, so there is no reasoning
+        // channel for an otherwise empty reply to count as output.
+        record_reply_outcome(
+            "anthropic",
+            &mut message,
+            canonical_stop_reason(self.stop_reason.as_deref()),
+            announced,
+            false,
+        )
+        .map_err(|defect| LlmError::Provider(Arc::from(defect.to_string())))?;
         // Reassemble the buffered-path usage shape: input + cache from
         // message_start, output overridden by the final message_delta count.
         if let Some(Value::Object(mut usage)) = self.usage_input.take() {
@@ -438,7 +555,7 @@ impl SseAccumulator for AnthropicAccumulator {
                 attach_token_usage(&mut message, usage);
             }
         }
-        message
+        Ok(message)
     }
 }
 
@@ -452,51 +569,67 @@ mod tests {
     use super::*;
     use agentos_proto::TOKEN_USAGE_METADATA_KEY;
 
-    /// Drive any accumulator over canned SSE bytes the way the live decoder
-    /// would (line framing across arbitrary chunk splits), and collect the
-    /// events. Provider-agnostic, so both OpenAI and Anthropic fixtures reuse it.
-    fn decode_with<A: SseAccumulator>(mut acc: A, chunks: &[&[u8]]) -> Vec<CompletionEvent> {
-        let mut buffer: Vec<u8> = Vec::new();
-        let mut pending: Pending = VecDeque::new();
+    /// Drive any accumulator over canned SSE bytes through the *production*
+    /// line framing and sentinel detection ([`drain_sse_lines`]), and collect
+    /// the events. Only the network is replaced: the byte stream is empty
+    /// because the fixture feeds `buffer` directly, which is exactly what the
+    /// driver does with each chunk it reads. Provider-agnostic, so both the
+    /// chat-completions and Anthropic fixtures reuse it.
+    fn try_decode_with<A: SseAccumulator>(
+        acc: A,
+        chunks: &[&[u8]],
+    ) -> Result<Vec<CompletionEvent>, LlmError> {
+        let mut st = SseState {
+            bytes: stream::empty().boxed(),
+            buffer: Vec::new(),
+            pending: VecDeque::new(),
+            acc,
+            sse_done: false,
+            saw_sentinel: false,
+            terminated: false,
+        };
         for chunk in chunks {
-            buffer.extend_from_slice(chunk);
-            while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
-                let line: Vec<u8> = buffer.drain(..=pos).collect();
-                let line = String::from_utf8_lossy(&line);
-                let line = line.trim();
-                let Some(data) = line.strip_prefix("data:") else {
-                    continue;
-                };
-                let data = data.trim();
-                if data == "[DONE]" {
-                    continue;
-                }
-                let value: Value = serde_json::from_str(data).expect("valid chunk json");
-                acc.ingest(&value, &mut pending);
-            }
+            st.buffer.extend_from_slice(chunk);
+            drain_sse_lines(&mut st);
         }
-        let mut events: Vec<CompletionEvent> = pending
-            .into_iter()
-            .map(|item| item.expect("no error in fixture"))
-            .collect();
-        events.push(CompletionEvent::Done(acc.finalize()));
-        events
+        // Queued errors propagate rather than panic, matching the real consumer:
+        // the driver hands pending items out before the terminal step, so an
+        // error an accumulator queued mid-stream is what the caller sees first.
+        let mut events: Vec<CompletionEvent> = Vec::new();
+        for item in std::mem::take(&mut st.pending) {
+            events.push(item?);
+        }
+        let saw_sentinel = st.saw_sentinel;
+        events.push(CompletionEvent::Done(st.acc.finalize(saw_sentinel)?));
+        Ok(events)
+    }
+
+    /// [`try_decode_with`] for the fixtures that are expected to assemble.
+    fn decode_with<A: SseAccumulator>(acc: A, chunks: &[&[u8]]) -> Vec<CompletionEvent> {
+        try_decode_with(acc, chunks).expect("fixture assembles a reply")
+    }
+
+    fn openai_acc(reasoning_key: Option<&'static str>) -> OpenAiAccumulator {
+        OpenAiAccumulator {
+            provider: "test",
+            model: Arc::from("test-model"),
+            reasoning_key,
+            content: String::new(),
+            reasoning: String::new(),
+            tool_calls: Vec::new(),
+            usage_body: None,
+            finish_reason: None,
+        }
     }
 
     /// OpenAI-shaped convenience wrapper over [`decode_with`].
     fn decode(chunks: &[&[u8]], reasoning_key: Option<&'static str>) -> Vec<CompletionEvent> {
-        decode_with(
-            OpenAiAccumulator {
-                provider: "test",
-                model: Arc::from("test-model"),
-                reasoning_key,
-                content: String::new(),
-                reasoning: String::new(),
-                tool_calls: Vec::new(),
-                usage_body: None,
-            },
-            chunks,
-        )
+        decode_with(openai_acc(reasoning_key), chunks)
+    }
+
+    /// OpenAI-shaped wrapper for the fixtures that are expected to be rejected.
+    fn try_decode(chunks: &[&[u8]]) -> Result<Vec<CompletionEvent>, LlmError> {
+        try_decode_with(openai_acc(None), chunks)
     }
 
     fn anthropic_acc() -> AnthropicAccumulator {
@@ -506,6 +639,8 @@ mod tests {
             tool_calls: BTreeMap::new(),
             usage_input: None,
             output_tokens: None,
+            stop_reason: None,
+            saw_message_stop: false,
         }
     }
 
@@ -538,6 +673,99 @@ mod tests {
         let done = done.expect("done event present");
         assert_eq!(text, "Hello, world");
         assert_eq!(done.content.as_ref(), "Hello, world");
+    }
+
+    #[test]
+    fn a_stream_that_stops_before_done_is_a_transport_failure() {
+        // A proxy or dropped connection cuts the SSE body. Everything decoded
+        // so far is a partial answer, and accepting it hands the run a
+        // truncated turn nothing downstream can detect. Reported as
+        // `StreamTransport` specifically, because that is the one error the
+        // orchestrator recovers from by retrying buffered.
+        let chunks = [text_chunk("Hello, wor").into_bytes()];
+        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+
+        let error = try_decode(&refs).expect_err("a cut stream is not a finished reply");
+
+        assert!(
+            matches!(error, LlmError::StreamTransport(_)),
+            "expected StreamTransport, got {error:?}"
+        );
+        assert!(error.to_string().contains("[DONE]"), "{error}");
+    }
+
+    #[test]
+    fn a_stream_cut_off_mid_tool_call_is_rejected_rather_than_losing_the_call() {
+        // The sentinel arrives, so the stream itself is intact — but the
+        // arguments stop mid-object, so the assembled call cannot be built and
+        // would otherwise be dropped silently.
+        let chunks = [
+            format!(
+                "data: {}\n\n",
+                serde_json::json!({ "choices": [{ "index": 0, "delta": { "tool_calls": [{
+                    "index": 0, "id": "call_1", "type": "function",
+                    "function": { "name": "file", "arguments": "{\"path\":\"/etc/ho" }
+                }] } }] })
+            )
+            .into_bytes(),
+            format!(
+                "data: {}\n\n",
+                serde_json::json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "length" }] })
+            )
+            .into_bytes(),
+            b"data: [DONE]\n\n".to_vec(),
+        ];
+        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+
+        let error = try_decode(&refs).expect_err("a lost tool call is not a valid reply");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("announced 1 tool call(s)"), "{rendered}");
+        assert!(rendered.contains("finish_reason=length"), "{rendered}");
+    }
+
+    #[test]
+    fn a_stream_that_produced_nothing_at_all_is_rejected() {
+        let chunks = [
+            format!(
+                "data: {}\n\n",
+                serde_json::json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }] })
+            )
+            .into_bytes(),
+            b"data: [DONE]\n\n".to_vec(),
+        ];
+        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+
+        let error = try_decode(&refs).expect_err("an empty reply is not a finished turn");
+
+        assert!(error.to_string().contains("no content"), "{error}");
+    }
+
+    #[test]
+    fn a_truncated_stream_that_kept_its_sentinel_records_the_stop_reason() {
+        let chunks = [
+            text_chunk("the answer is fo").into_bytes(),
+            format!(
+                "data: {}\n\n",
+                serde_json::json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "length" }] })
+            )
+            .into_bytes(),
+            b"data: [DONE]\n\n".to_vec(),
+        ];
+        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+        let events = decode(&refs, None);
+
+        let CompletionEvent::Done(message) = events.last().expect("events present") else {
+            panic!("last event must be Done");
+        };
+        assert_eq!(message.content.as_ref(), "the answer is fo");
+        assert_eq!(
+            message
+                .metadata
+                .get(crate::providers::reply::STOP_REASON_METADATA_KEY)
+                .and_then(Value::as_str),
+            Some("length")
+        );
     }
 
     #[test]
@@ -758,6 +986,14 @@ mod tests {
                 }),
             ),
             anthropic_event(
+                "message_delta",
+                serde_json::json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": "tool_use" },
+                    "usage": { "output_tokens": 9 }
+                }),
+            ),
+            anthropic_event(
                 "message_stop",
                 serde_json::json!({ "type": "message_stop" }),
             ),
@@ -774,5 +1010,182 @@ mod tests {
         assert_eq!(call.args.get(), r#"{"city":"paris"}"#);
         // A tool-use-only reply surfaces no assistant-visible text.
         assert!(message.content.is_empty());
+        // `tool_use` is one of this shape's two ordinary endings, so it maps onto
+        // `tool_calls` and leaves the message unmarked.
+        assert!(!message
+            .metadata
+            .contains_key(crate::providers::reply::STOP_REASON_METADATA_KEY));
+    }
+
+    #[test]
+    fn an_anthropic_stream_that_ends_without_message_stop_is_a_transport_failure() {
+        // The Anthropic analogue of a chat-completions stream cut before `[DONE]`:
+        // text arrived, `message_stop` never did, so what we hold is half an
+        // answer. `StreamTransport` is the error the orchestrator recovers from by
+        // retrying buffered.
+        let chunks = [
+            anthropic_event(
+                "message_start",
+                serde_json::json!({ "type": "message_start", "message": { "usage": {} } }),
+            ),
+            anthropic_event(
+                "content_block_delta",
+                serde_json::json!({
+                    "type": "content_block_delta", "index": 0,
+                    "delta": { "type": "text_delta", "text": "half an ans" }
+                }),
+            ),
+        ];
+        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+
+        let error = try_decode_with(anthropic_acc(), &refs)
+            .expect_err("a cut stream is not a finished reply");
+
+        assert!(
+            matches!(error, LlmError::StreamTransport(_)),
+            "expected StreamTransport, got {error:?}"
+        );
+        assert!(error.to_string().contains("message_stop"), "{error}");
+    }
+
+    #[test]
+    fn an_anthropic_reply_stopped_at_max_tokens_records_length() {
+        // The request pins `max_tokens`, so this is the routine case rather than
+        // an exotic one: the text is usable, but the transcript has to record
+        // that it was cut.
+        let chunks = [
+            anthropic_event(
+                "content_block_delta",
+                serde_json::json!({
+                    "type": "content_block_delta", "index": 0,
+                    "delta": { "type": "text_delta", "text": "the answer is fo" }
+                }),
+            ),
+            anthropic_event(
+                "message_delta",
+                serde_json::json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": "max_tokens" },
+                    "usage": { "output_tokens": 1024 }
+                }),
+            ),
+            anthropic_event(
+                "message_stop",
+                serde_json::json!({ "type": "message_stop" }),
+            ),
+        ];
+        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+        let events = decode_with(anthropic_acc(), &refs);
+
+        let CompletionEvent::Done(message) = events.last().expect("events present") else {
+            panic!("last event must be Done");
+        };
+        assert_eq!(message.content.as_ref(), "the answer is fo");
+        assert_eq!(
+            message
+                .metadata
+                .get(crate::providers::reply::STOP_REASON_METADATA_KEY)
+                .and_then(Value::as_str),
+            Some("length")
+        );
+    }
+
+    #[test]
+    fn an_anthropic_refusal_is_recorded_under_its_own_name() {
+        // Not folded into `content_filter`: the model declining is a different
+        // event from a provider filtering the output.
+        let chunks = [
+            anthropic_event(
+                "content_block_delta",
+                serde_json::json!({
+                    "type": "content_block_delta", "index": 0,
+                    "delta": { "type": "text_delta", "text": "I won't help with that." }
+                }),
+            ),
+            anthropic_event(
+                "message_delta",
+                serde_json::json!({
+                    "type": "message_delta", "delta": { "stop_reason": "refusal" }
+                }),
+            ),
+            anthropic_event(
+                "message_stop",
+                serde_json::json!({ "type": "message_stop" }),
+            ),
+        ];
+        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+        let events = decode_with(anthropic_acc(), &refs);
+
+        let CompletionEvent::Done(message) = events.last().expect("events present") else {
+            panic!("last event must be Done");
+        };
+        assert_eq!(
+            message
+                .metadata
+                .get(crate::providers::reply::STOP_REASON_METADATA_KEY)
+                .and_then(Value::as_str),
+            Some("refusal")
+        );
+    }
+
+    #[test]
+    fn an_anthropic_stream_cut_off_mid_tool_use_is_rejected_rather_than_losing_the_call() {
+        // `input_json_delta` fragments concatenate into a string that has to be
+        // re-parsed, so truncation here really does destroy the call — unlike the
+        // buffered path, where `input` arrives as an object.
+        let chunks = [
+            anthropic_event(
+                "content_block_start",
+                serde_json::json!({
+                    "type": "content_block_start", "index": 0,
+                    "content_block": { "type": "tool_use", "id": "toolu_1", "name": "file" }
+                }),
+            ),
+            anthropic_event(
+                "content_block_delta",
+                serde_json::json!({
+                    "type": "content_block_delta", "index": 0,
+                    "delta": { "type": "input_json_delta", "partial_json": "{\"path\":\"/etc/ho" }
+                }),
+            ),
+            anthropic_event(
+                "message_delta",
+                serde_json::json!({
+                    "type": "message_delta", "delta": { "stop_reason": "max_tokens" }
+                }),
+            ),
+            anthropic_event(
+                "message_stop",
+                serde_json::json!({ "type": "message_stop" }),
+            ),
+        ];
+        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+
+        let error = try_decode_with(anthropic_acc(), &refs)
+            .expect_err("a lost tool call is not a valid reply");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("announced 1 tool call(s)"), "{rendered}");
+        assert!(rendered.contains("finish_reason=length"), "{rendered}");
+    }
+
+    #[test]
+    fn an_anthropic_error_event_keeps_the_providers_own_diagnosis() {
+        // Without this the stream would simply stop, and the cut-stream error
+        // raised at assembly time would replace "overloaded" with a generic
+        // truncation message.
+        let chunks = [anthropic_event(
+            "error",
+            serde_json::json!({
+                "type": "error",
+                "error": { "type": "overloaded_error", "message": "Overloaded" }
+            }),
+        )];
+        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+
+        let error =
+            try_decode_with(anthropic_acc(), &refs).expect_err("an errored stream is not a reply");
+
+        assert!(error.to_string().contains("Overloaded"), "{error}");
     }
 }
