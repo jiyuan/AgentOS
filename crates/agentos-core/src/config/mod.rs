@@ -3,7 +3,7 @@ use agentos_interfaces::orchestrator::{
     DispatchPriority, OrchestratorTemplate, ResourceEntry, ResourceIndex, ResourceKind,
     RoutingRule, RoutingTable, TaskDomain,
 };
-use agentos_interfaces::tool::ToolSpec;
+use agentos_interfaces::tool::{SandboxMode, ToolSpec};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -188,7 +188,13 @@ pub struct McpToolConfig {
     pub name: Arc<str>,
     pub description: Arc<str>,
     pub response: Arc<str>,
-    pub requires_isolation: bool,
+    /// What this MCP-backed tool may do to the filesystem (roadmap X2).
+    ///
+    /// Defaults to `full_access`, which is exactly what the old
+    /// `requires_isolation = false` meant: the call is made in-process by the
+    /// MCP client, so there is no child process for a sandbox to restrict.
+    #[serde(default)]
+    pub sandbox: SandboxMode,
 }
 
 impl Default for McpToolConfig {
@@ -198,7 +204,7 @@ impl Default for McpToolConfig {
             name: Arc::from("remote_echo"),
             description: Arc::from("Static MCP-backed tool"),
             response: Arc::from("static MCP response"),
-            requires_isolation: false,
+            sandbox: SandboxMode::FullAccess,
         }
     }
 }

@@ -13,13 +13,69 @@ pub enum ToolError {
     Failed(Arc<str>),
 }
 
+/// What a tool may do to the filesystem.
+///
+/// Ordered from most to least restricted. Anything other than
+/// [`SandboxMode::FullAccess`] means the tool runs in a child process under a
+/// kernel sandbox — Landlock on Linux, Seatbelt on macOS — so the restriction
+/// is enforced by the kernel rather than by the tool's own good behaviour.
+///
+/// **What this does not cover:** a tool that does its work in-process cannot be
+/// restricted this way, because the only sandbox available would restrict the
+/// whole agent. Those tools declare [`SandboxMode::FullAccess`] and are bounded
+/// by the guardrails and the policy engine instead. Declaring a narrower mode
+/// on a tool that never spawns a child would be a claim the kernel is not
+/// making.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxMode {
+    /// May read the filesystem; may not write to it anywhere.
+    ReadOnly,
+    /// May write beneath the workspace root and the temporary directory;
+    /// may not write anywhere else.
+    WorkspaceWrite,
+    /// Unrestricted, and not run under a sandbox at all.
+    ///
+    /// The default, because it is exactly what the old `requires_isolation:
+    /// false` meant and most built-in tools do their work in-process where
+    /// there is nothing for a sandbox to restrict. It is a claim about
+    /// enforcement, not a grant of privilege: an unsandboxed tool is still
+    /// bounded by its guardrails and by `Approve`.
+    #[default]
+    FullAccess,
+}
+
+impl SandboxMode {
+    /// Whether this mode is enforced by running the tool in a sandboxed child
+    /// process.
+    pub fn is_sandboxed(self) -> bool {
+        !matches!(self, Self::FullAccess)
+    }
+
+    /// Stable name for traces, logs, and `/tools`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::WorkspaceWrite => "workspace_write",
+            Self::FullAccess => "full_access",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolSpec {
     pub name: Arc<str>,
     pub description: Arc<str>,
     pub input_schema: Value,
+    /// What this tool is allowed to do to the filesystem, and therefore how it
+    /// is executed (roadmap item X2).
+    ///
+    /// Replaces the old `requires_isolation: bool`, which said only *whether*
+    /// to spend a process on a tool and nothing about what that process could
+    /// then do — it ran as the same user with the same filesystem, network and
+    /// environment as the agent.
     #[serde(default)]
-    pub requires_isolation: bool,
+    pub sandbox: SandboxMode,
     /// How long this tool may run before the registry gives up on it, in
     /// milliseconds (roadmap item D2).
     ///

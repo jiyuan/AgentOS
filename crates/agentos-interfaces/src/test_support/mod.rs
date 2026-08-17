@@ -19,7 +19,7 @@ use crate::guardrail::{
 use crate::mcp::{McpClient, McpError, McpServer};
 use crate::orchestrator::{Orchestrator, OrchestratorError, Plan, RunContext};
 use crate::skill::{Skill, SkillError, SkillInvocation};
-use crate::tool::{Tool, ToolError, ToolSpec};
+use crate::tool::{SandboxMode, Tool, ToolError, ToolSpec};
 use agentos_proto::{
     ChannelId, Envelope, Message, MessageRole, ToolCall, ToolCallId, ToolResult, ToolStatus,
 };
@@ -477,7 +477,7 @@ impl MockTool {
                 name: Arc::clone(&name),
                 description: Arc::from("mock tool"),
                 input_schema: serde_json::json!({"type": "object"}),
-                requires_isolation: false,
+                sandbox: SandboxMode::FullAccess,
                 timeout_ms: None,
             },
             canned_result: Mutex::new(ok_tool_result(
@@ -718,7 +718,7 @@ mod tests {
             name: Arc::from("ping"),
             description: Arc::from("returns pong"),
             input_schema: serde_json::json!({}),
-            requires_isolation: false,
+            sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }]);
         let server = McpServer {

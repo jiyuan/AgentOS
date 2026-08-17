@@ -1,6 +1,6 @@
 use super::common::{default_skills_dir, elapsed_ms, result_metadata, skills_root_for_tests};
 use crate::skills::{validate_skill_dir, SkillStoreError};
-use agentos_interfaces::tool::{Tool, ToolError, ToolSpec};
+use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
 use agentos_proto::{ToolCall, ToolResult, ToolStatus};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -53,7 +53,7 @@ impl Tool for SkillValidateTool {
                     }
                 }
             }),
-            requires_isolation: false,
+            sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }
     }

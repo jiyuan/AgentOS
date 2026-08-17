@@ -1,6 +1,8 @@
 use super::McpTool;
 use crate::jobs::{JobId, JobRegistry, JobSnapshot, JobSpec, JobState};
 use crate::memory::conversation_id_from_context;
+use crate::sandbox::Sandbox;
+use crate::tools::builtin::workspace_root;
 use crate::tools::exec::{Exec, DEFAULT_MAX_OUTPUT_BYTES};
 use agentos_interfaces::mcp::{McpClient, McpError, McpServer};
 use agentos_interfaces::orchestrator::RunContext;
@@ -150,9 +152,10 @@ impl ToolRegistry {
             .ok_or_else(|| ToolRegistryError::UnknownTool(Arc::clone(&call.name)))?;
         let spec = tool.spec();
         let deadline = self.deadline(&spec);
-        if spec.requires_isolation {
+        if spec.sandbox.is_sandboxed() {
             if let Some(runner) = &self.isolation_runner {
-                return Ok(call_isolated_subprocess(runner, call, deadline).await?);
+                let sandbox = Sandbox::new(spec.sandbox, workspace_root());
+                return Ok(call_isolated_subprocess(runner, call, deadline, &sandbox).await?);
             }
         }
         match timeout(deadline, tool.call(call, &call.args)).await {
@@ -172,9 +175,10 @@ impl ToolRegistry {
             .ok_or_else(|| ToolRegistryError::UnknownTool(Arc::clone(&call.name)))?;
         let spec = tool.spec();
         let deadline = self.deadline(&spec);
-        if spec.requires_isolation {
+        if spec.sandbox.is_sandboxed() {
             if let Some(runner) = &self.isolation_runner {
-                return Ok(call_isolated_subprocess(runner, call, deadline).await?);
+                let sandbox = Sandbox::new(spec.sandbox, workspace_root());
+                return Ok(call_isolated_subprocess(runner, call, deadline, &sandbox).await?);
             }
         }
         if let Some(promoted) = self.call_promotable(tool, call, ctx, deadline).await {
@@ -364,6 +368,7 @@ pub async fn call_isolated_subprocess(
     runner: &std::path::Path,
     call: &ToolCall,
     timeout: Duration,
+    sandbox: &Sandbox,
 ) -> Result<ToolResult, ToolError> {
     let request = serde_json::to_vec(&IsolatedToolRequest { call })
         .map_err(|err| ToolError::Failed(err.to_string().into()))?;
@@ -375,6 +380,7 @@ pub async fn call_isolated_subprocess(
         stdin: Some(&request),
         timeout,
         max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+        sandbox,
     })
     .await
     .map_err(|err| ToolError::Failed(err.to_string().into()))?;
@@ -395,6 +401,12 @@ pub async fn call_isolated_subprocess(
         Arc::from("isolation"),
         Value::String("subprocess".to_owned()),
     );
+    // What the worker actually ran under, so a trace shows the enforcement
+    // rather than the intent.
+    result.metadata.insert(
+        Arc::from("sandbox"),
+        Value::String(sandbox.mode().as_str().to_owned()),
+    );
     result.metadata.insert(
         Arc::from("isolation_runner"),
         Value::String(runner.display().to_string()),
@@ -405,6 +417,7 @@ pub async fn call_isolated_subprocess(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentos_interfaces::tool::SandboxMode;
     use agentos_interfaces::tool::Tool;
     use agentos_proto::ToolCallId;
     use async_trait::async_trait;
@@ -422,7 +435,7 @@ mod tests {
                 name: Arc::from("hang"),
                 description: Arc::from("Never returns."),
                 input_schema: json!({"type": "object"}),
-                requires_isolation: false,
+                sandbox: SandboxMode::FullAccess,
                 timeout_ms: self.declared_timeout_ms,
             }
         }

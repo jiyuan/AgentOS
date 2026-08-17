@@ -18,6 +18,7 @@ pub mod orchestrator;
 pub mod prompt;
 pub mod runner;
 pub mod runtime;
+pub mod sandbox;
 pub mod skills;
 pub mod spill;
 pub mod subagents;

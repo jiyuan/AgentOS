@@ -12,7 +12,7 @@ use agentos_core::r#loop::{LoopDeps, RunLoopState, StartCtx};
 use agentos_core::tools::ToolRegistry;
 use agentos_interfaces::orchestrator::{Orchestrator, OrchestratorError, Plan, RunContext};
 use agentos_interfaces::session::{Item, Transcript};
-use agentos_interfaces::tool::{Tool, ToolError, ToolSpec};
+use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
 use agentos_interfaces::RunState;
 use agentos_proto::{
     AgentId, Message, MessageRole, RunId, ToolCall, ToolCallId, ToolResult, ToolStatus,
@@ -101,7 +101,7 @@ impl Tool for NoopEchoTool {
             name: Arc::from(BENCH_TOOL_NAME),
             description: Arc::from("bench echo tool"),
             input_schema: serde_json::json!({"type": "object"}),
-            requires_isolation: false,
+            sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }
     }

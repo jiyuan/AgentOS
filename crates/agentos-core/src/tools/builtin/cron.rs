@@ -1,6 +1,6 @@
 use super::common::{cron_root_for_tests, default_cron_dir, elapsed_ms, result_metadata};
 use crate::crons::{CronSchedule, CronStore, CronTask};
-use agentos_interfaces::tool::{Tool, ToolError, ToolSpec};
+use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
 use agentos_proto::{ChannelId, ConversationId, ToolCall, ToolResult, ToolStatus};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -85,7 +85,7 @@ impl Tool for CronCreatorTool {
                     }
                 }
             }),
-            requires_isolation: false,
+            sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }
     }
@@ -169,7 +169,7 @@ impl Tool for CronListTool {
                 "type": "object",
                 "properties": {}
             }),
-            requires_isolation: false,
+            sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }
     }
@@ -246,7 +246,7 @@ impl Tool for CronRemoveTool {
                     }
                 }
             }),
-            requires_isolation: false,
+            sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }
     }

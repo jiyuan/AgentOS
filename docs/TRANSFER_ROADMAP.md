@@ -1212,6 +1212,71 @@ boundary until this item lands.
   vacuously.
 - Exit: ring 4 in `DESIGN.md` describes what the code enforces.
 
+**Status: done.** New `sandbox/{mod,linux,macos}.rs`, `SandboxMode` replacing
+`ToolSpec::requires_isolation`, the sandbox applied in `tools/exec.rs` — the
+single choke point every subprocess the runtime starts goes through — and ring
+4 in `DESIGN.md` rewritten to describe enforcement rather than a process
+boundary. Both prerequisites done: the `shell` description now credits
+`[guardrails].shell_allowlist` for the allowlist instead of implying its own,
+and ring 4 no longer overstates what isolation buys. Verified: `cargo fmt --all
+--check`, `cargo clippy --workspace --all-targets -- -D warnings`, 512 tests,
+import boundaries, module sizes. **The enforcement suite really ran here** —
+this kernel reports Landlock ABI 6 — and is proven load-bearing: making
+`Sandbox::harden` a no-op turns six of its nine tests red.
+
+  - **Landlock is applied in `pre_exec`, between fork and exec.**
+    `landlock_restrict_self` restricts the calling thread irreversibly and every
+    descendant inherits it, so applying it anywhere in the agent would sandbox
+    the agent for the life of the process. The closure it runs is subject to the
+    usual post-fork rules — no allocation, no locks — so the directory
+    descriptors and rule structs are built in the parent and only syscalls
+    happen in the child.
+  - **Every enforcement test carries a control.** Each asserts first that the
+    write succeeds *unsandboxed*, then that it fails sandboxed. Without that,
+    `a_read_only_child_cannot_write_outside_it_either` passes on any machine
+    where the target was unwritable anyway — and the first version of the
+    `workspace_write` test did exactly that, "proving" the sandbox by trying to
+    write to `/` as a non-root user. The item warns about vacuous passes and
+    that is the shape they take.
+  - **`full_access` is the default, and it is a claim about enforcement rather
+    than a grant.** It is exactly what `requires_isolation: false` meant. Most
+    built-in tools do their work in-process, where the only sandbox available
+    would restrict the whole agent — so they say `full_access` and are bounded
+    by rings 2 and 3. Declaring `read_only` on a tool that never spawns a child
+    would be a claim the kernel is not making, and `DESIGN.md` now says which
+    ring covers which.
+  - **A sandbox that cannot be built fails the call.** Not a warning: the
+    alternative to a failed sandbox is running the tool with everything it asked
+    not to have. `agentos-gateway config` prints
+    `sandbox.enforcement=landlock|seatbelt|<reason>` so an operator learns this
+    at startup rather than from a failed tool call.
+  - **The macOS backend is compiled and unit-tested on Linux.** It is string
+    building and one `Path::exists`, so gating it on `target_os` would have left
+    the profile builder and its quote escaping unchecked on the machine that
+    runs CI. The escaping test matters: a workspace path containing a quote
+    would otherwise close the profile literal and let the rest of the path be
+    read as profile syntax. What genuinely cannot be checked off-macOS is
+    whether Seatbelt honours the profile, and that test skips with a reason.
+  - **`/dev/null` stays writable in every sandboxed mode.** `2>/dev/null` is
+    ordinary shell, and a sandbox that refuses it reads as the tool being broken
+    rather than as the sandbox working. Writing to the null device changes
+    nothing.
+  - **`workspace_write` grants the temp directory too.** Compilers, package
+    managers and anything using `mkstemp` write there; refusing it would make
+    the mode mean "cannot run a build" and push operators to `full_access`,
+    which is worse than granting a directory the machine already treats as
+    scratch.
+  - **Landlock rights are masked to the kernel's ABI.** `create_ruleset` rejects
+    a ruleset naming a right the kernel does not know (`REFER` is ABI 2,
+    `TRUNCATE` ABI 3), so asking for everything would fail closed on an older
+    kernel — a sandboxed tool that stops running rather than a tool that runs
+    unsandboxed, but still a regression against no reason.
+  - **Not done: network and read restrictions.** The mode bounds filesystem
+    writes only. Landlock gained network scoping in ABI 4 and Seatbelt can deny
+    sockets, but the two do not line up, and a tool that must not read a
+    particular path is a policy question rather than a sandbox one. Ring 4 in
+    `DESIGN.md` states both limits rather than leaving them to be discovered.
+
 ### X3. One config pass (F15)
 
 Move every deployment-varying constant into `agent.toml` with loader validation,
@@ -1349,7 +1414,7 @@ the result in the PR.
 | G1 | `Channel` gains a required `egress() -> Arc<dyn Egress>`; `send` becomes a provided method delegating to it | **Verified**: interfaces major (`trait_method_added` without default), proto and llm unchanged. Required: a sharded gateway cannot hold `&mut self` for `receive` and `&self` for `send` at once |
 | G2 | `ApprovalStatus` gains an `Unanswered` variant | **Verified**: interfaces major (`enum_variant_added`), proto and llm unchanged. `agentos-core` is also major (`ResumeDecision` and `RunError` variants, `GatewayRun::Paused` fields, `approval_prompt_envelope` arity) but has no external consumers |
 | X1 (b) | `Plan` gains `CallTools`; `RunState` gains `queued_tool_calls` | **Verified**: interfaces major (`enum_variant_added`, `constructible_struct_adds_field`), proto and llm unchanged |
-| X2 | `ToolSpec.requires_isolation` → sandbox mode | Breaking |
+| X2 | `ToolSpec.requires_isolation: bool` → `sandbox: SandboxMode` | **Verified**: interfaces major (`struct_pub_field_missing` plus the new field), proto and llm unchanged. `agentos-core` also major (`McpToolConfig.sandbox`, `Exec.sandbox`, `ExecError::Sandbox`) with no external consumers |
 | X6 | `Session::fork` as a defaulted method | Additive |
 
 `Approve`, `RunLoopState`, and the guardrail traits are unchanged by every item

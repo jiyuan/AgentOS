@@ -35,4 +35,4 @@ pub use run_state::{ApprovalStatus, Interruption, InterruptionAction, RunState};
 pub use semantic::{SemanticIndex, SemanticSearchHit};
 pub use session::{Item, Session, SessionError, Transcript};
 pub use skill::{Skill, SkillError, SkillInvocation};
-pub use tool::{Tool, ToolError, ToolMetadata, ToolSpec};
+pub use tool::{SandboxMode, Tool, ToolError, ToolMetadata, ToolSpec};

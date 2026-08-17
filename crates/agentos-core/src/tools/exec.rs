@@ -36,6 +36,7 @@
 //! truncated success. The first version of this module had that bug and its
 //! test caught it.
 
+use crate::sandbox::Sandbox;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -72,12 +73,27 @@ pub enum ExecError {
     /// `ToolResult`* the model can read and work around, never a run error.
     #[error("{program} exceeded its {timeout_ms} ms deadline and was terminated")]
     TimedOut { program: String, timeout_ms: u64 },
+    /// The sandbox the tool asked for could not be applied.
+    ///
+    /// Fatal for the call rather than a warning: the alternative to a sandbox
+    /// that failed to build is running the tool with everything it asked not
+    /// to have.
+    #[error("cannot sandbox {program}: {source}")]
+    Sandbox {
+        program: String,
+        #[source]
+        source: crate::sandbox::SandboxError,
+    },
 }
 
 /// What to run, and the bounds it runs under.
 pub struct Exec<'a> {
     pub program: &'a str,
     pub args: &'a [String],
+    /// What this child may write (roadmap item X2). Every subprocess the
+    /// runtime starts goes through here, so this is the one place a sandbox
+    /// has to be applied to cover all of them.
+    pub sandbox: &'a Sandbox,
     pub cwd: Option<PathBuf>,
     /// Written to the child's stdin, which is then closed. `None` closes it
     /// immediately, so a child that reads stdin sees EOF rather than hanging.
@@ -103,9 +119,13 @@ pub async fn run(exec: Exec<'_>) -> Result<ExecOutput, ExecError> {
     let program = exec.program.to_owned();
     let timeout_ms = exec.timeout.as_millis() as u64;
 
-    let mut command = Command::new(exec.program);
+    // On a platform that sandboxes by wrapping (macOS), this is where the
+    // wrapper takes over as the program being run; elsewhere it is the tool's
+    // own command, restricted below.
+    let (spawned, args) = exec.sandbox.wrap(exec.program, exec.args);
+    let mut command = Command::new(&spawned);
     command
-        .args(exec.args)
+        .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -115,6 +135,14 @@ pub async fn run(exec: Exec<'_>) -> Result<ExecOutput, ExecError> {
     if let Some(cwd) = &exec.cwd {
         command.current_dir(cwd);
     }
+    // Before the spawn, and fatal if it fails: a tool that asked to be
+    // sandboxed must not run unsandboxed instead.
+    exec.sandbox
+        .harden(&mut command)
+        .map_err(|source| ExecError::Sandbox {
+            program: program.clone(),
+            source,
+        })?;
 
     let mut child = command.spawn().map_err(|source| ExecError::Spawn {
         program: program.clone(),
@@ -203,6 +231,11 @@ where
 mod tests {
     use super::*;
 
+    /// These cover the child-process mechanics, so they run unsandboxed; the
+    /// sandbox has its own suite in `tests/sandbox.rs`.
+    static UNRESTRICTED: std::sync::LazyLock<Sandbox> =
+        std::sync::LazyLock::new(Sandbox::unrestricted);
+
     fn exec<'a>(program: &'a str, args: &'a [String]) -> Exec<'a> {
         Exec {
             program,
@@ -211,6 +244,7 @@ mod tests {
             stdin: None,
             timeout: Duration::from_secs(10),
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            sandbox: &UNRESTRICTED,
         }
     }
 

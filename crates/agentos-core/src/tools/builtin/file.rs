@@ -1,5 +1,5 @@
 use super::common::{elapsed_ms, result_metadata, safe_workspace_path, workspace_root};
-use agentos_interfaces::tool::{Tool, ToolError, ToolSpec};
+use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
 use agentos_proto::{ToolCall, ToolResult, ToolStatus};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -74,7 +74,7 @@ impl Tool for FileTool {
                     }
                 }
             }),
-            requires_isolation: false,
+            sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }
     }

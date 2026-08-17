@@ -8,6 +8,7 @@ use agentos_core::gateway::{
 use agentos_core::memory::MemoryManager;
 use agentos_core::runner::ResumeDecision;
 use agentos_core::runtime::{AgentRuntime, RuntimePaths};
+use agentos_core::sandbox;
 use agentos_interfaces::orchestrator::StreamSink;
 use agentos_interfaces::{Channel, Egress, StreamEgress};
 use agentos_llm::env as agentos_env;
@@ -497,6 +498,10 @@ fn print_effective_config(config: &ServiceConfig) -> Result<(), String> {
         "approval.expiry_seconds={}",
         workspace_config.approval.expiry_seconds
     );
+    // A fact about this machine, not about the config: a sandboxed tool fails
+    // rather than runs where there is no backend, so an operator needs to know
+    // before a tool call tells them.
+    println!("sandbox.enforcement={}", sandbox::availability().describe());
     println!(
         "resources.priority={}",
         join_arcs(&workspace_config.resources.priority)

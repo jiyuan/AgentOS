@@ -763,7 +763,7 @@ mod tests {
     use crate::tools::ToolRegistry;
     use agentos_interfaces::guardrail::{GuardrailError, GuardrailOutcome, ToolGuardrail};
     use agentos_interfaces::orchestrator::{OrchestratorError, Plan, RunContext, SubAgentSpec};
-    use agentos_interfaces::tool::{Tool, ToolError, ToolSpec};
+    use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
     use agentos_interfaces::{InterruptionAction, Orchestrator};
     use agentos_proto::{
         AgentId, ConversationId, MessageRole, ToolCall, ToolCallId, ToolResult, ToolStatus,
@@ -1377,7 +1377,7 @@ mod tests {
                 name: Arc::from("mock"),
                 description: Arc::from("mock approval tool"),
                 input_schema: json!({"type": "object"}),
-                requires_isolation: false,
+                sandbox: SandboxMode::FullAccess,
                 timeout_ms: None,
             }
         }

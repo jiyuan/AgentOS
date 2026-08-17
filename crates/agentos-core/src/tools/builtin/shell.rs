@@ -1,6 +1,7 @@
 use super::common::{elapsed_ms, result_metadata, safe_workspace_path, workspace_root};
+use crate::sandbox::Sandbox;
 use crate::tools::{Exec, ExecError, DEFAULT_MAX_OUTPUT_BYTES};
-use agentos_interfaces::tool::{Tool, ToolError, ToolSpec};
+use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
 use agentos_proto::{ToolCall, ToolResult, ToolStatus};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -12,6 +13,13 @@ use std::time::{Duration, Instant};
 /// The shell tool's self-declared deadline: long enough for a build or a test
 /// suite, short enough that a wedged command does not sit there for an hour.
 const SHELL_TIMEOUT_MS: u64 = 5 * 60 * 1_000;
+
+/// What a shell command may write (roadmap item X2).
+///
+/// `workspace_write` rather than `read_only`: running a build or a test suite
+/// is the reason this tool exists, and those write. Rather than the whole
+/// filesystem, which is what it had before.
+const SHELL_SANDBOX: SandboxMode = SandboxMode::WorkspaceWrite;
 
 #[derive(Default)]
 pub struct ShellTool;
@@ -31,7 +39,12 @@ impl Tool for ShellTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: Arc::from("shell"),
-            description: Arc::from("Run an allowlisted shell command with structured arguments."),
+            description: Arc::from(
+                "Run a shell command with structured arguments. The deployment's \
+                 `[guardrails].shell_allowlist` decides which programs are accepted, \
+                 and the command runs sandboxed: it may write beneath the workspace \
+                 and the temporary directory, and nowhere else.",
+            ),
             input_schema: json!({
                 "type": "object",
                 "required": ["command"],
@@ -41,7 +54,7 @@ impl Tool for ShellTool {
                     "cwd": { "type": "string" }
                 }
             }),
-            requires_isolation: true,
+            sandbox: SHELL_SANDBOX,
             // A shell command is the one built-in that legitimately runs for
             // minutes — a build, a test suite. It declares its own deadline so
             // an unconfigured deployment does not hold it to the default that
@@ -72,6 +85,10 @@ impl Tool for ShellTool {
             stdin: None,
             timeout: Duration::from_millis(SHELL_TIMEOUT_MS),
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            // The mode this tool declares in its own spec, enforced here
+            // because a shell command is run directly rather than through the
+            // isolation worker when no worker is configured.
+            sandbox: &Sandbox::new(SHELL_SANDBOX, workspace_root()),
         })
         .await;
 

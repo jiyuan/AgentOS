@@ -1,6 +1,6 @@
 use super::common::{elapsed_ms, result_metadata};
 use crate::http::shared_client;
-use agentos_interfaces::tool::{Tool, ToolError, ToolSpec};
+use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
 use agentos_proto::{ToolCall, ToolResult, ToolStatus};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -33,7 +33,7 @@ impl Tool for HttpTool {
                     "method": { "type": "string", "enum": ["GET"] }
                 }
             }),
-            requires_isolation: false,
+            sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }
     }

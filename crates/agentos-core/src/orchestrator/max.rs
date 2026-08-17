@@ -614,6 +614,7 @@ mod tests {
     use crate::skills::WorkspaceSkillCatalog;
     use agentos_interfaces::orchestrator::{DispatchTarget, SubAgentSpec, TaskDomain};
     use agentos_interfaces::session::Item;
+    use agentos_interfaces::tool::SandboxMode;
     use agentos_interfaces::RunState;
     use agentos_llm::LlmError;
     use agentos_proto::MessageRole;
@@ -721,7 +722,7 @@ mod tests {
             name: Arc::from("file"),
             description: Arc::from("read and write files"),
             input_schema: json!({"type": "object"}),
-            requires_isolation: false,
+            sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }])
         .with_skill_catalog(catalog)
@@ -783,7 +784,7 @@ mod tests {
             name: Arc::from("file"),
             description: Arc::from("read and write files"),
             input_schema: json!({"type": "object"}),
-            requires_isolation: false,
+            sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }])
         .with_skill_catalog(catalog)
@@ -842,7 +843,7 @@ mod tests {
             name: Arc::from("file"),
             description: Arc::from("read and write files"),
             input_schema: json!({"type": "object"}),
-            requires_isolation: false,
+            sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }])
         .with_skill_catalog(catalog)
@@ -897,7 +898,7 @@ mod tests {
             name: Arc::from("file"),
             description: Arc::from("read and write files"),
             input_schema: json!({"type": "object"}),
-            requires_isolation: false,
+            sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }])
         .with_routing_table(RoutingTable {
@@ -958,7 +959,7 @@ mod tests {
             name: Arc::from("file"),
             description: Arc::from("read and write files"),
             input_schema: json!({"type": "object"}),
-            requires_isolation: false,
+            sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }])
         .with_skill_catalog(catalog)

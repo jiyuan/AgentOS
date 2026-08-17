@@ -16,7 +16,7 @@ use agentos_interfaces::orchestrator::{
     Orchestrator, OrchestratorError, Plan, RunContext, SubAgentSpec,
 };
 use agentos_interfaces::session::Session;
-use agentos_interfaces::tool::{Tool, ToolError, ToolSpec};
+use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
 use agentos_proto::{
     AgentId, ConversationId, Message, MessageRole, RunId, ToolCall, ToolCallId, ToolResult,
     ToolStatus,
@@ -76,7 +76,7 @@ impl Tool for SlowTool {
             name: Arc::from(SLOW_TOOL),
             description: Arc::from("A tool that takes its time."),
             input_schema: serde_json::json!({"type": "object"}),
-            requires_isolation: false,
+            sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }
     }
