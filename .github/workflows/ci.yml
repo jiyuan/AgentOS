@@ -16,7 +16,7 @@ env:
 
 jobs:
   checks:
-    name: fmt, clippy, boundaries, module size
+    name: fmt, clippy, boundaries, module size, catalogs
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,6 +34,8 @@ jobs:
         run: bash scripts/check-import-boundaries.sh
       - name: Module size ceiling
         run: bash scripts/check-module-size.sh
+      - name: Generated catalogs are current
+        run: bash scripts/check-catalogs.sh
 
   test:
     name: workspace tests

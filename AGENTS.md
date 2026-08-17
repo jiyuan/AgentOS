@@ -49,6 +49,7 @@ cargo test -p agentos-core                                # Core unit + integrat
 cargo test --workspace                                    # Full test suite.
 cargo bench -p agentos-core                               # Loop overhead benchmarks.
 cargo semver-checks check-release -p agentos-interfaces   # Catch breaking interface changes.
+bash scripts/check-catalogs.sh                            # docs/*-catalog.md still match the code.
 ```
 
 Run the most targeted test first. For example, if you changed `crates/agentos-core/loop/`, run `cargo test -p agentos-core` before running the full workspace suite.

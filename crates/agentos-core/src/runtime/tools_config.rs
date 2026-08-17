@@ -156,6 +156,22 @@ fn subagent_memory_operations(subagent: &SubAgentConfig) -> Result<Vec<Arc<str>>
         .collect()
 }
 
+/// Every built-in tool this build offers.
+///
+/// One list so the tool catalog (roadmap X4) cannot describe a different set
+/// from the one `register_builtin_tool` will actually build — a catalog that
+/// silently omitted a tool would be worse than none, since the omission reads
+/// as "this deployment does not have it".
+pub const BUILTIN_TOOL_NAMES: &[&str] = &[
+    "shell",
+    "http",
+    "file",
+    "skill_validate",
+    "cron_create",
+    "cron_list",
+    "cron_remove",
+];
+
 /// Register a built-in tool by name, bounded by the deployment's `[limits]`.
 ///
 /// The limits are passed rather than read from a global so a sub-agent's
@@ -597,5 +613,20 @@ mod tests {
             loose > tight,
             "the control must return more than the capped listing, got {loose}"
         );
+    }
+    /// The catalog's list and the registration match must not drift: a name in
+    /// the list that does not register would put a tool in the docs that
+    /// nobody can enable.
+    #[test]
+    fn every_named_builtin_registers() {
+        let limits = LimitsConfig::default();
+        for name in BUILTIN_TOOL_NAMES {
+            let mut registry = ToolRegistry::new();
+            register_builtin_tool(&mut registry, name, &limits)
+                .unwrap_or_else(|err| panic!("{name} should register: {err}"));
+            assert_eq!(registry.specs().len(), 1, "{name} registered nothing");
+        }
+        let mut registry = ToolRegistry::new();
+        assert!(register_builtin_tool(&mut registry, "not_a_tool", &limits).is_err());
     }
 }

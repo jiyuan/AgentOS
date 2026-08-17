@@ -37,7 +37,7 @@ pub use mcp_config::register_configured_mcp;
 mod tools_config;
 
 use tools_config::{build_parent_tools, subagent_memory_tool_enabled, subagent_policy};
-pub use tools_config::{phase5_policy, register_builtin_tool};
+pub use tools_config::{phase5_policy, register_builtin_tool, BUILTIN_TOOL_NAMES};
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
