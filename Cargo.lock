@@ -18,7 +18,6 @@ dependencies = [
  "agentos-memory-vector",
  "agentos-proto",
  "async-trait",
- "serde",
  "serde_json",
  "tokio",
  "toml",

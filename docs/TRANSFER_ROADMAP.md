@@ -202,8 +202,9 @@ assembles a message vector by hand afterwards.
     `Llm::complete(ctx)` in `agentos-llm`, which cannot see sections because
     that crate cannot depend on core. `Llm::complete`'s doc comment now says an
     orchestrator must not build a conversation request through it. Its only
-    caller, `LlmOrchestrator`, is unreferenced outside its own crate and is a
-    deletion candidate.
+    caller, `LlmOrchestrator`, was unreferenced outside its own crate and has
+    since been deleted; `Llm::complete(ctx)` and `Llm::complete_stream(ctx)`
+    now have no caller at all and are candidates for removal from the trait.
   - Persona and task-workspace sections were not added: neither exists as a
     contribution today, so they would have been empty variants.
 

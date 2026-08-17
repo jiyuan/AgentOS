@@ -11,7 +11,6 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::mpsc;
 
 #[derive(Debug, Error)]
 pub enum CronError {
@@ -20,8 +19,6 @@ pub enum CronError {
         expression: Arc<str>,
         message: Arc<str>,
     },
-    #[error("gateway receiver is closed")]
-    GatewayClosed,
     #[error("memory maintenance failed: {0}")]
     Memory(#[from] MemoryError),
     #[error("cron storage failed: {0}")]
@@ -415,26 +412,6 @@ impl CronScheduler {
             .iter_mut()
             .find(|task| task.id.as_ref() == task_id)
             .ok_or_else(|| CronError::Storage(Arc::from(format!("unknown cron task '{task_id}'"))))
-    }
-
-    pub async fn enqueue_due(
-        &mut self,
-        now_unix: u64,
-        gateway: &mpsc::Sender<Envelope>,
-    ) -> Result<usize, CronError> {
-        let mut sent = 0;
-        for task in &mut self.tasks {
-            if !task.enabled || !task.is_due(now_unix)? {
-                continue;
-            }
-            gateway
-                .send(task.to_envelope())
-                .await
-                .map_err(|_| CronError::GatewayClosed)?;
-            task.mark_success(now_unix)?;
-            sent += 1;
-        }
-        Ok(sent)
     }
 }
 

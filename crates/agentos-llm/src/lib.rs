@@ -5,7 +5,7 @@ pub mod providers;
 
 pub use providers::ProviderError;
 
-use agentos_interfaces::orchestrator::{Orchestrator, OrchestratorError, Plan, RunContext};
+use agentos_interfaces::orchestrator::RunContext;
 use agentos_interfaces::tool::ToolSpec;
 use agentos_proto::{Message, MessageRole};
 use async_trait::async_trait;
@@ -14,17 +14,6 @@ use serde::{Deserialize, Serialize};
 use std::env as std_env;
 use std::sync::Arc;
 use thiserror::Error;
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct LlmRequest {
-    pub model: Arc<str>,
-    pub messages: Vec<Message>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct LlmResponse {
-    pub message: Message,
-}
 
 #[derive(Debug, Error)]
 pub enum LlmError {
@@ -157,66 +146,6 @@ pub fn single_message_stream(message: Message) -> CompletionStream {
     }
     events.push(Ok(CompletionEvent::Done(message)));
     stream::iter(events).boxed()
-}
-
-pub struct LlmOrchestrator {
-    llm: Arc<dyn Llm>,
-}
-
-impl LlmOrchestrator {
-    pub fn new(llm: Arc<dyn Llm>) -> Self {
-        Self { llm }
-    }
-}
-
-#[async_trait]
-impl Orchestrator for LlmOrchestrator {
-    async fn plan(&self, ctx: &RunContext<'_>) -> Result<Plan, OrchestratorError> {
-        let response = if ctx.has_stream_sink() {
-            // Recover a stream cut mid-flight (flaky network/proxy) by retrying
-            // once buffered, rather than failing the turn.
-            match drain_reply_stream(self.llm.complete_stream(ctx).await, ctx).await {
-                Err(LlmError::StreamTransport(detail)) => {
-                    tracing::warn!(
-                        error = %detail,
-                        "llm stream failed mid-flight; retrying with a buffered completion"
-                    );
-                    self.llm.complete(ctx).await
-                }
-                other => other,
-            }
-        } else {
-            self.llm.complete(ctx).await
-        }
-        .map_err(|err| match err {
-            // Keep the recoverable class typed all the way to the run loop.
-            LlmError::ContextLengthExceeded(detail) => {
-                OrchestratorError::ContextLengthExceeded(detail)
-            }
-            other => OrchestratorError::Backend(Arc::from(other.to_string())),
-        })?;
-        ctx.push_llm_usage_from_message(&response);
-        Ok(Plan::Reply(response))
-    }
-}
-
-/// Drain a [`CompletionStream`], forwarding each `Text` chunk to the run's
-/// stream sink and returning the assembled final message. Shared by the
-/// in-crate `LlmOrchestrator`; core orchestrators have their own helper over
-/// [`Llm::complete_messages_stream`].
-async fn drain_reply_stream(
-    stream: Result<CompletionStream, LlmError>,
-    ctx: &RunContext<'_>,
-) -> Result<Message, LlmError> {
-    let mut stream = stream?;
-    let mut done = None;
-    while let Some(event) = stream.next().await {
-        match event? {
-            CompletionEvent::Text(chunk) => ctx.emit_stream_delta(&chunk).await,
-            CompletionEvent::Done(message) => done = Some(message),
-        }
-    }
-    done.ok_or_else(|| LlmError::Provider(Arc::from("stream ended without a final message")))
 }
 
 /// Environment override for the resolved context window, in tokens.

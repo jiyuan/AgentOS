@@ -29,7 +29,6 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
-use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 mod mcp_config;
@@ -38,12 +37,6 @@ mod tools_config;
 
 use tools_config::{build_parent_tools, subagent_memory_tool_enabled, subagent_policy};
 pub use tools_config::{phase5_policy, register_builtin_tool, BUILTIN_TOOL_NAMES};
-
-#[derive(Debug, Error)]
-pub enum RuntimeError {
-    #[error("runtime failed: {0}")]
-    Failed(String),
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimePaths {

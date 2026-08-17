@@ -1,5 +1,3 @@
-mod yaml;
-
 use agentos_interfaces::orchestrator::Plan;
 use agentos_proto::ToolCall;
 use serde::{Deserialize, Serialize};
@@ -7,7 +5,6 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use thiserror::Error;
-use yaml::parse_policy_yaml;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -97,36 +94,6 @@ impl Policy {
                 .collect(),
             default_decision: PolicyVerb::Deny,
         }
-    }
-
-    pub fn phase3_reference() -> Self {
-        Self {
-            rules: vec![
-                PolicyRule {
-                    action: PolicyAction::Tool(Arc::from("shell")),
-                    decision: PolicyVerb::AskUser,
-                    reason: Some(Arc::from("shell tool requires user approval")),
-                    arg_equals: BTreeMap::new(),
-                },
-                PolicyRule {
-                    action: PolicyAction::Tool(Arc::from("file")),
-                    decision: PolicyVerb::Allow,
-                    reason: None,
-                    arg_equals: BTreeMap::from([(Arc::from("operation"), Value::from("read"))]),
-                },
-            ],
-            default_decision: PolicyVerb::Deny,
-        }
-    }
-
-    pub fn phase4_reference() -> Self {
-        let mut policy = Self::phase3_reference();
-        policy.rules.extend(memory_policy_rules());
-        policy
-    }
-
-    pub fn from_yaml(input: &str) -> Result<Self, PolicyError> {
-        parse_policy_yaml(input)
     }
 
     pub fn decide(&self, plan: &Plan) -> PolicyDecision {
@@ -219,29 +186,6 @@ impl Policy {
 
         Ok(child.clone())
     }
-}
-
-fn memory_policy_rules() -> Vec<PolicyRule> {
-    vec![
-        PolicyRule {
-            action: PolicyAction::Tool(Arc::from("memory")),
-            decision: PolicyVerb::Allow,
-            reason: None,
-            arg_equals: BTreeMap::from([(Arc::from("operation"), Value::from("read"))]),
-        },
-        PolicyRule {
-            action: PolicyAction::Tool(Arc::from("memory")),
-            decision: PolicyVerb::AskUser,
-            reason: Some(Arc::from("memory write requires user approval")),
-            arg_equals: BTreeMap::from([(Arc::from("operation"), Value::from("write"))]),
-        },
-        PolicyRule {
-            action: PolicyAction::Tool(Arc::from("memory")),
-            decision: PolicyVerb::AskUser,
-            reason: Some(Arc::from("memory forget requires user approval")),
-            arg_equals: BTreeMap::from([(Arc::from("operation"), Value::from("forget"))]),
-        },
-    ]
 }
 
 /// True when `child_rule` targets a tool the parent already exposes to this
@@ -461,9 +405,31 @@ mod tests {
         assert_eq!(policy.decide(&plan), PolicyDecision::Allow);
     }
 
+    /// `shell` behind approval, `file` allowed only for reads — the smallest
+    /// policy that exercises both a bare tool rule and an arg-constrained one.
+    fn arg_constrained_policy() -> Policy {
+        Policy {
+            rules: vec![
+                PolicyRule {
+                    action: PolicyAction::Tool(Arc::from("shell")),
+                    decision: PolicyVerb::AskUser,
+                    reason: Some(Arc::from("shell tool requires user approval")),
+                    arg_equals: BTreeMap::new(),
+                },
+                PolicyRule {
+                    action: PolicyAction::Tool(Arc::from("file")),
+                    decision: PolicyVerb::Allow,
+                    reason: None,
+                    arg_equals: BTreeMap::from([(Arc::from("operation"), Value::from("read"))]),
+                },
+            ],
+            default_decision: PolicyVerb::Deny,
+        }
+    }
+
     #[test]
     fn decide_matches_constrained_args() {
-        let policy = Policy::phase3_reference();
+        let policy = arg_constrained_policy();
         let allow = tool_call("file", "{\"operation\":\"read\"}");
         assert_eq!(policy.decide(&allow), PolicyDecision::Allow);
 

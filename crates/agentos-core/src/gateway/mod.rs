@@ -24,7 +24,6 @@ use agentos_proto::{Envelope, InterruptionId, RunId};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use tokio::sync::mpsc;
 
 /// How long an approval prompt counts, when the caller does not say.
 ///
@@ -57,29 +56,6 @@ pub enum GatewayRun {
         /// Unix seconds after which the prompt stops counting, if it expires.
         expires_at: Option<u64>,
     },
-}
-
-pub struct Gateway {
-    inbound_tx: mpsc::Sender<Envelope>,
-    inbound_rx: mpsc::Receiver<Envelope>,
-}
-
-impl Gateway {
-    pub fn bounded(capacity: usize) -> Self {
-        let (inbound_tx, inbound_rx) = mpsc::channel(capacity);
-        Self {
-            inbound_tx,
-            inbound_rx,
-        }
-    }
-
-    pub fn sender(&self) -> mpsc::Sender<Envelope> {
-        self.inbound_tx.clone()
-    }
-
-    pub async fn receive(&mut self) -> Option<Envelope> {
-        self.inbound_rx.recv().await
-    }
 }
 
 pub struct GatewayService<'a> {
