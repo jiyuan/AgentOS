@@ -1,13 +1,14 @@
-use agentos_cli::slash::{self, Parsed, SessionUsage, SlashCommand, SlashContext};
+use agentos_cli::slash::{self, Parsed, SessionUsage, SlashCommand};
 use agentos_core::channels::{feishu::FeishuChannel, telegram::TelegramChannel};
 use agentos_core::config::WorkspaceConfig;
 use agentos_core::crons::{CronSchedule, CronStore, MemoryMaintenanceCron};
-use agentos_core::gateway::{GatewayRun, GatewayService};
+use agentos_core::gateway::{
+    shard_set, GatewayRun, GatewayService, Router, ShardConfig, DEFAULT_IDLE_INTERVAL,
+};
 use agentos_core::memory::MemoryManager;
-use agentos_core::runner::ResumeDecision;
 use agentos_core::runtime::{AgentRuntime, RuntimePaths};
 use agentos_interfaces::orchestrator::StreamSink;
-use agentos_interfaces::{Channel, StreamEgress};
+use agentos_interfaces::{Channel, Egress, StreamEgress};
 use agentos_llm::env as agentos_env;
 use agentos_proto::{ConversationId, Envelope, Message, MessageRole, RunId, SpanKind};
 use std::collections::BTreeMap;
@@ -18,6 +19,10 @@ use std::process::{self, Command, Stdio};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+mod shard;
+
+use shard::{run_shard_thread, ShardContext};
 
 const DEFAULT_PID_RELPATH: &str = "workspace/run/agentos-gateway.pid";
 
@@ -479,6 +484,15 @@ fn print_effective_config(config: &ServiceConfig) -> Result<(), String> {
     );
     println!("channels.persistent={}", channels.join(","));
     println!(
+        "gateway.shards={} (resolved: {})",
+        workspace_config.gateway.shards,
+        workspace_config.gateway.shard_count()
+    );
+    println!(
+        "gateway.inbox_capacity={}",
+        workspace_config.gateway.inbox_capacity
+    );
+    println!(
         "resources.priority={}",
         join_arcs(&workspace_config.resources.priority)
     );
@@ -638,34 +652,95 @@ async fn run_feishu_gateway(config: &ServiceConfig) -> Result<(), String> {
     run_channel_gateway(config, channel, "feishu", RunId::new("feishu-gateway")).await
 }
 
+/// The gateway loop, as a router (roadmap item G1).
+///
+/// This thread does one thing: receive envelopes and hand each to the shard
+/// that owns its conversation. It never runs a turn, so a slow tool on one
+/// conversation cannot stop it receiving for the others — which was the whole
+/// failure the serial receive-run-send loop had.
+///
+/// Two things bypass the queue. `/stop` is answered here because queueing it
+/// behind the run it means to cancel would make it useless. The pid check stays
+/// here because it is about this process, not any conversation.
 async fn run_channel_gateway<C>(
     config: &ServiceConfig,
     mut channel: C,
-    channel_name: &str,
+    channel_name: &'static str,
     run_id: RunId,
 ) -> Result<(), String>
 where
     C: Channel,
 {
-    let runtime =
+    let runtime = Arc::new(
         AgentRuntime::build_with(runtime_paths(config), &agentos_cli::semantic_index_factory)
-            .await?;
+            .await?,
+    );
     log_line(config, &runtime.orchestrator.describe_llm())?;
-    let deps_scope = runtime.deps_scope();
-    let input_guardrails = deps_scope.input_guardrails();
-    let output_guardrails = deps_scope.output_guardrails();
-    let tool_guardrails = deps_scope.tool_guardrails();
-    let deps =
-        deps_scope.deps_with_guardrails(&input_guardrails, &output_guardrails, &tool_guardrails);
-    let gateway_service = GatewayService::new(&deps, Arc::from(runtime.active_agent.as_str()));
-    let cron_store = CronStore::new(config.home.join("workspace/crons"));
-    let orchestrator_handle = runtime.orchestrator.strategy_handle();
-    let model_controller = runtime.model_controller.clone();
-    let session_usage = SessionUsage::new();
-    let mut last_cron_scan: u64 = 0;
-    let mut reflection_cron = build_reflection_cron(&runtime, config)?;
-    log_line(config, &format!("{channel_name} gateway loop started"))?;
 
+    let gateway_config = runtime.workspace_config.gateway;
+    let shard_config = ShardConfig {
+        shards: gateway_config.shard_count(),
+        inbox_capacity: gateway_config.inbox_capacity,
+        idle_interval: DEFAULT_IDLE_INTERVAL,
+    };
+    let (router, inbounds) = shard_set(&shard_config);
+    let egress = channel.egress();
+    let stream_egress = gateway_streaming_enabled()
+        .then(|| channel.stream_egress())
+        .flatten();
+    let session_usage = Arc::new(SessionUsage::new());
+
+    let mut shards = Vec::with_capacity(inbounds.len());
+    for (shard, inbound) in inbounds.into_iter().enumerate() {
+        let context = ShardContext {
+            shard,
+            config: config.clone(),
+            channel_name,
+            run_id: run_id.clone(),
+            runtime: Arc::clone(&runtime),
+            egress: Arc::clone(&egress),
+            stream_egress: stream_egress.clone(),
+            session_usage: Arc::clone(&session_usage),
+        };
+        let handle = thread::Builder::new()
+            .name(format!("agentos-{channel_name}-shard-{shard}"))
+            .spawn(move || run_shard_thread(context, inbound, shard_config))
+            .map_err(|err| format!("failed to start {channel_name} shard {shard}: {err}"))?;
+        shards.push(handle);
+    }
+    log_line(
+        config,
+        &format!(
+            "{channel_name} gateway routing across {} shard(s)",
+            shard_config.shards
+        ),
+    )?;
+
+    let outcome = route_inbound(config, &mut channel, channel_name, &router, egress.as_ref()).await;
+
+    // Dropping the router closes every shard queue, which ends each shard once
+    // it has drained. Join so a shard's in-flight turn finishes before the
+    // process moves on.
+    drop(router);
+    for (shard, handle) in shards.into_iter().enumerate() {
+        if handle.join().is_err() {
+            log_line(config, &format!("{channel_name} shard {shard} panicked"))?;
+        }
+    }
+    outcome
+}
+
+/// Receive and route until the pid file changes hands or the channel closes.
+async fn route_inbound<C>(
+    config: &ServiceConfig,
+    channel: &mut C,
+    channel_name: &str,
+    router: &Router,
+    egress: &dyn Egress,
+) -> Result<(), String>
+where
+    C: Channel,
+{
     loop {
         if !pid_file_owned_by_current_process(config)? {
             log_line(
@@ -676,216 +751,41 @@ where
             )?;
             return Ok(());
         }
-        let Some(mut input) = channel.receive().await else {
-            // Idle tick — nothing inbound, so this is the gateway's chance to
-            // drive the cron scheduler. Throttled to CRON_SCAN_INTERVAL_SECS
-            // since cron resolution is one minute.
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            if now.saturating_sub(last_cron_scan) >= CRON_SCAN_INTERVAL_SECS {
-                last_cron_scan = now;
-                fire_due_crons(
-                    config,
-                    &channel,
-                    channel_name,
-                    &cron_store,
-                    &gateway_service,
-                    &session_usage,
-                    now,
-                )
-                .await?;
-                run_memory_reflection(
-                    config,
-                    channel_name,
-                    reflection_cron.as_mut(),
-                    &runtime.memory_manager,
-                    now,
-                )
-                .await?;
-            }
-            thread::sleep(Duration::from_secs(1));
+        let Some(input) = channel.receive().await else {
+            // Idle. Maintenance used to run here, competing with receiving;
+            // it now runs from a shard's idle phase, so this really is nothing
+            // to do. The pause keeps a channel whose `receive` returns
+            // immediately from spinning.
+            tokio::time::sleep(Duration::from_secs(1)).await;
             continue;
         };
-        match slash::parse(&input.message.content) {
-            Parsed::Cmd(SlashCommand::Clear) => {
-                let removed = runtime
-                    .session
-                    .clear_session(&input.conversation_id)
-                    .map_err(|err| {
-                        format!("failed to clear {channel_name} conversation history: {err}")
-                    })?;
+
+        // `/stop` cannot queue behind the run it is trying to cancel.
+        if matches!(
+            slash::parse(&input.message.content),
+            Parsed::Cmd(SlashCommand::Stop)
+        ) {
+            let stopped = match router.stop(&input.conversation_id).await {
+                Ok(stopped) => stopped,
+                Err(err) => {
+                    log_line(config, &format!("{channel_name} stop failed: {err}"))?;
+                    false
+                }
+            };
+            let reply = command_reply_envelope(&input, channel_name, &slash::format_stop(stopped));
+            if let Err(err) = egress.send(reply).await {
                 log_line(
                     config,
-                    &format!(
-                        "{channel_name} conversation {} cleared ({removed} items)",
-                        input.conversation_id.as_str()
-                    ),
+                    &format!("{channel_name} gateway failed to send stop reply: {err}"),
                 )?;
-                let reply = slash::format_clear(removed, channel_display_name(channel_name));
-                if let Err(send_err) = channel
-                    .send(command_reply_envelope(
-                        &input,
-                        runtime.active_agent.as_str(),
-                        &reply,
-                    ))
-                    .await
-                {
-                    log_line(
-                        config,
-                        &format!(
-                            "{channel_name} gateway failed to send clear confirmation: {send_err}"
-                        ),
-                    )?;
-                }
-                continue;
             }
-            Parsed::Cmd(cmd) => {
-                let ctx = SlashContext {
-                    skill_catalog: &runtime.skill_catalog,
-                    cron_store: &cron_store,
-                    tool_registry: deps.tools,
-                    memory_manager: runtime.memory_manager.as_ref(),
-                    orchestrator_handle: Some(&orchestrator_handle),
-                    model_controller: Some(&model_controller),
-                    session_usage: Some(&session_usage),
-                    agent_id: &runtime.active_agent,
-                    conversation_id: &input.conversation_id,
-                };
-                let reply = slash::render(cmd, &ctx).await;
-                if let Err(send_err) = channel
-                    .send(command_reply_envelope(
-                        &input,
-                        runtime.active_agent.as_str(),
-                        &reply,
-                    ))
-                    .await
-                {
-                    log_line(
-                        config,
-                        &format!("{channel_name} gateway failed to send slash reply: {send_err}"),
-                    )?;
-                }
-                continue;
-            }
-            Parsed::Usage(hint) => {
-                if let Err(send_err) = channel
-                    .send(command_reply_envelope(
-                        &input,
-                        runtime.active_agent.as_str(),
-                        &hint,
-                    ))
-                    .await
-                {
-                    log_line(
-                        config,
-                        &format!(
-                            "{channel_name} gateway failed to send slash usage hint: {send_err}"
-                        ),
-                    )?;
-                }
-                continue;
-            }
-            Parsed::NotSlash => {}
+            continue;
         }
-        input.metadata.insert(
-            Arc::from("task_id"),
-            serde_json::json!(runtime.orchestrator.current_strategy().task_id()),
-        );
-        // Per-message deps so a streaming channel can edit its reply in place.
-        // The base `gateway_service` (no sink) still drives crons.
-        let mut run_deps = deps_scope.deps_with_guardrails(
-            &input_guardrails,
-            &output_guardrails,
-            &tool_guardrails,
-        );
-        if gateway_streaming_enabled() {
-            if let Some(egress) = channel.stream_egress() {
-                run_deps.stream_sink =
-                    Some(channel_stream_sink(egress, input.conversation_id.clone()));
-            }
-        }
-        let run_service = GatewayService::new(&run_deps, Arc::from(runtime.active_agent.as_str()));
-        match run_service
-            .run_envelope(&channel, input.clone(), run_id.clone())
-            .await
-        {
-            Ok(GatewayRun::Finished { state, .. }) => {
-                session_usage.record_run(&state.usage);
-                log_trace(config, &state)?;
-            }
-            Ok(GatewayRun::Paused { mut paused, .. }) => loop {
-                let Some(approval_id) = paused
-                    .state
-                    .pending_approvals
-                    .first()
-                    .map(|approval| approval.id.clone())
-                else {
-                    log_line(
-                        config,
-                        &format!("{channel_name} run paused without pending approval"),
-                    )?;
-                    break;
-                };
-                let Some(answer) = channel.receive().await else {
-                    log_line(
-                        config,
-                        &format!("{channel_name} approval prompt sent; no approval received"),
-                    )?;
-                    break;
-                };
-                let decision = if answer.message.content.trim().eq_ignore_ascii_case("y") {
-                    ResumeDecision::Approve
-                } else {
-                    ResumeDecision::Reject {
-                        reason: Arc::from(format!("rejected by {channel_name} user")),
-                    }
-                };
-                match run_service
-                    .resume(&channel, paused, &approval_id, decision)
-                    .await
-                {
-                    Ok(GatewayRun::Finished { state, .. }) => {
-                        session_usage.record_run(&state.usage);
-                        log_trace(config, &state)?;
-                        break;
-                    }
-                    Ok(GatewayRun::Paused {
-                        paused: next_paused,
-                        ..
-                    }) => {
-                        log_line(
-                            config,
-                            &format!(
-                                "{channel_name} run paused again after resume; awaiting next approval"
-                            ),
-                        )?;
-                        paused = next_paused;
-                    }
-                    Err(err) => {
-                        log_line(config, &format!("{channel_name} resume failed: {err}"))?;
-                        break;
-                    }
-                }
-            },
-            Err(err) => {
-                log_line(config, &format!("{channel_name} gateway run failed: {err}"))?;
-                if let Err(send_err) = channel
-                    .send(failure_envelope(
-                        &input,
-                        runtime.active_agent.as_str(),
-                        &err.to_string(),
-                    ))
-                    .await
-                {
-                    log_line(
-                        config,
-                        &format!("{channel_name} gateway failed to send error reply: {send_err}"),
-                    )?;
-                }
-                thread::sleep(Duration::from_secs(5));
-            }
+
+        if let Err(err) = router.deliver(input).await {
+            // Every shard is gone; there is nothing left to route to.
+            log_line(config, &format!("{channel_name} routing failed: {err}"))?;
+            return Ok(());
         }
     }
 }
@@ -900,18 +800,15 @@ where
 /// double-fires a task nor delivers it through the wrong transport. (A task
 /// bound to a channel with no running persistent gateway therefore never
 /// fires.)
-async fn fire_due_crons<C>(
+async fn fire_due_crons(
     config: &ServiceConfig,
-    channel: &C,
+    egress: &dyn Egress,
     channel_name: &str,
     cron_store: &CronStore,
     gateway_service: &GatewayService<'_>,
     session_usage: &SessionUsage,
     now: u64,
-) -> Result<(), String>
-where
-    C: Channel,
-{
+) -> Result<(), String> {
     let mut scheduler = match cron_store.load_scheduler() {
         Ok(scheduler) => scheduler,
         Err(err) => {
@@ -956,7 +853,7 @@ where
         )?;
         let bookkeeping = match gateway_service
             .run_envelope(
-                channel,
+                egress,
                 invocation.envelope,
                 RunId::new(format!("cron-{task_id}")),
             )

@@ -893,6 +893,7 @@ its D2 deadline is **promoted** to a job rather than lost.
     conversation, which is the fallback the item sanctions. **G1 must call
     `AgentRuntime::jobs().dispose_conversation()` when a conversation ends**, or
     a long-lived gateway leaks cancelled-but-unreaped job entries.
+    *Resolved by G1:* the sharded gateway calls it on `/clear`.
   - **`runtime/mod.rs` was split**: the job registry pushed it to 813 LOC, so
     MCP registration moved to `runtime/mcp_config.rs` — the most self-contained
     thing in the file, reading one config section and producing tool specs.
@@ -934,6 +935,78 @@ from bench harness to product.
   is claimed at the next `Plan` rather than starting a second run.
 - Exit: one slow conversation cannot stall another; the gateway has a `/stop`
   that cancels the active run.
+
+**Status: done.** `gateway/inbox.rs` (per-conversation mailbox, `next-turn` and
+`next-step`), `gateway/shard.rs` (stable-hash routing, one `current_thread`
+runtime per shard thread, an idle phase for maintenance), `loop/steering.rs`
+(mid-run input, claimed at `Plan`), `config/gateway.rs` (`[gateway].shards`,
+`.inbox_capacity`), and the gateway binary split into
+`bin/agentos-gateway/{main.rs,shard.rs}` — the router and what the shards run.
+Verified: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --
+-D warnings`, 456 tests, import boundaries, module sizes. Both halves proven
+load-bearing: removing the `Plan`-time steering claim turns
+`mid_run_input_is_claimed_at_the_next_plan` red, and running a shard's turns
+serially instead of interleaved turns
+`one_slow_conversation_does_not_stall_another` plus both shard scheduling tests
+red.
+
+  - **`Channel` gained a required `egress()` and this is the enabling change.**
+    `Channel::receive` takes `&mut self`, so whoever receives holds the channel
+    exclusively — fine for a serial receive-run-send loop, fatal for a sharded
+    one where turns run on other threads while the router is parked in a
+    40-second long poll. Draining replies between polls would have made a reply
+    wait up to a poll cycle. So the send half is now a shareable `Arc<dyn
+    Egress>`, exactly as `stream_egress` already was for streaming deltas, and
+    for the same stated reason. Telegram and Feishu already had a struct holding
+    precisely what `send` needs; their `Channel::send` bodies moved onto it and
+    `send` became a provided method that delegates. **This is a breaking change
+    to `agentos-interfaces`**, machine-confirmed by `cargo semver-checks
+    --baseline-rev HEAD`: one major failure, `Channel::egress` added without a
+    default. `agentos-proto` and `agentos-llm` report no update required.
+  - **Turns are polled on a `FuturesUnordered`, not `spawn_local`.** A spawned
+    task must be `'static`, which would force every shard to build its own
+    `AgentRuntime` — separate session stores, separate memory, separate job
+    registries for what is one agent. Polling borrowed futures in place lets all
+    shards share one `Arc<AgentRuntime>` while each `!Send` run stays pinned to
+    the thread that started it. This is a departure from the concurrency bench's
+    `spawn_local` shape, and the reason is the borrow, not the scheduling.
+  - **Routing is a stable hash, never round-robin.** A conversation that could
+    migrate between shards could have two runs overlap on two threads, which is
+    the one thing sharding must not allow. Serialization itself is enforced in
+    `Inbox::claim`, which returns `None` while a run is in flight, rather than
+    trusted to the shard loop's control flow.
+  - **The two inbox lists shed load from opposite ends.** A full steer queue
+    drops its *oldest* entry (the newest instruction is the one the user means);
+    a full turn queue refuses the *newest* (a queued run is work already
+    promised, and dropping it for a later message would lose the request
+    silently). Pinned by `the_two_lists_shed_load_from_opposite_ends`.
+  - **Steering is folded in before compaction and hydration**, so the new input
+    is part of what gets summarized and recalled against rather than arriving
+    after the context for the turn was already assembled. Claimed messages
+    become ordinary user items, so they persist with the rest of the run and the
+    next run sees them.
+  - **An approval no longer freezes the gateway.** The serial loop answered an
+    approval by blocking on `channel.receive()` — one user's unanswered prompt
+    stopped every conversation. The paused run is now parked per conversation on
+    its shard and the next message on that conversation decides it. Correlating
+    an answer to a specific prompt is G2's job; until then "the next message
+    decides" is the same rule as before, minus the freeze.
+  - **Cron and reflection run from shard 0's idle phase, not through the
+    router.** Firing them on every shard would fire every task N times, so
+    `TurnHandler::idle` carries the shard index and the handler guards on it.
+    Cron runs go straight through the runner rather than the inbox, which is
+    safe *because* a cron envelope carries `session_scope = ephemeral`: it
+    neither loads nor writes back the conversation transcript, so it cannot race
+    a user's run for the state sharding exists to protect. A cron that ever
+    stops being ephemeral must be routed instead.
+  - **The gateway binary was split** into `bin/agentos-gateway/main.rs` (1187
+    LOC, allowlisted) and `bin/agentos-gateway/shard.rs` (361). Adding ~350
+    lines of new behaviour to a file already at 1320 is exactly what the module
+    rule forbids; the router half is now smaller than before this item.
+  - **Not done, deliberately:** the router still parses only `/stop` itself.
+    Every other slash command is delivered to the shard so it runs in
+    conversation order — `/clear` mutates the session, and answering it on the
+    router thread could race the run it is clearing.
 
 ### G2. Correlated approvals (F4)
 
@@ -1126,7 +1199,7 @@ Land these together in X3 rather than piecemeal.
 | `[compaction].enabled`, `.pressure_percent`, `.retain_tail_turns` | C3 | Compaction policy. **Landed** in C3; `.pressure_ratio` shipped as an integer `pressure_percent`, the unit C1 already traces. `.model` deferred to X3 — summaries use the run's own provider |
 | `[limits].tool_timeout_ms`, `[limits].tool_timeout_overrides` | D2 | Tool deadlines. **Landed** in D2, in `[limits]` rather than `[resources.tools]`: that section says *which* tools are enabled, and `ResourceSection` is shared with skills/mcp/llm where a timeout is meaningless. Replaces the MCP 10 s constant |
 | `[jobs].max_concurrent`, `.output_limit_bytes`, `.promotable` | D3 | Job registry bounds. **Landed** in D3; `.promotable` added — the allowlist of tools that become a job instead of failing at their deadline |
-| `[gateway].shards`, `.inbox_capacity` | G1 | Conversation sharding |
+| `[gateway].shards`, `.inbox_capacity` | G1 | Conversation sharding. **Landed** in G1; `shards = 0` means one per core, capped at 64. `.inbox_capacity` bounds both lists — envelopes waiting for a run of their own, and messages steering the one in flight |
 | `[approval].expiry_seconds` | G2 | Approval prompt expiry |
 | `[memory].hydrate_*` | X3 | Already config; move the remaining constants beside them |
 
@@ -1145,6 +1218,7 @@ the result in the PR.
 | D1 | `RunContext` gains a cancellation field | **Verified**: interfaces major (`constructible_struct_adds_field`), proto and llm unchanged. `Tool` was *not* changed — `call_with_context` already carries the context |
 | D2 | `ToolSpec` gains `timeout_ms` (`#[serde(default)]`) | **Verified**: interfaces major (`constructible_struct_adds_field`), proto and llm unchanged; additive on wire |
 | D3 | None — the job registry is entirely inside `agentos-core` | **Verified**: interfaces, proto, and llm all report no semver update required |
+| G1 | `Channel` gains a required `egress() -> Arc<dyn Egress>`; `send` becomes a provided method delegating to it | **Verified**: interfaces major (`trait_method_added` without default), proto and llm unchanged. Required: a sharded gateway cannot hold `&mut self` for `receive` and `&self` for `send` at once |
 | X1 (b) | `Plan::CallTool` carries a batch | Breaking |
 | X2 | `ToolSpec.requires_isolation` → sandbox mode | Breaking |
 | X6 | `Session::fork` as a defaulted method | Additive |

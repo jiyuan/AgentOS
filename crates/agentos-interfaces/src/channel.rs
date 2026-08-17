@@ -9,6 +9,17 @@ pub enum ChannelError {
     Backend(Arc<str>),
 }
 
+/// The send half of a channel, detached from the receive half.
+///
+/// Cheap to clone (it is always held as an `Arc`) and `'static`, so a gateway
+/// can hand one to every shard thread while the router keeps the channel itself
+/// parked in [`Channel::receive`]. See [`Channel::egress`].
+#[async_trait]
+pub trait Egress: Send + Sync {
+    /// Deliver `env` to the transport.
+    async fn send(&self, env: Envelope) -> Result<(), ChannelError>;
+}
+
 #[async_trait]
 pub trait Channel: Send + Sync {
     /// Return the stable channel identifier used in envelopes and traces.
@@ -19,8 +30,27 @@ pub trait Channel: Send + Sync {
     /// Returning `None` means the channel is closed.
     async fn receive(&mut self) -> Option<Envelope>;
 
+    /// Return this channel's shareable send half.
+    ///
+    /// [`Channel::receive`] takes `&mut self`, so whoever is receiving holds the
+    /// channel exclusively and nothing else can call [`Channel::send`] on it.
+    /// That is fine for a serial receive-run-send loop and fatal for a sharded
+    /// one, where the runs happen on other threads while the receiver is parked
+    /// in a long poll. An implementation therefore keeps the state `send` needs
+    /// — credentials, per-conversation edit state — behind an `Arc` and hands
+    /// out this handle, exactly as [`Channel::stream_egress`] already does for
+    /// streaming deltas.
+    ///
+    /// The handle must share that state rather than copy it: a reply finalized
+    /// through the egress has to see the placeholder a stream delta created.
+    fn egress(&self) -> Arc<dyn Egress>;
+
     /// Send an outbound envelope.
-    async fn send(&self, env: Envelope) -> Result<(), ChannelError>;
+    ///
+    /// Delegates to [`Channel::egress`]; implement that instead of this.
+    async fn send(&self, env: Envelope) -> Result<(), ChannelError> {
+        self.egress().send(env).await
+    }
 
     /// Return an edit-in-place streaming handle if this channel supports it.
     ///

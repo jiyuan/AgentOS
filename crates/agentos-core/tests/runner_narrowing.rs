@@ -206,6 +206,7 @@ fn runner_deps<'a>(
         content_limits: Default::default(),
         compaction: Default::default(),
         cancel: Default::default(),
+        steering: None,
     }
 }
 

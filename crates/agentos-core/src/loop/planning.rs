@@ -376,6 +376,7 @@ mod tests {
             stream_sink: None,
             content_limits: Default::default(),
             cancel: Default::default(),
+            steering: None,
             compaction: Compaction {
                 summarizer,
                 config: CompactionConfig::default(),

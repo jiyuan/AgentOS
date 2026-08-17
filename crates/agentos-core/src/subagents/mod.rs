@@ -408,6 +408,9 @@ impl SubAgentInvocation {
                     config: compaction_config,
                 },
                 cancel: cancel.clone(),
+                // A sub-agent is not a conversation: nothing routes user input to
+                // it, so there is nothing to steer it with.
+                steering: None,
                 // Sub-agents never stream to the parent's egress.
                 stream_sink: None,
             };
@@ -529,6 +532,7 @@ impl SubAgentInvocation {
                         config: compaction_config,
                     },
                     cancel: cancel.clone(),
+                    steering: None,
                 };
                 let paused_run = PausedRun {
                     channel_id: paused.channel_id.clone(),

@@ -1,7 +1,7 @@
 use crate::channels::attachments::{file_size, AttachmentStore};
 use crate::channels::text::split_text;
 use crate::http::shared_client;
-use agentos_interfaces::{Channel, ChannelError, StreamEgress};
+use agentos_interfaces::{Channel, ChannelError, Egress, StreamEgress};
 use agentos_proto::{
     Attachment, AttachmentKind, ChannelId, ConversationId, Envelope, Message, MessageRole,
 };
@@ -27,9 +27,11 @@ pub struct TelegramChannel {
     attachments: AttachmentStore,
     api_base: Arc<str>,
     file_base: Arc<str>,
-    /// Per-conversation edit-in-place state, shared with the `StreamEgress`
-    /// handle so `send` can finalize a message the egress streamed.
-    stream_state: Arc<Mutex<HashMap<String, TelegramEditState>>>,
+    /// The send half. Held behind an `Arc` so the gateway can keep sending
+    /// while this channel is parked in a `getUpdates` long poll, and so the
+    /// per-conversation edit state is shared with the `StreamEgress` handle —
+    /// `send` finalizes a message the streaming egress created.
+    egress: Arc<TelegramEgress>,
 }
 
 /// In-flight streamed reply for one chat: the placeholder message being edited,
@@ -122,16 +124,22 @@ impl TelegramChannel {
             .ok()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| api_base.clone());
+        let token: Arc<str> = Arc::from(token);
+        let api_base: Arc<str> = Arc::from(api_base.trim_end_matches('/').to_owned());
         Ok(Self {
-            token: Arc::from(token),
+            token: Arc::clone(&token),
             id: ChannelId::new("telegram"),
             allowed_chat_id,
             offset: None,
             log_receive_errors: false,
             attachments: AttachmentStore::from_env("telegram"),
-            api_base: Arc::from(api_base.trim_end_matches('/').to_owned()),
+            api_base: Arc::clone(&api_base),
             file_base: Arc::from(file_base.trim_end_matches('/').to_owned()),
-            stream_state: Arc::new(Mutex::new(HashMap::new())),
+            egress: Arc::new(TelegramEgress {
+                api_base,
+                token,
+                stream_state: Arc::new(Mutex::new(HashMap::new())),
+            }),
         })
     }
 
@@ -147,15 +155,6 @@ impl TelegramChannel {
 
     fn api_url(&self, method: &str) -> String {
         format!("{}/bot{}/{method}", self.api_base, self.token)
-    }
-
-    /// Remove and return any streaming state for `chat_id`, so `send` can
-    /// finalize a streamed reply exactly once.
-    fn take_stream_state(&self, chat_id: &str) -> Option<TelegramEditState> {
-        self.stream_state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(chat_id)
     }
 
     fn file_url(&self, file_path: &str) -> String {
@@ -275,54 +274,6 @@ impl TelegramChannel {
         }
         Ok(out)
     }
-
-    fn send_text(&self, chat_id: &str, text: &str) -> Result<(), ChannelError> {
-        for chunk in split_text(text, TELEGRAM_TEXT_LIMIT) {
-            self.send_text_chunk(chat_id, &chunk)?;
-        }
-        Ok(())
-    }
-
-    fn send_text_chunk(&self, chat_id: &str, text: &str) -> Result<(), ChannelError> {
-        let text_arg = format!("text={text}");
-        let chat_arg = format!("chat_id={chat_id}");
-        let output = Command::new("curl")
-            .args(["--silent", "--show-error", "--max-time", "10", "-X", "POST"])
-            .arg(self.api_url("sendMessage"))
-            .args(["-d", &chat_arg, "--data-urlencode", &text_arg])
-            .output()
-            .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
-        check_send_response(&output.status, &output.stdout, &output.stderr)
-    }
-
-    fn send_attachment(
-        &self,
-        chat_id: &str,
-        attachment: &Attachment,
-        caption: Option<&str>,
-    ) -> Result<(), ChannelError> {
-        let (method, field) = match attachment.kind {
-            AttachmentKind::Image => ("sendPhoto", "photo"),
-            AttachmentKind::Document => ("sendDocument", "document"),
-        };
-        let file_form = format!("{field}=@{}", attachment.path.display());
-        let chat_form = format!("chat_id={chat_id}");
-        let mut command = Command::new("curl");
-        command
-            .args(["--silent", "--show-error", "--max-time", "60", "-X", "POST"])
-            .arg(self.api_url(method))
-            .args(["-F", &chat_form, "-F", &file_form]);
-        if let Some(caption) = caption {
-            if !caption.is_empty() {
-                let caption_form = format!("caption={caption}");
-                command.args(["-F", &caption_form]);
-            }
-        }
-        let output = command
-            .output()
-            .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
-        check_send_response(&output.status, &output.stdout, &output.stderr)
-    }
 }
 
 #[async_trait]
@@ -374,60 +325,15 @@ impl Channel for TelegramChannel {
         None
     }
 
-    async fn send(&self, env: Envelope) -> Result<(), ChannelError> {
-        let chat_id = env.conversation_id.as_str();
-        let text = env.message.content.as_ref();
-
-        // If this reply was streamed, finalize the placeholder by editing it to
-        // the authoritative full text (so the last throttled delta is flushed),
-        // instead of posting a duplicate message. Falls back to a fresh send
-        // when there's no placeholder or the text is too long for one message.
-        let streamed = self.take_stream_state(chat_id);
-        let text_finalized = if let Some(message_id) = streamed.and_then(|state| state.message_id) {
-            if !text.is_empty() && text.chars().count() <= TELEGRAM_TEXT_LIMIT {
-                tg_edit_message(&self.api_base, &self.token, chat_id, &message_id, text).await?;
-                true
-            } else {
-                // Too long to fit the edited message; deliver as fresh chunks.
-                self.send_text(chat_id, text)?;
-                true
-            }
-        } else {
-            false
-        };
-
-        if env.message.attachments.is_empty() {
-            if text_finalized {
-                return Ok(());
-            }
-            return self.send_text(chat_id, text);
-        }
-
-        // Telegram captions are capped at 1024 chars. If the reply text is
-        // longer (or was already delivered via streaming), send it as a separate
-        // message first and don't attach a caption — otherwise the multipart
-        // sendPhoto/sendDocument would 400.
-        let caption = if text_finalized || text.is_empty() {
-            None
-        } else if text.chars().count() <= TELEGRAM_CAPTION_LIMIT {
-            Some(text)
-        } else {
-            self.send_text(chat_id, text)?;
-            None
-        };
-        let mut caption = caption;
-        for attachment in &env.message.attachments {
-            self.send_attachment(chat_id, attachment, caption)?;
-            caption = None;
-        }
-        Ok(())
+    fn egress(&self) -> Arc<dyn Egress> {
+        Arc::clone(&self.egress) as Arc<dyn Egress>
     }
 
     fn stream_egress(&self) -> Option<Arc<dyn StreamEgress>> {
         Some(Arc::new(TelegramStreamEgress {
             api_base: Arc::clone(&self.api_base),
             token: Arc::clone(&self.token),
-            state: Arc::clone(&self.stream_state),
+            state: Arc::clone(&self.egress.stream_state),
         }))
     }
 }
@@ -689,6 +595,132 @@ fn chat_id_string(chat: &Value) -> Option<String> {
     chat.get("id")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
+}
+
+/// Shareable, `'static` send half of [`TelegramChannel`].
+///
+/// Holds only what `send` needs: the HTTP credentials and the per-conversation
+/// streaming edit state, so a reply finalizes the placeholder a stream delta
+/// created rather than posting a duplicate.
+struct TelegramEgress {
+    api_base: Arc<str>,
+    token: Arc<str>,
+    stream_state: Arc<Mutex<HashMap<String, TelegramEditState>>>,
+}
+
+impl TelegramEgress {
+    fn api_url(&self, method: &str) -> String {
+        format!("{}/bot{}/{method}", self.api_base, self.token)
+    }
+
+    /// Remove and return any streaming state for `chat_id`, so `send` can
+    /// finalize a streamed reply exactly once.
+    fn take_stream_state(&self, chat_id: &str) -> Option<TelegramEditState> {
+        self.stream_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(chat_id)
+    }
+
+    fn send_text(&self, chat_id: &str, text: &str) -> Result<(), ChannelError> {
+        for chunk in split_text(text, TELEGRAM_TEXT_LIMIT) {
+            self.send_text_chunk(chat_id, &chunk)?;
+        }
+        Ok(())
+    }
+
+    fn send_text_chunk(&self, chat_id: &str, text: &str) -> Result<(), ChannelError> {
+        let text_arg = format!("text={text}");
+        let chat_arg = format!("chat_id={chat_id}");
+        let output = Command::new("curl")
+            .args(["--silent", "--show-error", "--max-time", "10", "-X", "POST"])
+            .arg(self.api_url("sendMessage"))
+            .args(["-d", &chat_arg, "--data-urlencode", &text_arg])
+            .output()
+            .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
+        check_send_response(&output.status, &output.stdout, &output.stderr)
+    }
+
+    fn send_attachment(
+        &self,
+        chat_id: &str,
+        attachment: &Attachment,
+        caption: Option<&str>,
+    ) -> Result<(), ChannelError> {
+        let (method, field) = match attachment.kind {
+            AttachmentKind::Image => ("sendPhoto", "photo"),
+            AttachmentKind::Document => ("sendDocument", "document"),
+        };
+        let file_form = format!("{field}=@{}", attachment.path.display());
+        let chat_form = format!("chat_id={chat_id}");
+        let mut command = Command::new("curl");
+        command
+            .args(["--silent", "--show-error", "--max-time", "60", "-X", "POST"])
+            .arg(self.api_url(method))
+            .args(["-F", &chat_form, "-F", &file_form]);
+        if let Some(caption) = caption {
+            if !caption.is_empty() {
+                let caption_form = format!("caption={caption}");
+                command.args(["-F", &caption_form]);
+            }
+        }
+        let output = command
+            .output()
+            .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
+        check_send_response(&output.status, &output.stdout, &output.stderr)
+    }
+}
+
+#[async_trait]
+impl Egress for TelegramEgress {
+    async fn send(&self, env: Envelope) -> Result<(), ChannelError> {
+        let chat_id = env.conversation_id.as_str();
+        let text = env.message.content.as_ref();
+
+        // If this reply was streamed, finalize the placeholder by editing it to
+        // the authoritative full text (so the last throttled delta is flushed),
+        // instead of posting a duplicate message. Falls back to a fresh send
+        // when there's no placeholder or the text is too long for one message.
+        let streamed = self.take_stream_state(chat_id);
+        let text_finalized = if let Some(message_id) = streamed.and_then(|state| state.message_id) {
+            if !text.is_empty() && text.chars().count() <= TELEGRAM_TEXT_LIMIT {
+                tg_edit_message(&self.api_base, &self.token, chat_id, &message_id, text).await?;
+                true
+            } else {
+                // Too long to fit the edited message; deliver as fresh chunks.
+                self.send_text(chat_id, text)?;
+                true
+            }
+        } else {
+            false
+        };
+
+        if env.message.attachments.is_empty() {
+            if text_finalized {
+                return Ok(());
+            }
+            return self.send_text(chat_id, text);
+        }
+
+        // Telegram captions are capped at 1024 chars. If the reply text is
+        // longer (or was already delivered via streaming), send it as a separate
+        // message first and don't attach a caption — otherwise the multipart
+        // sendPhoto/sendDocument would 400.
+        let caption = if text_finalized || text.is_empty() {
+            None
+        } else if text.chars().count() <= TELEGRAM_CAPTION_LIMIT {
+            Some(text)
+        } else {
+            self.send_text(chat_id, text)?;
+            None
+        };
+        let mut caption = caption;
+        for attachment in &env.message.attachments {
+            self.send_attachment(chat_id, attachment, caption)?;
+            caption = None;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

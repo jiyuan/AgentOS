@@ -186,8 +186,9 @@ impl AgentRuntime {
     /// This runtime's background jobs (roadmap item D3).
     ///
     /// Exposed so a caller that knows a conversation has ended can call
-    /// [`JobRegistry::dispose_conversation`]. Nothing does yet — the runtime
-    /// has no notion of a conversation ending until G1.
+    /// [`JobRegistry::dispose_conversation`]. The sharded gateway (G1) does
+    /// that on `/clear`, which is the one point where a conversation is
+    /// declared over — its jobs belong to a history that no longer exists.
     pub fn jobs(&self) -> &Arc<JobRegistry> {
         &self.jobs
     }
@@ -505,6 +506,10 @@ impl<'a> RuntimeDepsScope<'a> {
             content_limits: self.runtime.content_limits(),
             compaction: self.runtime.compaction(),
             cancel: self.runtime.cancel.child_token(),
+            // The caller decides whether this run can be steered: only a
+            // gateway that multiplexes conversations has anywhere for
+            // mid-run input to arrive from.
+            steering: None,
         }
     }
 
@@ -554,6 +559,10 @@ impl<'a> RuntimeDepsScope<'a> {
             content_limits: self.runtime.content_limits(),
             compaction: self.runtime.compaction(),
             cancel: self.runtime.cancel.child_token(),
+            // The caller decides whether this run can be steered: only a
+            // gateway that multiplexes conversations has anywhere for
+            // mid-run input to arrive from.
+            steering: None,
         }
     }
 

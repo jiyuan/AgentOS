@@ -125,6 +125,23 @@ output_limit_bytes = 262144
 # security bug rather than a degraded result.
 promotable = ["shell"]
 
+# How the persistent gateway spreads conversations over threads. Conversations
+# run concurrently with each other and strictly serially within themselves: two
+# runs on one conversation would both load its transcript and the second
+# write-back would drop the first one's turns.
+[gateway]
+# Shard threads, or 0 for one per core. The run loop's future is !Send, so a run
+# cannot migrate between threads; conversations are hashed onto a fixed shard
+# instead. More shards means more conversations at once, never one conversation
+# going faster. Maximum 64.
+shards = 0
+# Messages one conversation may have waiting for a run of their own. Per
+# conversation, so a user typing faster than the agent answers hits their own
+# bound and nobody else's. A message that arrives while that conversation's run
+# is already in flight does not queue here at all — it is handed to the running
+# turn and claimed at its next planning step. Minimum 1.
+inbox_capacity = 32
+
 [isolation]
 worker_path_env = "AGENTOS_TOOL_WORKER_PATH"
 
