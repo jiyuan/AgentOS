@@ -83,9 +83,9 @@ enum RejectedParam {
     /// value: 'temperature' does not support 0.7 with this model").
     Temperature,
     /// Some models reject the flag outright rather than ignoring it. Dropping
-    /// it only re-permits parallel calls, which costs a few output tokens: the
-    /// orchestrators act on `tool_calls.first()` and record just that one call
-    /// in the transcript, so extra calls change no behaviour.
+    /// it re-permits parallel calls, which the loop now keeps rather than
+    /// discards (roadmap X1): a response asking for several tools is planned
+    /// as a batch and drained one call per turn.
     ParallelToolCalls,
 }
 

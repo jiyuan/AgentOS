@@ -74,7 +74,11 @@ fn pause_for_approval(ctx: ApproveCtx, reason: Arc<str>) -> ApproveTransition {
             handoff_approval_id(&agent_id),
             InterruptionAction::Handoff { agent_id, payload },
         ),
-        Plan::Reply(_) | Plan::ResumeSubAgent { .. } => {
+        // A batch never reaches `Approve` — the loop splits it at `Plan` — so
+        // there is nothing here to ask about. Failing closed rather than
+        // pausing on a batch as if it were one action: approving "these five
+        // calls" is not a decision a user was shown enough to make.
+        Plan::CallTools(_) | Plan::Reply(_) | Plan::ResumeSubAgent { .. } => {
             return ApproveTransition::Unsupported { reason }
         }
     };

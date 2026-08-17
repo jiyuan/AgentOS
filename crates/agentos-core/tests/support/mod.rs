@@ -18,6 +18,13 @@
 // unused-in-this-binary warnings are noise rather than dead code.
 #![allow(dead_code)]
 
+mod fixtures;
+
+#[allow(unused_imports)]
+pub use fixtures::{
+    bulk_output, echo_registry, max_with, scenario_golden, BulkTool, EchoTool, BULK_TOOL, ECHO_TOOL,
+};
+
 use agentos_core::approve::{Policy, PolicyAction, PolicyRule, PolicyVerb};
 use agentos_core::memory::InMemorySession;
 use agentos_core::runner::{RunOutcome, RunnerDeps};
@@ -178,6 +185,27 @@ pub fn tool_call_response(call_id: &str, tool: &str, args: &str) -> Message {
             name: Arc::from(tool),
             args: RawValue::from_string(args.to_owned()).expect("scripted args are valid JSON"),
         }],
+        tool_call_id: None,
+        metadata: BTreeMap::new(),
+    }
+}
+
+/// A response asking for several tools at once (roadmap X1). `calls` is
+/// `(call_id, tool, args)` in the order the model asked for them.
+pub fn tool_batch_response(calls: &[(&str, &str, &str)]) -> Message {
+    Message {
+        role: MessageRole::Assistant,
+        content: Arc::from(""),
+        attachments: Vec::new(),
+        tool_calls: calls
+            .iter()
+            .map(|(call_id, tool, args)| ToolCall {
+                id: ToolCallId::new(*call_id),
+                name: Arc::from(*tool),
+                args: RawValue::from_string((*args).to_owned())
+                    .expect("scripted args are valid JSON"),
+            })
+            .collect(),
         tool_call_id: None,
         metadata: BTreeMap::new(),
     }

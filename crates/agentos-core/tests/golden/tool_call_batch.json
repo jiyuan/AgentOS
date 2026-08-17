@@ -1,0 +1,171 @@
+{
+  "outcome": {
+    "conversation_id": "golden-conversation",
+    "kind": "finished",
+    "reply": "Ran all three."
+  },
+  "request_headers": [
+    {
+      "context_budget_tokens": 4096,
+      "pressure_percent": 1,
+      "prompt_estimated_tokens": 42,
+      "sections": [
+        {
+          "chars": 25,
+          "id": "transcript",
+          "messages": 1,
+          "tokens": 11
+        }
+      ],
+      "tool_tokens": 31,
+      "total_chars": 25,
+      "total_messages": 1
+    },
+    {
+      "context_budget_tokens": 4096,
+      "pressure_percent": 2,
+      "prompt_estimated_tokens": 91,
+      "sections": [
+        {
+          "chars": 36,
+          "id": "transcript",
+          "messages": 7,
+          "tokens": 60
+        }
+      ],
+      "tool_tokens": 31,
+      "total_chars": 36,
+      "total_messages": 7
+    }
+  ],
+  "requests": [
+    {
+      "messages": [
+        {
+          "content": "Echo one, two, and three.",
+          "role": "user"
+        }
+      ],
+      "tools": [
+        "echo"
+      ]
+    },
+    {
+      "messages": [
+        {
+          "content": "Echo one, two, and three.",
+          "role": "user"
+        },
+        {
+          "content": "",
+          "role": "assistant",
+          "tool_calls": [
+            {
+              "args": "{\"text\":\"one\"}",
+              "id": "call-a",
+              "name": "echo"
+            }
+          ]
+        },
+        {
+          "content": "one",
+          "role": "tool",
+          "tool_call_id": "call-a"
+        },
+        {
+          "content": "",
+          "role": "assistant",
+          "tool_calls": [
+            {
+              "args": "{\"text\":\"two\"}",
+              "id": "call-b",
+              "name": "echo"
+            }
+          ]
+        },
+        {
+          "content": "two",
+          "role": "tool",
+          "tool_call_id": "call-b"
+        },
+        {
+          "content": "",
+          "role": "assistant",
+          "tool_calls": [
+            {
+              "args": "{\"text\":\"three\"}",
+              "id": "call-c",
+              "name": "echo"
+            }
+          ]
+        },
+        {
+          "content": "three",
+          "role": "tool",
+          "tool_call_id": "call-c"
+        }
+      ],
+      "tools": [
+        "echo"
+      ]
+    }
+  ],
+  "session_items": [
+    {
+      "content": "Echo one, two, and three.",
+      "role": "user"
+    },
+    {
+      "content": "",
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "args": "{\"text\":\"one\"}",
+          "id": "call-a",
+          "name": "echo"
+        }
+      ]
+    },
+    {
+      "content": "one",
+      "role": "tool",
+      "tool_call_id": "call-a"
+    },
+    {
+      "content": "",
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "args": "{\"text\":\"two\"}",
+          "id": "call-b",
+          "name": "echo"
+        }
+      ]
+    },
+    {
+      "content": "two",
+      "role": "tool",
+      "tool_call_id": "call-b"
+    },
+    {
+      "content": "",
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "args": "{\"text\":\"three\"}",
+          "id": "call-c",
+          "name": "echo"
+        }
+      ]
+    },
+    {
+      "content": "three",
+      "role": "tool",
+      "tool_call_id": "call-c"
+    },
+    {
+      "content": "Ran all three.",
+      "role": "assistant"
+    }
+  ]
+}

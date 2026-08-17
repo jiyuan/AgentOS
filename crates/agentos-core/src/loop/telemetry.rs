@@ -152,6 +152,17 @@ pub(super) fn plan_assignment_fields(state: &RunState, plan: &Plan) -> BTreeMap<
                 Value::String(call.name.as_ref().to_owned()),
             );
         }
+        // Unreachable in practice: the loop splits a batch into single calls
+        // before anything is assigned. Recorded anyway so a trace never has a
+        // silent gap where a plan should be.
+        Plan::CallTools(calls) => {
+            fields.insert(
+                field_key("plan_kind"),
+                Value::String("tool_batch".to_owned()),
+            );
+            fields.insert(field_key("target_type"), Value::String("tool".to_owned()));
+            fields.insert(field_key("tool_calls"), Value::from(calls.len()));
+        }
         Plan::Handoff(agent_id, payload) => {
             fields.insert(field_key("plan_kind"), Value::String("handoff".to_owned()));
             fields.insert(field_key("target_type"), Value::String("agent".to_owned()));

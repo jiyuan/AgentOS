@@ -2,6 +2,9 @@
 id = "default"
 orchestrator = "builtin.max"
 memory = "memory.in_memory"
+# Tool cycles one run may take. A model that asks for several tools in one
+# response spends one turn per call — they run in order, each crossing the
+# policy engine on its own — so a batch is bounded by this like any other work.
 max_turns = 256
 
 [policy]

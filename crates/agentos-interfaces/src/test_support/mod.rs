@@ -599,12 +599,8 @@ impl Orchestrator for MockOrchestrator {
 fn clone_plan(plan: &Plan) -> Plan {
     match plan {
         Plan::Reply(message) => Plan::Reply(message.clone()),
-        Plan::CallTool(call) => Plan::CallTool(ToolCall {
-            id: call.id.clone(),
-            name: Arc::clone(&call.name),
-            args: RawValue::from_string(call.args.get().to_owned())
-                .expect("ToolCall.args is valid JSON"),
-        }),
+        Plan::CallTool(call) => Plan::CallTool(call.clone()),
+        Plan::CallTools(calls) => Plan::CallTools(calls.clone()),
         Plan::Handoff(agent_id, payload) => Plan::Handoff(agent_id.clone(), payload.clone()),
         Plan::Delegate(spec) => Plan::Delegate(spec.clone()),
         Plan::Escalate(spec) => Plan::Escalate(spec.clone()),

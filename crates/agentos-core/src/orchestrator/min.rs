@@ -63,9 +63,6 @@ impl Orchestrator for MinOrchestrator {
                 .await
                 .map_err(super::planning_error)?;
         ctx.push_llm_usage_from_message(&response);
-        if let Some(first) = response.tool_calls.first().cloned() {
-            return Ok(Plan::CallTool(first));
-        }
-        Ok(Plan::Reply(response))
+        Ok(super::plan_from_response(response))
     }
 }
