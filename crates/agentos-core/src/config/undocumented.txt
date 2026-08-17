@@ -1,0 +1,118 @@
+# Config keys that have no doc comment yet.
+#
+# Roadmap item X4. The catalog is derived from the config structs, so a key
+# with no `///` on its field would render a blank description — which reads as
+# "this key does nothing" rather than "nobody wrote this down". The generator
+# refuses to invent one, so every such key is listed here.
+#
+# This list is a ratchet, and it only turns one way:
+#
+#   - a key that is missing a doc and is NOT listed here fails the check, so a
+#     new config key cannot be added without saying what it does;
+#   - a key that IS listed here but has since gained a doc also fails, so the
+#     list cannot go stale and shrinks as the debt is paid.
+#
+# Delete a line by writing the doc comment on its field. Do not add lines to
+# make a check pass.
+agent.id
+agent.max_turns
+agent.memory
+agent.orchestrator
+channels.feishu
+channels.feishu.enabled
+channels.feishu.mode
+channels.telegram
+channels.telegram.enabled
+channels.telegram.mode
+channels.tui
+channels.tui.enabled
+channels.tui.mode
+isolation.worker_path
+isolation.worker_path_env
+mcp_servers.endpoint
+mcp_servers.id
+mcp_servers.timeout_ms
+mcp_tools.description
+mcp_tools.name
+mcp_tools.response
+mcp_tools.server_id
+memory.backend
+memory.default_domain
+memory.episode_recording_enabled
+memory.hydrate_max_estimated_tokens
+memory.hydrate_max_fragments
+memory.hydrate_stores
+memory.hydrate_strategy
+memory.hydration_enabled
+memory.path
+memory.policy
+memory.policy.forgets
+memory.policy.shared_writes
+memory.policy.writes
+memory.qdrant
+memory.qdrant.api_key
+memory.qdrant.collection
+memory.qdrant.timeout_ms
+memory.qdrant.url
+memory.qdrant.vector_dimensions
+memory.qdrant.vector_name
+memory.reflection
+memory.reflection.enabled
+memory.reflection.rebuild_lexical_index
+memory.retention
+memory.retention.max_age_days
+memory.retention.max_bytes
+memory.retention.max_records
+memory.semantic_backend
+memory.shared_domains
+memory.shared_domains.name
+memory.shared_domains.read
+memory.shared_domains.write
+memory.sqlite_vec
+memory.sqlite_vec.table
+memory.sqlite_vec.vector_dimensions
+orchestrator_templates.description
+orchestrator_templates.developer_instructions
+orchestrator_templates.name
+orchestrator_templates.stages
+orchestrator_templates.stages.agent_id
+orchestrator_templates.stages.depends_on
+orchestrator_templates.stages.name
+orchestrator_templates.stages.policy_id
+policy.allowlist
+policy.default
+resources.llm
+resources.mcp
+resources.priority
+resources.skills
+resources.tools
+routing.fallback
+routing.fallback.agent_id
+routing.fallback.description
+routing.fallback.dispatch
+routing.fallback.domain
+routing.fallback.examples
+routing.fallback.policy_id
+routing.fallback.template
+routing.rules
+routing.rules.agent_id
+routing.rules.description
+routing.rules.dispatch
+routing.rules.domain
+routing.rules.examples
+routing.rules.policy_id
+routing.rules.template
+subagents.description
+subagents.developer_instructions
+subagents.id
+subagents.inherit_guardrails
+subagents.max_turns
+subagents.memory_domains
+subagents.memory_tools
+subagents.memory_view
+subagents.model_tier
+subagents.name
+subagents.orchestrator
+subagents.policy_id
+subagents.tools
+task_workspace.root

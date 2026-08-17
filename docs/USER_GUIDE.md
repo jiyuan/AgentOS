@@ -88,6 +88,12 @@ To inspect the loaded runtime configuration, run:
 agentos-gateway config --config workspace/agent.toml
 ```
 
+Every key `agent.toml` accepts — with its type, default, and what it does — is
+in [`config-catalog.md`](config-catalog.md), and every built-in tool with its
+sandbox mode and deadline is in [`tool-catalog.md`](tool-catalog.md). Both are
+generated from the code by `agentos-gateway catalog`, so they cannot describe a
+version of the runtime that no longer exists.
+
 Gateway persistent channel selection uses this precedence:
 
 1. `AGENTOS_ENABLED_CHANNELS=telegram,feishu` overrides workspace channel enablement.

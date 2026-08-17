@@ -4,11 +4,11 @@ use agentos_interfaces::orchestrator::{
     DispatchTarget, OrchestratorTemplate, RoutingRule, Stage, SubAgentSpec, TaskDomain,
 };
 use agentos_proto::AgentId;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct RoutingConfig {
     pub rules: Vec<RoutingRuleConfig>,
@@ -29,7 +29,7 @@ impl Default for RoutingConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct RoutingRuleConfig {
     pub domain: Arc<str>,
@@ -55,7 +55,7 @@ impl Default for RoutingRuleConfig {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct TemplateConfig {
     pub name: Arc<str>,
@@ -64,7 +64,7 @@ pub struct TemplateConfig {
     pub stages: Vec<StageConfig>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct StageConfig {
     pub name: Arc<str>,

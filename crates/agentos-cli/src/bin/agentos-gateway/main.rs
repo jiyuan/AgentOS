@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod catalog;
 mod shard;
 
 use shard::{run_shard_thread, ShardContext};
@@ -171,6 +172,17 @@ fn run() -> Result<(), String> {
         }
         "status" => status(&config),
         "config" => print_effective_config(&config),
+        "catalog" => {
+            // Not derived from `config`: the catalogs describe what this build
+            // offers, so they are located in the source tree and take no
+            // account of a deployment's own agent.toml.
+            let root = env::args()
+                .skip(2)
+                .find_map(|arg| arg.strip_prefix("--root=").map(PathBuf::from))
+                .unwrap_or_else(catalog::default_root);
+            let check = env::args().any(|arg| arg == "--check");
+            catalog::run(&root, check)
+        }
         "serve" => serve(&config),
         "-h" | "--help" | "help" => {
             usage();
@@ -183,7 +195,7 @@ fn run() -> Result<(), String> {
 fn usage() {
     eprintln!(
         "\
-Usage: agentos-gateway <start|stop|restart|status|config> [OPTIONS]
+Usage: agentos-gateway <start|stop|restart|status|config|catalog> [OPTIONS]
 
 Manage the AgentOS gateway as a persistent background service.
 
@@ -193,6 +205,9 @@ Subcommands:
   restart    Stop then start the gateway service.
   status     Report whether the gateway service is running.
   config     Print the effective workspace config used by the gateway.
+  catalog    Regenerate docs/config-catalog.md and docs/tool-catalog.md from
+             the code. `--check` verifies they are current without writing,
+             which is what CI runs; `--root=PATH` names the repository.
 
 All workspace paths derive from $AGENTOS_HOME (set in .env or the process env).
 If unset, $AGENTOS_HOME defaults to the parent dir of the loaded .env file,
@@ -241,6 +256,10 @@ where
             }
             option if option.starts_with("--env-file=") => {}
             "--no-env-override" => {}
+            // `catalog`'s own options. Parsed by that subcommand from the raw
+            // argv, since they name a source tree rather than a runtime path.
+            "--check" => {}
+            option if option.starts_with("--root=") => {}
             "-h" | "--help" => {
                 usage();
                 std::process::exit(0);

@@ -3,11 +3,11 @@ use crate::memory::{
     MemoryStore, QdrantSemanticConfig, ReflectionParams, RetrievalStrategy, SqliteVecConfig,
 };
 use crate::orchestrator::MemoryHydrationSettings;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct MemoryConfig {
     pub backend: Arc<str>,
@@ -55,7 +55,7 @@ impl Default for MemoryConfig {
 /// promotes repeated episodes into semantic facts, supersedes contradicted
 /// facts, and rebuilds the lexical index. Disabled in the conservative default;
 /// the deployment `agent.toml` opts in (mirroring `episode_recording_enabled`).
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct MemoryReflectionConfig {
     pub enabled: bool,
@@ -87,7 +87,7 @@ impl MemoryReflectionConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct MemorySqliteVecConfig {
     pub table: Arc<str>,
@@ -113,7 +113,7 @@ impl From<&MemorySqliteVecConfig> for SqliteVecConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct MemoryQdrantConfig {
     pub url: Arc<str>,
@@ -151,7 +151,7 @@ impl From<&MemoryQdrantConfig> for QdrantSemanticConfig {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct MemoryRetentionConfig {
     pub max_records: Option<usize>,
@@ -159,7 +159,7 @@ pub struct MemoryRetentionConfig {
     pub max_age_days: Option<u64>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct MemoryPolicyConfig {
     pub writes: Arc<str>,
@@ -177,7 +177,7 @@ impl Default for MemoryPolicyConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct MemorySharedDomainConfig {
     pub name: Arc<str>,

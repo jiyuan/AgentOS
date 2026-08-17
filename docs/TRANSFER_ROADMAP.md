@@ -1372,6 +1372,59 @@ baselines that the tree contradicts — is the argument.
 - Verify: editing a config field without regenerating fails CI.
 - Exit: config and tool surfaces are derived, not maintained by hand.
 
+**Status: done.** New `config/catalog.rs` (the renderer),
+`config/undocumented.txt` (the debt ratchet), `bin/agentos-gateway/catalog.rs`
+(`agentos-gateway catalog [--check]`), `scripts/check-catalogs.sh`, a CI step
+beside the boundary and module-size checks, and `tests/catalog_freshness.rs`.
+Generated: `docs/config-catalog.md` (148 keys) and `docs/tool-catalog.md`.
+Verified: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --
+-D warnings`, 545 tests, import boundaries, module sizes, catalogs current.
+Semver: nothing public changed shape — all six crates report no update
+required.
+
+  - **Three things are derived, from three sources that cannot disagree with
+    the code.** Keys, types and nesting come from the config structs' own
+    source, `include_str!`-ed at compile time — not read from disk, because the
+    catalog a binary produces has to describe *that binary*, not whatever tree
+    it is run from. Defaults come from serializing `WorkspaceConfig::default()`,
+    so a changed default changes the catalog. Prose comes from each field's
+    `///` comment, which is where it already lives.
+  - **The first thing the catalog did was prove the config surface is mostly
+    undocumented.** 121 of 148 keys had no doc comment. That is the finding, not
+    a blocker: writing 121 descriptions in this item would mean inventing
+    semantics for subsystems I had not verified, which is how documentation
+    becomes wrong rather than absent. Instead the 21 section-level fields on
+    `WorkspaceConfig` were written (the rows an operator reads first), and the
+    remaining 102 went on `config/undocumented.txt` as an acknowledged debt.
+  - **The debt list is a ratchet that turns both ways.** A key with no doc that
+    is *not* listed fails the check, so a new config key cannot be added without
+    saying what it does. A key that *is* listed but has since gained a doc also
+    fails, so the list cannot go stale and can only shrink. Both directions are
+    proven by deliberately breaking them.
+  - **Undocumented rows say so, and the count is rendered into the file.** A
+    blank description cell reads as "this key does nothing"; `*(undocumented)*`
+    plus a footer counting them reads as a debt. A debt nobody can see is a debt
+    nobody pays.
+  - **Markers, not whole-file generation.** Each catalog carries an
+    introduction the generator does not own, so regenerating cannot wipe prose
+    somebody wrote. A missing marker is an error rather than a silent no-op that
+    would report success while leaving the file stale.
+  - **The parser is string matching, not a syntax tree**, which is a deliberate
+    trade for one dependency-free file. It handles the shape every config struct
+    in this crate is written in and would silently miss anything exotic — so the
+    guard is that a field it fails to pair with a doc is *reported*, and
+    `every_section_is_reachable` pins that every top-level key of the serialized
+    default is one the walk actually reached. The failure mode is a loud gap.
+  - **The built-in tool list is now one constant.** `BUILTIN_TOOL_NAMES` is
+    shared by `register_builtin_tool` and the catalog, with a test that every
+    name in it registers — a catalog listing a different set from the one the
+    runtime builds would read as "this deployment does not have that tool".
+  - **Freshness is checked twice, on purpose.** `scripts/check-catalogs.sh` is
+    what CI runs, and `tests/catalog_freshness.rs` is what `cargo test` runs. A
+    check that only exists in CI drifts locally until a commit later; both are
+    proven to fail on a changed default, an added key, and a documented key
+    still on the debt list.
+
 ### X5. Runtime invariants (F14)
 
 Debug-build assertions over relationships that already have prose rules: every

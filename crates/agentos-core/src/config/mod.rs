@@ -4,12 +4,13 @@ use agentos_interfaces::orchestrator::{
     RoutingRule, RoutingTable, TaskDomain,
 };
 use agentos_interfaces::tool::{SandboxMode, ToolSpec};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod approval;
+pub mod catalog;
 mod compaction;
 mod gateway;
 mod jobs;
@@ -39,31 +40,53 @@ use normalize::normalize_domain;
 use orchestrator::rule_from_config;
 use subagents::{normalize_memory_tool, normalize_memory_view, subagent_metadata};
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct WorkspaceConfig {
+    /// Which orchestrator, memory backend, and turn budget this agent runs on.
     pub agent: AgentConfig,
+    /// The authorization default and the tools exempt from it.
     pub policy: PolicyConfig,
+    /// Content checks applied to input, tool calls, and output.
     pub guardrails: GuardrailsConfig,
+    /// Long-term memory: storage, what gets recalled into a request, and what
+    /// a run is allowed to write back.
     pub memory: MemoryConfig,
+    /// Which channels this deployment answers on, and in what mode.
     pub channels: ChannelsConfig,
+    /// Where the subprocess worker that runs sandboxed tools is found.
     pub isolation: IsolationConfig,
+    /// Sub-agents this agent may delegate to. Each carries its own tools and a
+    /// policy that can only narrow the parent's.
     pub subagents: Vec<SubAgentConfig>,
+    /// MCP servers to connect to.
     pub mcp_servers: Vec<McpServerConfig>,
+    /// Tools served by a static MCP server, declared inline.
     pub mcp_tools: Vec<McpToolConfig>,
+    /// Which skills, tools, MCP tools, and LLM entries are enabled, and in what
+    /// order they are offered to the model.
     pub resources: ResourceConfig,
+    /// How inbound work is classified and where each class is dispatched.
     pub routing: RoutingConfig,
+    /// Multi-stage sub-orchestrator templates a run can escalate into.
     pub orchestrator_templates: Vec<TemplateConfig>,
+    /// Where per-task scratch directories are created.
     pub task_workspace: TaskWorkspaceConfig,
+    /// Sizes and deadlines a deployment has real reason to change.
     pub limits: LimitsConfig,
+    /// When a conversation summarizes its own history, and with which model.
     pub compaction: CompactionConfig,
+    /// Bounds on background work promoted out of a tool deadline.
     pub jobs: JobsConfig,
+    /// How the persistent gateway spreads conversations over threads.
     pub gateway: GatewayConfig,
+    /// How long an approval prompt stays answerable.
     pub approval: ApprovalConfig,
+    /// Where oversized tool output is written, and how long it is kept.
     pub spill: SpillConfig,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct AgentConfig {
     pub id: Arc<str>,
@@ -83,7 +106,7 @@ impl Default for AgentConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct PolicyConfig {
     pub default: Arc<str>,
@@ -105,7 +128,7 @@ impl Default for PolicyConfig {
 pub const DEFAULT_SHELL_ALLOWLIST: [&str; 8] =
     ["printf", "echo", "pwd", "ls", "find", "cat", "head", "tail"];
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct GuardrailsConfig {
     /// Programs the shell tool guardrail permits in a call's `command` field.
@@ -126,7 +149,7 @@ impl Default for GuardrailsConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct ChannelsConfig {
     pub tui: ChannelConfig,
@@ -153,7 +176,7 @@ impl Default for ChannelsConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct ChannelConfig {
     pub enabled: bool,
@@ -169,14 +192,14 @@ impl Default for ChannelConfig {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct IsolationConfig {
     pub worker_path: Option<PathBuf>,
     pub worker_path_env: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct McpServerConfig {
     pub id: Arc<str>,
@@ -184,7 +207,7 @@ pub struct McpServerConfig {
     pub timeout_ms: Option<u64>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct McpToolConfig {
     pub server_id: Arc<str>,
@@ -212,7 +235,7 @@ impl Default for McpToolConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct ResourceConfig {
     pub priority: Vec<Arc<str>>,
@@ -246,13 +269,13 @@ impl Default for ResourceConfig {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct ResourceSection {
     pub enabled: Vec<Arc<str>>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct TaskWorkspaceConfig {
     pub root: PathBuf,
