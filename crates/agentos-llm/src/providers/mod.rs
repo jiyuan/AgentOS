@@ -1,4 +1,5 @@
 pub mod anthropic;
+pub(crate) mod chat_completions;
 pub(crate) mod content;
 pub mod deepseek;
 pub mod ollama;

@@ -129,7 +129,9 @@ impl SseAccumulator for ResponsesAccumulator {
         }
     }
 
-    fn finalize(&mut self) -> Message {
+    fn finalize(&mut self, _saw_sentinel: bool) -> Result<Message, LlmError> {
+        // The Responses stream is terminated by its own `response.completed`
+        // event and the connection closing, not by a `[DONE]` sentinel.
         let mut message = Message {
             role: MessageRole::Assistant,
             content: Arc::from(std::mem::take(&mut self.content)),
@@ -151,7 +153,7 @@ impl SseAccumulator for ResponsesAccumulator {
                 attach_token_usage(&mut message, usage);
             }
         }
-        message
+        Ok(message)
     }
 }
 
@@ -192,7 +194,12 @@ mod tests {
                 CompletionEvent::Done(_) => None,
             })
             .collect();
-        (text, acc.finalize())
+        // The Responses shape has no `[DONE]`, so the sentinel flag is
+        // irrelevant here; `false` is what the live driver passes.
+        (
+            text,
+            acc.finalize(false).expect("fixture assembles a reply"),
+        )
     }
 
     #[test]
