@@ -1484,6 +1484,50 @@ relationships over authoritative state, never that a type or method exists.
 - Effort: S. Depends: P1.
 - Verify: each invariant has a test that violates it and observes the panic.
 - Exit: the three named classes are machine-checked in debug builds.
+- **Status: done** (2026-08-17). All three classes are asserted in
+  `crates/agentos-core/src/invariants.rs`, and each has a test that violates it
+  and observes the panic (14 unit tests, 7 of them `#[should_panic]`). The
+  module and every call site are behind `#[cfg(debug_assertions)]` at the *call*
+  rather than only inside the function, so a release build compiles them away
+  entirely — verified with `cargo check --release --workspace`. Notes:
+  - **The call sites are proven live, not assumed.** A passing suite proves only
+    that an invariant does not misfire; it says nothing about whether the check
+    runs at all. Each of the three was probed by making it panic
+    unconditionally and re-running the workspace suite: 20 tests reach the
+    assembly check, 9 the delegation check, 10 the pairing check. Without that
+    probe the whole item could have shipped as dead code with green tests, which
+    is the failure X3 already found once in this repo.
+  - **One call site is not where the roadmap said.** The assembly invariant
+    lives in `prompt::assemble`, not `loop/mod.rs`. The loop records the
+    request header but never sees the assembled message vector — `assemble` is
+    the only place both sides of the relationship exist at once. The other two
+    are where the roadmap put them (`loop/mod.rs`, `subagents/mod.rs`).
+  - **The delegation check does not re-run `Policy::narrow`.** Asserting
+    `narrow(parent, child).is_ok()` immediately after calling it is a tautology.
+    The invariant instead states the coarser security property directly: for
+    every action the child can reach, the parent must have some non-`Deny` path
+    to it. That survives a rewrite of narrowing's rule-covering logic, and
+    fires if the rewrite lets something through.
+  - **Argument constraints are deliberately out of scope for it.** A child is
+    allowed to be *more specific* about arguments than its parent — that is what
+    an explicit sub-agent tool allowlist does, and `narrow` documents it. An
+    argument-level comparison would fire on configurations that are correct by
+    design, so the check compares actions only.
+  - **The pairing rule has a real exemption.** `Delegate` and `Escalate` results
+    are `Tool`-role items with no `tool_call_id` (`loop/items.rs`), because they
+    answer a delegation rather than a tool call. They carry nothing to pair and
+    are exempt; asserting over them would fire on every correct sub-agent run.
+  - **The pairing check runs at the append, not over loaded history.** Checking
+    a whole transcript would assert over items written by past builds, and a
+    debug-build gateway would then panic on legacy session data it did not
+    create. Checking the item just pushed catches the same defect class against
+    state this build produced.
+  - Interface impact: none. `agentos-interfaces` and `agentos-proto` unchanged
+    (`--baseline-rev HEAD`: no semver update required). The one visibility
+    change is `PolicyRule::label`, private → `pub(crate)`, so a violation names
+    its action the same way `PolicyError::Widened` does.
+  - Loop overhead is unaffected: benchmarks build in release, where these do not
+    exist. p50 4.83µs against the ≤2ms target.
 
 ### X6. Session fork (F11)
 

@@ -292,6 +292,11 @@ impl SubAgentRegistry {
                 policy_id: Arc::clone(&spec.policy_id),
             })?;
         let child_policy = Policy::narrow(parent_policy, &definition.policy)?;
+        // X5: state the security property over the policy the child run is
+        // actually handed, rather than trusting that the call above produced
+        // it. Independent of how `narrow` decides individual rules.
+        #[cfg(debug_assertions)]
+        crate::invariants::delegation_narrows(parent_policy, &child_policy);
         Ok(SubAgentInvocation {
             definition,
             policy: child_policy,

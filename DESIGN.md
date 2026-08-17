@@ -58,6 +58,22 @@ The gateway has two layers. `Gateway` remains a bounded `mpsc` ingress queue for
 3. Approve: every boundary action receives an allow, deny, or ask-user decision from the concrete policy engine. `Approve` is concrete, not an extension trait.
 4. Isolation: a tool declares a `SandboxMode` — `read_only`, `workspace_write`, or `full_access`. Anything but `full_access` runs the tool in a child process whose filesystem writes the kernel refuses: Landlock on Linux, Seatbelt on macOS, and the restriction is inherited by every descendant. `full_access` means no sandbox, which is what a tool that does its work in-process declares — the only restriction available to those would apply to the whole agent, permanently, so they are bounded by rings 2 and 3 instead. Reads are not restricted, and neither is the network. Where no backend exists, a sandboxed tool fails rather than running unsandboxed, and `agentos-gateway config` prints which mechanism (if any) this machine enforces with.
 
+### Checked invariants
+
+Three relationships the rings depend on are asserted in debug builds
+(`crates/agentos-core/src/invariants.rs`): every provider message derives from
+`RunState` and is accounted for in the manifest that claims to describe the
+request; every delegation's effective policy reaches no action its parent
+cannot; and every tool result in the transcript follows an assistant item
+carrying its call id.
+
+These are **not a fourth ring**. They are compiled out of release builds
+entirely, so they protect development rather than deployment — a violation is a
+bug in the core, not a state a deployment can reach by configuration. Each
+states a relationship between two pieces of authoritative state rather than
+re-running the code it checks, and each has a test that violates it and observes
+the panic.
+
 ## Status
 
 The scaffold milestone is complete. The active baseline includes the typed loop and trace shape, concrete approval with serializable paused runs, reference tools and guardrails, SQLite session and scoped memory storage with hydration and reflection, Telegram and Feishu reference channels, configured sub-agents and sub-orchestrator templates, static and stdio MCP registration, kernel-sandboxed subprocess execution for tools that declare a mode, and runtime path injection with an enforced extension boundary. Remaining architecture work and open decisions are tracked in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/PLAN.md`](docs/PLAN.md).

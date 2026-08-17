@@ -11,6 +11,10 @@ pub mod gateway;
 pub mod guardrails;
 pub mod hooks;
 pub(crate) mod http;
+/// Debug-build assertions over the runtime's load-bearing relationships
+/// (roadmap X5). Compiled away entirely in release builds.
+#[cfg(debug_assertions)]
+pub(crate) mod invariants;
 pub mod jobs;
 pub mod r#loop;
 pub mod memory;
