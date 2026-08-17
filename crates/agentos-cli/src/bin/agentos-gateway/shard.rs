@@ -13,13 +13,16 @@ use super::{
 use agentos_cli::slash::{self, Parsed, SessionUsage, SlashCommand, SlashContext};
 use agentos_core::crons::{CronStore, MemoryMaintenanceCron};
 use agentos_core::gateway::{
-    run_shard, GatewayRun, GatewayService, ShardConfig, ShardInbound, Turn, TurnHandler,
+    run_shard, unix_now, GatewayRun, GatewayService, ShardConfig, ShardInbound, Turn, TurnHandler,
 };
-use agentos_core::r#loop::{InputGuardrailEntry, OutputGuardrailEntry, ToolGuardrailEntry};
-use agentos_core::runner::{PausedRun, ResumeDecision};
+use agentos_core::r#loop::{
+    route, ApprovalOutcome, ApprovalTicket, InputGuardrailEntry, OutputGuardrailEntry, Routed,
+    ToolGuardrailEntry,
+};
+use agentos_core::runner::{PausedRun, ResumeDecision, RunnerDeps};
 use agentos_core::runtime::{AgentRuntime, RuntimeDepsScope};
 use agentos_interfaces::{Egress, StreamEgress};
-use agentos_proto::{ConversationId, Envelope, RunId};
+use agentos_proto::{ConversationId, Envelope, InterruptionId, RunId};
 use async_trait::async_trait;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -93,9 +96,44 @@ pub(super) fn run_shard_thread(
             reflection_cron: RefCell::new(reflection_cron),
             last_cron_scan: Cell::new(0),
             pending_approvals: RefCell::new(HashMap::new()),
+            expired: RefCell::new(Vec::new()),
         };
         run_shard(context.shard, inbound, &shard_config, &handler).await;
     });
+}
+
+/// What the shard should do with one inbound envelope.
+enum Answered {
+    /// It answered the pending approval; resume the run with this decision.
+    /// Boxed because a `PausedRun` carries a whole `RunState`, and every other
+    /// variant here is a couple of words.
+    Resume(Box<Resume>),
+    /// It named a prompt that is over. Tell the sender; run nothing.
+    Stale(ApprovalTicket),
+    /// It is ordinary input; start a run.
+    Run,
+}
+
+/// A decided approval, ready to resume.
+struct Resume {
+    pending: PendingApproval,
+    decision: ResumeDecision,
+}
+
+/// A run parked on an approval, and what it takes to answer it.
+struct PendingApproval {
+    paused: PausedRun,
+    /// Names this asking. An envelope that does not carry it back is ordinary
+    /// input, however affirmative it sounds.
+    ticket: ApprovalTicket,
+    /// Unix seconds after which the prompt stops counting, if it expires.
+    expires_at: Option<u64>,
+}
+
+impl PendingApproval {
+    fn is_expired(&self, now: u64) -> bool {
+        self.expires_at.is_some_and(|expires_at| now >= expires_at)
+    }
 }
 
 /// Runs one conversation's turns on its shard thread.
@@ -112,11 +150,13 @@ struct ShardTurns<'a> {
     ///
     /// The serial loop used to answer an approval by blocking on
     /// `channel.receive()`, which froze the whole gateway until that one user
-    /// replied. Here the paused run is parked and the next message on that
-    /// conversation is read as the answer, so every other conversation keeps
-    /// running. Correlating the answer to a specific prompt is G2's job; until
-    /// then the next message decides.
-    pending_approvals: RefCell<HashMap<ConversationId, PausedRun>>,
+    /// replied. The paused run is parked here instead, so every other
+    /// conversation keeps running, and only an envelope carrying this prompt's
+    /// ticket decides it (roadmap G2).
+    pending_approvals: RefCell<HashMap<ConversationId, PendingApproval>>,
+    /// Prompts that have expired and whose runs still need finishing. Resuming
+    /// is `async`; expiry is noticed while the map above is borrowed.
+    expired: RefCell<Vec<(PendingApproval, InterruptionId)>>,
 }
 
 #[async_trait(?Send)]
@@ -131,6 +171,23 @@ impl TurnHandler for ShardTurns<'_> {
     }
 
     async fn idle(&self, shard: usize) {
+        // Approval expiry is per-shard state: each shard holds the prompts for
+        // its own conversations, so every shard sweeps its own.
+        if let Err(err) = self.sweep_expired() {
+            let _ = log_line(
+                &self.context.config,
+                &format!("{} approval sweep failed: {err}", self.context.channel_name),
+            );
+        }
+        if let Err(err) = self.drain_expired().await {
+            let _ = log_line(
+                &self.context.config,
+                &format!(
+                    "{} approval expiry failed: {err}",
+                    self.context.channel_name
+                ),
+            );
+        }
         // Cron and reflection are process-wide, not per-shard: firing them on
         // every shard would fire every task N times.
         if shard != 0 {
@@ -198,17 +255,15 @@ impl ShardTurns<'_> {
         if let Some(stream) = self.context.stream_egress.clone() {
             deps.stream_sink = Some(channel_stream_sink(stream, input.conversation_id.clone()));
         }
-        let service =
-            GatewayService::new(&deps, Arc::from(self.context.runtime.active_agent.as_str()));
+        let service = self.service(&deps);
 
-        // A message on a conversation with a paused run answers that approval.
-        let pending = self
-            .pending_approvals
-            .borrow_mut()
-            .remove(&input.conversation_id);
-        let outcome = match pending {
-            Some(paused) => {
-                let Some(approval_id) = paused
+        // Does this envelope answer the approval this conversation is waiting
+        // on? Only an envelope carrying that prompt's ticket does.
+        let outcome = match self.decide(&input)? {
+            Answered::Resume(resume) => {
+                let Resume { pending, decision } = *resume;
+                let Some(approval_id) = pending
+                    .paused
                     .state
                     .pending_approvals
                     .first()
@@ -220,16 +275,33 @@ impl ShardTurns<'_> {
                     )?;
                     return Ok(());
                 };
-                let decision = if input.message.content.trim().eq_ignore_ascii_case("y") {
-                    ResumeDecision::Approve
-                } else {
-                    ResumeDecision::Reject {
-                        reason: Arc::from(format!("rejected by {channel_name} user")),
-                    }
-                };
-                service.resume(egress, paused, &approval_id, decision).await
+                log_line(
+                    config,
+                    &format!(
+                        "{channel_name} approval {} ({}) resolved: {}",
+                        approval_id.as_str(),
+                        pending.ticket,
+                        decision.outcome().as_str()
+                    ),
+                )?;
+                service
+                    .resume(egress, pending.paused, &approval_id, decision)
+                    .await
             }
-            None => {
+            Answered::Stale(ticket) => {
+                // A button from an asking that is over. Say so rather than
+                // running it as a message: the sender pressed a control.
+                return self
+                    .reply(
+                        &input,
+                        &format!(
+                            "That approval ({ticket}) is no longer waiting — it was already \
+                             answered or it expired."
+                        ),
+                    )
+                    .await;
+            }
+            Answered::Run => {
                 service
                     .run_envelope(egress, input.clone(), self.context.run_id.clone())
                     .await
@@ -241,11 +313,22 @@ impl ShardTurns<'_> {
                 self.context.session_usage.record_run(&state.usage);
                 log_trace(config, &state)?;
             }
-            Ok(GatewayRun::Paused { paused, .. }) => {
-                // Park it and go; the next message on this conversation decides.
-                self.pending_approvals
-                    .borrow_mut()
-                    .insert(paused.conversation_id.clone(), paused);
+            Ok(GatewayRun::Paused {
+                paused,
+                ticket,
+                expires_at,
+                ..
+            }) => {
+                // Park it and go. Only an answer carrying `ticket` resumes it,
+                // and the idle sweep cancels it if nobody ever does.
+                self.pending_approvals.borrow_mut().insert(
+                    paused.conversation_id.clone(),
+                    PendingApproval {
+                        paused,
+                        ticket,
+                        expires_at,
+                    },
+                );
             }
             Err(err) => {
                 log_line(config, &format!("{channel_name} gateway run failed: {err}"))?;
@@ -261,6 +344,153 @@ impl ShardTurns<'_> {
                     )?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// A gateway service carrying this deployment's approval expiry, so every
+    /// prompt this shard sends has a window and none outlives the run it gates.
+    fn service<'d>(&self, deps: &'d RunnerDeps<'d>) -> GatewayService<'d> {
+        GatewayService::new(deps, Arc::from(self.context.runtime.active_agent.as_str()))
+            .with_approval_expiry(self.context.runtime.workspace_config.approval.expiry())
+    }
+
+    /// Route `input` against whatever this conversation is waiting on.
+    ///
+    /// Expiry is checked first: a prompt whose window has closed is over
+    /// before the envelope is even read, so a late answer cannot decide it.
+    fn decide(&self, input: &Envelope) -> Result<Answered, String> {
+        let now = unix_now();
+        let mut pending = self.pending_approvals.borrow_mut();
+        if pending
+            .get(&input.conversation_id)
+            .is_some_and(|entry| entry.is_expired(now))
+        {
+            let entry = pending
+                .remove(&input.conversation_id)
+                .expect("checked just above");
+            drop(pending);
+            self.expire(entry)?;
+            // The prompt is gone, so this envelope cannot decide it — a late
+            // answer is stale, and anything else is ordinary input.
+            return Ok(match route(None, input) {
+                Routed::Stale { ticket } => Answered::Stale(ticket),
+                // With nothing pending, `route` cannot report a decision.
+                Routed::Unrelated | Routed::Decides { .. } => Answered::Run,
+            });
+        }
+
+        let ticket = pending
+            .get(&input.conversation_id)
+            .map(|entry| entry.ticket.clone());
+        match route(ticket.as_ref(), input) {
+            Routed::Unrelated => Ok(Answered::Run),
+            Routed::Stale { ticket } => Ok(Answered::Stale(ticket)),
+            Routed::Decides { outcome, reason } => {
+                let entry = pending
+                    .remove(&input.conversation_id)
+                    .expect("a decision implies a pending approval");
+                let decision = match outcome {
+                    ApprovalOutcome::Approved => ResumeDecision::Approve,
+                    _ => ResumeDecision::Reject {
+                        reason: reason.unwrap_or_else(|| {
+                            Arc::from(format!("rejected by {} user", self.context.channel_name))
+                        }),
+                    },
+                };
+                Ok(Answered::Resume(Box::new(Resume {
+                    pending: entry,
+                    decision,
+                })))
+            }
+        }
+    }
+
+    /// Resolve a prompt nobody answered in time.
+    ///
+    /// Recorded as *cancelled*, not rejected: the action does not run either
+    /// way, but the audit trail — and the memory the agent recalls later — must
+    /// not learn that this user refuses things they never saw.
+    fn expire(&self, pending: PendingApproval) -> Result<(), String> {
+        let config = &self.context.config;
+        let channel_name = self.context.channel_name;
+        let Some(approval_id) = pending
+            .paused
+            .state
+            .pending_approvals
+            .first()
+            .map(|approval| approval.id.clone())
+        else {
+            return Ok(());
+        };
+        log_line(
+            config,
+            &format!(
+                "{channel_name} approval {} ({}) resolved: {}",
+                approval_id.as_str(),
+                pending.ticket,
+                ApprovalOutcome::Cancelled.as_str()
+            ),
+        )?;
+        self.expired.borrow_mut().push((pending, approval_id));
+        Ok(())
+    }
+
+    /// Finish the runs whose prompts expired.
+    ///
+    /// Separate from [`ShardTurns::expire`] because resuming a run is `async`
+    /// and `expire` is called while the pending-approval map is borrowed.
+    async fn drain_expired(&self) -> Result<(), String> {
+        loop {
+            let Some((pending, approval_id)) = self.expired.borrow_mut().pop() else {
+                return Ok(());
+            };
+            let deps = self.deps_scope.deps_with_guardrails(
+                self.input_guardrails,
+                self.output_guardrails,
+                self.tool_guardrails,
+            );
+            let resumed = self
+                .service(&deps)
+                .resume(
+                    self.context.egress.as_ref(),
+                    pending.paused,
+                    &approval_id,
+                    ResumeDecision::Cancel {
+                        reason: Arc::from("approval prompt expired before it was answered"),
+                    },
+                )
+                .await;
+            // Cancelling fails the run closed, so an error here is the
+            // expected shape, not a problem: report it and move on.
+            if let Err(err) = resumed {
+                log_line(
+                    &self.context.config,
+                    &format!(
+                        "{} approval {} expired: {err}",
+                        self.context.channel_name,
+                        approval_id.as_str()
+                    ),
+                )?;
+            }
+        }
+    }
+
+    /// Retire every prompt on this shard whose window has closed.
+    fn sweep_expired(&self) -> Result<(), String> {
+        let now = unix_now();
+        let expired: Vec<ConversationId> = self
+            .pending_approvals
+            .borrow()
+            .iter()
+            .filter(|(_, entry)| entry.is_expired(now))
+            .map(|(conversation, _)| conversation.clone())
+            .collect();
+        for conversation in expired {
+            let Some(entry) = self.pending_approvals.borrow_mut().remove(&conversation) else {
+                continue;
+            };
+            self.expire(entry)?;
         }
         Ok(())
     }
@@ -330,8 +560,7 @@ impl ShardTurns<'_> {
             self.output_guardrails,
             self.tool_guardrails,
         );
-        let service =
-            GatewayService::new(&deps, Arc::from(self.context.runtime.active_agent.as_str()));
+        let service = self.service(&deps);
         fire_due_crons(
             &self.context.config,
             self.context.egress.as_ref(),

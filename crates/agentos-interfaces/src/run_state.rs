@@ -38,7 +38,19 @@ pub enum InterruptionAction {
 pub enum ApprovalStatus {
     Pending,
     Approved,
-    Rejected { reason: Arc<str> },
+    /// Someone was asked and said no.
+    Rejected {
+        reason: Arc<str>,
+    },
+    /// Ended without anyone deciding it — the prompt expired, or the run had
+    /// no one who could answer (a cron tick).
+    ///
+    /// Separate from [`ApprovalStatus::Rejected`] because the audit trail has
+    /// to be able to tell a refusal from a question nobody answered. Both fail
+    /// closed; only one of them is a decision.
+    Unanswered {
+        reason: Arc<str>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -116,6 +128,21 @@ impl RunState {
         }
     }
 
+    /// Mark an approval as ended without a decision. See
+    /// [`ApprovalStatus::Unanswered`].
+    pub fn mark_unanswered(&mut self, id: &InterruptionId, reason: impl Into<Arc<str>>) -> bool {
+        let reason = reason.into();
+        for interruption in &mut self.pending_approvals {
+            if &interruption.id == id {
+                interruption.status = ApprovalStatus::Unanswered {
+                    reason: Arc::clone(&reason),
+                };
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn take_rejected_reason(&mut self) -> Option<Arc<str>> {
         let index = self.pending_approvals.iter().position(|interruption| {
             matches!(interruption.status, ApprovalStatus::Rejected { .. })
@@ -123,7 +150,23 @@ impl RunState {
         let interruption = self.pending_approvals.remove(index);
         match interruption.status {
             ApprovalStatus::Rejected { reason } => Some(reason),
-            ApprovalStatus::Pending | ApprovalStatus::Approved => None,
+            ApprovalStatus::Pending
+            | ApprovalStatus::Approved
+            | ApprovalStatus::Unanswered { .. } => None,
+        }
+    }
+
+    /// Take the reason an approval ended without a decision, removing it.
+    pub fn take_unanswered_reason(&mut self) -> Option<Arc<str>> {
+        let index = self.pending_approvals.iter().position(|interruption| {
+            matches!(interruption.status, ApprovalStatus::Unanswered { .. })
+        })?;
+        let interruption = self.pending_approvals.remove(index);
+        match interruption.status {
+            ApprovalStatus::Unanswered { reason } => Some(reason),
+            ApprovalStatus::Pending
+            | ApprovalStatus::Approved
+            | ApprovalStatus::Rejected { .. } => None,
         }
     }
 }

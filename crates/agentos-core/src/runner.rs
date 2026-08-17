@@ -6,8 +6,10 @@ mod task_session;
 use crate::memory::MemoryManager;
 use crate::prompt::Compaction;
 use crate::r#loop::{
-    resume_approved, FinalOutput, InputGuardrailEntry, LoopDeps, OutputGuardrailEntry, RunError,
-    RunLoopState, StartCtx, Steering, ToolGuardrailEntry,
+    prompt_actions, resume_approved, ApprovalOutcome, ApprovalTicket, FinalOutput,
+    InputGuardrailEntry, LoopDeps, OutputGuardrailEntry, RunError, RunLoopState, StartCtx,
+    Steering, ToolGuardrailEntry, ACTIONS_KEY, EXPIRES_AT_KEY, INTERRUPTION_KEY, PROMPT_KIND,
+    TICKET_KEY,
 };
 use crate::spill::ContentLimits;
 use crate::subagents::SubAgentRegistry;
@@ -165,23 +167,67 @@ pub struct PausedRun {
     pub state: RunState,
 }
 
+/// What a caller decided about a pending approval.
+///
+/// One variant per [`ApprovalOutcome`], so a run cannot be resumed without
+/// saying which of the four things happened. Three of them fail closed; only
+/// [`ResumeDecision::Approve`] lets the gated action run.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ResumeDecision {
+    /// Someone holding the prompt's ticket said yes.
     Approve,
+    /// Someone holding the prompt's ticket said no.
     Reject { reason: Arc<str> },
+    /// The prompt expired before anyone answered.
+    Cancel { reason: Arc<str> },
+    /// There was nobody who could answer — a run with no interactive user
+    /// behind it, such as a cron tick that hit an `ask_user` policy.
+    Unavailable { reason: Arc<str> },
 }
 
-pub fn approval_prompt_envelope(paused: &PausedRun, sender: Arc<str>) -> Option<Envelope> {
+impl ResumeDecision {
+    /// The outcome this decision records.
+    pub fn outcome(&self) -> ApprovalOutcome {
+        match self {
+            Self::Approve => ApprovalOutcome::Approved,
+            Self::Reject { .. } => ApprovalOutcome::Rejected,
+            Self::Cancel { .. } => ApprovalOutcome::Cancelled,
+            Self::Unavailable { .. } => ApprovalOutcome::Unavailable,
+        }
+    }
+}
+
+/// Build the envelope that asks a user to decide a pending approval.
+///
+/// `ticket` names *this asking* (roadmap G2): an answer has to carry it back or
+/// it decides nothing. `expires_at` is unix seconds after which the prompt
+/// stops counting, carried in metadata so a channel can render it and the
+/// gateway can sweep it.
+///
+/// The `InterruptionId` travels alongside as `approval_id`. It says what is
+/// being authorised where the ticket says which asking, and the pair is what
+/// makes a decision traceable back to the action it permitted.
+pub fn approval_prompt_envelope(
+    paused: &PausedRun,
+    sender: Arc<str>,
+    ticket: &ApprovalTicket,
+    expires_at: Option<u64>,
+) -> Option<Envelope> {
     let approval = paused.state.pending_approvals.first()?;
     let mut metadata = BTreeMap::new();
+    metadata.insert(Arc::from("kind"), Value::String(PROMPT_KIND.to_owned()));
     metadata.insert(
-        Arc::from("kind"),
-        Value::String("approval_prompt".to_owned()),
-    );
-    metadata.insert(
-        Arc::from("approval_id"),
+        Arc::from(INTERRUPTION_KEY),
         Value::String(approval.id.as_str().to_owned()),
     );
+    metadata.insert(
+        Arc::from(TICKET_KEY),
+        Value::String(ticket.as_str().to_owned()),
+    );
+    metadata.insert(Arc::from(ACTIONS_KEY), prompt_actions(ticket));
+    if let Some(expires_at) = expires_at {
+        metadata.insert(Arc::from(EXPIRES_AT_KEY), Value::from(expires_at));
+    }
     metadata.insert(
         Arc::from("run_id"),
         Value::String(paused.state.run_id.as_str().to_owned()),
@@ -208,11 +254,12 @@ pub fn approval_prompt_envelope(paused: &PausedRun, sender: Arc<str>) -> Option<
         sender,
         message: Message {
             role: MessageRole::Assistant,
+            // The ticket is spelled out because on a channel with no buttons
+            // it is the only way to answer, and a user who cannot see it
+            // cannot approve anything.
             content: Arc::from(format!(
-                "Approve {} for {} '{}'? Reply y to approve, anything else to reject.",
-                approval.id.as_str(),
-                action_kind,
-                action_label
+                "Approve {action_kind} '{action_label}'?\n\
+                 Reply /approve {ticket} to allow it, or /deny {ticket} <reason> to refuse.",
             )),
             attachments: Vec::new(),
             tool_calls: Vec::new(),
@@ -389,19 +436,26 @@ pub async fn resume_run(
     let trace_span_start = paused.state.trace_spans.len();
     let trace_event_start = paused.state.trace_events.len();
     let task_session = activate_task_workspace_for_resume(&mut paused.state, deps)?;
-    let rejected_reason = match decision {
+    let outcome = decision.outcome();
+    match decision {
         ResumeDecision::Approve => {
             paused.state.approve(approval_id);
-            None
         }
         ResumeDecision::Reject { reason } => {
             paused.state.reject(approval_id, Arc::clone(&reason));
-            Some(reason)
+            record_denied_episode(&paused.state, &paused.conversation_id, &reason, deps).await;
+            return Err(RunError::ApprovalDenied { reason }.into());
         }
-    };
-    if let Some(reason) = rejected_reason {
-        record_denied_episode(&paused.state, &paused.conversation_id, &reason, deps).await;
-        return Err(RunError::ApprovalDenied { reason }.into());
+        // Expired, or nobody to ask. Fails the run closed like a denial, but
+        // as a distinct error and a distinct episode outcome — the audit trail
+        // has to be able to tell a refusal from a question nobody answered.
+        ResumeDecision::Cancel { reason } | ResumeDecision::Unavailable { reason } => {
+            let reason: Arc<str> = Arc::from(format!("{reason} ({})", outcome.as_str()));
+            paused
+                .state
+                .mark_unanswered(approval_id, Arc::clone(&reason));
+            return Err(RunError::ApprovalUnanswered { reason }.into());
+        }
     }
     let episode_seed = EpisodeSeed::from_state(&paused.state, &paused.conversation_id);
 

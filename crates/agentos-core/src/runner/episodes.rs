@@ -135,7 +135,11 @@ pub(super) async fn record_error_episode(
     };
     let outcome = match err {
         RunError::ApprovalDenied { .. } => EpisodeOutcome::Denied,
-        RunError::NotResumable
+        // Not `Denied`: nobody denied it. An expired prompt is a run that
+        // failed for want of an answer, and recalling it as a refusal would
+        // teach the agent the user says no to things they never saw.
+        RunError::ApprovalUnanswered { .. }
+        | RunError::NotResumable
         | RunError::AlreadyDone
         | RunError::MaxTurnsExceeded
         | RunError::ApprovalUnsupported { .. }

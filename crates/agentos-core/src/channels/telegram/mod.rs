@@ -1,6 +1,6 @@
 use crate::channels::attachments::{file_size, AttachmentStore};
-use crate::channels::text::split_text;
 use crate::http::shared_client;
+use crate::r#loop::{parse_action_data, DECISION_KEY, TICKET_KEY};
 use agentos_interfaces::{Channel, ChannelError, Egress, StreamEgress};
 use agentos_proto::{
     Attachment, AttachmentKind, ChannelId, ConversationId, Envelope, Message, MessageRole,
@@ -16,6 +16,10 @@ use std::time::{Duration, Instant};
 
 /// Telegram Bot API origin. Overridable via `AGENTOS_TELEGRAM_API_BASE` so the
 /// channel can be pointed at a local mock during tests.
+mod egress;
+
+use egress::TelegramEgress;
+
 const DEFAULT_API_BASE: &str = "https://api.telegram.org";
 
 pub struct TelegramChannel {
@@ -318,6 +322,12 @@ impl Channel for TelegramChannel {
                 continue;
             }
             self.offset = Some(update_id + 1);
+            if let Some(callback_id) = &parsed.callback_query_id {
+                // Best effort: an unacknowledged press leaves the client's
+                // button spinning, which is cosmetic — the decision is already
+                // in hand and must not be dropped for a failed acknowledgement.
+                tg_answer_callback(&self.api_base, &self.token, callback_id).await;
+            }
             let mut envelope = parsed.envelope;
             envelope.message.attachments = attachments;
             return Some(envelope);
@@ -366,6 +376,15 @@ fn clamp_stream_text(buffer: &str) -> String {
 /// Uses the pooled async HTTP client (not a `curl` subprocess) because this runs
 /// on the streaming hot path: a fresh process + TLS handshake per edit stalls
 /// the single-threaded loop and makes streaming slower than a buffered reply.
+/// Acknowledge a button press so Telegram stops showing a progress indicator.
+async fn tg_answer_callback(api_base: &str, token: &str, callback_query_id: &str) {
+    let _ = shared_client()
+        .post(format!("{api_base}/bot{token}/answerCallbackQuery"))
+        .form(&[("callback_query_id", callback_query_id)])
+        .send()
+        .await;
+}
+
 async fn tg_send_message(api_base: &str, token: &str, chat_id: &str, text: &str) -> Option<String> {
     let response: Value = shared_client()
         .post(format!("{api_base}/bot{token}/sendMessage"))
@@ -454,6 +473,9 @@ struct ParsedUpdate {
     envelope: Envelope,
     attachments: Vec<AttachmentDescriptor>,
     message_id_str: String,
+    /// Set when this update was a button press. Telegram spins the client's
+    /// button until `answerCallbackQuery` acknowledges it.
+    callback_query_id: Option<String>,
 }
 
 fn parse_update(
@@ -461,6 +483,9 @@ fn parse_update(
     channel_id: &ChannelId,
     allowed_chat_id: Option<&str>,
 ) -> Option<ParsedUpdate> {
+    if let Some(callback) = update.get("callback_query") {
+        return parse_callback_query(update, callback, channel_id, allowed_chat_id);
+    }
     let message = update.get("message")?;
     let chat_id = chat_id_string(message.get("chat")?)?;
     if allowed_chat_id.is_some_and(|allowed| allowed != chat_id) {
@@ -515,6 +540,65 @@ fn parse_update(
         },
         attachments,
         message_id_str,
+        callback_query_id: None,
+    })
+}
+
+/// An inline-keyboard press on an approval prompt (roadmap G2).
+///
+/// The payload is the one `prompt_actions` encoded, so a press carries the
+/// prompt's ticket structurally — nothing about it is guessable from prose,
+/// and a press on an older prompt's button names that older prompt and is
+/// refused as stale rather than deciding whatever is pending now.
+fn parse_callback_query(
+    update: &Value,
+    callback: &Value,
+    channel_id: &ChannelId,
+    allowed_chat_id: Option<&str>,
+) -> Option<ParsedUpdate> {
+    let data = callback.get("data").and_then(Value::as_str)?;
+    let (decision, ticket) = parse_action_data(data)?;
+    let chat = callback
+        .get("message")
+        .and_then(|message| message.get("chat"))?;
+    let chat_id = chat_id_string(chat)?;
+    if allowed_chat_id.is_some_and(|allowed| allowed != chat_id) {
+        return None;
+    }
+    let sender = callback
+        .get("from")
+        .and_then(|from| from.get("id").and_then(Value::as_i64))
+        .map_or_else(
+            || Arc::from("telegram-user"),
+            |id| Arc::from(id.to_string()),
+        );
+    let update_id = update.get("update_id")?.as_i64()?;
+
+    let mut metadata = BTreeMap::new();
+    metadata.insert(Arc::from("kind"), Value::String("telegram".to_owned()));
+    metadata.insert(Arc::from("update_id"), Value::from(update_id));
+    metadata.insert(
+        Arc::from(TICKET_KEY),
+        Value::String(ticket.as_str().to_owned()),
+    );
+    metadata.insert(Arc::from(DECISION_KEY), Value::String(decision.to_owned()));
+
+    Some(ParsedUpdate {
+        envelope: Envelope {
+            channel_id: channel_id.clone(),
+            conversation_id: ConversationId::new(chat_id),
+            sender,
+            // Echoed so the transcript and the gateway log read as the command
+            // the press stands for, rather than as an empty message.
+            message: Message::text(MessageRole::User, format!("/{decision} {ticket}")),
+            metadata,
+        },
+        attachments: Vec::new(),
+        message_id_str: format!("cb{update_id}"),
+        callback_query_id: callback
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
     })
 }
 
@@ -597,139 +681,116 @@ fn chat_id_string(chat: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-/// Shareable, `'static` send half of [`TelegramChannel`].
-///
-/// Holds only what `send` needs: the HTTP credentials and the per-conversation
-/// streaming edit state, so a reply finalizes the placeholder a stream delta
-/// created rather than posting a duplicate.
-struct TelegramEgress {
-    api_base: Arc<str>,
-    token: Arc<str>,
-    stream_state: Arc<Mutex<HashMap<String, TelegramEditState>>>,
-}
-
-impl TelegramEgress {
-    fn api_url(&self, method: &str) -> String {
-        format!("{}/bot{}/{method}", self.api_base, self.token)
-    }
-
-    /// Remove and return any streaming state for `chat_id`, so `send` can
-    /// finalize a streamed reply exactly once.
-    fn take_stream_state(&self, chat_id: &str) -> Option<TelegramEditState> {
-        self.stream_state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(chat_id)
-    }
-
-    fn send_text(&self, chat_id: &str, text: &str) -> Result<(), ChannelError> {
-        for chunk in split_text(text, TELEGRAM_TEXT_LIMIT) {
-            self.send_text_chunk(chat_id, &chunk)?;
-        }
-        Ok(())
-    }
-
-    fn send_text_chunk(&self, chat_id: &str, text: &str) -> Result<(), ChannelError> {
-        let text_arg = format!("text={text}");
-        let chat_arg = format!("chat_id={chat_id}");
-        let output = Command::new("curl")
-            .args(["--silent", "--show-error", "--max-time", "10", "-X", "POST"])
-            .arg(self.api_url("sendMessage"))
-            .args(["-d", &chat_arg, "--data-urlencode", &text_arg])
-            .output()
-            .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
-        check_send_response(&output.status, &output.stdout, &output.stderr)
-    }
-
-    fn send_attachment(
-        &self,
-        chat_id: &str,
-        attachment: &Attachment,
-        caption: Option<&str>,
-    ) -> Result<(), ChannelError> {
-        let (method, field) = match attachment.kind {
-            AttachmentKind::Image => ("sendPhoto", "photo"),
-            AttachmentKind::Document => ("sendDocument", "document"),
-        };
-        let file_form = format!("{field}=@{}", attachment.path.display());
-        let chat_form = format!("chat_id={chat_id}");
-        let mut command = Command::new("curl");
-        command
-            .args(["--silent", "--show-error", "--max-time", "60", "-X", "POST"])
-            .arg(self.api_url(method))
-            .args(["-F", &chat_form, "-F", &file_form]);
-        if let Some(caption) = caption {
-            if !caption.is_empty() {
-                let caption_form = format!("caption={caption}");
-                command.args(["-F", &caption_form]);
-            }
-        }
-        let output = command
-            .output()
-            .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
-        check_send_response(&output.status, &output.stdout, &output.stderr)
-    }
-}
-
-#[async_trait]
-impl Egress for TelegramEgress {
-    async fn send(&self, env: Envelope) -> Result<(), ChannelError> {
-        let chat_id = env.conversation_id.as_str();
-        let text = env.message.content.as_ref();
-
-        // If this reply was streamed, finalize the placeholder by editing it to
-        // the authoritative full text (so the last throttled delta is flushed),
-        // instead of posting a duplicate message. Falls back to a fresh send
-        // when there's no placeholder or the text is too long for one message.
-        let streamed = self.take_stream_state(chat_id);
-        let text_finalized = if let Some(message_id) = streamed.and_then(|state| state.message_id) {
-            if !text.is_empty() && text.chars().count() <= TELEGRAM_TEXT_LIMIT {
-                tg_edit_message(&self.api_base, &self.token, chat_id, &message_id, text).await?;
-                true
-            } else {
-                // Too long to fit the edited message; deliver as fresh chunks.
-                self.send_text(chat_id, text)?;
-                true
-            }
-        } else {
-            false
-        };
-
-        if env.message.attachments.is_empty() {
-            if text_finalized {
-                return Ok(());
-            }
-            return self.send_text(chat_id, text);
-        }
-
-        // Telegram captions are capped at 1024 chars. If the reply text is
-        // longer (or was already delivered via streaming), send it as a separate
-        // message first and don't attach a caption — otherwise the multipart
-        // sendPhoto/sendDocument would 400.
-        let caption = if text_finalized || text.is_empty() {
-            None
-        } else if text.chars().count() <= TELEGRAM_CAPTION_LIMIT {
-            Some(text)
-        } else {
-            self.send_text(chat_id, text)?;
-            None
-        };
-        let mut caption = caption;
-        for attachment in &env.message.attachments {
-            self.send_attachment(chat_id, attachment, caption)?;
-            caption = None;
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egress::inline_keyboard;
     use serde_json::json;
 
     fn channel_id() -> ChannelId {
         ChannelId::new("telegram")
+    }
+
+    /// A button press carries the prompt's ticket structurally, so the router
+    /// can correlate it without reading any prose (roadmap G2).
+    #[test]
+    fn a_button_press_becomes_a_correlated_answer() {
+        let ticket = crate::r#loop::ApprovalTicket::mint();
+        let update = json!({
+            "update_id": 42,
+            "callback_query": {
+                "id": "cbq-1",
+                "from": { "id": 7 },
+                "message": { "chat": { "id": 99 } },
+                "data": format!("approve:{ticket}"),
+            }
+        });
+        let parsed = parse_update(&update, &channel_id(), None).expect("envelope");
+        assert_eq!(parsed.envelope.conversation_id.as_str(), "99");
+        assert_eq!(parsed.callback_query_id.as_deref(), Some("cbq-1"));
+        assert_eq!(
+            parsed
+                .envelope
+                .metadata
+                .get(TICKET_KEY)
+                .and_then(Value::as_str),
+            Some(ticket.as_str())
+        );
+        assert_eq!(
+            parsed
+                .envelope
+                .metadata
+                .get(DECISION_KEY)
+                .and_then(Value::as_str),
+            Some("approve")
+        );
+        // The echoed text is the command the press stands for, so the log and
+        // the transcript read the same on a channel with buttons and without.
+        assert_eq!(
+            parsed.envelope.message.content.as_ref(),
+            format!("/approve {ticket}")
+        );
+    }
+
+    /// A press on some other feature's button is not an approval answer.
+    #[test]
+    fn a_callback_that_is_not_ours_is_ignored() {
+        let update = json!({
+            "update_id": 42,
+            "callback_query": {
+                "id": "cbq-1",
+                "from": { "id": 7 },
+                "message": { "chat": { "id": 99 } },
+                "data": "open:settings",
+            }
+        });
+        assert!(parse_update(&update, &channel_id(), None).is_none());
+    }
+
+    /// The chat allowlist covers button presses too — otherwise a stranger who
+    /// guessed a ticket could approve someone else's tool call.
+    #[test]
+    fn a_button_press_from_a_disallowed_chat_is_dropped() {
+        let update = json!({
+            "update_id": 42,
+            "callback_query": {
+                "id": "cbq-1",
+                "from": { "id": 7 },
+                "message": { "chat": { "id": 99 } },
+                "data": "approve:k3f",
+            }
+        });
+        assert!(parse_update(&update, &channel_id(), Some("100")).is_none());
+        assert!(parse_update(&update, &channel_id(), Some("99")).is_some());
+    }
+
+    #[test]
+    fn approval_actions_render_as_one_keyboard_row() {
+        let ticket = crate::r#loop::ApprovalTicket::mint();
+        let markup =
+            inline_keyboard(Some(&crate::r#loop::prompt_actions(&ticket))).expect("a keyboard");
+        let parsed: Value = serde_json::from_str(&markup).expect("valid JSON");
+        let rows = parsed
+            .get("inline_keyboard")
+            .and_then(Value::as_array)
+            .expect("rows");
+        assert_eq!(rows.len(), 1);
+        let row = rows[0].as_array().expect("buttons");
+        assert_eq!(row.len(), 2);
+        assert_eq!(row[0].get("text").and_then(Value::as_str), Some("Approve"));
+        assert_eq!(
+            row[0].get("callback_data").and_then(Value::as_str),
+            Some(format!("approve:{ticket}").as_str())
+        );
+    }
+
+    /// Missing or malformed action metadata sends the prompt as plain text
+    /// rather than failing: the body still says how to answer.
+    #[test]
+    fn absent_actions_produce_no_keyboard() {
+        assert!(inline_keyboard(None).is_none());
+        assert!(inline_keyboard(Some(&json!([]))).is_none());
+        assert!(inline_keyboard(Some(&json!("not an array"))).is_none());
     }
 
     #[test]

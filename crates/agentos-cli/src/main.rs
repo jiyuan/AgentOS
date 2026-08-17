@@ -3,6 +3,7 @@ use agentos_core::channels::{feishu::FeishuChannel, telegram::TelegramChannel};
 use agentos_core::crons::{CronSchedule, CronStore, CronTask};
 use agentos_core::gateway::{GatewayRun, GatewayService};
 use agentos_core::memory::{MemoryManager, SqliteStore};
+use agentos_core::r#loop::{route, ApprovalOutcome, ApprovalTicket, Routed};
 use agentos_core::runner::{
     delete_paused_run, load_paused_run, save_paused_run, ResumeDecision, RunnerDeps,
 };
@@ -380,7 +381,7 @@ where
         GatewayRun::Finished { state, .. } => {
             print_trace(&state);
         }
-        GatewayRun::Paused { paused, .. } => {
+        GatewayRun::Paused { paused, ticket, .. } => {
             save_paused_run(state_path, &paused)?;
             let Some(approval_id) = paused
                 .state
@@ -392,49 +393,61 @@ where
                 return Ok(());
             };
 
-            let Some(answer) = channel.receive().await else {
+            let Some(decision) = await_approval(channel, &ticket).await else {
                 eprintln!("paused run saved: {}", state_path.display());
                 return Ok(());
             };
             let paused = load_paused_run(state_path)?;
-            if answer.message.content.trim().eq_ignore_ascii_case("y") {
-                let outcome = gateway_service
-                    .resume(
-                        channel.egress().as_ref(),
-                        paused,
-                        &approval_id,
-                        ResumeDecision::Approve,
-                    )
-                    .await;
-                delete_paused_run(state_path)?;
-                match outcome? {
-                    GatewayRun::Finished { state, .. } => {
-                        print_trace(&state);
-                    }
-                    GatewayRun::Paused { paused, .. } => {
-                        save_paused_run(state_path, &paused)?;
-                    }
+            let outcome = gateway_service
+                .resume(channel.egress().as_ref(), paused, &approval_id, decision)
+                .await;
+            delete_paused_run(state_path)?;
+            match outcome? {
+                GatewayRun::Finished { state, .. } => {
+                    print_trace(&state);
                 }
-            } else {
-                let result = gateway_service
-                    .resume(
-                        channel.egress().as_ref(),
-                        paused,
-                        &approval_id,
-                        ResumeDecision::Reject {
-                            reason: Arc::from("rejected by user"),
-                        },
-                    )
-                    .await;
-                delete_paused_run(state_path)?;
-                if let Err(err) = result {
-                    return Err(Box::new(err) as Box<dyn std::error::Error>);
+                GatewayRun::Paused { paused, .. } => {
+                    save_paused_run(state_path, &paused)?;
                 }
             }
         }
     }
 
     Ok(())
+}
+
+/// Block until someone answers the approval `ticket` names.
+///
+/// Roadmap G2: an answer has to name its prompt. The old rule — the next line
+/// decides, `y` approves — meant any input at all authorised a tool call, which
+/// is exactly the ambient authority the item removes. Input that is not an
+/// answer is reported and the wait continues; `None` means the channel closed.
+async fn await_approval<C>(channel: &mut C, ticket: &ApprovalTicket) -> Option<ResumeDecision>
+where
+    C: Channel,
+{
+    loop {
+        let answer = channel.receive().await?;
+        match route(Some(ticket), &answer) {
+            Routed::Decides {
+                outcome: ApprovalOutcome::Approved,
+                ..
+            } => return Some(ResumeDecision::Approve),
+            Routed::Decides { reason, .. } => {
+                return Some(ResumeDecision::Reject {
+                    reason: reason.unwrap_or_else(|| Arc::from("rejected by user")),
+                })
+            }
+            Routed::Stale { ticket: named } => {
+                println!("That approval ({named}) is not the one waiting. Answer {ticket}.");
+            }
+            Routed::Unrelated => {
+                println!(
+                    "Waiting on approval {ticket}: reply /approve {ticket} or /deny {ticket}."
+                );
+            }
+        }
+    }
 }
 
 struct TuiResources<'a> {
@@ -511,7 +524,7 @@ async fn run_tui_loop(
                 session_usage.record_run(&state.usage);
                 print_trace(&state);
             }
-            GatewayRun::Paused { paused, .. } => {
+            GatewayRun::Paused { paused, ticket, .. } => {
                 save_paused_run(state_path, &paused)?;
                 let Some(approval_id) = paused
                     .state
@@ -524,44 +537,22 @@ async fn run_tui_loop(
                     continue;
                 };
 
-                let Some(answer) = channel.receive().await else {
+                let Some(decision) = await_approval(channel, &ticket).await else {
                     eprintln!("paused run saved: {}", state_path.display());
                     return Ok(());
                 };
                 let paused = load_paused_run(state_path)?;
-                if answer.message.content.trim().eq_ignore_ascii_case("y") {
-                    let outcome = gateway_service
-                        .resume(
-                            channel.egress().as_ref(),
-                            paused,
-                            &approval_id,
-                            ResumeDecision::Approve,
-                        )
-                        .await;
-                    delete_paused_run(state_path)?;
-                    match outcome? {
-                        GatewayRun::Finished { state, .. } => {
-                            session_usage.record_run(&state.usage);
-                            print_trace(&state);
-                        }
-                        GatewayRun::Paused { paused, .. } => {
-                            save_paused_run(state_path, &paused)?;
-                        }
+                let outcome = gateway_service
+                    .resume(channel.egress().as_ref(), paused, &approval_id, decision)
+                    .await;
+                delete_paused_run(state_path)?;
+                match outcome? {
+                    GatewayRun::Finished { state, .. } => {
+                        session_usage.record_run(&state.usage);
+                        print_trace(&state);
                     }
-                } else {
-                    let result = gateway_service
-                        .resume(
-                            channel.egress().as_ref(),
-                            paused,
-                            &approval_id,
-                            ResumeDecision::Reject {
-                                reason: Arc::from("rejected by user"),
-                            },
-                        )
-                        .await;
-                    delete_paused_run(state_path)?;
-                    if let Err(err) = result {
-                        return Err(Box::new(err) as Box<dyn std::error::Error>);
+                    GatewayRun::Paused { paused, .. } => {
+                        save_paused_run(state_path, &paused)?;
                     }
                 }
             }

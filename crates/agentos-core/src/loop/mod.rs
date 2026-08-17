@@ -3,11 +3,11 @@ use crate::hooks::Hooks;
 use crate::prompt::Compaction;
 use crate::spill::{ContentLimits, SpillRef, SpillSource};
 use crate::subagents::{SubAgentError, SubAgentRegistry};
-use crate::task_workspace::{TaskWorkspace, TaskWorkspaceError};
+use crate::task_workspace::TaskWorkspace;
 use crate::tools::{ToolRegistry, ToolRegistryError};
 use crate::trace;
 use agentos_interfaces::guardrail::{
-    GuardrailError, GuardrailOutcome, Input, InputGuardrail, OutputGuardrail, ToolGuardrail,
+    GuardrailOutcome, Input, InputGuardrail, OutputGuardrail, ToolGuardrail,
 };
 use agentos_interfaces::orchestrator::{Orchestrator, Plan, RunContext, StreamSink};
 use agentos_interfaces::run_state::{ApprovalStatus, Interruption, InterruptionAction, RunState};
@@ -15,14 +15,15 @@ use agentos_proto::{AgentId, InterruptionId, Message, SpanKind, ToolCall, ToolRe
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 mod approval;
+mod approval_route;
 mod budget;
 mod cancel;
 mod delegate;
+mod error;
 mod escalate;
 mod items;
 mod planning;
@@ -31,9 +32,15 @@ mod steering;
 mod telemetry;
 
 use approval::{approve_transition, ApproveTransition};
+pub use approval_route::{
+    parse_action_data, prompt_actions, prompt_interruption, route, ApprovalOutcome, ApprovalTicket,
+    Routed, ACTIONS_KEY, APPROVE, DECISION_KEY, DENY, EXPIRES_AT_KEY, INTERRUPTION_KEY,
+    PROMPT_KIND, REASON_KEY, TICKET_KEY,
+};
 use budget::{budget_exhausted_finish, record_llm_usage};
 use cancel::{cancelled_finish, unless_cancelled};
 use delegate::{execute_delegate, execute_resume_delegate, DelegateOutcome};
+pub use error::RunError;
 use escalate::{execute_escalate, EscalateOutcome};
 use items::{
     assistant_tool_call_item, metadata_value, subagent_result_item, suborchestrator_result_item,
@@ -43,42 +50,6 @@ use request::record_request_header;
 pub use steering::{Steered, Steering, DEFAULT_STEERING_CAPACITY};
 
 use telemetry::{field_key, plan_assignment_fields, record_telemetry_event};
-
-#[derive(Debug, Error)]
-pub enum RunError {
-    #[error("run has already finished")]
-    AlreadyDone,
-    #[error("paused run must be resumed through the approval path")]
-    NotResumable,
-    #[error("maximum turn count exceeded")]
-    MaxTurnsExceeded,
-    #[error("orchestrator failed: {0}")]
-    Orchestrator(#[from] agentos_interfaces::orchestrator::OrchestratorError),
-    #[error("guardrail backend failed: {0}")]
-    Guardrail(#[from] GuardrailError),
-    #[error("guardrail '{guardrail}' tripped: {reason}")]
-    GuardrailTripped {
-        guardrail: Arc<str>,
-        reason: Arc<str>,
-    },
-    #[error("tool execution failed: {0}")]
-    Tool(#[from] ToolRegistryError),
-    #[error("sub-agent execution failed: {0}")]
-    SubAgent(#[from] SubAgentError),
-    #[error("task workspace failed: {0}")]
-    TaskWorkspace(#[from] TaskWorkspaceError),
-    #[error("approval denied: {reason}")]
-    ApprovalDenied { reason: Arc<str> },
-    #[error("approval cannot pause this action yet: {reason}")]
-    ApprovalUnsupported { reason: Arc<str> },
-    /// The run's cancellation token fired mid-call.
-    ///
-    /// Internal to the loop: `act` converts it into a terminal stop notice, so
-    /// it never reaches a caller of `run_envelope`. It exists because the tool
-    /// path is several frames deep and needs a typed way back up.
-    #[error("run cancelled")]
-    Cancelled,
-}
 
 pub struct LoopDeps<'a> {
     pub orchestrator: &'a dyn Orchestrator,
@@ -153,6 +124,9 @@ pub fn resume_approved(state: RunState) -> Result<RunLoopState, RunError> {
     let mut state = state;
     if let Some(reason) = state.take_rejected_reason() {
         return Err(RunError::ApprovalDenied { reason });
+    }
+    if let Some(reason) = state.take_unanswered_reason() {
+        return Err(RunError::ApprovalUnanswered { reason });
     }
 
     let turns = resume_turns(&state);
