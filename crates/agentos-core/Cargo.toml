@@ -13,6 +13,10 @@ async-trait.workspace = true
 chrono.workspace = true
 croner.workspace = true
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# Landlock and `prctl` for the Linux sandbox (roadmap X2): raw syscalls, no
+# wrapper crate, because the surface used is three numbers and two structs.
+libc = "0.2"
+
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "http2", "json", "multipart"] }
 rusqlite.workspace = true
 serde.workspace = true

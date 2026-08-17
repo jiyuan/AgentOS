@@ -155,6 +155,10 @@ inbox_capacity = 32
 # maximum 86400.
 expiry_seconds = 900
 
+# Tools that declare a sandbox mode run in a child process the kernel holds to
+# it — Landlock on Linux, Seatbelt on macOS. `agentos-gateway config` prints
+# which mechanism this machine enforces with; where there is none, a sandboxed
+# tool fails rather than running unsandboxed.
 [isolation]
 worker_path_env = "AGENTOS_TOOL_WORKER_PATH"
 

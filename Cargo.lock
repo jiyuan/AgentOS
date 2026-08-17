@@ -37,6 +37,7 @@ dependencies = [
  "criterion",
  "croner",
  "futures-util",
+ "libc",
  "proptest",
  "reqwest",
  "rusqlite",

@@ -46,6 +46,13 @@ agentos gateway-stop
 agentos gateway-status
 ```
 
+The `shell` tool runs sandboxed: it may write beneath the workspace and the
+temporary directory, and nowhere else, enforced by the kernel rather than by
+the tool's own good behaviour. Which programs it will accept at all is a
+separate question, decided by `[guardrails].shell_allowlist`. Run
+`agentos-gateway config` to see whether this machine can enforce a sandbox —
+where it cannot, a sandboxed tool fails rather than running unrestricted.
+
 The gateway runs conversations concurrently: each is pinned to one of
 `[gateway].shards` worker threads, so one conversation waiting on a slow tool
 does not hold up anybody else's. Within a conversation everything stays in

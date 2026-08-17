@@ -743,6 +743,7 @@ mod tests {
         McpServerConfig, McpToolConfig, ResourceConfig, ResourceSection, DEFAULT_SHELL_ALLOWLIST,
     };
     use agentos_interfaces::guardrail::{GuardrailOutcome, ToolGuardrail};
+    use agentos_interfaces::tool::SandboxMode;
     use agentos_proto::{AgentId, RunId, ToolCall, ToolCallId};
     use serde_json::value::RawValue;
 
@@ -768,14 +769,14 @@ mod tests {
                     name: Arc::from("enabled_mcp"),
                     description: Arc::from("enabled"),
                     response: Arc::from("ok"),
-                    requires_isolation: false,
+                    sandbox: SandboxMode::FullAccess,
                 },
                 McpToolConfig {
                     server_id: Arc::from("static-mcp"),
                     name: Arc::from("disabled_mcp"),
                     description: Arc::from("disabled"),
                     response: Arc::from("no"),
-                    requires_isolation: false,
+                    sandbox: SandboxMode::FullAccess,
                 },
             ],
             resources: ResourceConfig {

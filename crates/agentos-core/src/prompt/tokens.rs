@@ -92,6 +92,7 @@ pub fn estimate_tool_specs(tools: &[ToolSpec]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentos_interfaces::tool::SandboxMode;
     use agentos_proto::{MessageRole, ToolCall, ToolCallId};
     use serde_json::{json, value::RawValue};
     use std::sync::Arc;
@@ -154,7 +155,7 @@ mod tests {
                 "required": ["text"],
                 "properties": { "text": { "type": "string" } }
             }),
-            requires_isolation: false,
+            sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }];
         // Name, description, and schema all contribute; a dozen such tools is

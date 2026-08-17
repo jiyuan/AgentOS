@@ -453,6 +453,7 @@ fn is_stale_session(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentos_interfaces::tool::SandboxMode;
     use serde_json::value::RawValue;
     use std::fs;
     use std::path::PathBuf;
@@ -497,7 +498,7 @@ mod tests {
             name: Arc::from("file"),
             description: Arc::from("read or write"),
             input_schema: json!({"type":"object","properties":{}}),
-            requires_isolation: false,
+            sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         };
         assert_eq!(

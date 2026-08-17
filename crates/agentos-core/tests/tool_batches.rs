@@ -13,7 +13,7 @@ use agentos_core::runner::{run_envelope, RunOutcome};
 use agentos_core::tools::ToolRegistry;
 use agentos_interfaces::orchestrator::{Orchestrator, OrchestratorError, Plan, RunContext};
 use agentos_interfaces::session::Session;
-use agentos_interfaces::tool::{Tool, ToolError, ToolSpec};
+use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
 use agentos_proto::{
     ChannelId, ConversationId, Envelope, Message, MessageRole, RunId, ToolCall, ToolCallId,
     ToolResult, ToolStatus,
@@ -92,7 +92,7 @@ impl Tool for Recorder {
             name: Arc::from(RECORDER),
             description: Arc::from("Records that it ran."),
             input_schema: json!({"type": "object"}),
-            requires_isolation: false,
+            sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }
     }

@@ -448,16 +448,18 @@ pub fn format_tools(registry: Option<&ToolRegistry>) -> String {
     let name_width = specs.iter().map(|spec| spec.name.len()).max().unwrap_or(0);
     let mut out = format!("Registered tools ({}):\n", specs.len());
     for spec in &specs {
-        let isolation = if spec.requires_isolation {
-            " [requires_isolation]"
+        // Only the sandboxed modes are worth the line noise: `full_access`
+        // means "not run under a sandbox", which is the ordinary case.
+        let sandbox = if spec.sandbox.is_sandboxed() {
+            format!(" [{}]", spec.sandbox.as_str())
         } else {
-            ""
+            String::new()
         };
         out.push_str(&format!(
             "  {:<width$}  {}{}\n",
             spec.name.as_ref(),
             spec.description.as_ref(),
-            isolation,
+            sandbox,
             width = name_width,
         ));
     }

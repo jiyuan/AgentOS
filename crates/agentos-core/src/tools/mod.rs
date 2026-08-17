@@ -1,5 +1,5 @@
 mod builtin;
-pub(crate) mod exec;
+pub mod exec;
 mod mcp;
 mod memory;
 mod registry;

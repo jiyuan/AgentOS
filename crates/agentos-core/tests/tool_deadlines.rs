@@ -12,7 +12,7 @@ use agentos_core::memory::InMemorySession;
 use agentos_core::runner::{run_envelope, RunOutcome};
 use agentos_core::tools::ToolRegistry;
 use agentos_interfaces::orchestrator::{Orchestrator, OrchestratorError, Plan, RunContext};
-use agentos_interfaces::tool::{Tool, ToolError, ToolSpec};
+use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
 use agentos_proto::{Message, MessageRole, RunId, ToolCall, ToolCallId, ToolResult, ToolStatus};
 use async_trait::async_trait;
 use serde_json::{json, value::RawValue};
@@ -62,7 +62,7 @@ impl Tool for HangTool {
             name: Arc::from(HANG_TOOL),
             description: Arc::from("Never returns."),
             input_schema: json!({"type": "object"}),
-            requires_isolation: false,
+            sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }
     }
@@ -155,7 +155,7 @@ async fn a_prompt_tool_is_unaffected_by_the_deadline() {
                 name: Arc::from(HANG_TOOL),
                 description: Arc::from("Returns at once."),
                 input_schema: json!({"type": "object"}),
-                requires_isolation: false,
+                sandbox: SandboxMode::FullAccess,
                 timeout_ms: None,
             }
         }

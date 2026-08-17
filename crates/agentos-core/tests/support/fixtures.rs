@@ -7,7 +7,7 @@ use super::{scenario, ScriptedLlm};
 use agentos_core::orchestrator::MaxOrchestrator;
 use agentos_core::runner::RunOutcome;
 use agentos_core::tools::ToolRegistry;
-use agentos_interfaces::tool::{Tool, ToolError, ToolSpec};
+use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
 use agentos_proto::{ToolCall, ToolResult, ToolStatus};
 use async_trait::async_trait;
 use serde_json::{json, value::RawValue, Value};
@@ -31,7 +31,7 @@ impl Tool for EchoTool {
                 "required": ["text"],
                 "properties": { "text": { "type": "string" } }
             }),
-            requires_isolation: false,
+            sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }
     }
@@ -74,7 +74,7 @@ impl Tool for BulkTool {
                 "required": ["lines"],
                 "properties": { "lines": { "type": "integer" } }
             }),
-            requires_isolation: false,
+            sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }
     }

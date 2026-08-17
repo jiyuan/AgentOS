@@ -278,6 +278,7 @@ fn document_block(attachment: &Attachment) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentos_interfaces::tool::SandboxMode;
     use agentos_proto::{Attachment, AttachmentKind};
     use serde_json::value::RawValue;
     use std::fs;
@@ -395,7 +396,7 @@ mod tests {
             name: Arc::from("file"),
             description: Arc::from("read or write"),
             input_schema: json!({"type":"object","properties":{}}),
-            requires_isolation: false,
+            sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         };
         let value = anthropic_tool_spec(&spec);

@@ -18,7 +18,7 @@ use agentos_core::runner::{ResumeDecision, RunnerError};
 use agentos_core::tools::ToolRegistry;
 use agentos_interfaces::orchestrator::{Orchestrator, OrchestratorError, Plan, RunContext};
 use agentos_interfaces::test_support::MockChannel;
-use agentos_interfaces::tool::{Tool, ToolError, ToolSpec};
+use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
 use agentos_interfaces::{Channel, RunState};
 use agentos_proto::{
     ChannelId, ConversationId, Envelope, Message, MessageRole, RunId, ToolCall, ToolCallId,
@@ -77,7 +77,7 @@ impl Tool for GatedTool {
             name: Arc::from(GATED_TOOL),
             description: Arc::from("Does something worth asking about."),
             input_schema: json!({"type": "object"}),
-            requires_isolation: false,
+            sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }
     }
