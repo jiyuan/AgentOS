@@ -1127,6 +1127,69 @@ calls have deadlines (D2) and can run concurrently without risking the gateway.
   reaches a provider.
 - Exit: extra tool calls are never silently dropped.
 
+**Status: done — (b), batching.** The roadmap recommended (a) now and (b) after
+Phase 4; Phase 4 has landed, so (b) is what shipped and (a) is superseded rather
+than deferred. New `loop/batch.rs` (queue and drain), `Plan::CallTools`,
+`RunState::queued_tool_calls`, `orchestrator::plan_from_response` shared by both
+orchestrators, and the OpenAI Responses adapter no longer forcing
+`parallel_tool_calls: false`. Verified: `cargo fmt --all --check`, `cargo clippy
+--workspace --all-targets -- -D warnings`, 492 tests, import boundaries, module
+sizes. Both halves proven load-bearing: taking `first()` in
+`plan_from_response` again turns `several_calls_are_all_kept_in_order` and the
+`tool_call_batch` golden red; refusing to drain the queue turns four of the six
+batch tests red.
+
+  - **The batch loop lives in `Plan`, not `Act`.** The item's sketch put it in
+    `Act`, and that cannot preserve per-call approval: `Act` runs what `Approve`
+    already decided, so a batch executed there would have crossed the policy
+    engine once, as a unit. Approving "these five calls" is not a decision a
+    user was shown enough to make. Instead the batch is queued on the run state
+    and drained one call per turn, each going back through `Plan → Approve →
+    Act → Observe`. No new state, no new transition — as the item asked — and
+    the loop never carries more than one call past `Plan`.
+  - **The queue lives in `RunState`, not the loop's frame**, because a batch can
+    pause for approval halfway through and what is left has to survive being
+    written to disk. Pinned by
+    `a_batch_pausing_for_approval_keeps_the_rest_queued`, which round-trips the
+    paused state through JSON.
+  - **A batch is replayed to the provider as paired single-call turns.** The
+    transcript records one assistant turn per call, each followed by its own
+    result, rather than one assistant turn with three calls and three results.
+    That is not cosmetic: every provider rejects a tool result whose call has no
+    preceding assistant turn, and it means no provider is ever shown a
+    half-answered batch while the loop works through one. The `tool_call_batch`
+    golden pins the assembled requests, and shows the other half of the win —
+    three tool calls cost **two** LLM round trips, not four.
+  - **Draining costs turns.** A five-call batch spends five of `max_turns`, so a
+    model emitting a hundred calls hits the same budget as one that loops a
+    hundred times. It costs no extra LLM round trips: the model already said
+    what it wanted.
+  - **Execution stays sequential, deliberately.** Concurrency is the larger
+    prize and a separate decision. Calls in one batch routinely touch the same
+    files, and interleaving two `file` writes because a model emitted them
+    together would be a bug introduced by an optimisation nobody asked for.
+    Sequential is also what makes "results append in order" free rather than a
+    reordering step. The exit condition — no call silently dropped — does not
+    require concurrency.
+  - **The policy engine decides a batch by its strictest member**, and `Act`
+    refuses one outright. Both are unreachable today because `Plan` splits every
+    batch first — but "unreachable" is not a security property, and a future
+    caller that routed a batch past the split must not get a weaker decision
+    than its most dangerous call would have received.
+  - **`parallel_tool_calls: false` is gone from the OpenAI Responses adapter.**
+    It was the only place forcing serialization, which is exactly the
+    non-uniformity the item complains about. Safe because that adapter already
+    parsed every `function_call` item, and because its stateful
+    `previous_response_id` resume never anchors on a tool-calling turn:
+    `assistant_tool_call_item` builds its message with empty metadata, so the
+    session pointer is not carried and every tool turn replays the full
+    stateless prefix.
+  - **Two files were split to stay under the ceiling**: tool execution moved
+    from `loop/mod.rs` to `loop/tool_call.rs`, and the golden suite's context
+    scenarios (memory hydration, spill/elision) from `tests/transcripts.rs` to
+    `tests/transcripts_context.rs`, with the shared tool fixtures moving to
+    `tests/support/fixtures.rs`.
+
 ### X2. Real sandboxing (F8)
 
 `requires_isolation` yields a subprocess as the same user with the same
@@ -1285,7 +1348,7 @@ the result in the PR.
 | D3 | None — the job registry is entirely inside `agentos-core` | **Verified**: interfaces, proto, and llm all report no semver update required |
 | G1 | `Channel` gains a required `egress() -> Arc<dyn Egress>`; `send` becomes a provided method delegating to it | **Verified**: interfaces major (`trait_method_added` without default), proto and llm unchanged. Required: a sharded gateway cannot hold `&mut self` for `receive` and `&self` for `send` at once |
 | G2 | `ApprovalStatus` gains an `Unanswered` variant | **Verified**: interfaces major (`enum_variant_added`), proto and llm unchanged. `agentos-core` is also major (`ResumeDecision` and `RunError` variants, `GatewayRun::Paused` fields, `approval_prompt_envelope` arity) but has no external consumers |
-| X1 (b) | `Plan::CallTool` carries a batch | Breaking |
+| X1 (b) | `Plan` gains `CallTools`; `RunState` gains `queued_tool_calls` | **Verified**: interfaces major (`enum_variant_added`, `constructible_struct_adds_field`), proto and llm unchanged |
 | X2 | `ToolSpec.requires_isolation` → sandbox mode | Breaking |
 | X6 | `Session::fork` as a defaulted method | Additive |
 

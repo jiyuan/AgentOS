@@ -1,17 +1,17 @@
 use crate::approve::Policy;
 use crate::hooks::Hooks;
 use crate::prompt::Compaction;
-use crate::spill::{ContentLimits, SpillRef, SpillSource};
+use crate::spill::ContentLimits;
 use crate::subagents::{SubAgentError, SubAgentRegistry};
 use crate::task_workspace::TaskWorkspace;
-use crate::tools::{ToolRegistry, ToolRegistryError};
+use crate::tools::ToolRegistry;
 use crate::trace;
 use agentos_interfaces::guardrail::{
     GuardrailOutcome, Input, InputGuardrail, OutputGuardrail, ToolGuardrail,
 };
 use agentos_interfaces::orchestrator::{Orchestrator, Plan, RunContext, StreamSink};
 use agentos_interfaces::run_state::{ApprovalStatus, Interruption, InterruptionAction, RunState};
-use agentos_proto::{AgentId, InterruptionId, Message, SpanKind, ToolCall, ToolResult, ToolStatus};
+use agentos_proto::{AgentId, InterruptionId, Message, SpanKind};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -20,6 +20,7 @@ use tracing::info;
 
 mod approval;
 mod approval_route;
+mod batch;
 mod budget;
 mod cancel;
 mod delegate;
@@ -30,6 +31,7 @@ mod planning;
 mod request;
 mod steering;
 mod telemetry;
+mod tool_call;
 
 use approval::{approve_transition, ApproveTransition};
 pub use approval_route::{
@@ -44,10 +46,11 @@ pub use error::RunError;
 use escalate::{execute_escalate, EscalateOutcome};
 use items::{
     assistant_tool_call_item, metadata_value, subagent_result_item, suborchestrator_result_item,
-    tool_result_item, tool_status_name,
+    tool_result_item,
 };
 use request::record_request_header;
 pub use steering::{Steered, Steering, DEFAULT_STEERING_CAPACITY};
+use tool_call::{denied_tool_result, execute_tool, spill_oversized};
 
 use telemetry::{field_key, plan_assignment_fields, record_telemetry_event};
 
@@ -271,6 +274,21 @@ async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunErro
     // knowing about it.
     steering::claim(&mut state, deps, &plan_span_id);
 
+    // X1: a tool-call batch already in flight is drained one call per turn,
+    // before the orchestrator is asked for anything new. Going back through
+    // `Plan` rather than looping inside `Act` is what keeps the guarantee that
+    // every call crosses `Approve` on its own — the loop never carries more
+    // than one call past this point, so a batch cannot smuggle a call past the
+    // policy engine. It also costs no round trip: the model already said what
+    // it wanted.
+    if let Some(next) = batch::next_queued(&mut state, deps, &plan_span_id) {
+        return Ok(RunLoopState::Approve(ApproveCtx {
+            state,
+            plan: Plan::CallTool(next),
+            turns: ctx.turns,
+        }));
+    }
+
     // C3: summarize the oldest span if the run is already over the configured
     // pressure, before hydration so recall and the orchestrator both see the
     // compacted transcript.
@@ -322,6 +340,8 @@ async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunErro
     for usage in pending_usage {
         record_llm_usage(&mut state, deps, plan_span_id.clone(), usage);
     }
+    // Kept past the move below: a batch split records under this same span.
+    let plan_span_id_for_batch = plan_span_id.clone();
     trace::record_event(
         &mut state,
         deps.hooks,
@@ -345,6 +365,25 @@ async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunErro
                 ensure_guardrail_passed(&entry.name, outcome)?;
             }
             Ok(RunLoopState::Finish(FinalOutput { state, message }))
+        }
+        // X1: the model asked for several tools at once. Take the first and
+        // queue the rest, so results append in the order it asked for them.
+        Plan::CallTools(calls) => {
+            match batch::enqueue(&mut state, deps, &plan_span_id_for_batch, calls) {
+                Some(first) => Ok(RunLoopState::Approve(ApproveCtx {
+                    state,
+                    plan: Plan::CallTool(first),
+                    turns: ctx.turns,
+                })),
+                // An empty batch is not a plan. Say so rather than inventing
+                // an outcome: an orchestrator that returns one has a bug, and
+                // silently finishing the run would hide it.
+                None => Err(RunError::Orchestrator(
+                    agentos_interfaces::orchestrator::OrchestratorError::Backend(Arc::from(
+                        "orchestrator planned an empty tool batch",
+                    )),
+                )),
+            }
         }
         plan => Ok(RunLoopState::Approve(ApproveCtx {
             state,
@@ -453,6 +492,18 @@ async fn act(ctx: ActCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunError>
                 return pause_for_subagent_approval(state, stage_agent, *paused);
             }
         },
+        // Unreachable: `plan` splits every batch into single calls before
+        // `Approve`, so `Act` only ever sees one. Failing closed rather than
+        // executing a batch here, which would be a way past the per-call
+        // approval the split exists to guarantee.
+        Plan::CallTools(calls) => {
+            return Err(RunError::ApprovalUnsupported {
+                reason: Arc::from(format!(
+                    "a batch of {} tool calls reached Act without being split",
+                    calls.len()
+                )),
+            });
+        }
         Plan::Handoff(agent_id, payload) => {
             execute_handoff(&mut state, deps, agent_id, payload);
         }
@@ -559,188 +610,6 @@ async fn observe(ctx: ObserveCtx) -> Result<RunLoopState, RunError> {
         state: ctx.state,
         turns: ctx.turns,
     }))
-}
-
-/// Persist an oversized tool result, returning the reference to cite inline.
-///
-/// Best effort by design: with no store configured, a result within the cap,
-/// or a storage failure, this yields `None` and the caller degrades to a plain
-/// truncation notice. A full disk must not turn a successful tool call into a
-/// failed run.
-async fn spill_oversized(
-    state: &RunState,
-    deps: &LoopDeps<'_>,
-    tool_name: &str,
-    result: &ToolResult,
-) -> Option<SpillRef> {
-    let store = deps.content_limits.spill?;
-    if result.content.len() <= deps.content_limits.tool_result_inline_bytes {
-        return None;
-    }
-    let source = SpillSource {
-        run_id: &state.run_id,
-        tool_name,
-        call_id: &result.call_id,
-    };
-    match store.save_text(&source, &result.content).await {
-        Ok(saved) => {
-            info!(
-                run_id = state.run_id.as_str(),
-                tool_call_id = result.call_id.as_str(),
-                bytes = saved.bytes,
-                locator = saved.locator.as_str(),
-                "tool output spilled"
-            );
-            Some(saved)
-        }
-        Err(error) => {
-            tracing::warn!(
-                run_id = state.run_id.as_str(),
-                tool_call_id = result.call_id.as_str(),
-                error = %error,
-                "tool output spill failed; falling back to truncation"
-            );
-            None
-        }
-    }
-}
-
-async fn execute_tool(
-    state: &mut RunState,
-    deps: &LoopDeps<'_>,
-    call: ToolCall,
-) -> Result<ToolResult, RunError> {
-    let parent_id = trace::run_span_id(state);
-    let mut fields = BTreeMap::new();
-    fields.insert(field_key("tool_name"), metadata_value(call.name.as_ref()));
-    fields.insert(field_key("tool_call_id"), metadata_value(call.id.as_str()));
-    let tool_span_id = trace::record_span(
-        state,
-        parent_id,
-        SpanKind::Tool,
-        format!("tool.{}", call.name),
-        fields,
-    );
-    trace::record_event(
-        state,
-        deps.hooks,
-        tool_span_id.clone(),
-        "tool_started",
-        BTreeMap::new(),
-    );
-
-    let preflight_guardrail_result = {
-        let mut run_ctx = RunContext::from_state(state);
-        run_ctx.cancel = deps.cancel.clone();
-        let mut failure = None;
-        for entry in deps.tool_guardrails {
-            let outcome = entry.guardrail.check_call(&call, &run_ctx).await?;
-            if let GuardrailOutcome::Tripped(reason) = outcome {
-                failure = Some(guardrail_tool_result(&call, &entry.name, reason));
-                break;
-            }
-        }
-        failure
-    };
-
-    let result = if let Some(result) = preflight_guardrail_result {
-        result
-    } else {
-        let tools = deps
-            .tools
-            .ok_or_else(|| ToolRegistryError::UnknownTool(Arc::clone(&call.name)))?;
-        // Tool failures (bad path, missing file, malformed args) become a Failed
-        // `ToolResult` rather than aborting the run, so the model can read the
-        // error in the next turn and self-correct (e.g. create the missing dir
-        // and retry). Unknown-tool / isolation errors still bubble up — those
-        // indicate a misconfigured runtime, not a recoverable model mistake.
-        let mut run_ctx = RunContext::from_state(state);
-        run_ctx.cancel = deps.cancel.clone();
-        // A tool that awaits is dropped mid-flight when the run is cancelled.
-        // A tool that blocks the thread is not — see `cancel`'s module docs.
-        let called = unless_cancelled(&deps.cancel, tools.call_with_context(&call, &run_ctx)).await;
-        let Some(called) = called else {
-            return Err(RunError::Cancelled);
-        };
-        match called {
-            Ok(result) => result,
-            Err(ToolRegistryError::Tool(tool_err)) => ToolResult {
-                call_id: call.id.clone(),
-                status: ToolStatus::Failed,
-                content: Arc::from(tool_err.to_string()),
-                metadata: BTreeMap::new(),
-            },
-            Err(other) => return Err(other.into()),
-        }
-    };
-
-    {
-        let mut run_ctx = RunContext::from_state(state);
-        run_ctx.cancel = deps.cancel.clone();
-        for entry in deps.tool_guardrails {
-            let outcome = entry.guardrail.check_result(&result, &run_ctx).await?;
-            ensure_guardrail_passed(&entry.name, outcome)?;
-        }
-    }
-
-    let mut fields = BTreeMap::new();
-    fields.insert(
-        field_key("status"),
-        metadata_value(tool_status_name(&result.status)),
-    );
-    trace::record_event(state, deps.hooks, tool_span_id, "tool_finished", fields);
-    Ok(result)
-}
-
-/// Record a denied tool call: a `Tool` span/event for the trace (so a denied
-/// call still shows up alongside executed ones) plus the `Denied` `ToolResult`
-/// fed back into the transcript for the model to observe.
-fn denied_tool_result(
-    state: &mut RunState,
-    deps: &LoopDeps<'_>,
-    call: &ToolCall,
-    reason: Arc<str>,
-) -> ToolResult {
-    let parent_id = trace::run_span_id(state);
-    let mut fields = BTreeMap::new();
-    fields.insert(field_key("tool_name"), metadata_value(call.name.as_ref()));
-    fields.insert(field_key("tool_call_id"), metadata_value(call.id.as_str()));
-    fields.insert(field_key("approval_denied"), Value::Bool(true));
-    let tool_span_id = trace::record_span(
-        state,
-        parent_id,
-        SpanKind::Tool,
-        format!("tool.{}", call.name),
-        fields,
-    );
-    let mut event_fields = BTreeMap::new();
-    event_fields.insert(
-        field_key("status"),
-        metadata_value(tool_status_name(&ToolStatus::Denied)),
-    );
-    event_fields.insert(field_key("reason"), metadata_value(reason.as_ref()));
-    trace::record_event(state, deps.hooks, tool_span_id, "tool_denied", event_fields);
-
-    let mut metadata = BTreeMap::new();
-    metadata.insert(field_key("approval_denied"), Value::Bool(true));
-    ToolResult {
-        call_id: call.id.clone(),
-        status: ToolStatus::Denied,
-        content: Arc::from(format!("tool call denied by policy: {reason}")),
-        metadata,
-    }
-}
-
-fn guardrail_tool_result(call: &ToolCall, guardrail: &Arc<str>, reason: Arc<str>) -> ToolResult {
-    let mut metadata = BTreeMap::new();
-    metadata.insert(field_key("guardrail"), metadata_value(guardrail.as_ref()));
-    metadata.insert(field_key("guardrail_tripped"), Value::Bool(true));
-    ToolResult {
-        call_id: call.id.clone(),
-        status: ToolStatus::Failed,
-        content: Arc::from(format!("guardrail '{guardrail}' tripped: {reason}")),
-        metadata,
-    }
 }
 
 fn ensure_guardrail_passed(name: &Arc<str>, outcome: GuardrailOutcome) -> Result<(), RunError> {

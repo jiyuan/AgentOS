@@ -34,7 +34,22 @@ pub enum OrchestratorError {
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum Plan {
     Reply(Message),
+    /// One tool call. This is the only form the loop's `Approve` and `Act`
+    /// states ever carry: whatever the model asked for, exactly one call
+    /// crosses the policy engine at a time.
     CallTool(ToolCall),
+    /// Several tool calls, in the order the model asked for them (roadmap X1).
+    ///
+    /// Returned by an orchestrator when a response carries more than one call.
+    /// The loop splits it immediately: the first call goes forward as a
+    /// [`Plan::CallTool`] and the rest queue on
+    /// [`RunState::queued_tool_calls`], one per turn. So a batch is a
+    /// convenience for the orchestrator, never a way for a call to reach a tool
+    /// without crossing `Approve` on its own.
+    ///
+    /// An empty batch is the same as having planned nothing; return
+    /// [`Plan::Reply`] instead.
+    CallTools(Vec<ToolCall>),
     Handoff(AgentId, Option<Value>),
     Delegate(SubAgentSpec),
     Escalate(SubOrchSpec),

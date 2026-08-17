@@ -120,8 +120,6 @@ fn base_payload(
         "model": model,
         "input": input,
         "tools": tools.iter().map(tool_to_function).collect::<Vec<_>>(),
-        // One call per turn — the loop iterates so we don't need parallelism.
-        "parallel_tool_calls": false,
         "store": stateful_sessions(),
         "temperature": 0.7,
     });
@@ -528,7 +526,9 @@ mod tests {
         );
         assert!(payload.get("messages").is_none());
         assert!(payload.get("previous_response_id").is_none());
-        assert_eq!(payload["parallel_tool_calls"], false);
+        // Roadmap X1: the loop keeps every call a response asks for, so this
+        // provider no longer forces the model to ask for one at a time.
+        assert!(payload.get("parallel_tool_calls").is_none());
     }
 
     #[test]

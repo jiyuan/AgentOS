@@ -63,6 +63,16 @@ pub struct RunState {
     pub task_session_id: Option<Arc<str>>,
     pub transcript: Transcript,
     pub pending_approvals: Vec<Interruption>,
+    /// Tool calls the model asked for that this run has not reached yet
+    /// (roadmap item X1).
+    ///
+    /// A response carrying several calls is planned once and drained one call
+    /// per turn, so each re-enters `Approve` on its own and the results append
+    /// in the order the model asked for them. Part of `RunState` rather than
+    /// the loop's own frame because a run can pause for approval mid-batch, and
+    /// what is left of the batch has to survive being written to disk.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queued_tool_calls: Vec<ToolCall>,
     pub usage: Usage,
     pub version: SchemaVersion,
     #[serde(default)]
@@ -80,6 +90,7 @@ impl RunState {
             task_session_id: None,
             transcript: Transcript::default(),
             pending_approvals: Vec::new(),
+            queued_tool_calls: Vec::new(),
             usage: Usage::default(),
             version: SchemaVersion::default(),
             trace_spans: Vec::new(),

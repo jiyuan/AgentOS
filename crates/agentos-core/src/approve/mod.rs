@@ -134,6 +134,21 @@ impl Policy {
             return PolicyDecision::Allow;
         }
 
+        // A batch is decided by its strictest member (roadmap X1). The loop
+        // splits batches before `Approve`, so this is unreachable today — but
+        // "unreachable" is not a security property, and a future caller that
+        // routed a batch straight here must not get a decision weaker than the
+        // one its most dangerous call would have received.
+        if let Plan::CallTools(calls) = plan {
+            return calls
+                .iter()
+                .map(|call| self.decide(&Plan::CallTool(call.clone())))
+                .reduce(strictest)
+                .unwrap_or_else(|| PolicyDecision::Deny {
+                    reason: Arc::from("empty tool batch"),
+                });
+        }
+
         let tool_args = match plan {
             Plan::CallTool(call) if self.tool_has_arg_constraints(&call.name) => {
                 serde_json::from_str::<Value>(call.args.get()).ok()
@@ -341,10 +356,22 @@ fn default_policy_decision(verb: &PolicyVerb, plan: &Plan) -> PolicyDecision {
     }
 }
 
+/// The more restrictive of two decisions: `Deny` beats `AskUser` beats `Allow`.
+fn strictest(left: PolicyDecision, right: PolicyDecision) -> PolicyDecision {
+    match (&left, &right) {
+        (PolicyDecision::Deny { .. }, _) => left,
+        (_, PolicyDecision::Deny { .. }) => right,
+        (PolicyDecision::AskUser { .. }, _) => left,
+        (_, PolicyDecision::AskUser { .. }) => right,
+        (PolicyDecision::Allow, PolicyDecision::Allow) => left,
+    }
+}
+
 fn default_deny_reason(plan: &Plan) -> String {
     match plan {
         Plan::Reply(_) => "reply is allowed".to_owned(),
         Plan::CallTool(call) => format!("tool '{}' is not allowed", call.name),
+        Plan::CallTools(calls) => format!("a batch of {} tool calls is not allowed", calls.len()),
         Plan::Handoff(agent_id, _) => format!("handoff to '{}' is not allowed", agent_id.as_str()),
         Plan::Delegate(spec) => {
             format!("delegation to '{}' is not allowed", spec.agent_id.as_str())
