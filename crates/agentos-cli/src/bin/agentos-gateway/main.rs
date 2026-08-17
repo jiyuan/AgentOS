@@ -6,6 +6,7 @@ use agentos_core::gateway::{
     shard_set, GatewayRun, GatewayService, Router, ShardConfig, DEFAULT_IDLE_INTERVAL,
 };
 use agentos_core::memory::MemoryManager;
+use agentos_core::runner::ResumeDecision;
 use agentos_core::runtime::{AgentRuntime, RuntimePaths};
 use agentos_interfaces::orchestrator::StreamSink;
 use agentos_interfaces::{Channel, Egress, StreamEgress};
@@ -493,6 +494,10 @@ fn print_effective_config(config: &ServiceConfig) -> Result<(), String> {
         workspace_config.gateway.inbox_capacity
     );
     println!(
+        "approval.expiry_seconds={}",
+        workspace_config.approval.expiry_seconds
+    );
+    println!(
         "resources.priority={}",
         join_arcs(&workspace_config.resources.priority)
     );
@@ -864,14 +869,36 @@ async fn fire_due_crons(
                 log_trace(config, &state)?;
                 scheduler.record_success(&task_id, now)
             }
-            Ok(GatewayRun::Paused { .. }) => {
+            Ok(GatewayRun::Paused { paused, ticket, .. }) => {
+                // A cron tick has no one behind it, so the prompt it just sent
+                // can never be answered. Resolve it as `Unavailable` rather
+                // than leaving a paused run parked forever — and not as a
+                // rejection, because nobody rejected anything.
                 log_line(
                     config,
                     &format!(
-                        "{channel_name} cron '{task_id}' paused for approval; \
-                         no interactive user — recording as failure"
+                        "{channel_name} cron '{task_id}' paused for approval ({ticket}); \
+                         no interactive user — resolving as unavailable"
                     ),
                 )?;
+                if let Some(approval_id) = paused
+                    .state
+                    .pending_approvals
+                    .first()
+                    .map(|approval| approval.id.clone())
+                {
+                    // Fails the run closed; the error is the expected shape.
+                    let _ = gateway_service
+                        .resume(
+                            egress,
+                            paused,
+                            &approval_id,
+                            ResumeDecision::Unavailable {
+                                reason: Arc::from("no interactive user behind a cron run"),
+                            },
+                        )
+                        .await;
+                }
                 scheduler.record_failure(
                     &task_id,
                     now,

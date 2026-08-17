@@ -990,7 +990,9 @@ red.
     stopped every conversation. The paused run is now parked per conversation on
     its shard and the next message on that conversation decides it. Correlating
     an answer to a specific prompt is G2's job; until then "the next message
-    decides" is the same rule as before, minus the freeze.
+    decides" is the same rule as before, minus the freeze. *Resolved by G2: only
+    an answer carrying the prompt's ticket decides it, and an unanswered prompt
+    expires.*
   - **Cron and reflection run from shard 0's idle phase, not through the
     router.** Firing them on every shard would fire every task N times, so
     `TurnHandler::idle` carries the shard index and the handler guards on it.
@@ -1030,6 +1032,69 @@ that the audit trail can tell apart from a deliberate refusal. Add an expiry.
   expired prompt records `cancelled`, not `rejected`.
 - Exit: no envelope can answer an approval it does not name; every decision has a
   correlated audit pair.
+
+**Status: done.** `loop/approval_route.rs` (tickets, matching, the closed
+outcome enum), `config/approval.rs` (`[approval].expiry_seconds`),
+`ApprovalStatus::Unanswered` and `ResumeDecision::{Cancel, Unavailable}`,
+`runner.rs::approval_prompt_envelope` rebuilt around the ticket, Telegram inline
+keyboards and `callback_query` handling, `/approve` and `/deny` on every
+channel, and expiry sweeping in the gateway shard. Verified: `cargo fmt --all
+--check`, `cargo clippy --workspace --all-targets -- -D warnings`, 482 tests,
+import boundaries, module sizes. Both halves proven load-bearing: restoring the
+`y`-approves fallback turns `an_unrelated_message_does_not_decide_a_pending_approval`,
+the pause/resume golden, and two unit tests red; recording an expired prompt as
+a rejection turns `an_expired_prompt_records_cancelled_not_rejected` and
+`a_run_with_nobody_to_ask_records_unavailable` red.
+
+  - **The correlation token is a per-prompt ticket, not the `InterruptionId`.**
+    The item says to carry the `InterruptionId` and require it back, and that is
+    not sufficient on its own: the id is *derived from the action*
+    (`approval-<tool call id>`), so a model retrying the same call, or a user
+    ignoring the first ask, produces two prompts with the same name — and a
+    stale button carrying it would decide the later one. `ApprovalTicket` is
+    minted per prompt and pinned by
+    `a_stale_ticket_does_not_decide_the_current_prompt`, which asserts that two
+    prompts share an `InterruptionId` and differ in ticket. The ticket is also
+    short by design: Telegram caps `callback_data` at 64 bytes, which the
+    action-derived id can exceed. The `InterruptionId` still travels on the
+    prompt as `approval_id` — one says which asking, the other says what it
+    authorises, and that pair is the correlated audit record the exit condition
+    asks for.
+  - **`y` no longer approves anything, anywhere.** That is the hole the item
+    exists to close, and it is a deliberate break in behaviour: previously *any*
+    next message resumed a paused run, so "yes, go ahead" about something else
+    entirely authorised a tool call. The CLI TUI was changed too rather than
+    left on the old rule — two authorization models is one more than is worth
+    reasoning about — so it now loops on input until something names the ticket.
+  - **Four outcomes, and the split that matters is not approve/deny.** It is
+    `Rejected` against `Cancelled`/`Unavailable`: a refusal is a decision
+    somebody made, and the other two are the absence of one. They fail closed
+    identically and are recorded differently — `ApprovalStatus::Unanswered`,
+    `RunError::ApprovalUnanswered`, and `EpisodeOutcome::Failed` rather than
+    `Denied`. Recalling an expired prompt as a refusal would teach the agent
+    that this user says no to things they never saw.
+  - **`Unavailable` has a real caller.** A cron tick that hits an `ask_user`
+    policy has nobody behind it, so its prompt can never be answered. It used to
+    be logged and left parked; it is now resolved as `Unavailable`, which ends
+    the run and reclaims it.
+  - **An unattributable answer does not resolve the prompt.** A stale ticket is
+    reported to the sender and the prompt stays pending until it expires or is
+    answered properly. Reading "unparseable answers resolve to a distinct
+    outcome" as *cancel the prompt* would hand anyone who can send a malformed
+    payload a way to cancel someone else's approval.
+  - **Expiry is swept on every shard, not just shard 0.** Pending prompts are
+    per-shard state (each shard holds its own conversations'), unlike cron,
+    which is process-wide and guarded. Expiry is also re-checked when a message
+    arrives for that conversation, because a busy shard may not reach its idle
+    phase.
+  - **Not done: Feishu card actions.** Telegram gets inline keyboards and
+    `callback_query` handling, unit-tested over recorded update shapes. Feishu
+    does not: its long connection filters to `type == "event"` frames, and card
+    actions arrive as `type == "card"` with a response frame whose shape I
+    cannot verify without a live tenant. Shipping buttons that silently do
+    nothing is worse than shipping none, so Feishu gets the same correlated
+    text path — the prompt spells out `/approve <ticket>`, which fails closed
+    identically. **This is the one part of the item's file list not delivered.**
 
 ---
 
@@ -1200,7 +1265,7 @@ Land these together in X3 rather than piecemeal.
 | `[limits].tool_timeout_ms`, `[limits].tool_timeout_overrides` | D2 | Tool deadlines. **Landed** in D2, in `[limits]` rather than `[resources.tools]`: that section says *which* tools are enabled, and `ResourceSection` is shared with skills/mcp/llm where a timeout is meaningless. Replaces the MCP 10 s constant |
 | `[jobs].max_concurrent`, `.output_limit_bytes`, `.promotable` | D3 | Job registry bounds. **Landed** in D3; `.promotable` added — the allowlist of tools that become a job instead of failing at their deadline |
 | `[gateway].shards`, `.inbox_capacity` | G1 | Conversation sharding. **Landed** in G1; `shards = 0` means one per core, capped at 64. `.inbox_capacity` bounds both lists — envelopes waiting for a run of their own, and messages steering the one in flight |
-| `[approval].expiry_seconds` | G2 | Approval prompt expiry |
+| `[approval].expiry_seconds` | G2 | Approval prompt expiry. **Landed** in G2; default 900s, `0` means no expiry, otherwise 30–86400. An expired prompt records `cancelled`, not `rejected` |
 | `[memory].hydrate_*` | X3 | Already config; move the remaining constants beside them |
 
 ## Interface-change ledger
@@ -1219,6 +1284,7 @@ the result in the PR.
 | D2 | `ToolSpec` gains `timeout_ms` (`#[serde(default)]`) | **Verified**: interfaces major (`constructible_struct_adds_field`), proto and llm unchanged; additive on wire |
 | D3 | None — the job registry is entirely inside `agentos-core` | **Verified**: interfaces, proto, and llm all report no semver update required |
 | G1 | `Channel` gains a required `egress() -> Arc<dyn Egress>`; `send` becomes a provided method delegating to it | **Verified**: interfaces major (`trait_method_added` without default), proto and llm unchanged. Required: a sharded gateway cannot hold `&mut self` for `receive` and `&self` for `send` at once |
+| G2 | `ApprovalStatus` gains an `Unanswered` variant | **Verified**: interfaces major (`enum_variant_added`), proto and llm unchanged. `agentos-core` is also major (`ResumeDecision` and `RunError` variants, `GatewayRun::Paused` fields, `approval_prompt_envelope` arity) but has no external consumers |
 | X1 (b) | `Plan::CallTool` carries a batch | Breaking |
 | X2 | `ToolSpec.requires_isolation` → sandbox mode | Breaking |
 | X6 | `Session::fork` as a defaulted method | Additive |

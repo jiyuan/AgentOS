@@ -21,9 +21,10 @@ use agentos_core::memory::{
     RetrievalStrategy, SqliteStore,
 };
 use agentos_core::orchestrator::{MaxOrchestrator, MemoryHydrationSettings};
+use agentos_core::r#loop::{route, ApprovalTicket};
 use agentos_core::runner::{
-    resume_run, run_envelope, PausedRun, ResumeDecision, RunOutcome, SESSION_SCOPE_EPHEMERAL,
-    SESSION_SCOPE_KEY,
+    approval_prompt_envelope, resume_run, run_envelope, PausedRun, ResumeDecision, RunOutcome,
+    SESSION_SCOPE_EPHEMERAL, SESSION_SCOPE_KEY,
 };
 use agentos_core::spill::{ContentLimits, SpillStore, SPILL_LOCATOR_KEY};
 use agentos_core::subagents::{SubAgentDefinition, SubAgentRegistry};
@@ -263,6 +264,40 @@ async fn golden_approval_pause_and_resume() {
         panic!("an ask_user tool call must pause, not finish");
     };
     let paused_view = support::normalize_approvals(&state);
+
+    // G2: pin the prompt the gateway sends. It is what a user has to answer,
+    // so the metadata a channel reads (ticket, the interruption it gates, when
+    // it stops counting) and the `/approve <ticket>` instruction in the body
+    // are part of the contract. The ticket and expiry are fixed here rather
+    // than minted so the golden is stable.
+    let ticket = ApprovalTicket::parse("g2fixture").expect("a well-formed fixture ticket");
+    let prompt = approval_prompt_envelope(
+        &PausedRun {
+            channel_id: ChannelId::new(CHANNEL),
+            conversation_id: ConversationId::new(CONVERSATION),
+            state: state.clone(),
+        },
+        Arc::from("golden-agent"),
+        &ticket,
+        Some(1_700_000_000),
+    )
+    .expect("a paused run has a prompt");
+    let prompt_view = json!({
+        "content": prompt.message.content.as_ref(),
+        "metadata": prompt.metadata,
+    });
+
+    // An unrelated message must not decide it, however affirmative it sounds.
+    let undecided: Vec<Value> = ["y", "yes, go ahead", "approve", "/approve"]
+        .into_iter()
+        .map(|text| {
+            let answer = user_envelope(text);
+            json!({
+                "input": text,
+                "routed": format!("{:?}", route(Some(&ticket), &answer)),
+            })
+        })
+        .collect();
     // Resume the way the gateway does: by the id the paused run is actually
     // waiting on, not a guessed one.
     let approval_id = state
@@ -292,6 +327,8 @@ async fn golden_approval_pause_and_resume() {
         "approval_pause_resume",
         &json!({
             "paused_approvals": paused_view,
+            "prompt": prompt_view,
+            "unrelated_input_does_not_decide": undecided,
             "after_resume": scenario(&llm, &transcript, &resumed),
         }),
     );

@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod approval;
 mod compaction;
 mod gateway;
 mod jobs;
@@ -18,6 +19,7 @@ mod normalize;
 mod orchestrator;
 mod subagents;
 
+pub use approval::ApprovalConfig;
 pub use compaction::CompactionConfig;
 pub use gateway::GatewayConfig;
 pub use jobs::JobsConfig;
@@ -55,6 +57,7 @@ pub struct WorkspaceConfig {
     pub compaction: CompactionConfig,
     pub jobs: JobsConfig,
     pub gateway: GatewayConfig,
+    pub approval: ApprovalConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -273,6 +276,7 @@ impl WorkspaceConfig {
         compaction::validate_compaction(&config.compaction).map_err(std::io::Error::other)?;
         jobs::validate_jobs(&config.jobs).map_err(std::io::Error::other)?;
         gateway::validate_gateway(&config.gateway).map_err(std::io::Error::other)?;
+        approval::validate_approval(&config.approval).map_err(std::io::Error::other)?;
         config
             .validate_guardrails()
             .map_err(std::io::Error::other)?;

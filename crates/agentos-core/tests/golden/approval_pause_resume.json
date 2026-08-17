@@ -121,5 +121,48 @@
       "id": "approval-call-gated",
       "status": "pending"
     }
+  ],
+  "prompt": {
+    "content": "Approve tool 'echo'?\nReply /approve g2fixture to allow it, or /deny g2fixture <reason> to refuse.",
+    "metadata": {
+      "action_kind": "tool",
+      "action_label": "echo",
+      "approval_actions": [
+        {
+          "data": "approve:g2fixture",
+          "decision": "approve",
+          "label": "Approve"
+        },
+        {
+          "data": "deny:g2fixture",
+          "decision": "deny",
+          "label": "Deny"
+        }
+      ],
+      "approval_expires_at": 1700000000,
+      "approval_id": "approval-call-gated",
+      "approval_ticket": "g2fixture",
+      "kind": "approval_prompt",
+      "run_id": "golden-approval",
+      "tool_name": "echo"
+    }
+  },
+  "unrelated_input_does_not_decide": [
+    {
+      "input": "y",
+      "routed": "Unrelated"
+    },
+    {
+      "input": "yes, go ahead",
+      "routed": "Unrelated"
+    },
+    {
+      "input": "approve",
+      "routed": "Unrelated"
+    },
+    {
+      "input": "/approve",
+      "routed": "Unrelated"
+    }
   ]
 }

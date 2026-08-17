@@ -142,6 +142,16 @@ shards = 0
 # turn and claimed at its next planning step. Minimum 1.
 inbox_capacity = 32
 
+# Approvals. A prompt names itself with a short ticket, and only an answer
+# carrying that ticket decides it — /approve <ticket>, /deny <ticket>, or the
+# inline buttons on channels that render them. Anything else is ordinary input.
+[approval]
+# Seconds a prompt counts for, or 0 for no expiry. An expired prompt is
+# resolved as *cancelled*, not rejected: the action does not run either way,
+# but the audit trail must not record a refusal nobody made. Minimum 30,
+# maximum 86400.
+expiry_seconds = 900
+
 [isolation]
 worker_path_env = "AGENTOS_TOOL_WORKER_PATH"
 

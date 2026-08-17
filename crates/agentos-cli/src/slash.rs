@@ -271,6 +271,11 @@ pub fn format_help() -> String {
             "Stop whatever this conversation is currently running.",
         ),
         (
+            "/approve <ticket>",
+            "Allow a pending approval. The ticket is printed in the prompt.",
+        ),
+        ("/deny <ticket> [reason]", "Refuse a pending approval."),
+        (
             "/orchestrator [max|min|status]",
             "Show or set the orchestrator strategy.",
         ),

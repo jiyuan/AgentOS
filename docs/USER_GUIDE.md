@@ -27,6 +27,8 @@ same set):
 - `/stop` — stop whatever this conversation is currently running. Gateway only:
   the TUI runs one turn at a time, so there is never anything to interrupt.
   Work already finished this turn is saved.
+- `/approve <ticket>` — allow a pending approval.
+- `/deny <ticket> [reason]` — refuse a pending approval.
 - `/orchestrator [max|min|status]` — show or switch the orchestrator strategy.
 - `/model [provider:model|status|reset]` — show, set, or reset the LLM model.
 - `/skills [list|status]` — list enabled workspace skills.
@@ -48,6 +50,17 @@ The gateway runs conversations concurrently: each is pinned to one of
 `[gateway].shards` worker threads, so one conversation waiting on a slow tool
 does not hold up anybody else's. Within a conversation everything stays in
 order — one turn at a time.
+
+When the agent needs permission for something, it asks and prints a short
+**ticket**. Only an answer carrying that ticket decides it — `/approve <ticket>`,
+`/deny <ticket> [reason]`, or the inline buttons on channels that render them.
+Saying "yes, go ahead" does not approve anything: it is an ordinary message, and
+the agent will still be waiting. That is deliberate, because otherwise any
+message at all could authorise a tool call the user was not thinking about.
+
+Prompts expire (`[approval].expiry_seconds`, 15 minutes by default). An expired
+prompt is recorded as *cancelled*, not refused: the action does not run either
+way, but the log does not claim you turned something down that you never saw.
 
 If you send another message while the agent is still working, it is not queued
 behind the current turn and it does not start a second one. It reaches the

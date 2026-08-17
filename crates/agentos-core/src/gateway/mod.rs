@@ -14,6 +14,7 @@ pub use shard::{
     DEFAULT_IDLE_INTERVAL,
 };
 
+use crate::r#loop::ApprovalTicket;
 use crate::runner::{
     approval_prompt_envelope, resume_run, run_envelope, PausedRun, ResumeDecision, RunOutcome,
     RunnerDeps, RunnerError,
@@ -21,8 +22,17 @@ use crate::runner::{
 use agentos_interfaces::{Channel, ChannelError, Egress, RunState};
 use agentos_proto::{Envelope, InterruptionId, RunId};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::mpsc;
+
+/// How long an approval prompt counts, when the caller does not say.
+///
+/// Long enough that a user who steps away can still answer, short enough that
+/// an abandoned prompt resolves the same day. An expiry is not a nicety: a
+/// prompt that never expires is a paused run pinned in memory and an action
+/// that could still fire hours after the context that asked for it is gone.
+pub const DEFAULT_APPROVAL_EXPIRY: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Error)]
 pub enum GatewayError {
@@ -41,6 +51,11 @@ pub enum GatewayRun {
     Paused {
         paused: PausedRun,
         prompt: Option<Envelope>,
+        /// Names this asking (roadmap G2). Whoever holds the paused run must
+        /// keep it: an answer that does not carry it back decides nothing.
+        ticket: ApprovalTicket,
+        /// Unix seconds after which the prompt stops counting, if it expires.
+        expires_at: Option<u64>,
     },
 }
 
@@ -70,6 +85,7 @@ impl Gateway {
 pub struct GatewayService<'a> {
     deps: &'a RunnerDeps<'a>,
     sender: Arc<str>,
+    approval_expiry: Option<Duration>,
 }
 
 impl<'a> GatewayService<'a> {
@@ -77,7 +93,16 @@ impl<'a> GatewayService<'a> {
         Self {
             deps,
             sender: sender.into(),
+            approval_expiry: Some(DEFAULT_APPROVAL_EXPIRY),
         }
+    }
+
+    /// How long this service's approval prompts count for. `None` leaves them
+    /// open indefinitely, which only makes sense for a one-shot entrypoint
+    /// whose process ends with the prompt.
+    pub fn with_approval_expiry(mut self, expiry: Option<Duration>) -> Self {
+        self.approval_expiry = expiry;
+        self
     }
 
     /// Receive one envelope and run it, replying through the channel's own
@@ -159,10 +184,29 @@ impl<'a> GatewayService<'a> {
         egress: &dyn Egress,
         paused: PausedRun,
     ) -> Result<GatewayRun, GatewayError> {
-        let prompt = approval_prompt_envelope(&paused, Arc::clone(&self.sender));
+        let ticket = ApprovalTicket::mint();
+        let expires_at = self
+            .approval_expiry
+            .map(|expiry| unix_now() + expiry.as_secs());
+        let prompt =
+            approval_prompt_envelope(&paused, Arc::clone(&self.sender), &ticket, expires_at);
         if let Some(prompt) = &prompt {
             egress.send(prompt.clone()).await?;
         }
-        Ok(GatewayRun::Paused { paused, prompt })
+        Ok(GatewayRun::Paused {
+            paused,
+            prompt,
+            ticket,
+            expires_at,
+        })
     }
+}
+
+/// Seconds since the epoch. A clock before the epoch reads as zero, which
+/// expires every prompt immediately — the fail-closed direction.
+pub fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
 }
