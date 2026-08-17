@@ -276,7 +276,10 @@ pub fn context_budget_for_model(model: &str) -> Option<usize> {
         .map(|(_, budget)| *budget)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Serialized lowercase, so a config file spells a tier the same way
+/// `AGENTOS_LLM_MODEL_<TIER>` and `/model` do.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum LlmModelTier {
     High,
     Medium,

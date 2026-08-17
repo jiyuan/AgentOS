@@ -301,9 +301,15 @@ async fn the_isolation_worker_runs_under_its_sandbox() {
         args: serde_json::value::RawValue::from_string("{}".to_owned()).expect("valid JSON"),
     };
     let sandbox = Sandbox::new(SandboxMode::ReadOnly, workspace.clone());
-    let tool_result = call_isolated_subprocess(&worker, &call, Duration::from_secs(10), &sandbox)
-        .await
-        .expect("the worker answers");
+    let tool_result = call_isolated_subprocess(
+        &worker,
+        &call,
+        Duration::from_secs(10),
+        &sandbox,
+        DEFAULT_MAX_OUTPUT_BYTES,
+    )
+    .await
+    .expect("the worker answers");
 
     assert_eq!(tool_result.content.as_ref(), "worker ran");
     // The mode is recorded on the result, so a trace shows what was enforced.

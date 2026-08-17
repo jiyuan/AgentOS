@@ -17,6 +17,7 @@ mod limits;
 mod memory;
 mod normalize;
 mod orchestrator;
+mod spill;
 mod subagents;
 
 pub use approval::ApprovalConfig;
@@ -29,6 +30,7 @@ pub use memory::{
     MemoryRetentionConfig, MemorySharedDomainConfig, MemorySqliteVecConfig,
 };
 pub use orchestrator::{RoutingConfig, RoutingRuleConfig, StageConfig, TemplateConfig};
+pub use spill::{SpillConfig, DEFAULT_SPILL_RELPATH};
 pub use subagents::SubAgentConfig;
 
 pub(crate) use orchestrator::stage_execution_order;
@@ -58,6 +60,7 @@ pub struct WorkspaceConfig {
     pub jobs: JobsConfig,
     pub gateway: GatewayConfig,
     pub approval: ApprovalConfig,
+    pub spill: SpillConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -283,6 +286,7 @@ impl WorkspaceConfig {
         jobs::validate_jobs(&config.jobs).map_err(std::io::Error::other)?;
         gateway::validate_gateway(&config.gateway).map_err(std::io::Error::other)?;
         approval::validate_approval(&config.approval).map_err(std::io::Error::other)?;
+        spill::validate_spill(&config.spill).map_err(std::io::Error::other)?;
         config
             .validate_guardrails()
             .map_err(std::io::Error::other)?;

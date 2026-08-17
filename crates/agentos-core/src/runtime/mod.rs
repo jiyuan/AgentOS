@@ -193,6 +193,25 @@ impl AgentRuntime {
         &self.jobs
     }
 
+    /// Delete spill artifacts past `[spill].retention_days`, returning how
+    /// many run directories were removed (roadmap item X3).
+    ///
+    /// A no-op when retention is `0` — "keep everything" — or when no spill
+    /// store is configured. Called from the gateway's idle phase, beside cron
+    /// and reflection, because sweeping a directory is maintenance and has no
+    /// business competing with a run.
+    pub async fn sweep_spill(&self) -> usize {
+        let Some(retention) = self.workspace_config.spill.retention_secs() else {
+            return 0;
+        };
+        let Some(spill) = self.spill.as_ref() else {
+            return 0;
+        };
+        spill
+            .sweep_older_than(std::time::Duration::from_secs(retention))
+            .await
+    }
+
     /// This runtime's root cancellation token (roadmap item D1).
     ///
     /// Every run started through [`RuntimeDepsScope::deps`] gets a *child* of
@@ -204,10 +223,11 @@ impl AgentRuntime {
     }
 
     /// The summarizer and trigger every run in this runtime compacts with.
-    /// The run's own high-tier provider writes the summaries: routing a
-    /// separate `[compaction].model` is deferred to X3, and a summary written
-    /// by a weaker model than the conversation it replaces would quietly lower
-    /// the ceiling on every later turn.
+    ///
+    /// Which model writes the summaries is `[compaction].model`, defaulting to
+    /// the same high tier having the conversation. A weaker tier is cheaper and
+    /// a real trade: the summary is what the model reads for the rest of the
+    /// conversation, so it lowers the ceiling on every later turn.
     pub fn compaction(&self) -> Compaction<'_> {
         Compaction {
             summarizer: Some(self.summarizer.as_ref()),
@@ -291,6 +311,11 @@ impl AgentRuntime {
             workspace_config.resource_index(&tools.specs(), &mcp_specs, &skill_catalog.metadata());
         let routing_table = workspace_config.routing_table()?;
         let high_llm = Arc::new(EnvLlm::new(LlmModelTier::High, model_controller.clone())?);
+        let summarizer = summarizer_for(
+            workspace_config.compaction.model,
+            &high_llm,
+            &model_controller,
+        )?;
         let max_orchestrator = MaxOrchestrator::with_tools(tools.specs())
             .with_resource_index(resource_index)
             .with_routing_table(routing_table)
@@ -313,7 +338,7 @@ impl AgentRuntime {
         ));
         // Spill artifacts live beside the other workspace-owned runtime state.
         let spill = Some(Arc::new(SpillStore::new(
-            resolved_workspace_root.join("spill"),
+            workspace_config.spill.root_in(&resolved_workspace_root),
         )));
         let tool_result_inline_bytes = workspace_config.limits.tool_result_inline_bytes;
         let subagents = subagents.map(|registry| {
@@ -345,7 +370,7 @@ impl AgentRuntime {
             shell_allowlist,
             spill,
             tool_result_inline_bytes,
-            summarizer: high_llm,
+            summarizer,
             cancel: CancellationToken::new(),
             jobs,
         })
@@ -353,6 +378,24 @@ impl AgentRuntime {
 
     pub fn deps_scope(&self) -> RuntimeDepsScope<'_> {
         RuntimeDepsScope { runtime: self }
+    }
+}
+
+/// The model that writes compaction summaries (roadmap item X3,
+/// `[compaction].model`).
+///
+/// Reuses the conversation's own client for the `high` default rather than
+/// building a second one for the same model — a separate client would mean a
+/// separate connection pool and a separate `/model` override state for what an
+/// operator asked to be the same model.
+fn summarizer_for(
+    tier: LlmModelTier,
+    high: &Arc<EnvLlm>,
+    controller: &LlmModelController,
+) -> Result<Arc<dyn Llm>, String> {
+    match tier {
+        LlmModelTier::High => Ok(high.clone()),
+        tier => Ok(Arc::new(EnvLlm::new(tier, controller.clone())?)),
     }
 }
 
@@ -595,7 +638,7 @@ pub fn build_subagents(
         let mut tools = ToolRegistry::new();
         for tool in &subagent.tools {
             if tool.as_ref() != "memory" {
-                register_builtin_tool(&mut tools, tool)?;
+                register_builtin_tool(&mut tools, tool, &config.limits)?;
             }
         }
         if subagent_memory_tool_enabled(subagent) {
@@ -842,5 +885,30 @@ mod tests {
             AgentId::new("main-agent"),
         )));
         RunContext::from_state(state)
+    }
+    /// The `high` default reuses the conversation's own client rather than
+    /// building a second one for the same model — and a configured tier is
+    /// what picks, so `[compaction].model` is not a key that reads back
+    /// correctly and changes nothing.
+    #[test]
+    fn the_summarizer_follows_the_configured_tier() {
+        let controller = LlmModelController::default();
+        let high = Arc::new(
+            EnvLlm::new(LlmModelTier::High, controller.clone()).expect("a high client builds"),
+        );
+
+        let same = summarizer_for(LlmModelTier::High, &high, &controller).expect("high resolves");
+        assert!(
+            Arc::ptr_eq(&(high.clone() as Arc<dyn Llm>), &same),
+            "the default tier must reuse the conversation's client"
+        );
+
+        for tier in [LlmModelTier::Medium, LlmModelTier::Low] {
+            let other = summarizer_for(tier, &high, &controller).expect("a tier resolves");
+            assert!(
+                !Arc::ptr_eq(&(high.clone() as Arc<dyn Llm>), &other),
+                "{tier:?} must get its own client, not the high one"
+            );
+        }
     }
 }

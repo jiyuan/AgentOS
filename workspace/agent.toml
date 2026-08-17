@@ -93,6 +93,20 @@ tool_result_inline_bytes = 65536
 # five minutes) keeps it unless overridden below. Minimum 100.
 tool_timeout_ms = 60000
 
+# Entries the `file` tool lists before truncating. A cap on what one turn puts
+# in front of the model, not on what the directory holds. Minimum 1.
+directory_list_entries = 200
+# Bytes the `file` tool reads when a call does not ask for a size, and the
+# ceiling it will read however much a call asks for. Minimum 256 each, and the
+# default may not exceed the ceiling.
+file_read_bytes = 65536
+file_read_max_bytes = 262144
+# Bytes captured from each of a child process's stdout and stderr before the
+# rest is read and discarded. Bounds memory against a runaway process; what the
+# model sees is shaped by tool_result_inline_bytes and the spill store above.
+# Minimum 1024.
+tool_output_bytes = 4194304
+
 # Per-tool deadlines. These win over both the default above and a tool's own
 # declaration, so this is the last word on how long this machine will wait.
 [limits.tool_timeout_overrides]
@@ -111,6 +125,26 @@ enabled = true
 pressure_percent = 90
 # Conversation items kept verbatim after the checkpoint. Minimum 2.
 retain_tail_turns = 8
+# Which model tier writes the summaries: "high", "medium", or "low", chosen the
+# same way AGENTOS_LLM_MODEL_<TIER> and /model choose one. Default "high" — the
+# model having the conversation. A cheaper tier is a real saving and a real
+# trade: the summary is what the model reads for every later turn, so a weaker
+# one lowers the ceiling invisibly.
+model = "high"
+
+# Where oversized tool output is written, and how long it is kept. A spill
+# artifact is whatever a tool read or fetched, so it is the most sensitive thing
+# this runtime puts on disk.
+[spill]
+# Relative to the workspace root; an absolute path is taken as given, for a
+# deployment that wants spill on a different volume. A relative path may not
+# climb above the workspace.
+root = "spill"
+# Days an artifact is kept, or 0 to keep everything. Swept from the gateway's
+# idle phase, a whole run's artifacts at a time. Minimum 1 when set — a shorter
+# window would race the run that wrote it, which is the destroyed-output
+# behaviour spill exists to replace.
+retention_days = 0
 
 # Background work. A tool that outlives its deadline becomes a job instead of
 # being killed, and the model follows it with job_status / job_output / job_kill.

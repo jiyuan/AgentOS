@@ -9,12 +9,51 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const DIRECTORY_LIST_LIMIT: usize = 200;
-const DEFAULT_READ_MAX_BYTES: usize = 64 * 1024;
-const MAX_READ_MAX_BYTES: usize = 256 * 1024;
+/// Entries one `list` call shows before truncating.
+///
+/// A cap on the turn, not on the directory: a listing of ten thousand names is
+/// tokens spent on nothing a model can act on.
+pub const DEFAULT_DIRECTORY_LIST_ENTRIES: usize = 200;
+/// Bytes one `read` call returns when it does not ask for a size.
+pub const DEFAULT_FILE_READ_BYTES: usize = 64 * 1024;
+/// Bytes one `read` call returns however much it asks for.
+pub const MAX_FILE_READ_BYTES: usize = 256 * 1024;
 
-#[derive(Default)]
-pub struct FileTool;
+/// Read and listing bounds this tool works to (roadmap item X3).
+///
+/// Carried on the tool rather than read from a global, so a sub-agent's
+/// registry and the parent's can differ and neither has to consult anything at
+/// call time.
+pub struct FileTool {
+    directory_list_entries: usize,
+    read_bytes: usize,
+    read_max_bytes: usize,
+}
+
+impl Default for FileTool {
+    fn default() -> Self {
+        Self {
+            directory_list_entries: DEFAULT_DIRECTORY_LIST_ENTRIES,
+            read_bytes: DEFAULT_FILE_READ_BYTES,
+            read_max_bytes: MAX_FILE_READ_BYTES,
+        }
+    }
+}
+
+impl FileTool {
+    /// The tool bounded by a deployment's `[limits]`.
+    pub fn with_limits(
+        directory_list_entries: usize,
+        read_bytes: usize,
+        read_max_bytes: usize,
+    ) -> Self {
+        Self {
+            directory_list_entries,
+            read_bytes,
+            read_max_bytes,
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -48,11 +87,18 @@ impl Tool for FileTool {
                     "operation": { "type": "string", "enum": ["read", "write"] },
                     "path": { "type": "string" },
                     "content": { "type": "string" },
+                    // Built from the configured bounds, not written out: a
+                    // schema that advertised a ceiling the tool no longer
+                    // enforces would have the model asking for reads it cannot
+                    // get, or not asking for ones it could.
                     "max_bytes": {
                         "type": "integer",
                         "minimum": 1,
-                        "maximum": 262144,
-                        "description": "Maximum bytes to return for read operations. Defaults to 65536 and is capped at 262144."
+                        "maximum": self.read_max_bytes,
+                        "description": format!(
+                            "Maximum bytes to return for read operations. Defaults to {} and is capped at {}.",
+                            self.read_bytes, self.read_max_bytes
+                        )
                     },
                     "offset": {
                         "type": "integer",
@@ -92,6 +138,7 @@ impl Tool for FileTool {
                         &safe_path,
                         parsed.include_metadata.unwrap_or(false),
                         parsed.modified_within_hours,
+                        self.directory_list_entries,
                     )?;
                     let bytes_out = listing.len() as u64;
                     return Ok(ToolResult {
@@ -103,8 +150,8 @@ impl Tool for FileTool {
                 }
                 let max_bytes = parsed
                     .max_bytes
-                    .unwrap_or(DEFAULT_READ_MAX_BYTES)
-                    .min(MAX_READ_MAX_BYTES);
+                    .unwrap_or(self.read_bytes)
+                    .min(self.read_max_bytes);
                 let (content, original_bytes, truncated) = read_file_slice(
                     &safe_path,
                     max_bytes,
@@ -208,6 +255,7 @@ fn read_directory_listing(
     path: &PathBuf,
     include_metadata: bool,
     modified_within_hours: Option<u64>,
+    limit: usize,
 ) -> Result<String, ToolError> {
     let modified_cutoff = modified_within_hours
         .map(|hours| SystemTime::now() - Duration::from_secs(hours.saturating_mul(60 * 60)));
@@ -252,8 +300,8 @@ fn read_directory_listing(
         .flatten()
         .collect::<Vec<_>>();
     entries.sort();
-    let truncated = entries.len() > DIRECTORY_LIST_LIMIT;
-    entries.truncate(DIRECTORY_LIST_LIMIT);
+    let truncated = entries.len() > limit;
+    entries.truncate(limit);
     let mut listing = entries.join("\n");
     if truncated {
         if !listing.is_empty() {
@@ -281,8 +329,8 @@ mod tests {
         std::fs::write(dir.join("b.txt"), b"b").unwrap();
         std::fs::write(dir.join("a.txt"), b"a").unwrap();
 
-        let listing =
-            read_directory_listing(&dir, false, None).expect("directory listing should succeed");
+        let listing = read_directory_listing(&dir, false, None, DEFAULT_DIRECTORY_LIST_ENTRIES)
+            .expect("directory listing should succeed");
 
         assert_eq!(listing, "a.txt\nb.txt\nnested/");
         let _ = std::fs::remove_dir_all(dir);
@@ -300,8 +348,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("recent.log"), b"recent").unwrap();
 
-        let listing =
-            read_directory_listing(&dir, true, Some(24)).expect("metadata listing should succeed");
+        let listing = read_directory_listing(&dir, true, Some(24), DEFAULT_DIRECTORY_LIST_ENTRIES)
+            .expect("metadata listing should succeed");
 
         assert!(listing.contains("recent.log"));
         assert!(listing.contains("modified_unix="));
@@ -334,5 +382,31 @@ mod tests {
         assert!(tail.starts_with("[file read truncated: omitted first 12 of 16 bytes]"));
 
         let _ = std::fs::remove_file(path);
+    }
+    /// The configured cap is what truncates, not the compiled-in default —
+    /// otherwise `[limits].directory_list_entries` would be a key that reads
+    /// back correctly and changes nothing.
+    #[test]
+    fn a_configured_listing_cap_is_what_truncates() {
+        let dir = std::env::temp_dir().join(format!(
+            "agentos-file-listing-cap-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("fixture dir creates");
+        for index in 0..5 {
+            std::fs::write(dir.join(format!("entry-{index}")), b"x").expect("entry writes");
+        }
+
+        let listing = read_directory_listing(&dir, false, None, 2).expect("listing succeeds");
+        let lines: Vec<&str> = listing.lines().collect();
+        // Two entries plus the truncation marker.
+        assert_eq!(lines.len(), 3, "got: {listing}");
+        assert_eq!(lines[2], "...");
+
+        let full = read_directory_listing(&dir, false, None, 10).expect("listing succeeds");
+        assert_eq!(full.lines().count(), 5);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

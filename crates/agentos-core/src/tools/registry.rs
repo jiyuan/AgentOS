@@ -41,6 +41,9 @@ pub struct ToolRegistry {
     timeout_overrides: BTreeMap<Arc<str>, Duration>,
     jobs: Option<Arc<JobRegistry>>,
     promotable: BTreeSet<Arc<str>>,
+    /// Bytes captured from an isolated tool's subprocess before the rest is
+    /// read and discarded (roadmap item X3, `[limits].tool_output_bytes`).
+    max_output_bytes: usize,
 }
 
 impl Default for ToolRegistry {
@@ -52,6 +55,7 @@ impl Default for ToolRegistry {
             timeout_overrides: BTreeMap::new(),
             jobs: None,
             promotable: BTreeSet::new(),
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
         }
     }
 }
@@ -70,6 +74,13 @@ impl ToolRegistry {
     ) -> Self {
         self.default_timeout = default_timeout;
         self.timeout_overrides = overrides;
+        self
+    }
+
+    /// Set how much output an isolated tool's subprocess may produce before
+    /// the rest is read and discarded (roadmap item X3).
+    pub fn with_output_limit(mut self, max_output_bytes: usize) -> Self {
+        self.max_output_bytes = max_output_bytes;
         self
     }
 
@@ -155,7 +166,14 @@ impl ToolRegistry {
         if spec.sandbox.is_sandboxed() {
             if let Some(runner) = &self.isolation_runner {
                 let sandbox = Sandbox::new(spec.sandbox, workspace_root());
-                return Ok(call_isolated_subprocess(runner, call, deadline, &sandbox).await?);
+                return Ok(call_isolated_subprocess(
+                    runner,
+                    call,
+                    deadline,
+                    &sandbox,
+                    self.max_output_bytes,
+                )
+                .await?);
             }
         }
         match timeout(deadline, tool.call(call, &call.args)).await {
@@ -178,7 +196,14 @@ impl ToolRegistry {
         if spec.sandbox.is_sandboxed() {
             if let Some(runner) = &self.isolation_runner {
                 let sandbox = Sandbox::new(spec.sandbox, workspace_root());
-                return Ok(call_isolated_subprocess(runner, call, deadline, &sandbox).await?);
+                return Ok(call_isolated_subprocess(
+                    runner,
+                    call,
+                    deadline,
+                    &sandbox,
+                    self.max_output_bytes,
+                )
+                .await?);
             }
         }
         if let Some(promoted) = self.call_promotable(tool, call, ctx, deadline).await {
@@ -369,6 +394,7 @@ pub async fn call_isolated_subprocess(
     call: &ToolCall,
     timeout: Duration,
     sandbox: &Sandbox,
+    max_output_bytes: usize,
 ) -> Result<ToolResult, ToolError> {
     let request = serde_json::to_vec(&IsolatedToolRequest { call })
         .map_err(|err| ToolError::Failed(err.to_string().into()))?;
@@ -379,7 +405,7 @@ pub async fn call_isolated_subprocess(
         cwd: None,
         stdin: Some(&request),
         timeout,
-        max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+        max_output_bytes,
         sandbox,
     })
     .await

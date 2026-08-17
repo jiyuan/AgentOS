@@ -26,7 +26,11 @@ async fn run() -> Result<(), String> {
 
     match request.call.name.as_ref() {
         "shell" => {
-            let tool = ShellTool;
+            // The default output cap, not the deployment's: the worker is a
+            // separate process and does not read `agent.toml`. The registry
+            // that spawned it applies the configured cap to what it reads back
+            // from this process, which is the bound that reaches the model.
+            let tool = ShellTool::default();
             let result = tool
                 .call(&request.call, &request.call.args)
                 .await
