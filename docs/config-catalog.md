@@ -84,6 +84,7 @@ Every key `agent.toml` accepts, derived from the config structs. Edit the doc co
 | `subagents.max_turns` | `usize` | — | *(undocumented — see `config/undocumented.txt`)* |
 | `subagents.inherit_guardrails` | `bool` | — | *(undocumented — see `config/undocumented.txt`)* |
 | `subagents.skill_bundle_writer` | `bool` | — | Opt-in: permits this sub-agent to write inside the skill-bundle directory. Defaults to `false`, so every sub-agent is blocked from tampering with `SKILL.md` bundles by the skill-bundle write guardrail unless it is the designated skill editor. This is a permission grant, not a convenience toggle — set it only on the dedicated skill editor. |
+| `subagents.seed_from_parent` | `bool` | — | Seed this sub-agent's conversation from the parent's history the first time it is delegated to (roadmap X6), instead of starting it empty.  Off by default, and the default is the conservative one. A sub-agent exists to work a bounded task under a narrowed policy; handing it the whole parent conversation costs tokens on every turn it takes and shows a possibly weaker model everything the parent has seen. Turn it on for the sub-agent that needs the discussion so far — a reviewer, an editor, a second opinion — not for one that fetches a URL.  Seeding happens once. A sub-agent's conversation id is stable across a conversation, so the second and every later delegation find history already there and leave it alone. |
 | `subagents.max_output_chars` | `usize` | — | Character cap for `MaxOutputLength` when `inherit_guardrails = true`. Tripped output aborts the run, so this needs to comfortably exceed any reply you expect from the model. Defaults are tuned for chat: long enough to fit a thorough multi-paragraph answer, short enough to catch runaway generation. |
 | `mcp_servers` | `Vec<McpServerConfig>` | (none) | MCP servers to connect to. |
 | `mcp_servers.id` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
@@ -156,5 +157,5 @@ Every key `agent.toml` accepts, derived from the config structs. Edit the doc co
 | `spill.root` | `PathBuf` | `spill` | Where artifacts are written. Relative paths resolve against the workspace root; an absolute path is taken as given, for a deployment that wants spill on a different volume from the session database. |
 | `spill.retention_days` | `u64` | `0` | Days an artifact is kept, or `0` to keep everything.  `0` is a choice rather than a disabled feature — see the module docs. |
 
-102 of 148 keys have no description yet. They are listed in `crates/agentos-core/src/config/undocumented.txt`; writing the doc comment on the field is what removes a line from it.
+102 of 149 keys have no description yet. They are listed in `crates/agentos-core/src/config/undocumented.txt`; writing the doc comment on the field is what removes a line from it.
 <!-- END GENERATED: config -->

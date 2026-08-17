@@ -5,6 +5,7 @@ use crate::prompt::Compaction;
 use crate::r#loop::{InputGuardrailEntry, OutputGuardrailEntry, ToolGuardrailEntry};
 use crate::runner::{
     resume_run, run_envelope, PausedRun, ResumeDecision, RunOutcome, RunnerDeps, TraceSink,
+    SESSION_SCOPE_EPHEMERAL, SESSION_SCOPE_KEY,
 };
 use crate::spill::{ContentLimits, SpillStore, DEFAULT_TOOL_RESULT_INLINE_BYTES};
 use crate::task_workspace::TaskWorkspace;
@@ -52,6 +53,15 @@ pub struct SubAgentDefinition {
     pub input_guardrails: Vec<OwnedInputGuardrailEntry>,
     pub output_guardrails: Vec<OwnedOutputGuardrailEntry>,
     pub tool_guardrails: Vec<OwnedToolGuardrailEntry>,
+    /// Whether this sub-agent's conversation is seeded from the parent's
+    /// history the first time it is delegated to (roadmap X6).
+    ///
+    /// Off by default. A sub-agent exists to work on a bounded task with a
+    /// narrowed policy, and handing it the whole parent conversation costs
+    /// tokens on every one of its turns and widens what a weaker model can
+    /// see. Turn it on for the sub-agent that needs the discussion so far —
+    /// a reviewer, an editor — not for the one that fetches a URL.
+    pub seed_from_parent: bool,
 }
 
 impl SubAgentDefinition {
@@ -72,6 +82,7 @@ impl SubAgentDefinition {
             input_guardrails: Vec::new(),
             output_guardrails: Vec::new(),
             tool_guardrails: Vec::new(),
+            seed_from_parent: false,
         }
     }
 
@@ -87,6 +98,11 @@ impl SubAgentDefinition {
 
     pub fn with_max_turns(mut self, max_turns: usize) -> Self {
         self.max_turns = max_turns;
+        self
+    }
+
+    pub fn with_seed_from_parent(mut self, seed_from_parent: bool) -> Self {
+        self.seed_from_parent = seed_from_parent;
         self
     }
 
@@ -182,6 +198,21 @@ pub struct SubAgentInvocation {
     /// whole delegation tree while a child stopping itself leaves the parent
     /// free to use whatever it produced.
     cancel: CancellationToken,
+    /// Where this child's conversation would be seeded from, when the
+    /// definition asks for it (roadmap X6). Supplied by the loop, which is
+    /// what holds the parent run; whether it is used is the definition's call.
+    parent_seed: Option<ParentSeed>,
+}
+
+/// The point in a parent conversation a child is branched from.
+#[derive(Clone, Debug)]
+pub struct ParentSeed {
+    pub conversation_id: ConversationId,
+    /// Items of the parent's log to copy. Taken from the parent's *in-memory*
+    /// transcript, which is the delegation point as the parent sees it; the
+    /// store holds a prefix of that, because the turn in flight is not
+    /// persisted until it finishes. `Session::fork` copies what exists.
+    pub boundary: usize,
 }
 
 pub struct SubAgentRegistry {
@@ -313,6 +344,7 @@ impl SubAgentRegistry {
             // A fresh token until the caller links it to a parent run; the
             // loop always does.
             cancel: CancellationToken::new(),
+            parent_seed: None,
         })
     }
 }
@@ -321,6 +353,13 @@ impl SubAgentInvocation {
     /// Tie this child run to `parent`, so cancelling the parent cancels it.
     pub fn with_cancel(mut self, parent: &CancellationToken) -> Self {
         self.cancel = parent.child_token();
+        self
+    }
+
+    /// Offer the parent conversation this child could branch from. Ignored
+    /// unless the sub-agent's definition sets `seed_from_parent`.
+    pub fn with_parent_seed(mut self, seed: ParentSeed) -> Self {
+        self.parent_seed = Some(seed);
         self
     }
 
@@ -344,6 +383,7 @@ impl SubAgentInvocation {
         let summarizer = self.summarizer;
         let compaction_config = self.compaction_config;
         let cancel = self.cancel;
+        let parent_seed = self.parent_seed;
         let local = LocalSet::new();
         let handle = local.spawn_local(async move {
             let Some(input) = input_rx.recv().await else {
@@ -365,6 +405,13 @@ impl SubAgentInvocation {
             };
             let child_channel_id = input.channel_id.clone();
             let child_conversation_id = input.conversation_id.clone();
+            // X6: branch this conversation from the parent's before the run
+            // loads it. Only ever on the first delegation — `fork` refuses a
+            // target that already holds items, which is exactly the second
+            // turn of a sub-agent whose conversation id is stable.
+            if definition.seed_from_parent {
+                seed_from_parent(session, parent_seed.as_ref(), &input).await;
+            }
             let input_guardrails = definition
                 .input_guardrails
                 .iter()
@@ -567,6 +614,65 @@ impl SubAgentInvocation {
     }
 }
 
+/// Branch a sub-agent's conversation from its parent's, once (roadmap X6).
+///
+/// Best effort, in the same sense as the spill store: a seed that does not
+/// happen leaves the sub-agent starting from an empty conversation, which is
+/// exactly the behaviour it had before this existed. Failing the delegation
+/// because history could not be copied would trade a working sub-agent for no
+/// sub-agent.
+///
+/// The two expected non-seeds are not failures and are logged as such: an
+/// ephemeral input has no conversation to seed, and a target that already
+/// holds items is the second and every later turn of a sub-agent whose
+/// conversation id is stable across a conversation.
+async fn seed_from_parent(session: &dyn Session, seed: Option<&ParentSeed>, input: &Envelope) {
+    let Some(seed) = seed else {
+        return;
+    };
+    if input
+        .metadata
+        .get(SESSION_SCOPE_KEY)
+        .and_then(Value::as_str)
+        == Some(SESSION_SCOPE_EPHEMERAL)
+    {
+        return;
+    }
+    match session
+        .fork(&seed.conversation_id, seed.boundary, &input.conversation_id)
+        .await
+    {
+        Ok(items) => tracing::info!(
+            parent_conversation = seed.conversation_id.as_str(),
+            child_conversation = input.conversation_id.as_str(),
+            items,
+            "sub-agent conversation seeded from parent"
+        ),
+        Err(error) => tracing::debug!(
+            parent_conversation = seed.conversation_id.as_str(),
+            child_conversation = input.conversation_id.as_str(),
+            error = %error,
+            "sub-agent conversation not seeded; starting from its own history"
+        ),
+    }
+}
+
+/// The user-facing conversation a parent run belongs to.
+///
+/// Read off the most recent transcript item's metadata, where the runner stamps
+/// it on every inbound. Falls back to the run id, which is what a run started
+/// outside a channel has.
+pub fn parent_conversation_id(parent_state: &agentos_interfaces::RunState) -> ConversationId {
+    parent_state
+        .transcript
+        .items
+        .last()
+        .and_then(|item| item.metadata.get("conversation_id"))
+        .and_then(Value::as_str)
+        .map(ConversationId::new)
+        .unwrap_or_else(|| ConversationId::new(parent_state.run_id.as_str()))
+}
+
 pub fn child_input_envelope(
     spec: &SubAgentSpec,
     parent_state: &agentos_interfaces::RunState,
@@ -604,14 +710,7 @@ pub fn child_input_envelope(
     // runner stamps it on every inbound). Sticking to parent_run_id here
     // would mint a new sub-agent conversation every turn and the persistent
     // session would never accumulate history.
-    let parent_conversation_id = parent_state
-        .transcript
-        .items
-        .last()
-        .and_then(|item| item.metadata.get("conversation_id"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| parent_state.run_id.as_str().to_owned());
+    let parent_conversation_id = parent_conversation_id(parent_state);
 
     let conversation_suffix = prompt
         .filter(|prompt| !prompt.trim().is_empty())
@@ -622,7 +721,7 @@ pub fn child_input_envelope(
         channel_id: ChannelId::new(format!("subagent:{}", spec.agent_id.as_str())),
         conversation_id: ConversationId::new(format!(
             "{}:{}{}",
-            parent_conversation_id,
+            parent_conversation_id.as_str(),
             spec.agent_id.as_str(),
             conversation_suffix
         )),

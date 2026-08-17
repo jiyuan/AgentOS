@@ -1543,6 +1543,62 @@ parent's context at the delegation point rather than a summary of it.
   additive-only; a forked child's projection equals the parent's prefix; spill
   locators in the seeded prefix resolve from the child without copying.
 - Exit: a conversation can be branched.
+- **Status: done** (2026-08-17). `Session::fork(source, boundary, child_id)` is a
+  defaulted trait method returning how many items landed;
+  `cargo semver-checks check-release -p agentos-interfaces --baseline-rev HEAD`
+  reports no semver update required. SQLite overrides it with one
+  `INSERT … SELECT`, so the rows never leave the database. `tests/session_fork.rs`
+  covers both (12 tests). Notes:
+  - **`boundary` is a length, not a range, and that is correctness rather than
+    convenience.** A compaction checkpoint names the span it hides by *absolute*
+    position, so a fork that dropped a head would leave every checkpoint in the
+    copied tail pointing at the wrong items — the child would hide text the
+    parent showed, or show text the parent had folded away. Copying from 0 keeps
+    positions identical, which is what makes the child's projection equal the
+    projection of the parent's prefix. This is the whole content of the P2
+    dependency, and the test that pins it fails if the prefix becomes a suffix.
+  - **A boundary past the end seeds what exists rather than failing**, and this
+    is load-bearing for the delegation path rather than leniency. The parent
+    names a point in the transcript it holds *in memory*; the store holds a
+    prefix of that, because the turn in flight is not persisted until the run
+    finishes. So a seeded sub-agent gets the parent's history up to the previous
+    turn, plus the delegation prompt as its own first input — the current ask
+    reaches it as a message, not as history. Worth knowing before relying on it:
+    earlier tool results from the *same* parent turn are not in the seed.
+  - **Forking onto a conversation that already has items is refused**, in both
+    implementations, inside SQLite's transaction so a concurrent append cannot
+    slip between the check and the copy. Merging two logs would invalidate every
+    checkpoint position in both. This refusal is also what makes sub-agent
+    seeding idempotent: a sub-agent's conversation id is stable, so the second
+    delegation finds history and leaves it alone.
+  - **The refusal uses `SessionError::Backend`, not a new variant.** A new
+    variant on an exhaustive public enum is a major bump, and this item's Verify
+    line requires additive-only. The message names the target and its item
+    count, so the condition is still diagnosable; a typed variant is worth doing
+    the next time `agentos-interfaces` takes a deliberate break.
+  - **Spilled output is not copied and does not need to be.** A locator is an
+    absolute path into a run-keyed store, so a seeded item resolves to the
+    artifact the parent's run wrote. The test asserts the child reads the
+    content back *and* that the run directory still holds exactly one file.
+  - **The sub-agent wiring is opt-in and off by default**
+    (`[[subagents]] seed_from_parent`, plumbed config → `SubAgentDefinition` →
+    `SubAgentInvocation` → `fork` before the child run loads its transcript).
+    Handing a sub-agent the whole parent conversation costs tokens on every turn
+    it takes and shows a possibly weaker model everything the parent has seen.
+    **No shipped sub-agent enables it** — turning it on for the code-review or
+    edit sub-agent is a deployment's call, not this item's.
+  - **Seeding is best effort.** A fork that fails leaves the sub-agent starting
+    from an empty conversation, which is exactly its pre-X6 behaviour; failing
+    the delegation because history could not be copied would trade a working
+    sub-agent for none. The two expected non-seeds — an ephemeral input, and a
+    target that already has history — log at debug rather than warn.
+  - Proven load-bearing by breaking each half: ignoring the definition flag
+    reddens the seeded-delegation test; an off-by-one in the SQLite boundary
+    reddens 2, including the one that asserts the override and the default agree;
+    copying a suffix instead of a prefix reddens 2; dropping the emptiness
+    refusal reddens 2.
+  - Interface impact: one defaulted trait method on `Session`. `agentos-proto`
+    unchanged.
 
 ### X7. Folded collaboration state (F10)
 

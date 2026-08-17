@@ -549,6 +549,60 @@ impl Session for SqliteStore {
 
         tx.commit().map_err(session_sqlite_error)
     }
+
+    /// Copy a prefix with one statement (roadmap X6).
+    ///
+    /// The default implementation would deserialize every item, move it through
+    /// memory, and re-serialize it. Here the rows never leave the database, and
+    /// the ordinals carry over unchanged — which is what keeps a compaction
+    /// checkpoint's absolute positions meaningful in the child.
+    ///
+    /// The emptiness and self-fork checks happen inside the same transaction as
+    /// the copy, so a concurrent append to the target cannot slip between the
+    /// look and the write.
+    async fn fork(
+        &self,
+        source: &ConversationId,
+        boundary: usize,
+        child_id: &ConversationId,
+    ) -> Result<usize, SessionError> {
+        if source == child_id {
+            return Err(SessionError::Backend(Arc::from(format!(
+                "cannot fork conversation '{}' onto itself",
+                source.as_str()
+            ))));
+        }
+        let boundary = i64::try_from(boundary).unwrap_or(i64::MAX);
+
+        let mut conn = self.session_conn()?;
+        let tx = conn.transaction().map_err(session_sqlite_error)?;
+        let existing: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM session_items WHERE conversation_id = ?1",
+                params![child_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(session_sqlite_error)?;
+        if existing > 0 {
+            return Err(SessionError::Backend(Arc::from(format!(
+                "fork target '{}' already holds {existing} items; seeding it would interleave \
+                 two histories",
+                child_id.as_str()
+            ))));
+        }
+
+        let seeded = tx
+            .execute(
+                "INSERT INTO session_items (conversation_id, ordinal, item_json) \
+                 SELECT ?1, ordinal, item_json FROM session_items \
+                 WHERE conversation_id = ?2 AND ordinal < ?3 \
+                 ORDER BY ordinal ASC",
+                params![child_id.as_str(), source.as_str(), boundary],
+            )
+            .map_err(session_sqlite_error)?;
+        tx.commit().map_err(session_sqlite_error)?;
+        Ok(seeded)
+    }
 }
 
 fn ensure_memory_record_columns(conn: &Connection) -> Result<(), MemoryError> {

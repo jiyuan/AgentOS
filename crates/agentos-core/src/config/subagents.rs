@@ -32,6 +32,20 @@ pub struct SubAgentConfig {
     /// unless it is the designated skill editor. This is a permission grant,
     /// not a convenience toggle — set it only on the dedicated skill editor.
     pub skill_bundle_writer: bool,
+    /// Seed this sub-agent's conversation from the parent's history the first
+    /// time it is delegated to (roadmap X6), instead of starting it empty.
+    ///
+    /// Off by default, and the default is the conservative one. A sub-agent
+    /// exists to work a bounded task under a narrowed policy; handing it the
+    /// whole parent conversation costs tokens on every turn it takes and shows
+    /// a possibly weaker model everything the parent has seen. Turn it on for
+    /// the sub-agent that needs the discussion so far — a reviewer, an editor,
+    /// a second opinion — not for one that fetches a URL.
+    ///
+    /// Seeding happens once. A sub-agent's conversation id is stable across a
+    /// conversation, so the second and every later delegation find history
+    /// already there and leave it alone.
+    pub seed_from_parent: bool,
     /// Character cap for `MaxOutputLength` when `inherit_guardrails = true`.
     /// Tripped output aborts the run, so this needs to comfortably exceed any
     /// reply you expect from the model. Defaults are tuned for chat: long
@@ -58,6 +72,7 @@ impl Default for SubAgentConfig {
             max_turns: 4,
             inherit_guardrails: true,
             skill_bundle_writer: false,
+            seed_from_parent: false,
             max_output_chars: 64_000,
         }
     }

@@ -4,8 +4,8 @@ use super::telemetry::{
 use super::{LoopDeps, RunError};
 use crate::runner::ResumeDecision;
 use crate::subagents::{
-    child_input_envelope, child_run_id, SubAgentError, SubAgentPausedRun, SubAgentRun,
-    SubAgentRunOutput,
+    child_input_envelope, child_run_id, parent_conversation_id, ParentSeed, SubAgentError,
+    SubAgentPausedRun, SubAgentRun, SubAgentRunOutput,
 };
 use crate::trace;
 use agentos_interfaces::orchestrator::SubAgentSpec;
@@ -84,9 +84,18 @@ pub(super) async fn execute_delegate(
             return Err(error.into());
         }
     };
+    // X6: offer the branch point. The parent's in-memory transcript length is
+    // the delegation point as the parent sees it; the store holds a prefix of
+    // it, since the turn in flight is not persisted until it finishes, and the
+    // ask itself reaches the child as its input message. Whether any of it is
+    // used is the sub-agent definition's call.
+    let seed = ParentSeed {
+        conversation_id: parent_conversation_id(state),
+        boundary: state.transcript.items.len(),
+    };
     let invocation = match subagents
         .prepare(spec, deps.policy, input, run_id)
-        .map(|invocation| invocation.with_cancel(&deps.cancel))
+        .map(|invocation| invocation.with_cancel(&deps.cancel).with_parent_seed(seed))
     {
         Ok(invocation) => invocation,
         Err(error) => {
