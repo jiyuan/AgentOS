@@ -1,5 +1,5 @@
 use crate::approve::{Policy, PolicyAction, PolicyRule, PolicyVerb};
-use crate::config::{SubAgentConfig, WorkspaceConfig};
+use crate::config::{LimitsConfig, SubAgentConfig, WorkspaceConfig};
 use crate::jobs::JobRegistry;
 use crate::memory::MemoryManager;
 use crate::tools::{
@@ -25,7 +25,7 @@ pub(super) fn build_parent_tools(
             "job_status" => tools.register(JobStatusTool::new(jobs.clone())),
             "job_output" => tools.register(JobOutputTool::new(jobs.clone())),
             "job_kill" => tools.register(JobKillTool::new(jobs.clone())),
-            _ => register_builtin_tool(&mut tools, tool)?,
+            _ => register_builtin_tool(&mut tools, tool, &config.limits)?,
         }
     }
     Ok(tools
@@ -33,6 +33,7 @@ pub(super) fn build_parent_tools(
             config.limits.tool_timeout(),
             config.limits.tool_timeout_overrides(),
         )
+        .with_output_limit(config.limits.tool_output_bytes)
         .with_jobs(jobs, config.jobs.promotable.iter().cloned()))
 }
 
@@ -155,11 +156,24 @@ fn subagent_memory_operations(subagent: &SubAgentConfig) -> Result<Vec<Arc<str>>
         .collect()
 }
 
-pub fn register_builtin_tool(tools: &mut ToolRegistry, name: &str) -> Result<(), String> {
+/// Register a built-in tool by name, bounded by the deployment's `[limits]`.
+///
+/// The limits are passed rather than read from a global so a sub-agent's
+/// registry is bounded the same way the parent's is, visibly, at the one place
+/// both go through.
+pub fn register_builtin_tool(
+    tools: &mut ToolRegistry,
+    name: &str,
+    limits: &LimitsConfig,
+) -> Result<(), String> {
     match name {
-        "shell" => tools.register(ShellTool),
+        "shell" => tools.register(ShellTool::with_output_limit(limits.tool_output_bytes)),
         "http" => tools.register(HttpTool),
-        "file" => tools.register(FileTool),
+        "file" => tools.register(FileTool::with_limits(
+            limits.directory_list_entries,
+            limits.file_read_bytes,
+            limits.file_read_max_bytes,
+        )),
         "skill_validate" => tools.register(SkillValidateTool),
         "cron_create" => tools.register(CronCreatorTool),
         "cron_list" => tools.register(CronListTool),
@@ -546,5 +560,42 @@ mod tests {
                 )
             });
         }
+    }
+    /// `[limits]` reaches the tool the registry built, not just the struct that
+    /// parsed it. Driven through `ToolRegistry::call` so the assertion is about
+    /// what a run would see, and with a control at a larger cap so a listing
+    /// that was short anyway cannot pass for a truncated one.
+    #[tokio::test]
+    async fn configured_file_limits_reach_the_registered_tool() {
+        async fn list_entries(limit: usize) -> usize {
+            let mut config = config_with_parent_tools(&["file"]);
+            config.limits.directory_list_entries = limit;
+            let memory = Arc::new(MemoryManager::new(Arc::new(InMemoryMemory::default())));
+            let jobs = Arc::new(JobRegistry::default());
+            let tools = build_parent_tools(&config, memory, jobs).expect("tools build");
+
+            // `read` on a directory is how the tool lists. `src` is relative
+            // to the workspace root, which in a unit test is the crate
+            // directory — comfortably more entries than the tight cap below.
+            let call = ToolCall {
+                id: ToolCallId::new("list"),
+                name: Arc::from("file"),
+                args: RawValue::from_string(
+                    json!({ "operation": "read", "path": "src" }).to_string(),
+                )
+                .expect("test args are valid JSON"),
+            };
+            let result = tools.call(&call).await.expect("the file tool answers");
+            result.content.lines().count()
+        }
+
+        let tight = list_entries(2).await;
+        let loose = list_entries(500).await;
+        // Two entries plus the truncation marker.
+        assert_eq!(tight, 3, "the configured cap must be what truncates");
+        assert!(
+            loose > tight,
+            "the control must return more than the capped listing, got {loose}"
+        );
     }
 }

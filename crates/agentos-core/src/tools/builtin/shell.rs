@@ -21,8 +21,27 @@ const SHELL_TIMEOUT_MS: u64 = 5 * 60 * 1_000;
 /// filesystem, which is what it had before.
 const SHELL_SANDBOX: SandboxMode = SandboxMode::WorkspaceWrite;
 
-#[derive(Default)]
-pub struct ShellTool;
+/// How much output one command may produce before the rest is read and
+/// discarded (roadmap item X3). Carried on the tool for the same reason
+/// `FileTool` carries its read bounds: nothing has to be consulted at call
+/// time.
+pub struct ShellTool {
+    max_output_bytes: usize,
+}
+
+impl Default for ShellTool {
+    fn default() -> Self {
+        Self {
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+        }
+    }
+}
+
+impl ShellTool {
+    pub fn with_output_limit(max_output_bytes: usize) -> Self {
+        Self { max_output_bytes }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -84,7 +103,7 @@ impl Tool for ShellTool {
             cwd,
             stdin: None,
             timeout: Duration::from_millis(SHELL_TIMEOUT_MS),
-            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            max_output_bytes: self.max_output_bytes,
             // The mode this tool declares in its own spec, enforced here
             // because a shell command is run directly rather than through the
             // isolation worker when no worker is configured.

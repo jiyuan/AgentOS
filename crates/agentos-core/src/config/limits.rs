@@ -6,7 +6,10 @@
 //! than adding a section per item.
 
 use crate::spill::DEFAULT_TOOL_RESULT_INLINE_BYTES;
-use crate::tools::DEFAULT_TOOL_TIMEOUT_MS;
+use crate::tools::{
+    DEFAULT_DIRECTORY_LIST_ENTRIES, DEFAULT_FILE_READ_BYTES, DEFAULT_MAX_OUTPUT_BYTES,
+    DEFAULT_TOOL_TIMEOUT_MS, MAX_FILE_READ_BYTES,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -25,6 +28,18 @@ const MIN_TOOL_RESULT_INLINE_BYTES: usize = 512;
 /// call would fail for a reason that has nothing to do with the tool.
 const MIN_TOOL_TIMEOUT_MS: u64 = 100;
 
+/// Smallest useful directory listing. One entry tells a model the directory is
+/// non-empty and nothing else.
+const MIN_DIRECTORY_LIST_ENTRIES: usize = 1;
+
+/// Smallest useful file read. Below a line's worth, every read reports
+/// truncation and shows nothing.
+const MIN_FILE_READ_BYTES: usize = 256;
+
+/// Smallest capture from a child process. Below this the deadline and the
+/// capture cap become indistinguishable to a caller reading the result.
+const MIN_TOOL_OUTPUT_BYTES: usize = 1_024;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LimitsConfig {
@@ -38,6 +53,23 @@ pub struct LimitsConfig {
     /// above and a tool's own `ToolSpec::timeout_ms`, so an operator always has
     /// the last word on how long their machine will wait.
     pub tool_timeout_overrides: BTreeMap<Arc<str>, u64>,
+    /// Entries the `file` tool lists before it truncates.
+    ///
+    /// A cap on what one call can put in front of the model, not on what the
+    /// directory holds: a listing of ten thousand names is a turn spent on
+    /// nothing useful.
+    pub directory_list_entries: usize,
+    /// Bytes the `file` tool reads when a call does not ask for a size.
+    pub file_read_bytes: usize,
+    /// Bytes the `file` tool will read however large a call asks for. The
+    /// ceiling, where `file_read_bytes` is the default.
+    pub file_read_max_bytes: usize,
+    /// Bytes captured from each of a child process's stdout and stderr before
+    /// the rest is read and discarded.
+    ///
+    /// Bounds memory against a runaway process; it is not what shapes what the
+    /// model sees, which is `tool_result_inline_bytes` and the spill store.
+    pub tool_output_bytes: usize,
 }
 
 impl Default for LimitsConfig {
@@ -46,6 +78,10 @@ impl Default for LimitsConfig {
             tool_result_inline_bytes: DEFAULT_TOOL_RESULT_INLINE_BYTES,
             tool_timeout_ms: DEFAULT_TOOL_TIMEOUT_MS,
             tool_timeout_overrides: BTreeMap::new(),
+            directory_list_entries: DEFAULT_DIRECTORY_LIST_ENTRIES,
+            file_read_bytes: DEFAULT_FILE_READ_BYTES,
+            file_read_max_bytes: MAX_FILE_READ_BYTES,
+            tool_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
         }
     }
 }
@@ -61,6 +97,11 @@ impl LimitsConfig {
 
     pub fn tool_timeout(&self) -> Duration {
         Duration::from_millis(self.tool_timeout_ms)
+    }
+
+    /// The `file` tool's read bounds, as the tool takes them.
+    pub fn file_read(&self) -> (usize, usize) {
+        (self.file_read_bytes, self.file_read_max_bytes)
     }
 }
 
@@ -81,6 +122,35 @@ pub fn validate_limits(config: &LimitsConfig) -> Result<(), String> {
                 "limits tool timeout for '{name}' must be at least {MIN_TOOL_TIMEOUT_MS} ms, got {ms}"
             ));
         }
+    }
+    if config.directory_list_entries < MIN_DIRECTORY_LIST_ENTRIES {
+        return Err(format!(
+            "limits.directory_list_entries must be at least {MIN_DIRECTORY_LIST_ENTRIES}, got {}",
+            config.directory_list_entries
+        ));
+    }
+    for (name, bytes) in [
+        ("file_read_bytes", config.file_read_bytes),
+        ("file_read_max_bytes", config.file_read_max_bytes),
+    ] {
+        if bytes < MIN_FILE_READ_BYTES {
+            return Err(format!(
+                "limits.{name} must be at least {MIN_FILE_READ_BYTES}, got {bytes}"
+            ));
+        }
+    }
+    if config.file_read_bytes > config.file_read_max_bytes {
+        return Err(format!(
+            "limits.file_read_bytes ({}) cannot exceed limits.file_read_max_bytes ({}); the \
+             default read would always be clamped",
+            config.file_read_bytes, config.file_read_max_bytes
+        ));
+    }
+    if config.tool_output_bytes < MIN_TOOL_OUTPUT_BYTES {
+        return Err(format!(
+            "limits.tool_output_bytes must be at least {MIN_TOOL_OUTPUT_BYTES}, got {}",
+            config.tool_output_bytes
+        ));
     }
     Ok(())
 }
@@ -146,6 +216,37 @@ mod tests {
             Some(&Duration::from_millis(300_000))
         );
         assert!(validate_limits(&parsed).is_ok());
+    }
+
+    /// A default read larger than the ceiling would be clamped on every call,
+    /// so the configured default would silently not be the default.
+    #[test]
+    fn a_default_read_above_the_ceiling_is_rejected() {
+        let config = LimitsConfig {
+            file_read_bytes: 1024 * 1024,
+            file_read_max_bytes: 64 * 1024,
+            ..Default::default()
+        };
+        let error = validate_limits(&config).expect_err("an inverted pair must be rejected");
+        assert!(error.contains("file_read_bytes"));
+        assert!(error.contains("file_read_max_bytes"));
+    }
+
+    #[test]
+    fn unusable_sizes_fail_loud_at_load() {
+        for (toml, key) in [
+            ("directory_list_entries = 0", "directory_list_entries"),
+            ("file_read_bytes = 8", "file_read_bytes"),
+            ("tool_output_bytes = 16", "tool_output_bytes"),
+        ] {
+            let config: LimitsConfig = toml::from_str(toml).expect("the key parses");
+            assert!(
+                validate_limits(&config)
+                    .expect_err("must be rejected")
+                    .contains(key),
+                "{toml} should be rejected naming {key}"
+            );
+        }
     }
 
     #[test]

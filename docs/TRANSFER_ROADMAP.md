@@ -565,7 +565,7 @@ answer.
   - **`[compaction].model` is not implemented.** Summaries are written by the
     run's own high-tier provider. Routing a separate, cheaper model would let a
     weaker summary lower the ceiling on every later turn, and the wiring
-    belongs with X3's other config work.
+    belongs with X3's other config work. *Landed in X3, as a model tier.*
   - **The D1 cancellation requirement is not met** — D1 does not exist yet, so
     there is no token to respect. A compaction call is one non-streaming
     round-trip at the start of a plan; when D1 lands it must be threaded
@@ -1291,6 +1291,74 @@ the directory listing limit. Fold in the new keys from C1–C3, D2, and G1.
   value fails loud at load; `agentos-gateway config` prints every new key.
 - Exit: no `DEFAULT_*` constant governs a value an operator has reason to change.
 
+**Status: done.** New `config/spill.rs` (`[spill].root`, `.retention_days` —
+the keys C2 deferred here) and `[compaction].model` (deferred by C3);
+`[limits]` gained `directory_list_entries`, `file_read_bytes`,
+`file_read_max_bytes` and `tool_output_bytes`. `agentos-gateway config` prints
+every one. Verified: `cargo fmt --all --check`, `cargo clippy --workspace
+--all-targets -- -D warnings`, 530 tests, import boundaries, module sizes.
+
+  - **Two of the four constants the item names were already gone.** The MCP
+    timeout moved to `[limits].tool_timeout_ms` with a per-server override in
+    D2, and the hydration budgets were already `[memory].hydrate_*` — the
+    constants in `orchestrator/max.rs` are the `Default` impl behind them, not a
+    second source of truth. Only the directory listing limit and the inline cap
+    (done in C2) were outstanding, so this item was smaller than written and the
+    deferred keys were the real work.
+  - **Both wiring gaps were found by breaking the code, not by reading it.**
+    Making `register_builtin_tool` ignore the configured file limits, and the
+    summarizer ignore its configured tier, left the whole suite green: the
+    tests covered `FileTool::with_limits` and `CompactionConfig` parsing, and
+    nothing asserted the runtime *used* either. A key that reads back correctly
+    and changes nothing is the exact failure mode this item exists to prevent.
+    Both now have tests that go config → registry → tool output, and config →
+    the client actually built; each turns red when its wiring is removed.
+  - **`[compaction].model` is a tier, not a `provider:model` string.** Every
+    other model in this runtime is chosen by `AGENTOS_LLM_MODEL_<TIER>` and by
+    `/model`; a second spelling would be a second thing to keep in sync, and a
+    typo'd tier now fails the load rather than the turn that would have
+    compacted. The `high` default reuses the conversation's own client rather
+    than building a second one for the same model — a separate client means a
+    separate connection pool and a separate `/model` override state.
+  - **The elide-then-compact ladder is now enforced, not commented.**
+    `pressure_percent` had to sit above the 80% at which tool output is elided
+    for free; that was a comment and a test on the *default*. A deployment
+    setting `pressure_percent = 70` would have inverted it silently, spending a
+    summarizer call on a request free pruning would have fixed. It is a load
+    error now.
+  - **Retention sweeps whole runs, from the gateway's idle phase.** A run's
+    artifacts are referenced together by the transcript that produced them, so
+    removing half of one leaves a conversation with locators that resolve and
+    locators that do not — worse than removing all of it. The default is `0`,
+    "keep everything", which is what C2 shipped; the floor when set is one day,
+    because a shorter window would race the run that wrote it and turn a
+    recoverable result back into the destroyed one spill exists to replace.
+  - **The `file` tool's JSON schema is built from the configured bounds.** It
+    advertised `maximum: 262144` as a literal. A schema naming a ceiling the
+    tool no longer enforces has the model asking for reads it cannot get, or
+    not asking for ones it could.
+  - **Deliberately left as constants**, because the exit condition is about
+    values an operator has reason to change and these are not:
+    - `prune::PRUNE_TRIGGER_RATIO` (0.8) is not a policy trigger like
+      `pressure_percent`. The remaining fifth of the window is headroom for the
+      *reply*, which the estimator does not measure; changing it changes how
+      much room the model has to answer, not a cost/quality trade.
+    - `http::DEFAULT_TIMEOUT` (30 s) bounds a process-wide `OnceLock` client
+      shared by the `http` tool, Qdrant, and Feishu — it cannot see per-
+      deployment config without being rebuilt, and the bound an operator
+      actually cares about for the tool is `[limits].tool_timeout_ms`, which is
+      configurable and wins.
+    - `compact::SPAN_SHARE_OF_WINDOW`, `tokens::ASCII_CHARS_PER_TOKEN`,
+      `hybrid::RRF_K`, `task_workspace::SESSION_QUEUE_CAPACITY`, and the
+      Landlock ABI bits are algorithm and protocol shape. Exposing them would
+      invite tuning that changes results without changing a decision.
+  - **Not closed: the isolation worker's own output cap.**
+    `agentos-tool-worker` is a separate process that does not read
+    `agent.toml`, so its inner `exec` capture stays at the compiled-in default.
+    The registry that spawned it applies the configured cap to what it reads
+    back, which is the bound that reaches the model; the inner one only bounds
+    the worker's own memory. Stated in the worker rather than left to be found.
+
 ### X4. Generated catalogs (F13)
 
 Generate `docs/config-catalog.md` from the config structs and a tool catalog from
@@ -1387,9 +1455,9 @@ Land these together in X3 rather than piecemeal.
 | Key | Item | Purpose |
 |---|---|---|
 | `[limits].tool_result_inline_bytes` | C2, X3 | Inline cap before spill. **Landed** in C2; default `64 KiB`, floor `512` |
-| `[limits].directory_list_entries` | X3 | Directory listing cap |
-| `[spill].root`, `[spill].retention_days` | C2 → X3 | Spill artifact storage. C2 fixed the root at `<workspace>/spill` and left retention unimplemented — nothing prunes old artifacts yet |
-| `[compaction].enabled`, `.pressure_percent`, `.retain_tail_turns` | C3 | Compaction policy. **Landed** in C3; `.pressure_ratio` shipped as an integer `pressure_percent`, the unit C1 already traces. `.model` deferred to X3 — summaries use the run's own provider |
+| `[limits].directory_list_entries`, `.file_read_bytes`, `.file_read_max_bytes`, `.tool_output_bytes` | X3 | **Landed** in X3. The `file` tool's JSON schema is built from the read bounds, so it cannot advertise a ceiling the tool does not enforce |
+| `[spill].root`, `[spill].retention_days` | C2 → X3 | Spill artifact storage. **Landed** in X3; retention defaults to `0` (keep everything, C2's behaviour) and sweeps whole run directories from the gateway's idle phase when set |
+| `[compaction].enabled`, `.pressure_percent`, `.retain_tail_turns`, `.model` | C3, X3 | Compaction policy. **Landed** in C3; `.pressure_ratio` shipped as an integer `pressure_percent`, the unit C1 already traces. `.model` **landed** in X3 as a model *tier* (`high`/`medium`/`low`), the same vocabulary `AGENTOS_LLM_MODEL_<TIER>` and `/model` use, defaulting to the conversation's own model. X3 also made "compact above the elision trigger" a load-time check rather than a comment |
 | `[limits].tool_timeout_ms`, `[limits].tool_timeout_overrides` | D2 | Tool deadlines. **Landed** in D2, in `[limits]` rather than `[resources.tools]`: that section says *which* tools are enabled, and `ResourceSection` is shared with skills/mcp/llm where a timeout is meaningless. Replaces the MCP 10 s constant |
 | `[jobs].max_concurrent`, `.output_limit_bytes`, `.promotable` | D3 | Job registry bounds. **Landed** in D3; `.promotable` added — the allowlist of tools that become a job instead of failing at their deadline |
 | `[gateway].shards`, `.inbox_capacity` | G1 | Conversation sharding. **Landed** in G1; `shards = 0` means one per core, capped at 64. `.inbox_capacity` bounds both lists — envelopes waiting for a run of their own, and messages steering the one in flight |

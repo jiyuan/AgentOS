@@ -503,6 +503,76 @@ fn print_effective_config(config: &ServiceConfig) -> Result<(), String> {
     // before a tool call tells them.
     println!("sandbox.enforcement={}", sandbox::availability().describe());
     println!(
+        "limits.tool_result_inline_bytes={}",
+        workspace_config.limits.tool_result_inline_bytes
+    );
+    println!(
+        "limits.tool_timeout_ms={}",
+        workspace_config.limits.tool_timeout_ms
+    );
+    println!(
+        "limits.tool_timeout_overrides={}",
+        workspace_config
+            .limits
+            .tool_timeout_overrides
+            .iter()
+            .map(|(tool, ms)| format!("{tool}={ms}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    println!(
+        "limits.directory_list_entries={}",
+        workspace_config.limits.directory_list_entries
+    );
+    println!(
+        "limits.file_read_bytes={}",
+        workspace_config.limits.file_read_bytes
+    );
+    println!(
+        "limits.file_read_max_bytes={}",
+        workspace_config.limits.file_read_max_bytes
+    );
+    println!(
+        "limits.tool_output_bytes={}",
+        workspace_config.limits.tool_output_bytes
+    );
+    println!("compaction.enabled={}", workspace_config.compaction.enabled);
+    println!(
+        "compaction.pressure_percent={}",
+        workspace_config.compaction.pressure_percent
+    );
+    println!(
+        "compaction.retain_tail_turns={}",
+        workspace_config.compaction.retain_tail_turns
+    );
+    println!(
+        "compaction.model={}",
+        workspace_config.compaction.model.name()
+    );
+    println!(
+        "spill.root={}",
+        workspace_config
+            .spill
+            .root_in(&runtime_paths.workspace_root)
+            .display()
+    );
+    println!(
+        "spill.retention_days={}",
+        workspace_config.spill.retention_days
+    );
+    println!(
+        "jobs.max_concurrent={}",
+        workspace_config.jobs.max_concurrent
+    );
+    println!(
+        "jobs.output_limit_bytes={}",
+        workspace_config.jobs.output_limit_bytes
+    );
+    println!(
+        "jobs.promotable={}",
+        join_arcs(&workspace_config.jobs.promotable)
+    );
+    println!(
         "resources.priority={}",
         join_arcs(&workspace_config.resources.priority)
     );
