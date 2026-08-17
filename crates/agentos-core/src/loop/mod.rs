@@ -469,6 +469,11 @@ async fn act(ctx: ActCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunError>
                 deps.content_limits.tool_result_inline_bytes,
                 spilled,
             ));
+            // X5: the pairing the comment above depends on, checked against
+            // the transcript that was just written rather than left to the
+            // provider to reject a turn later.
+            #[cfg(debug_assertions)]
+            crate::invariants::tool_result_follows_its_call(&state.transcript);
         }
         Plan::Delegate(spec) => match execute_delegate(&mut state, deps, &spec).await? {
             DelegateOutcome::Finished(result) => {

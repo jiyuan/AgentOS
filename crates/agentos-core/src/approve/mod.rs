@@ -333,7 +333,10 @@ impl PolicyRule {
             .all(|(key, value)| child.arg_equals.get(key) == Some(value))
     }
 
-    fn label(&self) -> Arc<str> {
+    /// How this rule names its action in an error or an assertion. Already the
+    /// payload of [`PolicyError::Widened`]; `pub(crate)` so X5's delegation
+    /// invariant reports a violation the same way narrowing reports a refusal.
+    pub(crate) fn label(&self) -> Arc<str> {
         match &self.action {
             PolicyAction::Any => Arc::from("any"),
             PolicyAction::Tool(name) => Arc::clone(name),

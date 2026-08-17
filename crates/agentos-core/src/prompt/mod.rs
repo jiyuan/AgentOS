@@ -211,6 +211,13 @@ pub fn assemble(ctx: &RunContext<'_>, input: &Assembly<'_>) -> Prompt {
         transcript,
     );
 
+    // X5: the request the provider is about to see must derive from the run
+    // state, and the manifest must describe it exactly. Checked here because
+    // this is the only place both sides exist at once — the loop records the
+    // header but never sees the messages.
+    #[cfg(debug_assertions)]
+    crate::invariants::request_derives_from_state(ctx.state, &messages, &manifest);
+
     // Durable record of what this request was made of, drained by the loop
     // into a `request_header` trace event after `plan()` returns.
     ctx.push_request_header(manifest.header());
