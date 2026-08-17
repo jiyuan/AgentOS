@@ -74,6 +74,7 @@ fn bench_reply_turn(c: &mut Criterion) {
                 content_limits: Default::default(),
                 compaction: Default::default(),
                 cancel: Default::default(),
+                steering: None,
             };
             black_box(runtime.block_on(drive_to_finish(&deps)));
         });

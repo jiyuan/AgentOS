@@ -1,10 +1,8 @@
 use crate::channels::attachments::{file_size, AttachmentStore};
-use crate::channels::text::split_text;
 use crate::http::shared_client;
-use agentos_interfaces::{Channel, ChannelError, StreamEgress};
-use agentos_proto::{Attachment, AttachmentKind, ChannelId, ConversationId, Envelope};
+use agentos_interfaces::{Channel, ChannelError, Egress, StreamEgress};
+use agentos_proto::{Attachment, AttachmentKind, ChannelId, Envelope};
 use async_trait::async_trait;
-use reqwest::multipart::{Form, Part};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::env;
@@ -14,11 +12,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tracing::debug;
 
+mod egress;
 mod event;
 mod long_connection;
 mod proto;
 mod websocket;
 
+use egress::FeishuEgress;
 use event::{feishu_allowed_source_ids_from_env, AttachmentDescriptor};
 use long_connection::{FeishuEndpoint, FeishuLongConnection};
 
@@ -28,7 +28,7 @@ const DEFAULT_API_BASE: &str = "https://open.feishu.cn/open-apis";
 /// API limit is ~30 KB, but UTF-8 multi-byte chars eat into that and bot
 /// clients render long bodies poorly — chunking at 4000 chars matches what
 /// users actually see in chat.
-const FEISHU_TEXT_LIMIT: usize = 4000;
+pub(super) const FEISHU_TEXT_LIMIT: usize = 4000;
 
 pub struct FeishuChannel {
     app_id: Arc<str>,
@@ -41,9 +41,11 @@ pub struct FeishuChannel {
     long_connection: Option<FeishuLongConnection>,
     log_receive_errors: bool,
     attachments: AttachmentStore,
-    /// Per-conversation edit-in-place state, shared with the `StreamEgress`
-    /// handle so `send` can finalize a message the egress streamed.
-    stream_state: Arc<Mutex<HashMap<String, FeishuEditState>>>,
+    /// The send half. Held behind an `Arc` so the gateway can keep sending
+    /// while this channel is parked in its long connection, and so the
+    /// per-conversation edit state is shared with the `StreamEgress` handle —
+    /// `send` finalizes a message the streaming egress created.
+    egress: Arc<FeishuEgress>,
     /// Consecutive long-connection dial failures, reset on a successful
     /// (re)connect. Drives the reconnect backoff window below.
     reconnect_failures: u32,
@@ -52,17 +54,8 @@ pub struct FeishuChannel {
     retry_not_before: Option<Instant>,
 }
 
-/// In-flight streamed reply for one chat: the placeholder message being edited,
-/// the accumulated text, and when it was last edited (for throttling).
-#[derive(Default)]
-struct FeishuEditState {
-    message_id: Option<String>,
-    buffer: String,
-    last_edit: Option<Instant>,
-}
-
 /// Minimum gap between Feishu message edits per chat, to stay under rate limits.
-const FEISHU_EDIT_INTERVAL: Duration = Duration::from_millis(900);
+pub(super) const FEISHU_EDIT_INTERVAL: Duration = Duration::from_millis(900);
 
 /// First reconnect backoff after a long-connection dial failure. Doubles on each
 /// consecutive failure up to `FEISHU_RECONNECT_BACKOFF_MAX`.
@@ -72,7 +65,7 @@ const FEISHU_RECONNECT_BACKOFF_BASE: Duration = Duration::from_secs(1);
 const FEISHU_RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug)]
-struct CachedTenantToken {
+pub(super) struct CachedTenantToken {
     token: Arc<str>,
     expires_at: u64,
 }
@@ -88,19 +81,34 @@ impl FeishuChannel {
         let receive_id_type =
             env::var("AGENTOS_FEISHU_RECEIVE_ID_TYPE").unwrap_or_else(|_| "chat_id".to_owned());
         let allowed_source_ids = feishu_allowed_source_ids_from_env();
+        // The channel and its egress share one token cache: two caches would
+        // mean two `tenant_access_token` round trips and, worse, a send racing
+        // a receive to refresh the same expiring token.
+        let tenant_token = Arc::new(Mutex::new(None));
+        let app_id: Arc<str> = Arc::from(app_id);
+        let app_secret: Arc<str> = Arc::from(app_secret);
+        let api_base: Arc<str> = Arc::from(api_base.trim_end_matches('/').to_owned());
+        let receive_id_type: Arc<str> = Arc::from(receive_id_type);
 
         Ok(Self {
-            app_id: Arc::from(app_id),
-            app_secret: Arc::from(app_secret),
+            app_id: Arc::clone(&app_id),
+            app_secret: Arc::clone(&app_secret),
             id: ChannelId::new("feishu"),
-            api_base: Arc::from(api_base.trim_end_matches('/').to_owned()),
-            receive_id_type: Arc::from(receive_id_type),
+            api_base: Arc::clone(&api_base),
+            receive_id_type: Arc::clone(&receive_id_type),
             allowed_source_ids,
-            tenant_token: Arc::new(Mutex::new(None)),
+            tenant_token: Arc::clone(&tenant_token),
             long_connection: None,
             log_receive_errors: false,
             attachments: AttachmentStore::from_env("feishu"),
-            stream_state: Arc::new(Mutex::new(HashMap::new())),
+            egress: Arc::new(FeishuEgress {
+                api_base,
+                app_id,
+                app_secret,
+                receive_id_type,
+                tenant_token,
+                stream_state: Arc::new(Mutex::new(HashMap::new())),
+            }),
             reconnect_failures: 0,
             retry_not_before: None,
         })
@@ -128,39 +136,6 @@ impl FeishuChannel {
             &self.tenant_token,
         )
         .await
-    }
-
-    async fn send_text(&self, receive_id: &str, text: &str) -> Result<(), ChannelError> {
-        for chunk in split_text(text, FEISHU_TEXT_LIMIT) {
-            let content = json!({ "text": chunk }).to_string();
-            self.send_message(receive_id, "text", &content).await?;
-        }
-        Ok(())
-    }
-
-    async fn send_message(
-        &self,
-        receive_id: &str,
-        msg_type: &str,
-        content_json: &str,
-    ) -> Result<(), ChannelError> {
-        let token = self.tenant_access_token().await?;
-        let body = json!({
-            "receive_id": receive_id,
-            "msg_type": msg_type,
-            "content": content_json,
-        });
-        let url = format!(
-            "{}?receive_id_type={}",
-            self.api_url("im/v1/messages"),
-            self.receive_id_type.as_ref()
-        );
-        let response: Value = post_json(&url, Some(token.as_ref()), &body).await?;
-        if response.get("code").and_then(Value::as_i64) == Some(0) {
-            Ok(())
-        } else {
-            Err(ChannelError::Backend(Arc::from(response.to_string())))
-        }
     }
 
     async fn download_resource(
@@ -219,93 +194,6 @@ impl FeishuChannel {
             });
         }
         Ok(out)
-    }
-
-    async fn upload_image(&self, path: &Path) -> Result<String, ChannelError> {
-        let token = self.tenant_access_token().await?;
-        let bytes = fs::read(path)
-            .await
-            .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
-        let file_name = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "image".to_owned());
-        let form = Form::new()
-            .text("image_type", "message")
-            .part("image", Part::bytes(bytes).file_name(file_name));
-        let response: Value = shared_client()
-            .post(self.api_url("im/v1/images"))
-            .bearer_auth(token.as_ref())
-            .multipart(form)
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
-            .map_err(reqwest_to_channel_err)?
-            .json()
-            .await
-            .map_err(reqwest_to_channel_err)?;
-        if response.get("code").and_then(Value::as_i64) != Some(0) {
-            return Err(ChannelError::Backend(Arc::from(response.to_string())));
-        }
-        response
-            .get("data")
-            .and_then(|d| d.get("image_key"))
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-            .ok_or_else(|| {
-                ChannelError::Backend(Arc::from("Feishu image upload missing image_key"))
-            })
-    }
-
-    async fn upload_file(&self, name: &str, path: &Path) -> Result<String, ChannelError> {
-        let token = self.tenant_access_token().await?;
-        let bytes = fs::read(path)
-            .await
-            .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
-        let part = Part::bytes(bytes).file_name(name.to_owned());
-        let form = Form::new()
-            .text("file_type", "stream")
-            .text("file_name", name.to_owned())
-            .part("file", part);
-        let response: Value = shared_client()
-            .post(self.api_url("im/v1/files"))
-            .bearer_auth(token.as_ref())
-            .multipart(form)
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
-            .map_err(reqwest_to_channel_err)?
-            .json()
-            .await
-            .map_err(reqwest_to_channel_err)?;
-        if response.get("code").and_then(Value::as_i64) != Some(0) {
-            return Err(ChannelError::Backend(Arc::from(response.to_string())));
-        }
-        response
-            .get("data")
-            .and_then(|d| d.get("file_key"))
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-            .ok_or_else(|| ChannelError::Backend(Arc::from("Feishu file upload missing file_key")))
-    }
-
-    async fn send_attachment(
-        &self,
-        receive_id: &str,
-        attachment: &Attachment,
-    ) -> Result<(), ChannelError> {
-        match attachment.kind {
-            AttachmentKind::Image => {
-                let key = self.upload_image(&attachment.path).await?;
-                let content = json!({ "image_key": key }).to_string();
-                self.send_message(receive_id, "image", &content).await
-            }
-            AttachmentKind::Document => {
-                let key = self.upload_file(&attachment.name, &attachment.path).await?;
-                let content = json!({ "file_key": key }).to_string();
-                self.send_message(receive_id, "file", &content).await
-            }
-        }
     }
 
     async fn websocket_endpoint(&self) -> Result<FeishuEndpoint, ChannelError> {
@@ -479,136 +367,18 @@ impl Channel for FeishuChannel {
         }
     }
 
-    async fn send(&self, env: Envelope) -> Result<(), ChannelError> {
-        let receive_id = env.conversation_id.as_str();
-        let text = env.message.content.as_ref();
-
-        // Finalize a streamed reply by editing the placeholder to the full text
-        // (flushing the last throttled delta) instead of posting a duplicate.
-        let streamed = self
-            .stream_state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(receive_id);
-        let text_finalized = if let Some(message_id) = streamed.and_then(|state| state.message_id) {
-            if !text.is_empty() && text.chars().count() <= FEISHU_TEXT_LIMIT {
-                let token = self.tenant_access_token().await?;
-                feishu_edit_text(&self.api_base, &token, &message_id, text).await?;
-                true
-            } else {
-                // Too long for one editable message; deliver as fresh chunks.
-                self.send_text(receive_id, text).await?;
-                true
-            }
-        } else {
-            false
-        };
-
-        if !text_finalized && !text.is_empty() {
-            self.send_text(receive_id, text).await?;
-        }
-        for attachment in &env.message.attachments {
-            self.send_attachment(receive_id, attachment).await?;
-        }
-        if !text_finalized && text.is_empty() && env.message.attachments.is_empty() {
-            return self.send_text(receive_id, "").await;
-        }
-        Ok(())
+    fn egress(&self) -> Arc<dyn Egress> {
+        Arc::clone(&self.egress) as Arc<dyn Egress>
     }
 
     fn stream_egress(&self) -> Option<Arc<dyn StreamEgress>> {
-        Some(Arc::new(FeishuStreamEgress {
-            api_base: Arc::clone(&self.api_base),
-            app_id: Arc::clone(&self.app_id),
-            app_secret: Arc::clone(&self.app_secret),
-            receive_id_type: Arc::clone(&self.receive_id_type),
-            tenant_token: Arc::clone(&self.tenant_token),
-            state: Arc::clone(&self.stream_state),
-        }))
-    }
-}
-
-/// Shareable, `'static` streaming handle decoupled from the receive-owning
-/// channel. Shares the tenant-token cache and per-conversation edit state.
-struct FeishuStreamEgress {
-    api_base: Arc<str>,
-    app_id: Arc<str>,
-    app_secret: Arc<str>,
-    receive_id_type: Arc<str>,
-    tenant_token: Arc<Mutex<Option<CachedTenantToken>>>,
-    state: Arc<Mutex<HashMap<String, FeishuEditState>>>,
-}
-
-#[async_trait]
-impl StreamEgress for FeishuStreamEgress {
-    async fn push_delta(&self, conversation: &ConversationId, delta: &str) {
-        let receive_id = conversation.as_str().to_owned();
-        // Accumulate under the lock, decide whether an edit is due, then release
-        // the lock before the (async) HTTP call — a std Mutex guard is not held
-        // across an await.
-        let (due, text, message_id) = {
-            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let entry = guard.entry(receive_id.clone()).or_default();
-            entry.buffer.push_str(delta);
-            let now = Instant::now();
-            let due = entry
-                .last_edit
-                .is_none_or(|last| now.duration_since(last) >= FEISHU_EDIT_INTERVAL);
-            if due {
-                entry.last_edit = Some(now);
-                (
-                    true,
-                    clamp_feishu_text(&entry.buffer),
-                    entry.message_id.clone(),
-                )
-            } else {
-                (false, String::new(), None)
-            }
-        };
-        if !due || text.is_empty() {
-            return;
-        }
-        let Ok(token) = feishu_tenant_token(
-            &self.api_base,
-            &self.app_id,
-            &self.app_secret,
-            &self.tenant_token,
-        )
-        .await
-        else {
-            return;
-        };
-        // Best-effort: a failed placeholder/edit just skips this tick; the
-        // channel's `send` still delivers the complete reply.
-        match message_id {
-            None => {
-                if let Ok(Some(id)) = feishu_send_text_message(
-                    &self.api_base,
-                    &token,
-                    &self.receive_id_type,
-                    &receive_id,
-                    &text,
-                )
-                .await
-                {
-                    self.state
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .entry(receive_id)
-                        .or_default()
-                        .message_id = Some(id);
-                }
-            }
-            Some(id) => {
-                let _ = feishu_edit_text(&self.api_base, &token, &id, &text).await;
-            }
-        }
+        Some(self.egress.stream_handle())
     }
 }
 
 /// Acquire (or reuse a cached) tenant access token. Shared by the channel and
 /// its [`StreamEgress`] handle so both hit the same cache.
-async fn feishu_tenant_token(
+pub(super) async fn feishu_tenant_token(
     api_base: &str,
     app_id: &str,
     app_secret: &str,
@@ -652,7 +422,7 @@ async fn feishu_tenant_token(
 
 /// POST a text message, returning the new message id. Used by the streaming
 /// placeholder; `None` when the response omits a `message_id`.
-async fn feishu_send_text_message(
+pub(super) async fn feishu_send_text_message(
     api_base: &str,
     token: &str,
     receive_id_type: &str,
@@ -674,7 +444,7 @@ async fn feishu_send_text_message(
 }
 
 /// PUT an updated text body onto an existing message (edit in place).
-async fn feishu_edit_text(
+pub(super) async fn feishu_edit_text(
     api_base: &str,
     token: &str,
     message_id: &str,
@@ -703,7 +473,7 @@ async fn feishu_edit_text(
 
 /// Clamp a streamed in-flight buffer to Feishu's per-message char budget so an
 /// over-long preview still edits cleanly; `send` delivers the full final text.
-fn clamp_feishu_text(buffer: &str) -> String {
+pub(super) fn clamp_feishu_text(buffer: &str) -> String {
     if buffer.chars().count() <= FEISHU_TEXT_LIMIT {
         buffer.to_owned()
     } else {
@@ -711,7 +481,11 @@ fn clamp_feishu_text(buffer: &str) -> String {
     }
 }
 
-async fn post_json(url: &str, bearer: Option<&str>, body: &Value) -> Result<Value, ChannelError> {
+pub(super) async fn post_json(
+    url: &str,
+    bearer: Option<&str>,
+    body: &Value,
+) -> Result<Value, ChannelError> {
     let mut request = shared_client().post(url).json(body);
     if let Some(token) = bearer {
         request = request.bearer_auth(token);
@@ -741,7 +515,7 @@ fn is_expected_disconnect(err: &ChannelError) -> bool {
     BENIGN.iter().any(|needle| message.contains(needle))
 }
 
-fn reqwest_to_channel_err(err: reqwest::Error) -> ChannelError {
+pub(super) fn reqwest_to_channel_err(err: reqwest::Error) -> ChannelError {
     // reqwest's top-level Display is opaque (e.g. "error sending request for
     // url (...)"); the actionable cause — TLS rejection, connection reset, DNS
     // failure, timeout — lives in the `source()` chain. Flatten the whole chain
@@ -783,7 +557,14 @@ mod tests {
             long_connection: None,
             log_receive_errors: false,
             attachments: AttachmentStore::new(std::env::temp_dir(), "feishu"),
-            stream_state: Arc::new(Mutex::new(HashMap::new())),
+            egress: Arc::new(FeishuEgress {
+                api_base: Arc::from(DEFAULT_API_BASE),
+                app_id: Arc::from("app"),
+                app_secret: Arc::from("secret"),
+                receive_id_type: Arc::from("chat_id"),
+                tenant_token: Arc::new(Mutex::new(None)),
+                stream_state: Arc::new(Mutex::new(HashMap::new())),
+            }),
             reconnect_failures: 0,
             retry_not_before: None,
         }

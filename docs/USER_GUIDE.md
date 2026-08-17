@@ -22,7 +22,11 @@ Slash commands inside the TUI (the Telegram and Feishu gateways accept the
 same set):
 
 - `/help` — list available slash commands.
-- `/clear` — clear the current conversation history.
+- `/clear` — clear the current conversation history. On a gateway this also
+  cancels and reclaims that conversation's background jobs.
+- `/stop` — stop whatever this conversation is currently running. Gateway only:
+  the TUI runs one turn at a time, so there is never anything to interrupt.
+  Work already finished this turn is saved.
 - `/orchestrator [max|min|status]` — show or switch the orchestrator strategy.
 - `/model [provider:model|status|reset]` — show, set, or reset the LLM model.
 - `/skills [list|status]` — list enabled workspace skills.
@@ -39,6 +43,17 @@ agentos gateway-restart
 agentos gateway-stop
 agentos gateway-status
 ```
+
+The gateway runs conversations concurrently: each is pinned to one of
+`[gateway].shards` worker threads, so one conversation waiting on a slow tool
+does not hold up anybody else's. Within a conversation everything stays in
+order — one turn at a time.
+
+If you send another message while the agent is still working, it is not queued
+behind the current turn and it does not start a second one. It reaches the
+agent at its next planning step, so "actually, do X instead" lands within
+seconds rather than after the tool call you are trying to interrupt. Use
+`/stop` when you want the turn abandoned outright.
 
 The gateway uses:
 

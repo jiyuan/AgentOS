@@ -27,6 +27,7 @@ mod escalate;
 mod items;
 mod planning;
 mod request;
+mod steering;
 mod telemetry;
 
 use approval::{approve_transition, ApproveTransition};
@@ -39,6 +40,8 @@ use items::{
     tool_result_item, tool_status_name,
 };
 use request::record_request_header;
+pub use steering::{Steered, Steering, DEFAULT_STEERING_CAPACITY};
+
 use telemetry::{field_key, plan_assignment_fields, record_telemetry_event};
 
 #[derive(Debug, Error)]
@@ -100,6 +103,10 @@ pub struct LoopDeps<'a> {
     /// The run's cancellation token. A default token is never cancelled, so a
     /// caller that does not want to stop runs can ignore this field.
     pub cancel: CancellationToken,
+    /// Where input that arrived mid-run waits to be claimed (roadmap item G1).
+    /// `None` means nothing can steer this run, which is every entrypoint that
+    /// does not multiplex a conversation.
+    pub steering: Option<Steering>,
 }
 
 pub struct InputGuardrailEntry<'a> {
@@ -283,6 +290,12 @@ async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunErro
         "plan_started",
         BTreeMap::new(),
     );
+
+    // G1: claim anything the user said while this run was in flight. Before
+    // compaction and hydration so the new input is part of what gets summarized
+    // and recalled against, and so the orchestrator plans this turn already
+    // knowing about it.
+    steering::claim(&mut state, deps, &plan_span_id);
 
     // C3: summarize the oldest span if the run is already over the configured
     // pressure, before hydration so recall and the orchestrator both see the

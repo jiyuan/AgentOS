@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod compaction;
+mod gateway;
 mod jobs;
 mod limits;
 mod memory;
@@ -18,6 +19,7 @@ mod orchestrator;
 mod subagents;
 
 pub use compaction::CompactionConfig;
+pub use gateway::GatewayConfig;
 pub use jobs::JobsConfig;
 pub use limits::LimitsConfig;
 pub use memory::{
@@ -52,6 +54,7 @@ pub struct WorkspaceConfig {
     pub limits: LimitsConfig,
     pub compaction: CompactionConfig,
     pub jobs: JobsConfig,
+    pub gateway: GatewayConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -269,6 +272,7 @@ impl WorkspaceConfig {
         limits::validate_limits(&config.limits).map_err(std::io::Error::other)?;
         compaction::validate_compaction(&config.compaction).map_err(std::io::Error::other)?;
         jobs::validate_jobs(&config.jobs).map_err(std::io::Error::other)?;
+        gateway::validate_gateway(&config.gateway).map_err(std::io::Error::other)?;
         config
             .validate_guardrails()
             .map_err(std::io::Error::other)?;

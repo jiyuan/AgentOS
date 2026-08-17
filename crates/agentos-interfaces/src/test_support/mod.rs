@@ -12,7 +12,7 @@
 //! Available with `--features test-support` for downstream consumers; always
 //! available within `cfg(test)`.
 
-use crate::channel::{Channel, ChannelError};
+use crate::channel::{Channel, ChannelError, Egress};
 use crate::guardrail::{
     GuardrailError, GuardrailOutcome, Input, InputGuardrail, OutputGuardrail, ToolGuardrail,
 };
@@ -44,8 +44,34 @@ pub use storage::{MockMemory, MockSession};
 pub struct MockChannel {
     id: ChannelId,
     inbound: Mutex<Vec<Envelope>>,
+    /// The send half, shared with every [`Egress`] handle this mock hands out
+    /// so `sent()` observes those sends too.
+    egress: Arc<MockEgress>,
+}
+
+/// The captured outbound side of [`MockChannel`].
+struct MockEgress {
     sent: Mutex<Vec<Envelope>>,
     send_error: Mutex<Option<Arc<str>>>,
+}
+
+#[async_trait]
+impl Egress for MockEgress {
+    async fn send(&self, env: Envelope) -> Result<(), ChannelError> {
+        if let Some(reason) = self
+            .send_error
+            .lock()
+            .expect("MockChannel send_error lock not poisoned")
+            .clone()
+        {
+            return Err(ChannelError::Backend(reason));
+        }
+        self.sent
+            .lock()
+            .expect("MockChannel sent lock not poisoned")
+            .push(env);
+        Ok(())
+    }
 }
 
 impl MockChannel {
@@ -53,8 +79,10 @@ impl MockChannel {
         Self {
             id: ChannelId::new(id),
             inbound: Mutex::new(Vec::new()),
-            sent: Mutex::new(Vec::new()),
-            send_error: Mutex::new(None),
+            egress: Arc::new(MockEgress {
+                sent: Mutex::new(Vec::new()),
+                send_error: Mutex::new(None),
+            }),
         }
     }
 
@@ -68,6 +96,7 @@ impl MockChannel {
 
     pub fn with_send_error(self, reason: impl Into<Arc<str>>) -> Self {
         *self
+            .egress
             .send_error
             .lock()
             .expect("MockChannel send_error lock not poisoned") = Some(reason.into());
@@ -76,7 +105,8 @@ impl MockChannel {
 
     /// Snapshot the envelopes that have been observed via `send()`.
     pub fn sent(&self) -> Vec<Envelope> {
-        self.sent
+        self.egress
+            .sent
             .lock()
             .expect("MockChannel sent lock not poisoned")
             .clone()
@@ -101,20 +131,8 @@ impl Channel for MockChannel {
         }
     }
 
-    async fn send(&self, env: Envelope) -> Result<(), ChannelError> {
-        if let Some(reason) = self
-            .send_error
-            .lock()
-            .expect("MockChannel send_error lock not poisoned")
-            .clone()
-        {
-            return Err(ChannelError::Backend(reason));
-        }
-        self.sent
-            .lock()
-            .expect("MockChannel sent lock not poisoned")
-            .push(env);
-        Ok(())
+    fn egress(&self) -> Arc<dyn Egress> {
+        Arc::clone(&self.egress) as Arc<dyn Egress>
     }
 }
 

@@ -70,12 +70,19 @@ serialization, cached skill prelude) cut both scenarios by ~20%:
 
 Concurrency / tail latency (1000 concurrent tool-call conversations per round, 5 rounds, 16 shard threads):
 
-| Metric | Value | Phase 1 baseline |
-|---|---|---|
-| p50 per-conversation latency | **3.0 µs** | 3.1 µs |
-| p95 | **3.8 µs** | 3.9 µs |
-| p99 | **10.4 µs** | 6.1 µs |
-| throughput | ~1.5 M conversations/s | ~1.3–1.5 M/s |
+| Metric | Value | After G1 | Phase 1 baseline |
+|---|---|---|---|
+| p50 per-conversation latency | **3.0 µs** | 4.7 µs | 3.1 µs |
+| p95 | **3.8 µs** | 5.7 µs | 3.9 µs |
+| p99 | **10.4 µs** | 19.7 µs | 6.1 µs |
+| throughput | ~1.5 M conversations/s | ~0.8 M/s | ~1.3–1.5 M/s |
+
+The G1 column carries the same ~1 µs per-turn codegen cost D2 introduced (see
+above) plus the tool-deadline `timeout` wrapper each of these conversations now
+goes through, on a bench whose per-conversation work is ~3 µs to begin with.
+The shape is unchanged — flat p50, a tail an order of magnitude above it — and
+none of it is sharding overhead: the bench drives the loop directly, not
+`gateway::shard`.
 
 ### Performance finding: shared interned `Arc<str>` keys contend under concurrency
 
@@ -90,6 +97,12 @@ codebase: never share refcounted hot-path constants across shard threads —
 intern per thread or per runtime.
 
 ### Architectural finding: the loop future is `!Send`
+
+*Roadmap G1 turned this bench's shape into the product's:
+`gateway/shard.rs` shards conversations across one `current_thread` runtime per
+OS thread, exactly as modelled here. One departure — the shards poll turns on a
+`FuturesUnordered` rather than `spawn_local`, because a spawned task must be
+`'static` and that would force each shard to build its own `AgentRuntime`.*
 
 Writing the concurrency bench surfaced a structural constraint:
 `RunLoopState::step()` returns a `!Send` future because sub-agent execution

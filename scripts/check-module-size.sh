@@ -18,7 +18,7 @@ limit=800
 is_allowlisted() {
   case "$1" in
     crates/agentos-cli/src/main.rs) return 0 ;;
-    crates/agentos-cli/src/bin/agentos-gateway.rs) return 0 ;;
+    crates/agentos-cli/src/bin/agentos-gateway/main.rs) return 0 ;;
     *) return 1 ;;
   esac
 }

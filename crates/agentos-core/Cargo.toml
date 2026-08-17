@@ -29,6 +29,9 @@ tracing.workspace = true
 agentos-interfaces = { workspace = true, features = ["test-support"] }
 criterion = "0.5"
 proptest = "1"
+# `test-util` for the paused clock: the shard tests assert scheduling order
+# under a 30-second stall, which must not cost 30 seconds of wall time.
+tokio = { workspace = true, features = ["test-util"] }
 
 [[bench]]
 name = "loop_overhead"

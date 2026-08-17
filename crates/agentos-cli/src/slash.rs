@@ -56,6 +56,7 @@ impl SessionUsage {
 pub enum SlashCommand {
     Help,
     Clear,
+    Stop,
     ListSkills,
     ListCrons,
     ListTools,
@@ -99,6 +100,9 @@ pub fn parse(input: &str) -> Parsed {
     let trimmed = input.trim();
     if trimmed.eq_ignore_ascii_case("clear") || trimmed.eq_ignore_ascii_case("/clear") {
         return Parsed::Cmd(SlashCommand::Clear);
+    }
+    if trimmed.eq_ignore_ascii_case("stop") || trimmed.eq_ignore_ascii_case("/stop") {
+        return Parsed::Cmd(SlashCommand::Stop);
     }
     if trimmed.eq_ignore_ascii_case("/help") || trimmed.eq_ignore_ascii_case("/?") {
         return Parsed::Cmd(SlashCommand::Help);
@@ -206,6 +210,7 @@ pub async fn render(cmd: SlashCommand, ctx: &SlashContext<'_>) -> String {
     match cmd {
         SlashCommand::Help => format_help(),
         SlashCommand::Clear => format_clear_unavailable(),
+        SlashCommand::Stop => format_stop_unavailable(),
         SlashCommand::ListSkills => format_skills(ctx.skill_catalog),
         SlashCommand::ListCrons => format_crons(ctx.cron_store),
         SlashCommand::ListTools => format_tools(ctx.tool_registry),
@@ -262,6 +267,10 @@ pub fn format_help() -> String {
         ("/help", "Show this list of slash commands."),
         ("/clear", "Clear the current conversation history."),
         (
+            "/stop",
+            "Stop whatever this conversation is currently running.",
+        ),
+        (
             "/orchestrator [max|min|status]",
             "Show or set the orchestrator strategy.",
         ),
@@ -300,6 +309,23 @@ pub fn format_clear(removed: usize, channel_label: &str) -> String {
 
 fn format_clear_unavailable() -> String {
     "Clear is handled by the surface; this should be unreachable.".to_owned()
+}
+
+/// Confirmation for `/stop`.
+///
+/// Says plainly whether there was anything to stop: "nothing was running" and
+/// "stopped it" are different facts, and a user who typed `/stop` because the
+/// agent seemed stuck needs to know which one happened.
+pub fn format_stop(stopped: bool) -> String {
+    if stopped {
+        "Stopping. Whatever had already finished this turn is saved.".to_owned()
+    } else {
+        "Nothing is running in this conversation.".to_owned()
+    }
+}
+
+fn format_stop_unavailable() -> String {
+    "Stop needs a running gateway; this surface runs one turn at a time.".to_owned()
 }
 
 pub fn format_skills(catalog: &WorkspaceSkillCatalog) -> String {

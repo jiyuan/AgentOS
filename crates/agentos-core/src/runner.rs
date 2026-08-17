@@ -7,7 +7,7 @@ use crate::memory::MemoryManager;
 use crate::prompt::Compaction;
 use crate::r#loop::{
     resume_approved, FinalOutput, InputGuardrailEntry, LoopDeps, OutputGuardrailEntry, RunError,
-    RunLoopState, StartCtx, ToolGuardrailEntry,
+    RunLoopState, StartCtx, Steering, ToolGuardrailEntry,
 };
 use crate::spill::ContentLimits;
 use crate::subagents::SubAgentRegistry;
@@ -112,6 +112,11 @@ pub struct RunnerDeps<'a> {
     /// Cancels this run. Clone it before starting the run to keep a handle;
     /// a default token is never cancelled.
     pub cancel: CancellationToken,
+    /// Where input that arrives while this run is in flight waits to be claimed
+    /// (roadmap item G1). A sharded gateway sets it so a second message steers
+    /// the running turn instead of starting a second, racing run on the same
+    /// conversation; a one-shot entrypoint leaves it `None`.
+    pub steering: Option<Steering>,
 }
 
 pub trait TraceSink: Send + Sync {
@@ -328,6 +333,7 @@ pub async fn run_envelope(
         content_limits: deps.content_limits,
         compaction: deps.compaction,
         cancel: deps.cancel.clone(),
+        steering: deps.steering.clone(),
     };
     let mut current = RunLoopState::Start(StartCtx { state });
 
@@ -414,6 +420,7 @@ pub async fn resume_run(
         content_limits: deps.content_limits,
         compaction: deps.compaction,
         cancel: deps.cancel.clone(),
+        steering: deps.steering.clone(),
     };
     let mut current = match resume_approved(paused.state) {
         Ok(current) => current,
@@ -765,6 +772,7 @@ mod tests {
             content_limits: Default::default(),
             compaction: Default::default(),
             cancel: Default::default(),
+            steering: None,
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),
@@ -866,6 +874,7 @@ mod tests {
             content_limits: Default::default(),
             compaction: Default::default(),
             cancel: Default::default(),
+            steering: None,
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),
@@ -918,6 +927,7 @@ mod tests {
             content_limits: Default::default(),
             compaction: Default::default(),
             cancel: Default::default(),
+            steering: None,
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),
@@ -971,6 +981,7 @@ mod tests {
             content_limits: Default::default(),
             compaction: Default::default(),
             cancel: Default::default(),
+            steering: None,
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),
@@ -1037,6 +1048,7 @@ mod tests {
             content_limits: Default::default(),
             compaction: Default::default(),
             cancel: Default::default(),
+            steering: None,
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),
@@ -1115,6 +1127,7 @@ mod tests {
             content_limits: Default::default(),
             compaction: Default::default(),
             cancel: Default::default(),
+            steering: None,
         };
         let mut metadata = BTreeMap::new();
         metadata.insert(
@@ -1404,6 +1417,7 @@ mod tests {
             content_limits: Default::default(),
             compaction: Default::default(),
             cancel: Default::default(),
+            steering: None,
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),

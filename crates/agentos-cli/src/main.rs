@@ -11,7 +11,7 @@ use agentos_core::skills::{
     create_skill, validate_skill_dir, SkillCreation, SkillResourceKind, WorkspaceSkillCatalog,
 };
 use agentos_interfaces::orchestrator::StreamSink;
-use agentos_interfaces::{Channel, ChannelError};
+use agentos_interfaces::{Channel, ChannelError, Egress};
 use agentos_llm::{env as agentos_env, LlmModelController};
 use agentos_proto::{
     AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole, RunId, SpanKind,
@@ -327,7 +327,11 @@ where
 
     let gateway_service = GatewayService::new(deps, Arc::from(deps.active_agent.as_str()));
     match gateway_service
-        .run_envelope(channel, invocation.envelope, RunId::new(run_id.to_owned()))
+        .run_envelope(
+            channel.egress().as_ref(),
+            invocation.envelope,
+            RunId::new(run_id.to_owned()),
+        )
         .await
     {
         Ok(GatewayRun::Finished { state, .. }) => {
@@ -395,7 +399,12 @@ where
             let paused = load_paused_run(state_path)?;
             if answer.message.content.trim().eq_ignore_ascii_case("y") {
                 let outcome = gateway_service
-                    .resume(&*channel, paused, &approval_id, ResumeDecision::Approve)
+                    .resume(
+                        channel.egress().as_ref(),
+                        paused,
+                        &approval_id,
+                        ResumeDecision::Approve,
+                    )
                     .await;
                 delete_paused_run(state_path)?;
                 match outcome? {
@@ -409,7 +418,7 @@ where
             } else {
                 let result = gateway_service
                     .resume(
-                        &*channel,
+                        channel.egress().as_ref(),
                         paused,
                         &approval_id,
                         ResumeDecision::Reject {
@@ -480,7 +489,11 @@ async fn run_tui_loop(
             serde_json::json!(channel.orchestrator_strategy().task_id()),
         );
         let result = match gateway_service
-            .run_envelope(channel, input, RunId::new(format!("cli-run-{turn}")))
+            .run_envelope(
+                channel.egress().as_ref(),
+                input,
+                RunId::new(format!("cli-run-{turn}")),
+            )
             .await
         {
             Ok(result) => result,
@@ -518,7 +531,12 @@ async fn run_tui_loop(
                 let paused = load_paused_run(state_path)?;
                 if answer.message.content.trim().eq_ignore_ascii_case("y") {
                     let outcome = gateway_service
-                        .resume(&*channel, paused, &approval_id, ResumeDecision::Approve)
+                        .resume(
+                            channel.egress().as_ref(),
+                            paused,
+                            &approval_id,
+                            ResumeDecision::Approve,
+                        )
                         .await;
                     delete_paused_run(state_path)?;
                     match outcome? {
@@ -533,7 +551,7 @@ async fn run_tui_loop(
                 } else {
                     let result = gateway_service
                         .resume(
-                            &*channel,
+                            channel.egress().as_ref(),
                             paused,
                             &approval_id,
                             ResumeDecision::Reject {
@@ -585,7 +603,7 @@ where
     };
     let gateway_service = GatewayService::new(deps, Arc::from(deps.active_agent.as_str()));
     let outcome = gateway_service
-        .resume(channel, paused, &approval_id, decision)
+        .resume(channel.egress().as_ref(), paused, &approval_id, decision)
         .await;
     delete_paused_run(state_path)?;
     match outcome? {
@@ -826,6 +844,20 @@ impl Channel for TuiChannel {
         self.read_line().await.map(|input| self.envelope(input))
     }
 
+    fn egress(&self) -> Arc<dyn Egress> {
+        Arc::new(TuiEgress {
+            streamed: Arc::clone(&self.streamed),
+        })
+    }
+}
+
+/// The TUI's send half: stdout plus the shared "already streamed this turn" flag.
+struct TuiEgress {
+    streamed: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl Egress for TuiEgress {
     async fn send(&self, env: Envelope) -> Result<(), ChannelError> {
         // When the reply was streamed token-by-token this turn, the text is
         // already on screen — just close the line. Otherwise print it whole.
