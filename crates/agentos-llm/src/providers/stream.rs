@@ -21,6 +21,7 @@
 //! [`CompletionEvent::Done`] carrying the assembled message, its tool calls, and
 //! `agentos.token_usage` logged identically to the buffered path.
 
+use crate::providers::anthropic::canonical_stop_reason;
 use crate::providers::reply::record_reply_outcome;
 use crate::providers::{attach_token_usage, log_token_usage};
 use crate::{CompletionEvent, CompletionStream, LlmError};
@@ -74,6 +75,8 @@ pub(crate) fn anthropic_stream(model: Arc<str>, response: reqwest::Response) -> 
             tool_calls: BTreeMap::new(),
             usage_input: None,
             output_tokens: None,
+            stop_reason: None,
+            saw_message_stop: false,
         },
     )
 }
@@ -410,6 +413,13 @@ struct AnthropicAccumulator {
     usage_input: Option<Value>,
     /// Final cumulative output tokens from `message_delta`.
     output_tokens: Option<u64>,
+    /// Raw `delta.stop_reason` from `message_delta`, translated by
+    /// [`canonical_stop_reason`] when the reply is assembled.
+    stop_reason: Option<String>,
+    /// Whether the stream's own terminal event arrived. Anthropic has no
+    /// `[DONE]`, but `message_stop` is always its last event, so reaching the end
+    /// of the byte stream without one means the response was cut.
+    saw_message_stop: bool,
 }
 
 impl SseAccumulator for AnthropicAccumulator {
@@ -468,25 +478,72 @@ impl SseAccumulator for AnthropicAccumulator {
                     .get("usage")
                     .and_then(|usage| usage.get("output_tokens"))
                     .and_then(Value::as_u64);
+                if let Some(reason) = chunk
+                    .get("delta")
+                    .and_then(|delta| delta.get("stop_reason"))
+                    .and_then(Value::as_str)
+                {
+                    self.stop_reason = Some(reason.to_owned());
+                }
             }
-            // ping, content_block_stop, message_stop: no state to fold.
+            Some("message_stop") => self.saw_message_stop = true,
+            Some("error") => {
+                // Anthropic can report a mid-stream failure (overloaded, billing)
+                // as an `error` event and then simply stop sending. Surfacing it
+                // here keeps the provider's own diagnosis, which the cut-stream
+                // error raised at assembly time would otherwise replace with a
+                // generic one.
+                let error = chunk.get("error").unwrap_or(chunk);
+                pending.push_back(Err(LlmError::Provider(Arc::from(format!(
+                    "anthropic stream failed: {error}"
+                )))));
+            }
+            // ping, content_block_stop: no state to fold.
             _ => {}
         }
     }
 
     fn finalize(&mut self, _saw_sentinel: bool) -> Result<Message, LlmError> {
-        // Anthropic's Messages stream has no `[DONE]`: it ends by connection
-        // close, so there is no sentinel to have missed.
+        // Anthropic's Messages stream has no `[DONE]`, so the driver's
+        // `saw_sentinel` says nothing here. What plays the same role is
+        // `message_stop`, always the stream's last event: reaching the end of the
+        // byte stream without it means the response was cut, and everything
+        // accumulated so far is a partial answer. Reported as a transport failure
+        // so the caller retries buffered rather than handing the run a truncated
+        // turn it cannot detect. A stream that reported an `error` event already
+        // queued that cause ahead of this one, so the provider's own diagnosis
+        // still wins.
+        if !self.saw_message_stop {
+            return Err(LlmError::StreamTransport(Arc::from(format!(
+                "anthropic stream ended without a message_stop event after {} content byte(s); \
+                 the response was cut short",
+                self.content.len()
+            ))));
+        }
+        let builders = std::mem::take(&mut self.tool_calls);
+        let announced = builders
+            .values()
+            .filter(|builder| builder.id.is_some() && builder.name.is_some())
+            .count();
         let mut message = Message {
             role: MessageRole::Assistant,
             content: Arc::from(std::mem::take(&mut self.content)),
             attachments: Vec::new(),
-            tool_calls: tool_calls_from_builders(
-                std::mem::take(&mut self.tool_calls).into_values(),
-            ),
+            tool_calls: tool_calls_from_builders(builders.into_values()),
             tool_call_id: None,
             metadata: Default::default(),
         };
+        // `produced_reasoning` is always false: `thinking` blocks are neither
+        // requested nor captured by this provider, so there is no reasoning
+        // channel for an otherwise empty reply to count as output.
+        record_reply_outcome(
+            "anthropic",
+            &mut message,
+            canonical_stop_reason(self.stop_reason.as_deref()),
+            announced,
+            false,
+        )
+        .map_err(|defect| LlmError::Provider(Arc::from(defect.to_string())))?;
         // Reassemble the buffered-path usage shape: input + cache from
         // message_start, output overridden by the final message_delta count.
         if let Some(Value::Object(mut usage)) = self.usage_input.take() {
@@ -535,10 +592,13 @@ mod tests {
             st.buffer.extend_from_slice(chunk);
             drain_sse_lines(&mut st);
         }
-        let mut events: Vec<CompletionEvent> = std::mem::take(&mut st.pending)
-            .into_iter()
-            .map(|item| item.expect("no error in fixture"))
-            .collect();
+        // Queued errors propagate rather than panic, matching the real consumer:
+        // the driver hands pending items out before the terminal step, so an
+        // error an accumulator queued mid-stream is what the caller sees first.
+        let mut events: Vec<CompletionEvent> = Vec::new();
+        for item in std::mem::take(&mut st.pending) {
+            events.push(item?);
+        }
         let saw_sentinel = st.saw_sentinel;
         events.push(CompletionEvent::Done(st.acc.finalize(saw_sentinel)?));
         Ok(events)
@@ -579,6 +639,8 @@ mod tests {
             tool_calls: BTreeMap::new(),
             usage_input: None,
             output_tokens: None,
+            stop_reason: None,
+            saw_message_stop: false,
         }
     }
 
@@ -924,6 +986,14 @@ mod tests {
                 }),
             ),
             anthropic_event(
+                "message_delta",
+                serde_json::json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": "tool_use" },
+                    "usage": { "output_tokens": 9 }
+                }),
+            ),
+            anthropic_event(
                 "message_stop",
                 serde_json::json!({ "type": "message_stop" }),
             ),
@@ -940,5 +1010,182 @@ mod tests {
         assert_eq!(call.args.get(), r#"{"city":"paris"}"#);
         // A tool-use-only reply surfaces no assistant-visible text.
         assert!(message.content.is_empty());
+        // `tool_use` is one of this shape's two ordinary endings, so it maps onto
+        // `tool_calls` and leaves the message unmarked.
+        assert!(!message
+            .metadata
+            .contains_key(crate::providers::reply::STOP_REASON_METADATA_KEY));
+    }
+
+    #[test]
+    fn an_anthropic_stream_that_ends_without_message_stop_is_a_transport_failure() {
+        // The Anthropic analogue of a chat-completions stream cut before `[DONE]`:
+        // text arrived, `message_stop` never did, so what we hold is half an
+        // answer. `StreamTransport` is the error the orchestrator recovers from by
+        // retrying buffered.
+        let chunks = [
+            anthropic_event(
+                "message_start",
+                serde_json::json!({ "type": "message_start", "message": { "usage": {} } }),
+            ),
+            anthropic_event(
+                "content_block_delta",
+                serde_json::json!({
+                    "type": "content_block_delta", "index": 0,
+                    "delta": { "type": "text_delta", "text": "half an ans" }
+                }),
+            ),
+        ];
+        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+
+        let error = try_decode_with(anthropic_acc(), &refs)
+            .expect_err("a cut stream is not a finished reply");
+
+        assert!(
+            matches!(error, LlmError::StreamTransport(_)),
+            "expected StreamTransport, got {error:?}"
+        );
+        assert!(error.to_string().contains("message_stop"), "{error}");
+    }
+
+    #[test]
+    fn an_anthropic_reply_stopped_at_max_tokens_records_length() {
+        // The request pins `max_tokens`, so this is the routine case rather than
+        // an exotic one: the text is usable, but the transcript has to record
+        // that it was cut.
+        let chunks = [
+            anthropic_event(
+                "content_block_delta",
+                serde_json::json!({
+                    "type": "content_block_delta", "index": 0,
+                    "delta": { "type": "text_delta", "text": "the answer is fo" }
+                }),
+            ),
+            anthropic_event(
+                "message_delta",
+                serde_json::json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": "max_tokens" },
+                    "usage": { "output_tokens": 1024 }
+                }),
+            ),
+            anthropic_event(
+                "message_stop",
+                serde_json::json!({ "type": "message_stop" }),
+            ),
+        ];
+        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+        let events = decode_with(anthropic_acc(), &refs);
+
+        let CompletionEvent::Done(message) = events.last().expect("events present") else {
+            panic!("last event must be Done");
+        };
+        assert_eq!(message.content.as_ref(), "the answer is fo");
+        assert_eq!(
+            message
+                .metadata
+                .get(crate::providers::reply::STOP_REASON_METADATA_KEY)
+                .and_then(Value::as_str),
+            Some("length")
+        );
+    }
+
+    #[test]
+    fn an_anthropic_refusal_is_recorded_under_its_own_name() {
+        // Not folded into `content_filter`: the model declining is a different
+        // event from a provider filtering the output.
+        let chunks = [
+            anthropic_event(
+                "content_block_delta",
+                serde_json::json!({
+                    "type": "content_block_delta", "index": 0,
+                    "delta": { "type": "text_delta", "text": "I won't help with that." }
+                }),
+            ),
+            anthropic_event(
+                "message_delta",
+                serde_json::json!({
+                    "type": "message_delta", "delta": { "stop_reason": "refusal" }
+                }),
+            ),
+            anthropic_event(
+                "message_stop",
+                serde_json::json!({ "type": "message_stop" }),
+            ),
+        ];
+        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+        let events = decode_with(anthropic_acc(), &refs);
+
+        let CompletionEvent::Done(message) = events.last().expect("events present") else {
+            panic!("last event must be Done");
+        };
+        assert_eq!(
+            message
+                .metadata
+                .get(crate::providers::reply::STOP_REASON_METADATA_KEY)
+                .and_then(Value::as_str),
+            Some("refusal")
+        );
+    }
+
+    #[test]
+    fn an_anthropic_stream_cut_off_mid_tool_use_is_rejected_rather_than_losing_the_call() {
+        // `input_json_delta` fragments concatenate into a string that has to be
+        // re-parsed, so truncation here really does destroy the call — unlike the
+        // buffered path, where `input` arrives as an object.
+        let chunks = [
+            anthropic_event(
+                "content_block_start",
+                serde_json::json!({
+                    "type": "content_block_start", "index": 0,
+                    "content_block": { "type": "tool_use", "id": "toolu_1", "name": "file" }
+                }),
+            ),
+            anthropic_event(
+                "content_block_delta",
+                serde_json::json!({
+                    "type": "content_block_delta", "index": 0,
+                    "delta": { "type": "input_json_delta", "partial_json": "{\"path\":\"/etc/ho" }
+                }),
+            ),
+            anthropic_event(
+                "message_delta",
+                serde_json::json!({
+                    "type": "message_delta", "delta": { "stop_reason": "max_tokens" }
+                }),
+            ),
+            anthropic_event(
+                "message_stop",
+                serde_json::json!({ "type": "message_stop" }),
+            ),
+        ];
+        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+
+        let error = try_decode_with(anthropic_acc(), &refs)
+            .expect_err("a lost tool call is not a valid reply");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("announced 1 tool call(s)"), "{rendered}");
+        assert!(rendered.contains("finish_reason=length"), "{rendered}");
+    }
+
+    #[test]
+    fn an_anthropic_error_event_keeps_the_providers_own_diagnosis() {
+        // Without this the stream would simply stop, and the cut-stream error
+        // raised at assembly time would replace "overloaded" with a generic
+        // truncation message.
+        let chunks = [anthropic_event(
+            "error",
+            serde_json::json!({
+                "type": "error",
+                "error": { "type": "overloaded_error", "message": "Overloaded" }
+            }),
+        )];
+        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+
+        let error =
+            try_decode_with(anthropic_acc(), &refs).expect_err("an errored stream is not a reply");
+
+        assert!(error.to_string().contains("Overloaded"), "{error}");
     }
 }

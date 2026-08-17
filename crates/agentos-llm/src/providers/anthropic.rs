@@ -2,6 +2,7 @@ use crate::providers::content::{
     append_descriptors, document_mime, format_text_document, image_mime, read_base64,
     read_text_document,
 };
+use crate::providers::reply::record_reply_outcome;
 use crate::providers::stream::anthropic_stream;
 use crate::providers::{
     attach_token_usage, log_token_usage, post_json, post_sse, raw_args_from_json_value,
@@ -22,19 +23,28 @@ pub async fn complete(
     let (url, headers) = endpoint_and_headers()?;
     let payload = base_payload(model, messages, tools);
     let response = post_json("llm", &url, &headers, &payload).await?;
+    // Logged before the reply is validated: the tokens were spent either way.
     let token_usage = log_token_usage("anthropic", model, &response.body);
-    let content_blocks = response
-        .body
+    let mut message = reply_from_body(&response.body)?;
+    if let Some(usage) = token_usage {
+        attach_token_usage(&mut message, usage);
+    }
+    Ok(message)
+}
+
+/// Assemble and validate the assistant turn from a buffered Messages body — the
+/// buffered counterpart of the streaming accumulator's `finalize`, applying the
+/// same [`record_reply_outcome`] rules to the same fields.
+fn reply_from_body(body: &Value) -> Result<Message, ProviderError> {
+    let content_blocks = body
         .get("content")
         .and_then(Value::as_array)
         .ok_or_else(|| ProviderError::MalformedResponse {
-            detail: format!(
-                "Anthropic response missing assistant content: {}",
-                response.body
-            ),
+            detail: format!("Anthropic response missing assistant content: {body}"),
         })?;
     let mut text = String::new();
     let mut tool_calls = Vec::new();
+    let mut announced = 0usize;
     for block in content_blocks {
         match block.get("type").and_then(Value::as_str) {
             Some("text") => {
@@ -52,6 +62,13 @@ pub async fn complete(
                 let Some(name) = block.get("name").and_then(Value::as_str) else {
                     continue;
                 };
+                // Counted before the arguments are built, so a call the reply
+                // fully identified but whose arguments do not survive is visible
+                // as a loss rather than silently absent. Unlike the two
+                // OpenAI-shaped providers this is a guard rather than a fix:
+                // Anthropic sends `input` as a JSON object, so a truncated one
+                // fails the response parse upstream instead of arriving here.
+                announced += 1;
                 if let Some(args) = raw_args_from_json_value(block.get("input")) {
                     tool_calls.push(ToolCall {
                         id: ToolCallId::new(id),
@@ -71,10 +88,43 @@ pub async fn complete(
         tool_call_id: None,
         metadata: Default::default(),
     };
-    if let Some(usage) = token_usage {
-        attach_token_usage(&mut message, usage);
-    }
+    // `produced_reasoning` is always false: extended thinking arrives as
+    // `thinking` content blocks, which this provider neither requests nor
+    // captures, so there is no reasoning channel for an otherwise empty reply to
+    // count as output.
+    record_reply_outcome(
+        "anthropic",
+        &mut message,
+        canonical_stop_reason(body.get("stop_reason").and_then(Value::as_str)),
+        announced,
+        false,
+    )
+    .map_err(|defect| ProviderError::MalformedResponse {
+        detail: defect.to_string(),
+    })?;
     Ok(message)
+}
+
+/// Translate an Anthropic `stop_reason` into the vocabulary
+/// [`STOP_REASON_METADATA_KEY`](crate::providers::reply::STOP_REASON_METADATA_KEY)
+/// uses, so a session log reads the same whichever provider wrote it. Shared with
+/// the streaming path, which reads the same field from `message_delta`.
+///
+/// `end_turn` and `tool_use` are this shape's two ordinary endings and map onto
+/// `stop` and `tool_calls`. `stop_sequence` is ordinary too — Chat Completions
+/// reports a stop sequence as plain `stop` — and `max_tokens` is `length`.
+/// Anything else passes through under its own name rather than being folded into
+/// a near neighbour: `refusal` is the model declining, which is not the same
+/// event as a provider content filter, and `pause_turn` means the turn should be
+/// continued rather than that anything went wrong. Both are worth recording as
+/// themselves.
+pub(crate) fn canonical_stop_reason(raw: Option<&str>) -> Option<&str> {
+    match raw? {
+        "end_turn" | "stop_sequence" => Some("stop"),
+        "tool_use" => Some("tool_calls"),
+        "max_tokens" => Some("length"),
+        other => Some(other),
+    }
 }
 
 /// Stream a Messages completion over SSE. Builds the same request as
@@ -388,6 +438,96 @@ mod tests {
 
     fn raw_args(s: &str) -> Box<RawValue> {
         RawValue::from_string(s.to_owned()).unwrap()
+    }
+
+    #[test]
+    fn a_buffered_reply_stopped_at_max_tokens_records_length() {
+        // `base_payload` pins max_tokens at 1024, so this is the routine case:
+        // the text is usable, but the transcript has to record that it was cut.
+        let body = json!({
+            "stop_reason": "max_tokens",
+            "content": [{ "type": "text", "text": "the answer is fo" }]
+        });
+
+        let message = reply_from_body(&body).expect("truncated text is still usable");
+
+        assert_eq!(message.content.as_ref(), "the answer is fo");
+        assert_eq!(
+            message
+                .metadata
+                .get(crate::providers::reply::STOP_REASON_METADATA_KEY)
+                .and_then(Value::as_str),
+            Some("length")
+        );
+    }
+
+    #[test]
+    fn an_ordinary_buffered_reply_gains_no_stop_reason() {
+        let body = json!({
+            "stop_reason": "end_turn",
+            "content": [{ "type": "text", "text": "the answer is four" }]
+        });
+
+        let message = reply_from_body(&body).expect("an ordinary reply is not a defect");
+
+        assert!(!message
+            .metadata
+            .contains_key(crate::providers::reply::STOP_REASON_METADATA_KEY));
+    }
+
+    #[test]
+    fn a_buffered_reply_with_nothing_in_it_is_rejected() {
+        // Every output token went to a thinking block this provider does not
+        // capture, so the run loop would be handed a finished turn containing
+        // nothing.
+        let body = json!({
+            "stop_reason": "max_tokens",
+            "content": [{ "type": "thinking", "thinking": "...", "signature": "sig" }]
+        });
+
+        let error = reply_from_body(&body).expect_err("an empty reply is not a finished turn");
+
+        assert!(error.to_string().contains("no content"), "{error}");
+    }
+
+    #[test]
+    fn a_buffered_tool_use_turn_is_accepted_and_left_unmarked() {
+        let body = json!({
+            "stop_reason": "tool_use",
+            "content": [{
+                "type": "tool_use", "id": "toolu_1", "name": "file",
+                "input": { "path": "a.txt" }
+            }]
+        });
+
+        let message = reply_from_body(&body).expect("a tool-use turn is not a defect");
+
+        assert_eq!(message.tool_calls.len(), 1);
+        assert_eq!(message.tool_calls[0].id.as_str(), "toolu_1");
+        assert!(!message
+            .metadata
+            .contains_key(crate::providers::reply::STOP_REASON_METADATA_KEY));
+    }
+
+    #[test]
+    fn canonical_stop_reason_maps_the_ordinary_endings_and_passes_the_rest_through() {
+        assert_eq!(canonical_stop_reason(Some("end_turn")), Some("stop"));
+        assert_eq!(canonical_stop_reason(Some("stop_sequence")), Some("stop"));
+        assert_eq!(canonical_stop_reason(Some("tool_use")), Some("tool_calls"));
+        assert_eq!(canonical_stop_reason(Some("max_tokens")), Some("length"));
+        // Not folded into `content_filter`: a model declining is a different
+        // event from a provider filtering the output.
+        assert_eq!(canonical_stop_reason(Some("refusal")), Some("refusal"));
+        assert_eq!(
+            canonical_stop_reason(Some("pause_turn")),
+            Some("pause_turn")
+        );
+        // A reason this build has never heard of is still worth recording.
+        assert_eq!(
+            canonical_stop_reason(Some("future_reason")),
+            Some("future_reason")
+        );
+        assert_eq!(canonical_stop_reason(None), None);
     }
 
     #[test]

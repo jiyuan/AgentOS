@@ -29,11 +29,12 @@
 //! thing in a session log regardless of which provider wrote it. The reason is
 //! recorded only when it is *abnormal*, so its presence is itself the signal.
 //!
-//! Wired into the two Chat Completions paths (buffered
-//! [`super::deepseek::complete`], streamed
-//! [`super::stream::openai_compatible_stream`]) and the two Responses paths
-//! (`openai::responses` and `openai::events`). Anthropic still assembles its
-//! reply without these checks.
+//! Wired into every provider path that assembles a reply: Chat Completions
+//! (buffered [`super::deepseek::complete`], streamed
+//! [`super::stream::openai_compatible_stream`]), Responses (`openai::responses`
+//! and `openai::events`), and Anthropic Messages
+//! ([`super::anthropic::complete`] and its SSE accumulator). Ollama has no
+//! streaming path and reports no stop reason, so it is the one shape left out.
 
 use agentos_proto::Message;
 use serde_json::Value;
