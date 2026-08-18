@@ -627,3 +627,23 @@
 - **Actual Behavior**: The first validation used the newer `aliases:` keyword, which macOS system Ruby 2.6 does not support.
 - **Root Cause**: The one-off command assumed a newer Psych method signature than the workspace host provides.
 - **Suggested Fix**: Use the lowest-common-denominator `YAML.load_file(path)` call for syntax validation unless alias control is required. The compatible command was rerun successfully.
+
+## [2026-08-18 17:38] TOOL [RESOLVED]
+
+- **Agent**: main-codex
+- **Task**: Build and validate the red release archive for `REL-001`.
+- **Guideline Violated**: GUIDELINES > Correctness
+- **Expected Behavior**: The archive should contain exactly one top-level bundle directory on every supported packaging host.
+- **Actual Behavior**: macOS `tar` added an AppleDouble `._agentos-*` entry, so the clean-room checker found two top-level roots before reaching the intended missing-workspace assertion.
+- **Root Cause**: The packaging command did not disable macOS copyfile metadata emission.
+- **Suggested Fix**: Set `COPYFILE_DISABLE=1` for archive creation and keep the single-root assertion. The rebuilt archive contains one root and passes the checker.
+
+## [2026-08-18 17:38] ORCHESTRATION [RESOLVED]
+
+- **Agent**: main-codex
+- **Task**: Implement the `REL-001` self-contained release slice.
+- **Guideline Violated**: ORCHESTRATION > Subagent Delegation & Creation
+- **Expected Behavior**: Delegate work involving more than two sequential tool calls to a matching subagent.
+- **Actual Behavior**: Work was performed locally because the active runtime instructions only permit spawning subagents when the user explicitly requests delegation.
+- **Root Cause**: Higher-priority runtime instructions conflict with the repository's automatic delegation threshold, and the user did not explicitly authorize subagent spawning.
+- **Suggested Fix**: Amend the repository guideline to account for environments where subagent spawning is gated by explicit user consent.

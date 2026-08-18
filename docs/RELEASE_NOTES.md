@@ -65,6 +65,13 @@ Three load-bearing invariants are asserted in debug builds. A conversation can b
 forked from a prefix of another. Memory gained reflection sweeps, real
 embeddings, and the first extension crate, `agentos-memory-vector`.
 
+**Self-contained release archive.** Release bundles now include the enabled
+skills, subagents, sub-orchestrator templates, empty runtime directories, and
+the complete linked documentation set without copying session or trace state.
+An artifact check extracts the archive outside the checkout, resolves workspace
+and documentation references, constructs the runtime, and completes an offline
+`builtin.echo` turn. Installed wrapper behavior remains tracked by `REL-002`.
+
 **Other.** OpenAI migrated to the Responses API exclusively; Anthropic replies
 are capped at each model's published output limit; reply-integrity checks reject
 provider responses that lost information; the email PII guardrail no longer

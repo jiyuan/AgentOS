@@ -81,6 +81,18 @@ jobs:
       - name: Smoke-run benches
         run: cargo bench -p agentos-core -- --test
 
+  release-archive:
+    name: self-contained release archive
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release archive
+        run: DIST_DIR="$RUNNER_TEMP/agentos-dist" scripts/package-release.sh
+      - name: Verify archive without repository paths
+        run: python3 scripts/check-release-archive.py "$RUNNER_TEMP"/agentos-dist/*.tar.gz
+
   semver-checks:
     name: semver-checks (advisory)
     runs-on: ubuntu-latest

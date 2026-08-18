@@ -53,10 +53,10 @@ It also found release-blocking contract gaps:
     package installation, the gateway pipeline, or real Seatbelt enforcement.
 
 The audit ran against `75db88c`. Commit `224f070` subsequently removed the three
-missing skills from `[resources.skills].enabled`, so clean source startup is no
-longer blocked by those names. That change is **partial closure only**: release
-packaging still omits the workspace assets referenced by `agent.toml`, and no
-clean-room artifact test protects the contract.
+missing skills from `[resources.skills].enabled`. `REL-001` completes that
+configuration repair by removing the same unavailable names from the general
+subagent and packages every static workspace asset behind an archive smoke
+test. Installer command behavior remains in `REL-002`.
 
 ## 3. Definition of done
 
@@ -186,14 +186,16 @@ Primary files:
 
 Priority: P0  
 Size: M  
-Status: in progress; missing default skill names were partially repaired by `224f070`, and `CI-001` portability/probe changes are implemented pending required CI runs
+Status: in progress; `REL-001` archive self-containment and `CI-001` portability/probe changes are implemented pending required CI runs; installer/wrapper behavior remains in `REL-002`
 Dependencies: M0
 
 Deliverables:
 
 1. Package the complete runtime workspace: enabled skills, subagents,
    sub-orchestrator templates, example config, and every document linked from
-   the packaged README or User Guide.
+   the packaged README or User Guide. **Implemented:** the archive copies only
+   static workspace assets, the complete documentation tree, `DESIGN.md`, and
+   `BENCHMARKS.md`; the artifact checker resolves their references.
 2. Choose one install layout. Prefer the XDG paths already documented:
    `~/.local/bin/agentos` and `~/.local/share/agentos`.
 3. Expose diagnostics through the installed wrapper (`agentos config`) instead
@@ -207,7 +209,9 @@ Deliverables:
 7. Probe actual Seatbelt profile application on macOS; presence of
    `/usr/bin/sandbox-exec` alone is not availability. **Implemented:** a cached
    permissive-profile and denied-write probe determines availability.
-8. Add a clean-room source and release-artifact smoke job.
+8. Add a clean-room source and release-artifact smoke job. **Partially
+   implemented:** CI builds an archive and runs its offline echo smoke from an
+   extracted temporary directory; source/install smoke remains in `REL-002`.
 
 Acceptance criteria:
 
@@ -536,7 +540,7 @@ policy semantics, and new features in one PR.
 |---|---|---|
 | `ADR-001` | Resolve narrowing, sandbox, identity, request, audit, clear, and streaming contracts (**complete:** [`ADR-001`](adr/ADR-001-remediation-contracts.md)) | — |
 | `TEST-001` | Add red tests for the P0/P1 audit findings (**in progress:** strict policy-narrowing and no-body-invocation sandbox regressions landed) | ADR-001 |
-| `REL-001` | Self-contained release workspace and documentation | TEST-001 |
+| `REL-001` | Self-contained release workspace and documentation (**implemented:** complete static workspace/docs plus clean-room archive checker; qualifying CI run pending) | TEST-001 |
 | `REL-002` | Installer/wrapper contract and clean-room smoke | REL-001 |
 | `CI-001` | Portable spill/golden tests and macOS sandbox probe (**in progress:** implementation and required Linux/macOS sandbox jobs added; qualifying CI run pending) | TEST-001 |
 | `ID-001` | Typed principal and injective namespace | ADR-001 |
@@ -601,8 +605,8 @@ Additionally:
 
 | Audit finding | Priority | Milestone | Owner role | Initial disposition |
 |---|---:|---|---|---|
-| Missing configured skills | P0 | M1 | Release engineering | Partially resolved by `224f070`; preserve with smoke test |
-| Release archive omits workspace assets | P0 | M1 | Release engineering | Open |
+| Missing configured skills | P0 | M1 | Release engineering | Resolved by `REL-001`; archive smoke validates parent and subagent skill references |
+| Release archive omits workspace assets | P0 | M1 | Release engineering | Resolved by `REL-001`; required CI artifact run pending |
 | Installer/docs/wrapper mismatch | P1 | M1 | CLI/release | Open |
 | Remote ingress plus permissive tool defaults | P0 | M2, M3 | Gateway security | Open |
 | Cross-channel/session/sender identity collision | P0 | M2 | Identity/persistence | Open |

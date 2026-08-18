@@ -29,13 +29,24 @@ mkdir -p "$dist_dir"
 rm -rf "$stage_dir" "$archive_path" "$checksum_path"
 
 rustup run "$rust_toolchain" cargo build \
+  --locked \
   --release \
   --manifest-path "$root/Cargo.toml" \
   -p agentos-cli \
   -p agentos-core \
   --bins
 
-install -d "$stage_dir/bin" "$stage_dir/scripts" "$stage_dir/docs" "$stage_dir/workspace"
+install -d \
+  "$stage_dir/bin" \
+  "$stage_dir/scripts" \
+  "$stage_dir/docs" \
+  "$stage_dir/workspace/skills" \
+  "$stage_dir/workspace/subagents" \
+  "$stage_dir/workspace/suborchs" \
+  "$stage_dir/workspace/crons" \
+  "$stage_dir/workspace/tasks" \
+  "$stage_dir/workspace/runs" \
+  "$stage_dir/workspace/traces"
 
 for binary in agentos-cli agentos-gateway agentos-tool-worker agentos-mcp-stdio-worker; do
   install -m 755 "$root/target/release/$binary" "$stage_dir/bin/$binary"
@@ -45,14 +56,17 @@ install -m 755 "$root/scripts/install-agentos.sh" "$stage_dir/scripts/install-ag
 install -m 755 "$root/scripts/start-agentos.sh" "$stage_dir/scripts/start-agentos.sh"
 install -m 644 "$root/.env.example" "$stage_dir/.env.example"
 install -m 644 "$root/workspace/agent.toml" "$stage_dir/workspace/agent.toml"
+cp -R "$root/workspace/skills/." "$stage_dir/workspace/skills/"
+cp -R "$root/workspace/subagents/." "$stage_dir/workspace/subagents/"
+cp -R "$root/workspace/suborchs/." "$stage_dir/workspace/suborchs/"
 install -m 644 "$root/README.md" "$stage_dir/README.md"
 install -m 644 "$root/LICENSE" "$stage_dir/LICENSE"
-install -m 644 "$root/docs/INSTALL.md" "$stage_dir/docs/INSTALL.md"
-install -m 644 "$root/docs/USER_GUIDE.md" "$stage_dir/docs/USER_GUIDE.md"
-install -m 644 "$root/docs/RELEASE_NOTES.md" "$stage_dir/docs/RELEASE_NOTES.md"
+install -m 644 "$root/DESIGN.md" "$stage_dir/DESIGN.md"
+install -m 644 "$root/BENCHMARKS.md" "$stage_dir/BENCHMARKS.md"
+cp -R "$root/docs/." "$stage_dir/docs/"
 printf '%s\n' "$version" >"$stage_dir/VERSION"
 
-LC_ALL=C LANG=C tar -C "$dist_dir" -czf "$archive_path" "$bundle_name"
+COPYFILE_DISABLE=1 LC_ALL=C LANG=C tar -C "$dist_dir" -czf "$archive_path" "$bundle_name"
 
 write_checksum() {
   local target="$1"

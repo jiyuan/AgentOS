@@ -17,8 +17,7 @@ allowlist = ["shell", "file", "cron_create", "cron_remove", "memory", "job_statu
 
 # Programs the shell tool guardrail accepts in a call's `command` field.
 # The first eight are read-only inspection commands (the built-in default);
-# `python3` is added so skill bundles (email-digest, rss-digest) can run
-# their bundled fetch scripts.
+# `python3` is added so workspace skill bundles can run bundled scripts.
 [guardrails]
 shell_allowlist = ["printf", "echo", "pwd", "ls", "find", "cat", "head", "tail", "python3"]
 

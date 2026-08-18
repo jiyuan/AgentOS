@@ -92,6 +92,7 @@ ERROR
   fi
   "$root/scripts/install-toolchain.sh"
   rustup run "$rust_toolchain" cargo build \
+    --locked \
     --release \
     --manifest-path "$root/Cargo.toml" \
     -p agentos-cli \
@@ -121,7 +122,19 @@ for binary in agentos-cli agentos-gateway agentos-tool-worker agentos-mcp-stdio-
   fi
 done
 
-install -d "$bindir" "$agentos_home/bin" "$agentos_home/scripts" "$agentos_home/docs" "$agentos_home/workspace" "$agentos_home/logs"
+install -d \
+  "$bindir" \
+  "$agentos_home/bin" \
+  "$agentos_home/scripts" \
+  "$agentos_home/docs" \
+  "$agentos_home/workspace/skills" \
+  "$agentos_home/workspace/subagents" \
+  "$agentos_home/workspace/suborchs" \
+  "$agentos_home/workspace/crons" \
+  "$agentos_home/workspace/tasks" \
+  "$agentos_home/workspace/runs" \
+  "$agentos_home/workspace/traces" \
+  "$agentos_home/logs"
 
 for binary in agentos-cli agentos-gateway agentos-tool-worker agentos-mcp-stdio-worker; do
   install -m 755 "$bin_source_dir/$binary" "$agentos_home/bin/$binary"
@@ -130,17 +143,18 @@ done
 install -m 755 "$root/scripts/start-agentos.sh" "$agentos_home/scripts/start-agentos.sh"
 install -m 644 "$root/.env.example" "$agentos_home/.env.example"
 install -m 644 "$root/workspace/agent.toml" "$agentos_home/workspace/agent.toml"
+cp -R "$root/workspace/skills/." "$agentos_home/workspace/skills/"
+cp -R "$root/workspace/subagents/." "$agentos_home/workspace/subagents/"
+cp -R "$root/workspace/suborchs/." "$agentos_home/workspace/suborchs/"
 install -m 644 "$root/README.md" "$agentos_home/README.md"
-install -m 644 "$root/docs/INSTALL.md" "$agentos_home/docs/INSTALL.md"
-install -m 644 "$root/docs/USER_GUIDE.md" "$agentos_home/docs/USER_GUIDE.md"
-install -m 644 "$root/docs/RELEASE_NOTES.md" "$agentos_home/docs/RELEASE_NOTES.md"
 install -m 644 "$root/LICENSE" "$agentos_home/LICENSE"
+install -m 644 "$root/DESIGN.md" "$agentos_home/DESIGN.md"
+install -m 644 "$root/BENCHMARKS.md" "$agentos_home/BENCHMARKS.md"
+cp -R "$root/docs/." "$agentos_home/docs/"
 
 if [[ ! -f "$agentos_home/.env" ]]; then
   cp "$agentos_home/.env.example" "$agentos_home/.env"
 fi
-
-cp -r "$root/workspace" "$agentos_home/"
 
 cat >"$bindir/agentos" <<EOF
 #!/usr/bin/env bash
