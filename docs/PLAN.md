@@ -3,13 +3,17 @@
 Last reconstructed: 2026-05-13. Snapshot refreshed: 2026-08-17.
 
 This plan is the record of the 2026-05-13 architectural audit and the invariant
-and config-authority milestones it opened. **All three of its milestones are
-complete**; the findings below are kept for their rationale and their exit
-criteria, not as a description of open work.
+and config-authority milestones it opened. **All three of its original
+milestones were marked complete**, but the 2026-08-18 audit found regressions
+and end-to-end contract gaps behind several of those claims. Current remediation
+work is tracked in [`AUDIT_REMEDIATION_PLAN.md`](AUDIT_REMEDIATION_PLAN.md); the
+findings below are kept for their rationale and historical exit criteria.
 
-Current sequencing lives in [`TRANSFER_ROADMAP.md`](TRANSFER_ROADMAP.md); the
-current architecture reference is [`ARCHITECTURE.md`](ARCHITECTURE.md). Where
-this document and either of those disagree, they are current.
+Current remediation sequencing lives in
+[`AUDIT_REMEDIATION_PLAN.md`](AUDIT_REMEDIATION_PLAN.md); the current architecture
+reference is [`ARCHITECTURE.md`](ARCHITECTURE.md). The transfer, feature, and
+optimization roadmaps remain implementation history. Where their completion
+claims disagree with the remediation plan, the remediation plan is current.
 
 ## Current Snapshot
 

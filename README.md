@@ -4,6 +4,11 @@ AgentOS is an agent-agnostic Rust agent runtime built around one auditable run
 loop. Every run follows the same typed state machine, and every external
 capability crosses a narrow trait or policy boundary.
 
+The project is in an audit-remediation cycle. The [capability
+matrix](docs/CAPABILITY_MATRIX.md) is the source of truth for what is Stable,
+Preview, or Deferred; a feature appearing below means it is implemented, not
+necessarily release-qualified.
+
 Highlights:
 
 - a typed run loop (`Start → Plan → Approve → Act → Observe`) with serializable
@@ -88,6 +93,8 @@ loop model, memory architecture, and extension boundary.
 - [Install Guide](docs/INSTALL.md)
 - [User Guide](docs/USER_GUIDE.md)
 - [Architecture Design Document](docs/ARCHITECTURE.md)
+- [Capability Matrix](docs/CAPABILITY_MATRIX.md)
+- [Audit Remediation Plan](docs/AUDIT_REMEDIATION_PLAN.md)
 - [Skills Guide](docs/SKILLS.md)
 - [Config catalog](docs/CONFIG_CATALOG.md) and [tool catalog](docs/TOOL_CATALOG.md) — generated from the code
 - [Release Notes](docs/RELEASE_NOTES.md)

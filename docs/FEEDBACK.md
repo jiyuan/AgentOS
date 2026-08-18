@@ -567,3 +567,33 @@
 - **Actual Behavior**: `audit-skill` read append-only JSONL/log artifacts directly, including a 10 MB gateway log, and the next DeepSeek request exceeded the model context limit with 2,940,746 message tokens.
 - **Root Cause**: The file tool had no read range/tail controls or default output bound, and the audit skill documented unbounded reads for large operational artifacts.
 - **Suggested Fix**: Add bounded file reads with `max_bytes`, `offset`, and `tail`, cap tool-result transcript content defensively, and require audit-skill to read recent log/JSONL tails instead of full files.
+
+## [2026-08-18 17:20] TOOL [RESOLVED]
+
+- **Agent**: main-codex
+- **Task**: Validate local Markdown links added for the audit-remediation contract slice.
+- **Guideline Violated**: GUIDELINES > Correctness
+- **Expected Behavior**: The read-only link checker should parse all repository Markdown as UTF-8 and report only unresolved local targets.
+- **Actual Behavior**: The first Ruby invocation inherited a US-ASCII external encoding and stopped on non-ASCII documentation before checking links.
+- **Root Cause**: The one-off validation command did not set its external and internal encodings explicitly.
+- **Suggested Fix**: Run repository documentation checks with explicit UTF-8 decoding. The command was rerun with `-EUTF-8:UTF-8` and all selected links passed.
+
+## [2026-08-18 15:30] TOOL [RESOLVED]
+
+- **Agent**: main-codex
+- **Task**: Measure the clean temporary TUI startup baseline.
+- **Guideline Violated**: GUIDELINES > Efficiency
+- **Expected Behavior**: A command that completes in 0.02 seconds should return its captured result within the configured 30-second yield window.
+- **Actual Behavior**: The command-result transport continued to report the execution cell as running long after the process had exited, which initially looked like an AgentOS shutdown hang.
+- **Root Cause**: The delayed completion was in orchestration result delivery; the captured `/usr/bin/time` output proved the tested process had already exited successfully.
+- **Suggested Fix**: On an implausibly long yielded cell, poll or terminate the execution cell and inspect captured process timing before attributing the delay to the program under test. The result was corrected in-session.
+
+## [2026-08-18 15:35] TOOL
+
+- **Agent**: main-codex
+- **Task**: Record the M0 gateway smoke and storage baseline.
+- **Guideline Violated**: GUIDELINES > Consistency / M0 > test floor
+- **Expected Behavior**: The gateway pipeline should isolate its config, session database, logs, and control files under a temporary test home so a smoke run cannot mix with checkout runtime state.
+- **Actual Behavior**: The pipeline isolated logs and PID artifacts but inherited the checkout's `AGENTOS_HOME`; its 50-task run appended session and memory-access state to the ignored `workspace/agentos.sqlite`.
+- **Root Cause**: `_build_gateway_env` pins provider and channel variables but does not set a temporary `AGENTOS_HOME`, while the gateway now derives persistence paths exclusively from that home.
+- **Suggested Fix**: Give each pipeline cycle a temporary AgentOS home populated with the minimum runtime assets, pass that home to the gateway, record storage from it, and remove it after the structured result is written. Track this with the gateway/hermetic CI work in `CI-002`.

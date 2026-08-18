@@ -1,12 +1,18 @@
 # Release Notes
 
+> **Audit status (2026-08-18):** v0.6.0 is not release-qualified. The
+> [`capability matrix`](CAPABILITY_MATRIX.md) classifies the features below as
+> Stable, Preview, or Deferred and names their promotion gates. The
+> [`remediation plan`](AUDIT_REMEDIATION_PLAN.md) supersedes unqualified
+> completion claims in these development notes.
+
 ## v0.6.0
 
 The current development version. Two roadmaps landed since v0.5.0:
 [`FEATURE_ROADMAP.md`](FEATURE_ROADMAP.md) in full, and
 [`TRANSFER_ROADMAP.md`](TRANSFER_ROADMAP.md) except its last item.
 
-**Streaming.** Native SSE decoding for OpenAI, Anthropic, and DeepSeek, wired
+**Streaming (Preview).** Native SSE decoding for OpenAI, Anthropic, and DeepSeek, wired
 through the run loop, both orchestrators, the TUI, and edit-in-place message
 egress on Telegram and Feishu. Ollama uses the single-chunk fallback.
 
@@ -41,10 +47,11 @@ only an answer carrying that ticket decides it — `/approve <ticket>`,
 `/deny <ticket>`, or an inline button. Prompts expire (default 15 minutes) and
 an expired prompt is recorded as cancelled, not refused.
 
-**Real sandboxing.** `requires_isolation` was replaced by a `SandboxMode`
+**Sandbox modes (Preview pending fail-closed enforcement).** `requires_isolation` was replaced by a `SandboxMode`
 (`read_only`, `workspace_write`, `full_access`) that the kernel enforces —
 Landlock on Linux, Seatbelt on macOS — inherited by every descendant process.
-Where no backend exists, a sandboxed tool fails rather than running unrestricted.
+The intended contract is that a missing or incompatible backend refuses the
+call before the tool body runs. `SBX-001` tracks enforcement of that contract.
 
 **Correctness and hygiene.** Every tool call in a multi-call response is now
 kept and drained one per turn instead of the first being run and the rest

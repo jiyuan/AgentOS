@@ -7,14 +7,23 @@ This document is the unified architecture reference for AgentOS. It supersedes
 the older standalone extension-boundary, memory-system, and development-plan
 documents while preserving their current design decisions.
 
-Sequencing and per-item rationale live in the roadmaps:
+Current audit remediation priorities and release gates live in
+[`AUDIT_REMEDIATION_PLAN.md`](AUDIT_REMEDIATION_PLAN.md). Sequencing and
+per-item rationale for earlier implementation work live in the roadmaps:
 [`TRANSFER_ROADMAP.md`](TRANSFER_ROADMAP.md) (request authority, context
-management, deadlines, gateway concurrency — the most recent work),
+management, deadlines, gateway concurrency),
 [`FEATURE_ROADMAP.md`](FEATURE_ROADMAP.md) (streaming, memory intelligence,
 extension ecosystem), [`OPTIMIZATION_ROADMAP.md`](OPTIMIZATION_ROADMAP.md)
 (performance debt), and [`PLAN.md`](PLAN.md) (invariant and config-authority
-milestones). This document describes what is built; those describe why and in
-what order.
+milestones). This document describes the intended architecture; the remediation
+plan records audit findings where the current implementation does not yet meet
+that intent.
+
+[`ADR-001`](adr/ADR-001-remediation-contracts.md) fixes the normative contracts
+for the disputed safety boundaries. The audited maturity and supported scope of
+each feature are recorded in [`CAPABILITY_MATRIX.md`](CAPABILITY_MATRIX.md).
+Those documents take precedence over unqualified completion language below
+until the corresponding remediation acceptance tests pass.
 
 ## 1. Purpose
 
@@ -728,6 +737,13 @@ Trace records carry `emitted_unix` so an audit can window by event time. Full
 sensitive memory bodies are never written to traces.
 
 ## 17. Current State
+
+The list below records implemented baselines, not unconditional Stable support.
+See [`CAPABILITY_MATRIX.md`](CAPABILITY_MATRIX.md) for current maturity,
+platform assumptions, and promotion gates. In particular, remote-channel
+production guarantees, stdio MCP, fail-closed sandboxing, subagent policy
+narrowing, provisional streaming, and real-vector memory remain Preview while
+their remediation milestones are open.
 
 Completed baselines:
 

@@ -2,7 +2,13 @@
 
 Agent OS is built around one typed run loop. The loop owns all transitions between planning, approval, action, observation, pause, and finish states. Extensions can implement public interfaces, but the core engine owns the safety-critical control flow.
 
-This document is the condensed loop-and-safety reference. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full architecture, memory model, and extension boundary.
+This document is the condensed loop-and-safety reference. See
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full architecture, memory
+model, and extension boundary. During audit remediation,
+[`ADR-001`](docs/adr/ADR-001-remediation-contracts.md) is authoritative for
+policy narrowing, isolation, principal identity, provider requests, safety
+events, clear semantics, and output delivery. The current support level of each
+feature is listed in the [`capability matrix`](docs/CAPABILITY_MATRIX.md).
 
 ## Layering
 
@@ -92,6 +98,10 @@ the panic.
 
 ## Status
 
-The scaffold milestone is complete. The active baseline includes the typed loop and trace shape; concrete approval with serializable paused runs and ticket-correlated prompts; one prompt-assembly authority with projection, spill, elision, compaction, and overflow recovery; reference tools and guardrails with per-call deadlines and background-job promotion; run cancellation and mid-run steering; per-conversation actors sharded across threads; SQLite session and scoped memory storage with hydration and reflection; streaming across three providers and both chat channels; Telegram and Feishu reference channels; configured sub-agents and sub-orchestrator templates; static and stdio MCP registration; kernel-sandboxed subprocess execution for tools that declare a mode; and runtime path injection with an enforced extension boundary.
-
-Remaining architecture work and open decisions are tracked in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); current sequencing is [`docs/TRANSFER_ROADMAP.md`](docs/TRANSFER_ROADMAP.md).
+The typed loop and its supporting features are implemented, but implementation
+presence is not a release-support claim. The 2026-08-18 audit found contract
+gaps in identity, authorization, isolation, request auditability, configuration,
+streaming, and distribution. The [`capability
+matrix`](docs/CAPABILITY_MATRIX.md) is the authority for Stable, Preview, and
+Deferred status. Remediation sequencing lives in
+[`docs/AUDIT_REMEDIATION_PLAN.md`](docs/AUDIT_REMEDIATION_PLAN.md).

@@ -1,4 +1,8 @@
 [agent]
+# Audit-remediation example, not a release-qualified production policy. Some
+# configured resources are Preview so their loaders and diagnostics remain
+# exercised. Consult docs/CAPABILITY_MATRIX.md before enabling this workspace
+# for untrusted input or remote channels.
 id = "default"
 orchestrator = "builtin.max"
 memory = "memory.in_memory"

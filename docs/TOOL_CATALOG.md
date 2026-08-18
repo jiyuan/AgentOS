@@ -1,6 +1,6 @@
 # Tool catalog
 
-Every built-in tool, derived from its `ToolSpec`. `Sandbox` is what the kernel enforces for the tool's child processes; `Deadline` is the tool's own declaration, which a deployment's `[limits]` can override.
+Every built-in tool, derived from its `ToolSpec`. `Sandbox` records the requested isolation contract; until `SBX-001` closes, it is a Preview claim rather than proof that a compatible executor will enforce it. `Deadline` is the tool's own declaration, which a deployment's `[limits]` can override. Consult the [capability matrix](CAPABILITY_MATRIX.md) for release maturity and security limitations.
 
 Four more built-in tools are not in the table because they cannot be constructed
 without a live runtime — the generator builds each spec from a bare registry, and
