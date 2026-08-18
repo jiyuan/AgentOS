@@ -1,19 +1,13 @@
 //! A5 invariant: `Policy::narrow` property tests over random parent/child
 //! pairs — narrowing must never widen what the parent permits.
 //!
-//! The implementation's narrowing contract is *tool-granular*, not
-//! argument-granular: a child `Allow` on tool T is accepted whenever the
-//! parent has any `Allow`/`AskUser` rule for T, even if that parent rule is
-//! constrained to specific arguments (see `parent_exposes_tool` in
-//! `approve/mod.rs` — this is the documented "explicitly allowlisted
-//! sub-agent tool needs no approval" escape hatch). The properties below
-//! therefore assert the contract the code actually guarantees:
+//! Narrowing is defined per concrete call, including operation and arguments.
+//! The properties below assert the contract from ADR-001:
 //!
 //! 1. Narrowing is reflexive: every policy narrows to itself.
 //! 2. The narrowed default verb never exceeds the parent default verb.
-//! 3. For actions the parent never exposes through any `Allow`/`AskUser`
-//!    rule, the narrowed policy can never decide more permissively than the
-//!    parent's default verb.
+//! 3. For every generated action and argument combination, the child's
+//!    effective decision never exceeds the parent's decision.
 //! 4. A child `Allow` rule on a tool the parent does not expose is rejected
 //!    with `PolicyError::Widened`.
 //! 5. A child default verb more permissive than the parent's is rejected.
@@ -136,19 +130,20 @@ fn plan_universe() -> Vec<Plan> {
 /// rule for structural plans. Mirrors (conservatively, ignoring argument
 /// constraints) the exposure checks `Policy::narrow` performs.
 fn parent_exposes(parent: &Policy, plan: &Plan) -> bool {
-    parent.rules.iter().any(|rule| {
-        if !matches!(rule.decision, PolicyVerb::Allow | PolicyVerb::AskUser) {
-            return false;
-        }
-        match (&rule.action, plan) {
-            (PolicyAction::Any, _) => true,
-            (PolicyAction::Tool(tool), Plan::CallTool(call)) => tool == &call.name,
-            (PolicyAction::Handoff, Plan::Handoff(_, _)) => true,
-            (PolicyAction::Delegate, Plan::Delegate(_)) => true,
-            (PolicyAction::Escalate, Plan::Escalate(_)) => true,
-            _ => false,
-        }
-    })
+    !matches!(parent.default_decision, PolicyVerb::Deny)
+        || parent.rules.iter().any(|rule| {
+            if !matches!(rule.decision, PolicyVerb::Allow | PolicyVerb::AskUser) {
+                return false;
+            }
+            match (&rule.action, plan) {
+                (PolicyAction::Any, _) => true,
+                (PolicyAction::Tool(tool), Plan::CallTool(call)) => tool == &call.name,
+                (PolicyAction::Handoff, Plan::Handoff(_, _)) => true,
+                (PolicyAction::Delegate, Plan::Delegate(_)) => true,
+                (PolicyAction::Escalate, Plan::Escalate(_)) => true,
+                _ => false,
+            }
+        })
 }
 
 proptest! {
@@ -187,7 +182,7 @@ proptest! {
     }
 
     #[test]
-    fn narrowed_policy_never_exceeds_parent_default_on_unexposed_actions(
+    fn narrowed_policy_never_exceeds_parent_on_any_call(
         parent in policy_strategy(),
         child in policy_strategy(),
     ) {
@@ -196,25 +191,23 @@ proptest! {
             return Ok(());
         };
         for plan in plan_universe() {
-            if parent_exposes(&parent, &plan) {
-                continue;
-            }
-            let decision = effective.decide(&plan);
+            let parent_decision = parent.decide(&plan);
+            let child_decision = effective.decide(&plan);
             prop_assert!(
-                decision_rank(&decision) <= verb_rank(&parent.default_decision),
-                "unexposed plan {plan:?} decided {decision:?} but parent default is {:?}\n\
-                 parent: {parent:?}\nchild: {child:?}",
-                parent.default_decision,
+                decision_rank(&child_decision) <= decision_rank(&parent_decision),
+                "plan {plan:?} decided {child_decision:?} for child but {parent_decision:?} for parent\n\
+                 parent: {parent:?}\nchild: {child:?}\neffective: {effective:?}",
             );
         }
     }
 
     #[test]
     fn allow_rule_on_unexposed_tool_is_rejected(
-        parent in policy_strategy(),
+        mut parent in policy_strategy(),
         tool_index in 0..TOOLS.len(),
         child_verb in prop_oneof![Just(PolicyVerb::Allow), Just(PolicyVerb::AskUser)],
     ) {
+        parent.default_decision = PolicyVerb::Deny;
         let tool = TOOLS[tool_index];
         let exposed = parent_exposes(&parent, &call_tool_plan(tool, "{}"));
         prop_assume!(!exposed);

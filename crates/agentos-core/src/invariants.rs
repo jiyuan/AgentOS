@@ -126,14 +126,45 @@ pub(crate) fn request_derives_from_state(
 /// the security property that narrowing exists to produce, in terms simple
 /// enough to survive a rewrite of how narrowing decides individual rules.
 ///
-/// The property: for every action the child could take — because a rule allows
-/// or asks about it, or because its default does — the parent must have some
-/// non-`Deny` path to that same action. Argument constraints are ignored here.
-/// A child is permitted to be more specific about arguments than its parent
-/// (that is what an explicit sub-agent tool allowlist does), so an
-/// argument-level comparison would fire on configurations that are correct by
-/// design.
+/// The property is checked at the same semantic boundary as policy evaluation:
+/// action, ordered decision, and argument constraints. Every child rule must be
+/// covered by a parent rule or default with an equal-or-more-permissive verb,
+/// and no earlier overlapping parent rule may be stricter. The implementation
+/// below deliberately does not call `Policy::narrow`, so this assertion can
+/// still catch a regression in the production verifier.
 pub(crate) fn delegation_narrows(parent: &Policy, child: &Policy) {
+    if parent == child {
+        return;
+    }
+
+    for child_rule in &child.rules {
+        if matches!(child_rule.decision, PolicyVerb::Deny) {
+            continue;
+        }
+
+        let mut covered = false;
+        for parent_rule in &parent.rules {
+            if !rules_overlap(parent_rule, child_rule) {
+                continue;
+            }
+            assert!(
+                permissiveness(&parent_rule.decision) >= permissiveness(&child_rule.decision),
+                "sub-agent policy permits {} more permissively than an overlapping parent rule",
+                child_rule.label()
+            );
+            if rule_covers(parent_rule, child_rule) {
+                covered = true;
+                break;
+            }
+        }
+        assert!(
+            covered
+                || permissiveness(&parent.default_decision) >= permissiveness(&child_rule.decision),
+            "sub-agent policy permits {} but no parent rule or default covers it",
+            child_rule.label()
+        );
+    }
+
     assert!(
         permissiveness(&child.default_decision) <= permissiveness(&parent.default_decision),
         "sub-agent default decision {:?} is more permissive than its parent's {:?}",
@@ -141,28 +172,76 @@ pub(crate) fn delegation_narrows(parent: &Policy, child: &Policy) {
         parent.default_decision
     );
 
-    for rule in &child.rules {
-        if matches!(rule.decision, PolicyVerb::Deny) {
-            continue;
+    if !matches!(child.default_decision, PolicyVerb::Deny) {
+        for parent_rule in &parent.rules {
+            if permissiveness(&parent_rule.decision) >= permissiveness(&child.default_decision) {
+                continue;
+            }
+            assert!(
+                child
+                    .rules
+                    .iter()
+                    .any(|child_rule| rule_covers(child_rule, parent_rule)),
+                "sub-agent default is more permissive than a parent rule it can reach"
+            );
         }
-        let parent_exposes = permissiveness(&parent.default_decision) > 0
-            || parent.rules.iter().any(|parent_rule| {
-                !matches!(parent_rule.decision, PolicyVerb::Deny)
-                    && action_covers(&parent_rule.action, &rule.action)
-            });
-        assert!(
-            parent_exposes,
-            "sub-agent policy permits {} but no parent rule exposes it and the parent default \
-             is Deny; the delegation widens rather than narrows",
-            rule.label()
-        );
     }
 }
 
-/// Whether a parent action reaches everything a child action does. `Any` covers
-/// every action; otherwise the two must name the same thing.
-fn action_covers(parent: &PolicyAction, child: &PolicyAction) -> bool {
-    matches!(parent, PolicyAction::Any) || parent == child
+fn rule_covers(parent: &crate::approve::PolicyRule, child: &crate::approve::PolicyRule) -> bool {
+    match (&parent.action, &child.action) {
+        (PolicyAction::Any, PolicyAction::Handoff)
+        | (PolicyAction::Any, PolicyAction::Delegate)
+        | (PolicyAction::Any, PolicyAction::Escalate) => return parent.arg_equals.is_empty(),
+        (PolicyAction::Any, PolicyAction::Any | PolicyAction::Tool(_)) => {}
+        (PolicyAction::Tool(parent), PolicyAction::Tool(child)) if parent == child => {}
+        (PolicyAction::Handoff, PolicyAction::Handoff)
+        | (PolicyAction::Delegate, PolicyAction::Delegate)
+        | (PolicyAction::Escalate, PolicyAction::Escalate) => return true,
+        _ => return false,
+    }
+    parent
+        .arg_equals
+        .iter()
+        .all(|(key, value)| child.arg_equals.get(key) == Some(value))
+}
+
+fn rules_overlap(left: &crate::approve::PolicyRule, right: &crate::approve::PolicyRule) -> bool {
+    let actions_overlap = match (&left.action, &right.action) {
+        (PolicyAction::Any, PolicyAction::Handoff)
+        | (PolicyAction::Any, PolicyAction::Delegate)
+        | (PolicyAction::Any, PolicyAction::Escalate) => left.arg_equals.is_empty(),
+        (PolicyAction::Handoff, PolicyAction::Any)
+        | (PolicyAction::Delegate, PolicyAction::Any)
+        | (PolicyAction::Escalate, PolicyAction::Any) => right.arg_equals.is_empty(),
+        (PolicyAction::Any, PolicyAction::Any | PolicyAction::Tool(_))
+        | (PolicyAction::Tool(_), PolicyAction::Any) => true,
+        (PolicyAction::Tool(left), PolicyAction::Tool(right)) => left == right,
+        (PolicyAction::Handoff, PolicyAction::Handoff)
+        | (PolicyAction::Delegate, PolicyAction::Delegate)
+        | (PolicyAction::Escalate, PolicyAction::Escalate) => true,
+        (PolicyAction::Tool(_), _)
+        | (PolicyAction::Handoff, _)
+        | (PolicyAction::Delegate, _)
+        | (PolicyAction::Escalate, _) => false,
+    };
+    if !actions_overlap {
+        return false;
+    }
+    if matches!(
+        (&left.action, &right.action),
+        (PolicyAction::Handoff, PolicyAction::Handoff)
+            | (PolicyAction::Delegate, PolicyAction::Delegate)
+            | (PolicyAction::Escalate, PolicyAction::Escalate)
+    ) {
+        return true;
+    }
+    left.arg_equals.iter().all(|(key, value)| {
+        right
+            .arg_equals
+            .get(key)
+            .is_none_or(|right_value| right_value == value)
+    })
 }
 
 /// Invariant 3: the tool result just appended answers a call the transcript
@@ -374,7 +453,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "no parent rule exposes it")]
+    #[should_panic(expected = "no parent rule or default covers it")]
     fn a_child_reaching_a_tool_the_parent_never_grants_is_caught() {
         let parent = Policy {
             rules: vec![rule(
@@ -420,6 +499,33 @@ mod tests {
             )],
             default_decision: PolicyVerb::Deny,
         };
+        delegation_narrows(&parent, &child);
+    }
+
+    #[test]
+    #[should_panic(expected = "more permissively than an overlapping parent rule")]
+    fn parent_ask_user_cannot_become_child_allow() {
+        let parent = Policy::ask_user_tools(["shell"]);
+        let child = Policy::allow_tools(["shell"]);
+        delegation_narrows(&parent, &child);
+    }
+
+    #[test]
+    #[should_panic(expected = "no parent rule or default covers it")]
+    fn child_cannot_drop_parent_argument_constraints() {
+        let parent = Policy {
+            rules: vec![PolicyRule {
+                action: PolicyAction::Tool(Arc::from("file")),
+                decision: PolicyVerb::Allow,
+                reason: None,
+                arg_equals: BTreeMap::from([(
+                    Arc::from("operation"),
+                    serde_json::Value::from("read"),
+                )]),
+            }],
+            default_decision: PolicyVerb::Deny,
+        };
+        let child = Policy::allow_tools(["file"]);
         delegation_narrows(&parent, &child);
     }
 

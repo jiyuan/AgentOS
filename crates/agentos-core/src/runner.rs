@@ -874,7 +874,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subagent_allowlisted_tool_runs_without_parent_approval() {
+    async fn subagent_tool_runs_when_parent_also_allows_it() {
         let session = Arc::new(InMemorySession::default());
         let child_orchestrator = Arc::new(ChildApprovalOrchestrator);
         let parent_orchestrator = ParentDelegateOrchestrator;
@@ -902,8 +902,8 @@ mod tests {
                 },
                 PolicyRule {
                     action: PolicyAction::Tool(Arc::from("mock")),
-                    decision: PolicyVerb::AskUser,
-                    reason: Some(Arc::from("mock requires approval")),
+                    decision: PolicyVerb::Allow,
+                    reason: None,
                     arg_equals: BTreeMap::new(),
                 },
             ],
@@ -940,10 +940,10 @@ mod tests {
 
         let output = match run_envelope(input, RunId::new("parent-run"), &deps)
             .await
-            .expect("allowlisted child tool should finish")
+            .expect("matching parent and child allow should finish")
         {
             RunOutcome::Finished { output, .. } => output,
-            RunOutcome::Paused(_) => panic!("allowlisted child tool should not pause"),
+            RunOutcome::Paused(_) => panic!("matching allow rules should not pause"),
         };
 
         assert_eq!(

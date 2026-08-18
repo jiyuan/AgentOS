@@ -9,8 +9,8 @@
 //! 2. A parent's own tool call still requires user approval even when a
 //!    configured child declares that tool `allow` — the parent does not
 //!    inherit child permissions.
-//! 3. A child whose `allow` narrows a parent `ask_user` runs the tool
-//!    without pausing — narrowing in the permitted direction still works.
+//! 3. A child cannot turn a parent's `ask_user` rule into unattended `allow`.
+//! 4. Matching parent/child `allow` authority still delegates successfully.
 
 use agentos_core::approve::{Policy, PolicyAction, PolicyRule, PolicyVerb};
 use agentos_core::memory::InMemorySession;
@@ -271,25 +271,45 @@ async fn parent_tool_call_still_requires_approval_when_child_declares_allow() {
 }
 
 #[tokio::test]
-async fn child_allow_narrowing_parent_ask_user_runs_without_pause() {
-    // Parent gates the tool behind ask_user; the child allowlists it. This is
-    // the permitted narrowing direction: the delegated child executes the
-    // tool without pausing, and the parent gets its result.
+async fn child_allow_cannot_widen_parent_ask_user() {
+    // Parent gates the tool behind ask_user; the child tries to allow it
+    // unattended. Delegation must fail before the child tool body runs.
     let session = Arc::new(InMemorySession::default());
     let registry = child_registry(session.clone(), Policy::allow_tools([TOOL_NAME]));
     let parent = DelegatingParent;
     let policy = parent_policy(Some(PolicyVerb::AskUser));
     let deps = runner_deps(&parent, session.as_ref(), &policy, None, Some(&registry));
 
+    let error = run_envelope(
+        user_envelope("delegate please"),
+        RunId::new("ask-user-widen-run"),
+        &deps,
+    )
+    .await
+    .expect_err("child allow must not suppress the parent's approval gate");
+    assert!(
+        error.to_string().contains("not a narrowing"),
+        "error must name the narrowing violation, got: {error}"
+    );
+}
+
+#[tokio::test]
+async fn matching_parent_and_child_allow_delegates_without_pause() {
+    let session = Arc::new(InMemorySession::default());
+    let registry = child_registry(session.clone(), Policy::allow_tools([TOOL_NAME]));
+    let parent = DelegatingParent;
+    let policy = parent_policy(Some(PolicyVerb::Allow));
+    let deps = runner_deps(&parent, session.as_ref(), &policy, None, Some(&registry));
+
     let outcome = run_envelope(
         user_envelope("delegate please"),
-        RunId::new("narrow-run"),
+        RunId::new("matching-allow-run"),
         &deps,
     )
     .await
     .expect("delegated run completes");
     let RunOutcome::Finished { output, .. } = outcome else {
-        panic!("narrowed child must run without pausing");
+        panic!("matching allow policies must run without pausing");
     };
     assert!(
         output.message.content.contains("child result: ok"),

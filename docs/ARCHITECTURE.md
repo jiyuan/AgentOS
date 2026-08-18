@@ -451,7 +451,10 @@ code it checks, and each has a test that violates it and observes the panic.
 ### Sub-agent safety
 
 - Child policy is checked with `Policy::narrow(parent, child)`, which returns
-  `Err` on any widening attempt.
+  `Err` on any widening attempt. Narrowing compares the ordered decision lists
+  per action and argument constraint: `Deny < AskUser < Allow`, parent
+  `AskUser` remains attended, and a child may add but never remove argument
+  constraints. Unprovable coverage fails closed.
 - Child tools and skills are opt-in; the `memory` tool is opt-in per operation
   (`read`, `write`, `forget`).
 - Child memory views are opt-in and scoped.

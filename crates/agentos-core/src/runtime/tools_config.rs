@@ -128,11 +128,11 @@ pub(super) fn subagent_policy(subagent: &SubAgentConfig) -> Result<Policy, Strin
 }
 
 fn add_subagent_tool_allow_policy(policy: &mut Policy, tool: &str) {
-    // Naming a tool in the sub-agent allowlist is an explicit grant: allow
-    // every operation of that tool unconditionally so the sub-agent never
-    // re-prompts for approval mid-task (e.g. `file` write, not just read).
-    // `memory` is excluded here and handled per-operation by the caller so
-    // shared-domain writes/forgets keep their own gating.
+    // Naming a tool makes it available to the child registry and proposes an
+    // unconditional child rule. `Policy::narrow` still requires the parent to
+    // hold unconditional `Allow`; the declaration cannot suppress a parent
+    // approval gate or drop argument constraints. `memory` is excluded here and
+    // handled per operation by the caller.
     allow_tool_once(policy, Arc::from(tool));
 }
 
@@ -373,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn subagent_file_policy_narrows_parent_file_policy() {
+    fn unconstrained_subagent_file_policy_does_not_narrow_parent_file_policy() {
         let config = config_with_parent_tools(&["file"]);
         let parent = phase5_policy(&config, &[]);
         let child_config = SubAgentConfig {
@@ -382,7 +382,7 @@ mod tests {
         };
         let child = subagent_policy(&child_config).expect("child policy builds");
 
-        Policy::narrow(&parent, &child).expect("file child policy should narrow parent policy");
+        assert!(Policy::narrow(&parent, &child).is_err());
         assert_eq!(
             child.decide(&tool_plan(
                 "file",
@@ -393,11 +393,9 @@ mod tests {
     }
 
     #[test]
-    fn narrowed_subagent_listed_tool_never_asks_for_approval() {
-        // Parent gates `file` write behind AskUser for itself. A sub-agent
-        // that explicitly lists `file` must get the *narrowed* (effective)
-        // policy that allows every file operation without approval — the
-        // parent's AskUser must not leak into the delegatee.
+    fn listed_subagent_tools_cannot_suppress_parent_approval_or_constraints() {
+        // Parent gates file writes and shell behind AskUser. An unconditional
+        // child allowlist is a widening configuration and must be rejected.
         let config = config_with_parent_tools(&["file", "shell"]);
         let parent = phase5_policy(&config, &[]);
         let child_config = SubAgentConfig {
@@ -405,27 +403,7 @@ mod tests {
             ..SubAgentConfig::default()
         };
         let child = subagent_policy(&child_config).expect("child policy builds");
-        let effective =
-            Policy::narrow(&parent, &child).expect("listed tools should narrow cleanly");
-
-        assert_eq!(
-            effective.decide(&tool_plan(
-                "file",
-                json!({ "operation": "write", "path": "x", "content": "y" })
-            )),
-            PolicyDecision::Allow
-        );
-        assert_eq!(
-            effective.decide(&tool_plan(
-                "file",
-                json!({ "operation": "delete", "path": "x" })
-            )),
-            PolicyDecision::Allow
-        );
-        assert_eq!(
-            effective.decide(&tool_plan("shell", json!({ "command": "ls" }))),
-            PolicyDecision::Allow
-        );
+        assert!(Policy::narrow(&parent, &child).is_err());
     }
 
     #[test]
@@ -444,7 +422,7 @@ mod tests {
     }
 
     #[test]
-    fn subagent_explicit_tool_allowlist_avoids_tool_approval() {
+    fn subagent_tool_list_builds_rules_that_still_require_parent_coverage() {
         let child_config = SubAgentConfig {
             tools: vec![
                 Arc::from("shell"),

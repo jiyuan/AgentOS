@@ -146,41 +146,59 @@ impl Policy {
     }
 
     pub fn narrow(parent: &Self, child: &Self) -> Result<Self, PolicyError> {
-        if !default_decision_covers(&parent.default_decision, &child.default_decision) {
-            return Err(PolicyError::Widened(Arc::from("default")));
+        if parent == child {
+            return Ok(child.clone());
         }
 
+        // Rules form ordered decision lists. A child rule is safe only when
+        // one parent rule covers its complete action/argument region and no
+        // earlier overlapping parent rule is stricter. If no rule covers the
+        // region, every overlapping parent rule and the parent default must
+        // still be at least as permissive. This is conservative by design: a
+        // relationship the equality-constraint language cannot prove is a
+        // startup error, never an implicit delegation grant.
         for child_rule in &child.rules {
-            match child_rule.decision {
-                PolicyVerb::Allow => {
-                    // A child `Allow` is valid if the parent already exposes
-                    // that exact action (the normal `covers` check) OR — for
-                    // tools — if the parent governs the same tool at all with
-                    // an Allow/AskUser rule. The latter lets an explicit
-                    // sub-agent tool allowlist suppress approval prompts for a
-                    // tool the parent itself can use, without letting the
-                    // sub-agent reach tools the parent denies or never grants.
-                    let covered = parent.rules.iter().any(|parent_rule| {
-                        matches!(
-                            parent_rule.decision,
-                            PolicyVerb::Allow | PolicyVerb::AskUser
-                        ) && parent_rule.covers(child_rule)
-                    });
-                    if !covered && !parent_exposes_tool(parent, child_rule) {
-                        return Err(PolicyError::Widened(child_rule.label()));
-                    }
+            if matches!(child_rule.decision, PolicyVerb::Deny) {
+                continue;
+            }
+
+            let mut covered = false;
+            for parent_rule in &parent.rules {
+                if !parent_rule.overlaps(child_rule) {
+                    continue;
                 }
-                PolicyVerb::AskUser => {
-                    if !parent.rules.iter().any(|parent_rule| {
-                        matches!(
-                            parent_rule.decision,
-                            PolicyVerb::Allow | PolicyVerb::AskUser
-                        ) && parent_rule.covers(child_rule)
-                    }) {
-                        return Err(PolicyError::Widened(child_rule.label()));
-                    }
+                if !decision_covers(&parent_rule.decision, &child_rule.decision) {
+                    return Err(PolicyError::Widened(child_rule.label()));
                 }
-                PolicyVerb::Deny => {}
+                if parent_rule.covers(child_rule) {
+                    covered = true;
+                    break;
+                }
+            }
+
+            if !covered && !decision_covers(&parent.default_decision, &child_rule.decision) {
+                return Err(PolicyError::Widened(child_rule.label()));
+            }
+        }
+
+        // The child default reaches everything no child rule matches. A
+        // stricter parent rule is safe only when one child predicate excludes
+        // its complete region from that default.
+        if !decision_covers(&parent.default_decision, &child.default_decision) {
+            return Err(PolicyError::Widened(Arc::from("default")));
+        }
+        if !matches!(child.default_decision, PolicyVerb::Deny) {
+            for parent_rule in &parent.rules {
+                if decision_covers(&parent_rule.decision, &child.default_decision) {
+                    continue;
+                }
+                let excluded_from_child_default = child
+                    .rules
+                    .iter()
+                    .any(|child_rule| child_rule.covers(parent_rule));
+                if !excluded_from_child_default {
+                    return Err(PolicyError::Widened(Arc::from("default")));
+                }
             }
         }
 
@@ -188,25 +206,7 @@ impl Policy {
     }
 }
 
-/// True when `child_rule` targets a tool the parent already exposes to this
-/// delegatee (any same-tool rule whose decision is `Allow` or `AskUser`).
-///
-/// This is the mechanism behind "an explicitly allowlisted sub-agent tool
-/// needs no approval": the parent may gate the tool behind `AskUser` (or
-/// per-operation arg constraints) for itself, but a sub-agent that names the
-/// tool in its allowlist gets blanket `Allow`. Tools the parent denies or
-/// never grants are not exposed, so the sub-agent still cannot reach them.
-fn parent_exposes_tool(parent: &Policy, child_rule: &PolicyRule) -> bool {
-    let PolicyAction::Tool(child_tool) = &child_rule.action else {
-        return false;
-    };
-    parent.rules.iter().any(|rule| {
-        matches!(rule.decision, PolicyVerb::Allow | PolicyVerb::AskUser)
-            && matches!(&rule.action, PolicyAction::Tool(tool) if tool == child_tool)
-    })
-}
-
-fn default_decision_covers(parent: &PolicyVerb, child: &PolicyVerb) -> bool {
+fn decision_covers(parent: &PolicyVerb, child: &PolicyVerb) -> bool {
     match child {
         PolicyVerb::Deny => true,
         PolicyVerb::AskUser => matches!(parent, PolicyVerb::Allow | PolicyVerb::AskUser),
@@ -264,17 +264,57 @@ impl PolicyRule {
 
     fn covers(&self, child: &Self) -> bool {
         match (&self.action, &child.action) {
-            (PolicyAction::Any, _) => {}
+            (PolicyAction::Any, PolicyAction::Handoff)
+            | (PolicyAction::Any, PolicyAction::Delegate)
+            | (PolicyAction::Any, PolicyAction::Escalate) => {
+                return self.arg_equals.is_empty();
+            }
+            (PolicyAction::Any, PolicyAction::Any | PolicyAction::Tool(_)) => {}
             (PolicyAction::Tool(parent), PolicyAction::Tool(child)) if parent == child => {}
             (PolicyAction::Handoff, PolicyAction::Handoff)
             | (PolicyAction::Delegate, PolicyAction::Delegate)
-            | (PolicyAction::Escalate, PolicyAction::Escalate) => {}
+            | (PolicyAction::Escalate, PolicyAction::Escalate) => return true,
             _ => return false,
         }
 
         self.arg_equals
             .iter()
             .all(|(key, value)| child.arg_equals.get(key) == Some(value))
+    }
+
+    fn overlaps(&self, other: &Self) -> bool {
+        let actions_overlap = match (&self.action, &other.action) {
+            (PolicyAction::Any, PolicyAction::Handoff)
+            | (PolicyAction::Any, PolicyAction::Delegate)
+            | (PolicyAction::Any, PolicyAction::Escalate) => self.arg_equals.is_empty(),
+            (PolicyAction::Handoff, PolicyAction::Any)
+            | (PolicyAction::Delegate, PolicyAction::Any)
+            | (PolicyAction::Escalate, PolicyAction::Any) => other.arg_equals.is_empty(),
+            (PolicyAction::Any, PolicyAction::Any | PolicyAction::Tool(_))
+            | (PolicyAction::Tool(_), PolicyAction::Any) => true,
+            (PolicyAction::Tool(left), PolicyAction::Tool(right)) => left == right,
+            (PolicyAction::Handoff, PolicyAction::Handoff)
+            | (PolicyAction::Delegate, PolicyAction::Delegate)
+            | (PolicyAction::Escalate, PolicyAction::Escalate) => true,
+            (PolicyAction::Tool(_), _)
+            | (PolicyAction::Handoff, _)
+            | (PolicyAction::Delegate, _)
+            | (PolicyAction::Escalate, _) => false,
+        };
+        if !actions_overlap {
+            return false;
+        }
+        if matches!(
+            (&self.action, &other.action),
+            (PolicyAction::Handoff, PolicyAction::Handoff)
+                | (PolicyAction::Delegate, PolicyAction::Delegate)
+                | (PolicyAction::Escalate, PolicyAction::Escalate)
+        ) {
+            return true;
+        }
+        self.arg_equals
+            .iter()
+            .all(|(key, left)| other.arg_equals.get(key).is_none_or(|right| right == left))
     }
 
     /// How this rule names its action in an error or an assertion. Already the
@@ -438,12 +478,60 @@ mod tests {
     }
 
     #[test]
-    fn narrow_allows_child_allow_when_parent_would_ask_user() {
+    fn narrow_rejects_child_allow_when_parent_would_ask_user() {
         let parent = Policy::ask_user_tools(["shell"]);
         let child = Policy::allow_tools(["shell"]);
 
-        Policy::narrow(&parent, &child)
-            .expect("delegated child allowlist may allow a parent-ask tool");
+        assert!(
+            Policy::narrow(&parent, &child).is_err(),
+            "delegation cannot turn attended authority into unattended authority"
+        );
+    }
+
+    #[test]
+    fn narrow_rejects_child_rule_that_drops_parent_argument_constraints() {
+        let parent = Policy {
+            rules: vec![PolicyRule {
+                action: PolicyAction::Tool(Arc::from("file")),
+                decision: PolicyVerb::Allow,
+                reason: None,
+                arg_equals: BTreeMap::from([(Arc::from("operation"), Value::from("read"))]),
+            }],
+            default_decision: PolicyVerb::Deny,
+        };
+        let child = Policy::allow_tools(["file"]);
+
+        assert!(
+            Policy::narrow(&parent, &child).is_err(),
+            "a read-only parent cannot delegate unconstrained file authority"
+        );
+    }
+
+    #[test]
+    fn narrow_rejects_child_rule_overlapping_an_earlier_parent_deny() {
+        let parent = Policy {
+            rules: vec![
+                PolicyRule {
+                    action: PolicyAction::Tool(Arc::from("file")),
+                    decision: PolicyVerb::Deny,
+                    reason: None,
+                    arg_equals: BTreeMap::from([(Arc::from("operation"), Value::from("write"))]),
+                },
+                PolicyRule {
+                    action: PolicyAction::Tool(Arc::from("file")),
+                    decision: PolicyVerb::Allow,
+                    reason: None,
+                    arg_equals: BTreeMap::new(),
+                },
+            ],
+            default_decision: PolicyVerb::Deny,
+        };
+        let child = Policy::allow_tools(["file"]);
+
+        assert!(
+            Policy::narrow(&parent, &child).is_err(),
+            "a later broad allow cannot cover calls denied by an earlier rule"
+        );
     }
 
     #[test]

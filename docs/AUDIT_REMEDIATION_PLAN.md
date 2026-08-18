@@ -143,7 +143,7 @@ or migration work that must be staged.
 
 Priority: P0  
 Size: S  
-Status: in progress (`ADR-001` accepted and baseline recorded; `TEST-001` not started)  
+Status: in progress (`ADR-001` accepted, baseline recorded, and the first `TEST-001`/`AUTH-002` regressions landed)
 Dependencies: none
 
 Deliverables:
@@ -526,14 +526,14 @@ policy semantics, and new features in one PR.
 | Slice | Scope | Depends on |
 |---|---|---|
 | `ADR-001` | Resolve narrowing, sandbox, identity, request, audit, clear, and streaming contracts (**complete:** [`ADR-001`](adr/ADR-001-remediation-contracts.md)) | — |
-| `TEST-001` | Add red tests for the P0/P1 audit findings | ADR-001 |
+| `TEST-001` | Add red tests for the P0/P1 audit findings (**in progress:** strict policy-narrowing regressions landed) | ADR-001 |
 | `REL-001` | Self-contained release workspace and documentation | TEST-001 |
 | `REL-002` | Installer/wrapper contract and clean-room smoke | REL-001 |
 | `CI-001` | Portable spill/golden tests and macOS sandbox probe | TEST-001 |
 | `ID-001` | Typed principal and injective namespace | ADR-001 |
 | `ID-002` | Versioned persistence migration and collision report | ID-001 |
 | `AUTH-001` | Remote sender authentication and approval binding | ID-001 |
-| `AUTH-002` | Exact policy lattice and explicit delegation grants | ADR-001 |
+| `AUTH-002` | Exact policy lattice and explicit delegation grants (**in progress:** strict lattice enforced; explicit grants pending) | ADR-001 |
 | `AUTH-003` | Conservative shipped policy and command profiles | AUTH-002 |
 | `SBX-001` | Fail-closed registry and executor capability protocol | ADR-001 |
 | `FS-001` | Validated path segments and no-follow containment | TEST-001 |
@@ -597,7 +597,7 @@ Additionally:
 | Installer/docs/wrapper mismatch | P1 | M1 | CLI/release | Open |
 | Remote ingress plus permissive tool defaults | P0 | M2, M3 | Gateway security | Open |
 | Cross-channel/session/sender identity collision | P0 | M2 | Identity/persistence | Open |
-| Policy narrowing widens authority | P0 | M2 | Core authorization | Open |
+| Policy narrowing widens authority | P0 | M2 | Core authorization | Strict per-call narrowing implemented and property-tested; explicit grant model pending |
 | Sandboxed tool fallback/incompatible worker | P0 | M3 | Core sandbox | Open |
 | Task/path traversal and symlink escape | P1 | M3 | Core filesystem | Open |
 | SSRF, inherited secrets, process descendants, unbounded ingress | P1 | M3 | Tool security | Open |
