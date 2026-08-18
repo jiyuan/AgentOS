@@ -21,8 +21,8 @@ use agentos_interfaces::run_state::InterruptionAction;
 use agentos_interfaces::session::{Item, Session, SessionError, Transcript};
 use agentos_interfaces::RunState;
 use agentos_proto::{
-    AgentId, ChannelId, ConversationId, Envelope, InterruptionId, Message, MessageRole, RunId,
-    SessionKey, SpanKind,
+    AgentId, ChannelId, ConversationId, Envelope, InterruptionId, Message, MessageRole,
+    PrincipalKey, RunId, SenderIdentity, SessionKey, SpanKind,
 };
 use episodes::{record_denied_episode, record_error_episode, record_finished_episode, EpisodeSeed};
 use serde::{Deserialize, Serialize};
@@ -549,10 +549,32 @@ pub fn load_paused_run(path: &Path) -> Result<PausedRun, RunnerError> {
         path: path.to_path_buf(),
         source,
     })?;
-    serde_json::from_slice(&encoded).map_err(|source| RunnerError::StateJson {
-        path: path.to_path_buf(),
-        source,
-    })
+    let mut paused: PausedRun =
+        serde_json::from_slice(&encoded).map_err(|source| RunnerError::StateJson {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if paused.state.session_key.is_none() {
+        let sender = paused
+            .state
+            .transcript
+            .items
+            .iter()
+            .rev()
+            .find_map(|item| item.metadata.get("sender").and_then(Value::as_str))
+            .unwrap_or_default();
+        paused.state.session_key = Some(SessionKey::initial(PrincipalKey::v1(
+            paused.state.active_agent.clone(),
+            paused.channel_id.clone(),
+            paused.conversation_id.clone(),
+            if sender.is_empty() {
+                SenderIdentity::Unattributed
+            } else {
+                SenderIdentity::identified(sender)
+            },
+        )));
+    }
+    Ok(paused)
 }
 
 pub fn delete_paused_run(path: &Path) -> Result<(), RunnerError> {
@@ -780,6 +802,44 @@ mod tests {
     };
     use async_trait::async_trait;
     use serde_json::{json, value::RawValue};
+
+    #[test]
+    fn loading_legacy_paused_state_derives_typed_session_without_rewriting_file() {
+        let path = std::env::temp_dir().join(format!(
+            "agentos-paused-migration-{}.json",
+            std::process::id()
+        ));
+        let mut state = RunState::new(RunId::new("legacy-run"), AgentId::new("agent-a"));
+        state.transcript.items.push(Item {
+            message: Message::text(MessageRole::User, "approve this"),
+            metadata: BTreeMap::from([
+                (Arc::from("channel_id"), json!("telegram")),
+                (Arc::from("conversation_id"), json!("42")),
+                (Arc::from("sender"), json!("alice")),
+            ]),
+        });
+        let paused = PausedRun {
+            channel_id: ChannelId::new("telegram"),
+            conversation_id: ConversationId::new("42"),
+            state,
+        };
+        let encoded = serde_json::to_vec_pretty(&paused).expect("legacy state serializes");
+        std::fs::write(&path, &encoded).expect("legacy state writes");
+
+        let loaded = load_paused_run(&path).expect("legacy state loads");
+        let key = loaded.state.session_key.expect("typed key is derived");
+        assert_eq!(
+            key,
+            SessionKey::initial(PrincipalKey::v1(
+                AgentId::new("agent-a"),
+                ChannelId::new("telegram"),
+                ConversationId::new("42"),
+                SenderIdentity::identified("alice"),
+            ))
+        );
+        assert_eq!(std::fs::read(&path).expect("state remains"), encoded);
+        std::fs::remove_file(path).expect("temporary state removes");
+    }
 
     #[tokio::test]
     async fn paused_subagent_tool_approval_resumes_child_and_parent() {

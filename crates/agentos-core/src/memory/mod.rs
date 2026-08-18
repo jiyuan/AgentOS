@@ -9,6 +9,7 @@ mod accounting;
 mod authorize;
 mod hybrid;
 mod in_memory;
+mod migration;
 mod qdrant;
 mod query;
 mod reflection;
@@ -21,6 +22,10 @@ use authorize::{authorize_scope, hydration_scopes, unauthorized};
 use hybrid::reciprocal_rank_fusion;
 pub use hybrid::{SemanticIndex, SemanticSearchHit};
 pub use in_memory::{InMemoryMemory, InMemorySession};
+pub use migration::{
+    inspect_persistence, migrate_persistence, MigrationCollision, MigrationError, MigrationIssue,
+    MigrationReport, CURRENT_PERSISTENCE_VERSION,
+};
 pub use qdrant::{QdrantSemanticConfig, QdrantSemanticIndex};
 use query::{estimate_fragment_tokens, selector_matches_record};
 pub(crate) use query::{record_is_active, record_matches_query};

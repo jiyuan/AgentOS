@@ -123,6 +123,17 @@ impl PrincipalKey {
     pub fn storage_key(&self) -> String {
         format!("pk1_{}", encode_base64url(&self.canonical_bytes()))
     }
+
+    /// Parse and validate a canonical storage key.
+    pub fn parse_storage_key(input: &str) -> Option<Self> {
+        let encoded = input.strip_prefix("pk1_")?;
+        let bytes = decode_base64url(encoded)?;
+        if encode_base64url(&bytes) != encoded {
+            return None;
+        }
+        let (principal, consumed) = parse_principal_bytes(&bytes)?;
+        (consumed == bytes.len()).then_some(principal)
+    }
 }
 
 /// A session is one epoch of one principal's append-only log.
@@ -146,6 +157,18 @@ impl SessionKey {
         bytes.extend_from_slice(&self.epoch.to_be_bytes());
         format!("sk1_{}", encode_base64url(&bytes))
     }
+
+    /// Parse and validate a canonical storage key.
+    pub fn parse_storage_key(input: &str) -> Option<Self> {
+        let encoded = input.strip_prefix("sk1_")?;
+        let bytes = decode_base64url(encoded)?;
+        if encode_base64url(&bytes) != encoded {
+            return None;
+        }
+        let (principal, consumed) = parse_principal_bytes(&bytes)?;
+        let epoch_bytes: [u8; 8] = bytes.get(consumed..)?.try_into().ok()?;
+        Some(Self::new(principal, u64::from_be_bytes(epoch_bytes)))
+    }
 }
 
 /// Encode arbitrary bytes as unpadded, filesystem-safe base64url.
@@ -168,6 +191,80 @@ pub fn encode_base64url(input: &[u8]) -> String {
         }
     }
     output
+}
+
+/// Decode unpadded canonical base64url text.
+pub fn decode_base64url(input: &str) -> Option<Vec<u8>> {
+    if input.len() % 4 == 1 {
+        return None;
+    }
+    let mut output = Vec::with_capacity(input.len() / 4 * 3 + 2);
+    for chunk in input.as_bytes().chunks(4) {
+        let first = decode_base64url_byte(*chunk.first()?)?;
+        let second = decode_base64url_byte(*chunk.get(1)?)?;
+        output.push((first << 2) | (second >> 4));
+        if let Some(third_byte) = chunk.get(2) {
+            let third = decode_base64url_byte(*third_byte)?;
+            output.push((second << 4) | (third >> 2));
+            if let Some(fourth_byte) = chunk.get(3) {
+                let fourth = decode_base64url_byte(*fourth_byte)?;
+                output.push((third << 6) | fourth);
+            }
+        }
+    }
+    (encode_base64url(&output) == input).then_some(output)
+}
+
+fn decode_base64url_byte(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'-' => Some(62),
+        b'_' => Some(63),
+        _ => None,
+    }
+}
+
+fn parse_principal_bytes(bytes: &[u8]) -> Option<(PrincipalKey, usize)> {
+    let version = u16::from_be_bytes(bytes.get(..2)?.try_into().ok()?);
+    if version != 1 {
+        return None;
+    }
+    let mut offset = 2;
+    let agent_id = take_component(bytes, &mut offset)?;
+    let channel_id = take_component(bytes, &mut offset)?;
+    let conversation_id = take_component(bytes, &mut offset)?;
+    let sender = match *bytes.get(offset)? {
+        0 => {
+            offset += 1;
+            SenderIdentity::Unattributed
+        }
+        1 => {
+            offset += 1;
+            SenderIdentity::identified(take_component(bytes, &mut offset)?)
+        }
+        _ => return None,
+    };
+    Some((
+        PrincipalKey::v1(
+            AgentId::new(agent_id),
+            ChannelId::new(channel_id),
+            ConversationId::new(conversation_id),
+            sender,
+        ),
+        offset,
+    ))
+}
+
+fn take_component(bytes: &[u8], offset: &mut usize) -> Option<Arc<str>> {
+    let length_end = offset.checked_add(8)?;
+    let length = u64::from_be_bytes(bytes.get(*offset..length_end)?.try_into().ok()?);
+    let length = usize::try_from(length).ok()?;
+    let component_end = length_end.checked_add(length)?;
+    let component = std::str::from_utf8(bytes.get(length_end..component_end)?).ok()?;
+    *offset = component_end;
+    Some(Arc::from(component))
 }
 
 fn push_component(bytes: &mut Vec<u8>, component: &str) {
@@ -243,5 +340,21 @@ mod tests {
             SessionKey::new(principal.clone(), 0).storage_key(),
             SessionKey::new(principal, 1).storage_key()
         );
+    }
+
+    #[test]
+    fn storage_keys_round_trip_and_reject_noncanonical_text() {
+        let principal = principal("agent/a", "telegram", "42", "alice_b");
+        let session = SessionKey::new(principal.clone(), 7);
+        assert_eq!(
+            PrincipalKey::parse_storage_key(&principal.storage_key()),
+            Some(principal)
+        );
+        assert_eq!(
+            SessionKey::parse_storage_key(&session.storage_key()),
+            Some(session)
+        );
+        assert!(SessionKey::parse_storage_key("sk1_not+base64").is_none());
+        assert!(SessionKey::parse_storage_key("conversation-42").is_none());
     }
 }

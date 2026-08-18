@@ -24,6 +24,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod calibrate;
 mod catalog;
+mod migrate;
 mod shard;
 
 use shard::{run_shard_thread, ShardContext};
@@ -197,6 +198,7 @@ fn run() -> Result<(), String> {
             let check = env::args().any(|arg| arg == "--check");
             calibrate::run(&root, check)
         }
+        "migrate" => migrate::run(&config, &env::args().skip(2).collect::<Vec<_>>()),
         "serve" => serve(&config),
         "-h" | "--help" | "help" => {
             usage();
@@ -209,7 +211,7 @@ fn run() -> Result<(), String> {
 fn usage() {
     eprintln!(
         "\
-Usage: agentos-gateway <start|stop|restart|status|config|catalog|calibrate> [OPTIONS]
+Usage: agentos-gateway <start|stop|restart|status|config|catalog|calibrate|migrate> [OPTIONS]
 
 Manage the AgentOS gateway as a persistent background service.
 
@@ -226,6 +228,8 @@ Subcommands:
              counts and record the result (roadmap C1). Spends real requests.
              `--check` re-scores today's estimator against the recorded counts
              offline, spending nothing; `--root=PATH` names the repository.
+  migrate    Inspect or migrate legacy persistence identity. Use `--dry-run`
+             first; applying requires `--backup PATH` and a stopped gateway.
 
 All workspace paths derive from $AGENTOS_HOME (set in .env or the process env).
 If unset, $AGENTOS_HOME defaults to the parent dir of the loaded .env file,
@@ -274,6 +278,11 @@ where
             }
             option if option.starts_with("--env-file=") => {}
             "--no-env-override" => {}
+            "--dry-run" => {}
+            "--backup" => {
+                let _ = next_path(&mut args, "--backup")?;
+            }
+            option if option.starts_with("--backup=") => {}
             // `catalog`'s and `calibrate`'s own options. Parsed by those
             // subcommands from the raw argv, since they name a source tree
             // rather than a runtime path.

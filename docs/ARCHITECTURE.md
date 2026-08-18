@@ -582,9 +582,10 @@ Caller view includes:
 - explicitly delegated parent fragments.
 
 The manager rejects cross-principal, cross-user, cross-agent, and cross-task
-access unless explicitly delegated. `conversation` owners remain readable only
-as a legacy representation pending the `ID-002` migration; new run-scoped
-memory is owned by the complete principal.
+access unless explicitly delegated. The versioned `ID-002` migration converts
+unambiguous legacy `conversation` owners to complete principals and quarantines
+ambiguous records instead of merging them. New run-scoped memory is owned by
+the complete principal.
 
 ### Hydration
 
@@ -723,7 +724,12 @@ Supporting tables:
 - `memory_access_log` for reads, writes, forgets, promotions, and prunes.
 - Optional FTS/vector tables for retrieval acceleration.
 
-Existing databases open through idempotent migrations.
+Fresh databases are stamped with `PRAGMA user_version = 1`. Version-0 databases
+fail closed at runtime with an actionable migration command. The explicit
+`agentos-gateway migrate` path provides a read-only report, consistent backup,
+prepared/completed progress marker, atomic session and memory rewrite, and
+quarantine tables for identities that cannot be proven. See
+[`PERSISTENCE_MIGRATION.md`](PERSISTENCE_MIGRATION.md).
 
 ## 16. Observability
 

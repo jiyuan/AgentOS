@@ -677,3 +677,23 @@
 - **Actual Behavior**: Backticks around `ConversationId` in a double-quoted command were evaluated by the shell, producing a harmless `command not found` before the search completed.
 - **Root Cause**: Markdown-style code quoting was copied into a shell command without accounting for command substitution.
 - **Suggested Fix**: Use single-quoted search patterns or omit backticks in shell queries. The search was rerun with safe quoting and no workspace state was changed.
+
+## [2026-08-18 21:44] ORCHESTRATION [RESOLVED]
+
+- **Agent**: main-codex
+- **Task**: Implement the `ID-002` versioned persistence migration and collision-report slice.
+- **Guideline Violated**: ORCHESTRATION > Subagent Delegation & Creation
+- **Expected Behavior**: Delegate work involving more than two sequential tool calls to a matching subagent.
+- **Actual Behavior**: Work was performed locally because the active runtime instructions only permit spawning subagents when the user explicitly requests delegation.
+- **Root Cause**: Higher-priority runtime instructions conflict with the repository's automatic delegation threshold, and the user did not explicitly authorize subagent spawning.
+- **Suggested Fix**: Amend the repository guideline to account for environments where subagent spawning is gated by explicit user consent.
+
+## [2026-08-18 21:44] CONSISTENCY [RESOLVED]
+
+- **Agent**: main-codex
+- **Task**: Implement the `ID-002` migration engine within repository module-size limits.
+- **Guideline Violated**: STRUCTURE / Code conventions > module size
+- **Expected Behavior**: New non-test Rust modules stay below the enforced 800-line ceiling.
+- **Actual Behavior**: The first complete migration module contained 891 non-test lines and was rejected by `scripts/check-module-size.sh`.
+- **Root Cause**: Report aggregation, legacy parsing helpers, and migration execution were initially placed in one module while establishing the end-to-end transaction.
+- **Suggested Fix**: Split analysis/report helpers as soon as the migration boundary stabilizes. The helpers now live in `memory/migration/report.rs`, and the module-size check passes.

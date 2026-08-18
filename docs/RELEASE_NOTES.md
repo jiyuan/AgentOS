@@ -49,8 +49,11 @@ epoch. Canonical length-prefixed bytes and unpadded base64url storage names
 replace collision-prone replacement sanitization. This deliberately changes
 the public `Session` trait from `ConversationId` to `SessionKey` and adds
 `RunState.session_key`, so external struct literals must provide that optional
-field. Legacy SQLite rows and paused states require the pending `ID-002`
-migration before they are visible to the new runtime.
+field. Legacy SQLite databases are inspected and upgraded with
+`agentos-gateway migrate`: dry-run collision reporting is read-only, apply
+requires a consistent backup, unresolved rows are quarantined, and the atomic
+rewrite is restart-safe. Legacy paused states derive their typed key when read
+without rewriting the source file.
 
 **Approvals must be answered by name.** An approval prompt issues a ticket, and
 only an answer carrying that ticket decides it — `/approve <ticket>`,

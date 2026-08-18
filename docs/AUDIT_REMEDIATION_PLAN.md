@@ -246,9 +246,8 @@ Primary files:
 
 Priority: P0  
 Size: L  
-Status: in progress (`ID-001` typed principal/session ownership and injective
-encoding implemented; `ID-002` migration and `AUTH-001` remote authorization
-remain)
+Status: in progress (`ID-001` typed principal/session ownership and `ID-002`
+versioned migration implemented; `AUTH-001` remote authorization remains)
 Dependencies: M0 and a persistence schema-version mechanism
 
 Deliverables:
@@ -279,6 +278,10 @@ Deliverables:
    defaults.
 9. Provide a dry-run migration report, collision detection, backup requirement,
    atomic migration, and restart-safe progress marker for legacy data.
+   **Implemented:** `agentos-gateway migrate --dry-run` reports principal and
+   namespace splits without mutation; apply requires a non-overwritten SQLite
+   backup, quarantines unresolved rows, and advances version 1 atomically behind
+   a prepared/completed restart marker.
 
 Acceptance criteria:
 
@@ -560,7 +563,7 @@ policy semantics, and new features in one PR.
 | `REL-002` | Installer/wrapper contract and clean-room smoke (**implemented:** XDG defaults, wrapper diagnostics, pathless resume, and Linux/macOS source/artifact install smoke; qualifying CI runs pending) | REL-001 |
 | `CI-001` | Portable spill/golden tests and macOS sandbox probe (**in progress:** implementation and required Linux/macOS sandbox jobs added; qualifying CI run pending) | TEST-001 |
 | `ID-001` | Typed principal and injective namespace (**implemented and locally verified:** principal-keyed sessions, memory, jobs, clear, task sessions, traces, and subagent forks) | ADR-001 |
-| `ID-002` | Versioned persistence migration and collision report | ID-001 |
+| `ID-002` | Versioned persistence migration and collision report (**implemented and locally verified:** read-only report, mandatory backup, atomic rewrite, quarantine, crash/disk-full restart, rollback snapshot, and paused-state compatibility) | ID-001 |
 | `AUTH-001` | Remote sender authentication and approval binding | ID-001 |
 | `AUTH-002` | Exact policy lattice and explicit delegation grants (**in progress:** strict lattice enforced; explicit grants pending) | ADR-001 |
 | `AUTH-003` | Conservative shipped policy and command profiles | AUTH-002 |
@@ -625,7 +628,7 @@ Additionally:
 | Release archive omits workspace assets | P0 | M1 | Release engineering | Resolved by `REL-001`; required CI artifact run pending |
 | Installer/docs/wrapper mismatch | P1 | M1 | CLI/release | Resolved by `REL-002`; required CI matrix runs pending |
 | Remote ingress plus permissive tool defaults | P0 | M2, M3 | Gateway security | Open |
-| Cross-channel/session/sender identity collision | P0 | M2 | Identity/persistence | Resolved by `ID-001`; legacy persistence migration remains `ID-002` |
+| Cross-channel/session/sender identity collision | P0 | M2 | Identity/persistence | Resolved by `ID-001` and `ID-002`; legacy splits are reported and ambiguous rows quarantined |
 | Policy narrowing widens authority | P0 | M2 | Core authorization | Strict per-call narrowing implemented and property-tested; explicit grant model pending |
 | Sandboxed tool fallback/incompatible worker | P0 | M3 | Core sandbox | Registry fallback resolved with typed capability checks; actual MCP server isolation and platform qualification remain |
 | Task/path traversal and symlink escape | P1 | M3 | Core filesystem | Open |

@@ -28,6 +28,9 @@ impl SqliteStore {
         }
 
         let conn = Connection::open(path).map_err(memory_sqlite_error)?;
+        if persistence_tables_exist(&conn)? {
+            super::migration::require_current_schema(&conn)?;
+        }
         let store = Self {
             conn: Mutex::new(conn),
         };
@@ -72,15 +75,15 @@ impl SqliteStore {
 
             CREATE TABLE IF NOT EXISTS session_items (
                 row_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                conversation_id TEXT NOT NULL,
+                session_key TEXT NOT NULL,
                 ordinal INTEGER NOT NULL,
                 item_json TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(conversation_id, ordinal)
+                UNIQUE(session_key, ordinal)
             );
 
-            CREATE INDEX IF NOT EXISTS idx_session_items_conversation_ordinal
-                ON session_items(conversation_id, ordinal);
+            CREATE INDEX IF NOT EXISTS idx_session_items_session_ordinal
+                ON session_items(session_key, ordinal);
             "#,
         )
         .map_err(memory_sqlite_error)?;
@@ -123,6 +126,8 @@ impl SqliteStore {
 
             CREATE INDEX IF NOT EXISTS idx_memory_access_log_namespace_row
                 ON memory_access_log(namespace, row_id);
+
+            PRAGMA user_version = 1;
             "#,
         )
         .map_err(memory_sqlite_error)?;
@@ -145,7 +150,7 @@ impl SqliteStore {
     pub fn clear_session(&self, session_key: &SessionKey) -> Result<usize, SessionError> {
         let conn = self.session_conn()?;
         conn.execute(
-            "DELETE FROM session_items WHERE conversation_id = ?1",
+            "DELETE FROM session_items WHERE session_key = ?1",
             params![session_key.storage_key()],
         )
         .map_err(session_sqlite_error)
@@ -500,7 +505,7 @@ impl Session for SqliteStore {
             .prepare(
                 "SELECT item_json \
                  FROM session_items \
-                 WHERE conversation_id = ?1 \
+                 WHERE session_key = ?1 \
                  ORDER BY ordinal ASC",
             )
             .map_err(session_sqlite_error)?;
@@ -529,7 +534,7 @@ impl Session for SqliteStore {
         let tx = conn.transaction().map_err(session_sqlite_error)?;
         let next_ordinal = tx
             .query_row(
-                "SELECT COALESCE(MAX(ordinal) + 1, 0) FROM session_items WHERE conversation_id = ?1",
+                "SELECT COALESCE(MAX(ordinal) + 1, 0) FROM session_items WHERE session_key = ?1",
                 params![session_key.storage_key()],
                 |row| row.get::<_, i64>(0),
             )
@@ -543,7 +548,7 @@ impl Session for SqliteStore {
             })?;
             let item_json = serde_json::to_string(&item).map_err(session_json_error)?;
             tx.execute(
-                "INSERT INTO session_items (conversation_id, ordinal, item_json) VALUES (?1, ?2, ?3)",
+                "INSERT INTO session_items (session_key, ordinal, item_json) VALUES (?1, ?2, ?3)",
                 params![session_key.storage_key(), next_ordinal + offset, item_json],
             )
             .map_err(session_sqlite_error)?;
@@ -580,7 +585,7 @@ impl Session for SqliteStore {
         let tx = conn.transaction().map_err(session_sqlite_error)?;
         let existing: i64 = tx
             .query_row(
-                "SELECT COUNT(*) FROM session_items WHERE conversation_id = ?1",
+                "SELECT COUNT(*) FROM session_items WHERE session_key = ?1",
                 params![child_id.storage_key()],
                 |row| row.get(0),
             )
@@ -595,9 +600,9 @@ impl Session for SqliteStore {
 
         let seeded = tx
             .execute(
-                "INSERT INTO session_items (conversation_id, ordinal, item_json) \
+                "INSERT INTO session_items (session_key, ordinal, item_json) \
                  SELECT ?1, ordinal, item_json FROM session_items \
-                 WHERE conversation_id = ?2 AND ordinal < ?3 \
+                 WHERE session_key = ?2 AND ordinal < ?3 \
                  ORDER BY ordinal ASC",
                 params![child_id.storage_key(), source.storage_key(), boundary],
             )
@@ -631,6 +636,16 @@ fn ensure_memory_record_columns(conn: &Connection) -> Result<(), MemoryError> {
         }
     }
     Ok(())
+}
+
+fn persistence_tables_exist(conn: &Connection) -> Result<bool, MemoryError> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' \
+         AND name IN ('session_items', 'memory_records'))",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(memory_sqlite_error)
 }
 
 pub(crate) fn memory_record_column_exists(
