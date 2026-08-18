@@ -223,7 +223,7 @@ Effective config sections:
 | `[agent]` | id, orchestrator, memory id, `max_turns`. |
 | `[policy]` | parent policy default decision. |
 | `[memory]` | backend, semantic backend, hydration, retention, reflection, shared-domain policy. |
-| `[channels.*]` | TUI and persistent-channel enablement and modes. |
+| `[channels.*]` | TUI enablement plus remote-channel modes, sender/chat allowlists, administrators, and explicit allow-all compatibility. |
 | `[resources.skills]`, `[resources.tools]`, `[resources.mcp]`, `[resources.llm]` | which skills, built-in tools, MCP tools, and LLM fallbacks are enabled. |
 | `[[mcp_servers]]`, `[[mcp_tools]]` | static or stdio MCP declarations. |
 | `[[routing.rules]]`, `[orchestrator_templates]` | routing table and sub-orchestrator templates. |
@@ -415,6 +415,12 @@ Roadmap D1–D3 and G1–G2. All of this sits around the loop, not inside it.
   Anything that is not an answer stays ordinary input. Prompts expire after
   `[approval].expiry_seconds` (default 900) and an expired prompt records
   `ApprovalStatus::Unanswered` — cancelled, not rejected.
+- **Authenticated remote resolution.** Telegram and Feishu reject unattributed
+  events and require an explicit sender/chat policy (or the deliberate
+  `allow_all_senders` compatibility switch). Pending approvals are keyed by the
+  initiator's `SessionKey`; a different group participant cannot resolve one.
+  Configured administrators may resolve it only from the same channel and
+  conversation. See [`REMOTE_CHANNEL_SECURITY.md`](REMOTE_CHANNEL_SECURITY.md).
 
 ## 10. Safety Architecture
 
@@ -767,8 +773,8 @@ real-vector memory remain Preview while their remediation milestones are open.
 Completed baselines:
 
 - typed loop states and trace shape;
-- concrete approval, serializable paused runs, and correlated approval tickets
-  with expiry;
+- concrete approval, serializable paused runs, and principal-bound approval
+  tickets with expiry;
 - reference tools and guardrails, tool deadlines, and background jobs;
 - kernel sandboxing (Landlock/Seatbelt) for tools declaring a `SandboxMode`;
 - one prompt-assembly authority, request manifests, transcript projection,
@@ -782,7 +788,7 @@ Completed baselines:
 - streaming across the OpenAI, Anthropic, and DeepSeek providers, wired through
   the loop, both orchestrators, the TUI, and edit-in-place Telegram/Feishu
   egress (Ollama uses the single-chunk fallback);
-- Telegram and Feishu reference channels;
+- Telegram and Feishu reference channels with fail-closed remote ingress;
 - configured sub-agents and sub-orchestrator templates;
 - static and stdio MCP registration;
 - config authority with generated catalogs, effective-config diagnostics, and

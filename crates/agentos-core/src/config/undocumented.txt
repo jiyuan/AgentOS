@@ -19,14 +19,8 @@ agent.max_turns
 agent.memory
 agent.orchestrator
 channels.feishu
-channels.feishu.enabled
-channels.feishu.mode
 channels.telegram
-channels.telegram.enabled
-channels.telegram.mode
 channels.tui
-channels.tui.enabled
-channels.tui.mode
 isolation.worker_path
 isolation.worker_path_env
 mcp_servers.endpoint

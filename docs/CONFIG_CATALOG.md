@@ -57,14 +57,22 @@ Every key `agent.toml` accepts, derived from the config structs. Edit the doc co
 | `memory.shared_domains.write` | `bool` | — | *(undocumented — see `config/undocumented.txt`)* |
 | `channels` | `ChannelsConfig` | (table) | Which channels this deployment answers on, and in what mode. |
 | `channels.tui` | `ChannelConfig` | (table) | *(undocumented — see `config/undocumented.txt`)* |
-| `channels.tui.enabled` | `bool` | `true` | *(undocumented — see `config/undocumented.txt`)* |
-| `channels.tui.mode` | `Arc<str>` | `interactive` | *(undocumented — see `config/undocumented.txt`)* |
-| `channels.telegram` | `ChannelConfig` | (table) | *(undocumented — see `config/undocumented.txt`)* |
-| `channels.telegram.enabled` | `bool` | `false` | *(undocumented — see `config/undocumented.txt`)* |
-| `channels.telegram.mode` | `Arc<str>` | `poll_once` | *(undocumented — see `config/undocumented.txt`)* |
-| `channels.feishu` | `ChannelConfig` | (table) | *(undocumented — see `config/undocumented.txt`)* |
-| `channels.feishu.enabled` | `bool` | `false` | *(undocumented — see `config/undocumented.txt`)* |
-| `channels.feishu.mode` | `Arc<str>` | `long_connection` | *(undocumented — see `config/undocumented.txt`)* |
+| `channels.tui.enabled` | `bool` | `true` | Whether this channel is enabled. |
+| `channels.tui.mode` | `Arc<str>` | `interactive` | The channel's supported receive mode. |
+| `channels.telegram` | `RemoteChannelConfig` | (table) | *(undocumented — see `config/undocumented.txt`)* |
+| `channels.telegram.enabled` | `bool` | `false` | Whether this remote channel is enabled. |
+| `channels.telegram.mode` | `Arc<str>` | `poll_once` | The channel's supported receive mode. |
+| `channels.telegram.allowed_sender_ids` | `Vec<Arc<str>>` | (empty) | Stable provider sender identifiers allowed to submit input. |
+| `channels.telegram.allowed_conversation_ids` | `Vec<Arc<str>>` | (empty) | Provider conversation or chat identifiers whose authenticated members may submit input. |
+| `channels.telegram.administrator_ids` | `Vec<Arc<str>>` | (empty) | Stable provider sender identifiers allowed to resolve another member's approval in the same conversation. |
+| `channels.telegram.allow_all_senders` | `bool` | `false` | Explicit compatibility opt-in accepting every provider-authenticated sender. |
+| `channels.feishu` | `RemoteChannelConfig` | (table) | *(undocumented — see `config/undocumented.txt`)* |
+| `channels.feishu.enabled` | `bool` | `false` | Whether this remote channel is enabled. |
+| `channels.feishu.mode` | `Arc<str>` | `long_connection` | The channel's supported receive mode. |
+| `channels.feishu.allowed_sender_ids` | `Vec<Arc<str>>` | (empty) | Stable provider sender identifiers allowed to submit input. |
+| `channels.feishu.allowed_conversation_ids` | `Vec<Arc<str>>` | (empty) | Provider conversation or chat identifiers whose authenticated members may submit input. |
+| `channels.feishu.administrator_ids` | `Vec<Arc<str>>` | (empty) | Stable provider sender identifiers allowed to resolve another member's approval in the same conversation. |
+| `channels.feishu.allow_all_senders` | `bool` | `false` | Explicit compatibility opt-in accepting every provider-authenticated sender. |
 | `isolation` | `IsolationConfig` | (table) | Where the subprocess worker that runs sandboxed tools is found. |
 | `isolation.worker_path` | `Option<PathBuf>` | (unset) | *(undocumented — see `config/undocumented.txt`)* |
 | `isolation.worker_path_env` | `Option<String>` | (unset) | *(undocumented — see `config/undocumented.txt`)* |
@@ -157,5 +165,5 @@ Every key `agent.toml` accepts, derived from the config structs. Edit the doc co
 | `spill.root` | `PathBuf` | `spill` | Where artifacts are written. Relative paths resolve against the workspace root; an absolute path is taken as given, for a deployment that wants spill on a different volume from the session database. |
 | `spill.retention_days` | `u64` | `0` | Days an artifact is kept, or `0` to keep everything.  `0` is a choice rather than a disabled feature — see the module docs. |
 
-102 of 149 keys have no description yet. They are listed in `crates/agentos-core/src/config/undocumented.txt`; writing the doc comment on the field is what removes a line from it.
+96 of 157 keys have no description yet. They are listed in `crates/agentos-core/src/config/undocumented.txt`; writing the doc comment on the field is what removes a line from it.
 <!-- END GENERATED: config -->

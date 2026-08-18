@@ -763,7 +763,9 @@ fn run_persistent_channel(config: &ServiceConfig, channel: &'static str) -> Resu
 
 async fn run_telegram_gateway(config: &ServiceConfig) -> Result<(), String> {
     let attachments_dir = attachments_dir_path(config);
-    let channel = TelegramChannel::from_env()
+    let workspace = WorkspaceConfig::load(&agent_config_path(config))
+        .map_err(|err| format!("failed to load workspace config: {err}"))?;
+    let channel = TelegramChannel::from_env(&workspace.channels.telegram)
         .map_err(|err| format!("failed to configure telegram channel: {err}"))?
         .with_attachments_root(attachments_dir)
         .with_receive_error_logging(true);
@@ -772,7 +774,9 @@ async fn run_telegram_gateway(config: &ServiceConfig) -> Result<(), String> {
 
 async fn run_feishu_gateway(config: &ServiceConfig) -> Result<(), String> {
     let attachments_dir = attachments_dir_path(config);
-    let channel = FeishuChannel::from_env()
+    let workspace = WorkspaceConfig::load(&agent_config_path(config))
+        .map_err(|err| format!("failed to load workspace config: {err}"))?;
+    let channel = FeishuChannel::from_env(&workspace.channels.feishu)
         .map_err(|err| format!("failed to configure feishu channel: {err}"))?
         .with_attachments_root(attachments_dir)
         .with_receive_error_logging(true);

@@ -1,5 +1,6 @@
 use agentos_cli::slash::{self, Parsed, SessionUsage, SlashCommand, SlashContext};
 use agentos_core::channels::{feishu::FeishuChannel, telegram::TelegramChannel};
+use agentos_core::config::RemoteChannelConfig;
 use agentos_core::crons::{CronSchedule, CronStore, CronTask};
 use agentos_core::gateway::{GatewayRun, GatewayService};
 use agentos_core::memory::{MemoryManager, SqliteStore};
@@ -26,6 +27,8 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing_subscriber::EnvFilter;
+
+mod remote_approval;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -69,36 +72,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if args.first().is_some_and(|arg| arg == "telegram-once") {
-        let mut channel = TelegramChannel::from_env()?.with_attachments_root(&attachments_dir);
+        let mut channel = TelegramChannel::from_env(&runtime.workspace_config.channels.telegram)?
+            .with_attachments_root(&attachments_dir);
         run_channel_once(
             &mut channel,
             &state_path,
             &deps,
             &active_agent,
+            &runtime.workspace_config.channels.telegram,
             RunId::new("telegram-once"),
         )
         .await?;
         return Ok(());
     }
     if args.first().is_some_and(|arg| arg == "telegram-cron-smoke") {
-        let channel = TelegramChannel::from_env()?.with_attachments_root(&attachments_dir);
+        let channel = TelegramChannel::from_env(&runtime.workspace_config.channels.telegram)?
+            .with_attachments_root(&attachments_dir);
         run_telegram_cron_smoke(&channel, &args, &deps).await?;
         return Ok(());
     }
     if args.first().is_some_and(|arg| arg == "feishu-once") {
-        let mut channel = FeishuChannel::from_env()?.with_attachments_root(&attachments_dir);
+        let mut channel = FeishuChannel::from_env(&runtime.workspace_config.channels.feishu)?
+            .with_attachments_root(&attachments_dir);
         run_channel_once(
             &mut channel,
             &state_path,
             &deps,
             &active_agent,
+            &runtime.workspace_config.channels.feishu,
             RunId::new("feishu-once"),
         )
         .await?;
         return Ok(());
     }
     if args.first().is_some_and(|arg| arg == "feishu-cron-smoke") {
-        let channel = FeishuChannel::from_env()?.with_attachments_root(&attachments_dir);
+        let channel = FeishuChannel::from_env(&runtime.workspace_config.channels.feishu)?
+            .with_attachments_root(&attachments_dir);
         run_feishu_cron_smoke(&channel, &args, &deps).await?;
         return Ok(());
     }
@@ -367,6 +376,7 @@ async fn run_channel_once<C>(
     state_path: &Path,
     deps: &RunnerDeps<'_>,
     active_agent: &AgentId,
+    remote_config: &RemoteChannelConfig,
     run_id: RunId,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
@@ -393,7 +403,19 @@ where
                 return Ok(());
             };
 
-            let Some(decision) = await_approval(channel, &ticket).await else {
+            let Some(owner) = paused.state.session_key.as_ref() else {
+                eprintln!("paused run has no principal-bound session key");
+                return Ok(());
+            };
+            let Some(decision) = remote_approval::await_approval(
+                channel,
+                &ticket,
+                owner,
+                active_agent,
+                remote_config,
+            )
+            .await
+            else {
                 eprintln!("paused run saved: {}", state_path.display());
                 return Ok(());
             };
@@ -436,7 +458,7 @@ where
             Routed::Decides { reason, .. } => {
                 return Some(ResumeDecision::Reject {
                     reason: reason.unwrap_or_else(|| Arc::from("rejected by user")),
-                })
+                });
             }
             Routed::Stale { ticket: named } => {
                 println!("That approval ({named}) is not the one waiting. Answer {ticket}.");

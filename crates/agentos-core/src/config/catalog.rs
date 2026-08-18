@@ -39,6 +39,7 @@ use std::fmt::Write as _;
 const SOURCES: &[&str] = &[
     include_str!("mod.rs"),
     include_str!("approval.rs"),
+    include_str!("channels.rs"),
     include_str!("compaction.rs"),
     include_str!("gateway.rs"),
     include_str!("jobs.rs"),

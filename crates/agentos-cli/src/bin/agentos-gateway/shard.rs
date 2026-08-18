@@ -16,13 +16,13 @@ use agentos_core::gateway::{
     run_shard, unix_now, GatewayRun, GatewayService, ShardConfig, ShardInbound, Turn, TurnHandler,
 };
 use agentos_core::r#loop::{
-    route, ApprovalOutcome, ApprovalTicket, InputGuardrailEntry, OutputGuardrailEntry, Routed,
-    ToolGuardrailEntry,
+    approval_resolver_authorized, route, ApprovalOutcome, ApprovalTicket, InputGuardrailEntry,
+    OutputGuardrailEntry, Routed, ToolGuardrailEntry,
 };
 use agentos_core::runner::{PausedRun, ResumeDecision, RunnerDeps};
 use agentos_core::runtime::{AgentRuntime, RuntimeDepsScope};
 use agentos_interfaces::{Egress, StreamEgress};
-use agentos_proto::{ConversationId, Envelope, InterruptionId, RunId};
+use agentos_proto::{Envelope, InterruptionId, RunId, SessionKey};
 use async_trait::async_trait;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -153,7 +153,7 @@ struct ShardTurns<'a> {
     /// replied. The paused run is parked here instead, so every other
     /// conversation keeps running, and only an envelope carrying this prompt's
     /// ticket decides it (roadmap G2).
-    pending_approvals: RefCell<HashMap<ConversationId, PendingApproval>>,
+    pending_approvals: RefCell<HashMap<SessionKey, PendingApproval>>,
     /// Prompts that have expired and whose runs still need finishing. Resuming
     /// is `async`; expiry is noticed while the map above is borrowed.
     expired: RefCell<Vec<(PendingApproval, InterruptionId)>>,
@@ -323,8 +323,12 @@ impl ShardTurns<'_> {
             }) => {
                 // Park it and go. Only an answer carrying `ticket` resumes it,
                 // and the idle sweep cancels it if nobody ever does.
+                let session_key =
+                    paused.state.session_key.clone().ok_or_else(|| {
+                        "paused run has no principal-bound session key".to_owned()
+                    })?;
                 self.pending_approvals.borrow_mut().insert(
-                    paused.conversation_id.clone(),
+                    session_key,
                     PendingApproval {
                         paused,
                         ticket,
@@ -363,14 +367,13 @@ impl ShardTurns<'_> {
     /// before the envelope is even read, so a late answer cannot decide it.
     fn decide(&self, input: &Envelope) -> Result<Answered, String> {
         let now = unix_now();
+        let input_key = input.session_key(&self.context.runtime.active_agent);
         let mut pending = self.pending_approvals.borrow_mut();
         if pending
-            .get(&input.conversation_id)
+            .get(&input_key)
             .is_some_and(|entry| entry.is_expired(now))
         {
-            let entry = pending
-                .remove(&input.conversation_id)
-                .expect("checked just above");
+            let entry = pending.remove(&input_key).expect("checked just above");
             drop(pending);
             self.expire(entry)?;
             // The prompt is gone, so this envelope cannot decide it — a late
@@ -382,24 +385,53 @@ impl ShardTurns<'_> {
             });
         }
 
-        let ticket = pending
-            .get(&input.conversation_id)
-            .map(|entry| entry.ticket.clone());
+        let ticket = pending.get(&input_key).map(|entry| entry.ticket.clone());
         match route(ticket.as_ref(), input) {
             Routed::Unrelated => Ok(Answered::Run),
-            Routed::Stale { ticket } => Ok(Answered::Stale(ticket)),
+            Routed::Stale { ticket } => {
+                if !self.is_administrator(&input.sender) {
+                    return Ok(Answered::Stale(ticket));
+                }
+                let matching = pending
+                    .iter()
+                    .filter(|(key, entry)| {
+                        entry.ticket == ticket
+                            && approval_resolver_authorized(
+                                key,
+                                input,
+                                &self.context.runtime.active_agent,
+                                true,
+                            )
+                    })
+                    .map(|(key, _)| key.clone())
+                    .collect::<Vec<_>>();
+                if matching.len() != 1 {
+                    return Ok(Answered::Stale(ticket));
+                }
+                let key = &matching[0];
+                if pending.get(key).is_some_and(|entry| entry.is_expired(now)) {
+                    let entry = pending.remove(key).expect("matched just above");
+                    drop(pending);
+                    self.expire(entry)?;
+                    return Ok(Answered::Stale(ticket));
+                }
+                let entry = pending.remove(key).expect("matched just above");
+                let outcome = match route(Some(&ticket), input) {
+                    Routed::Decides { outcome, reason } => (outcome, reason),
+                    Routed::Stale { .. } | Routed::Unrelated => {
+                        return Ok(Answered::Stale(ticket));
+                    }
+                };
+                Ok(Answered::Resume(Box::new(Resume {
+                    pending: entry,
+                    decision: resume_decision(outcome.0, outcome.1, self.context.channel_name),
+                })))
+            }
             Routed::Decides { outcome, reason } => {
                 let entry = pending
-                    .remove(&input.conversation_id)
+                    .remove(&input_key)
                     .expect("a decision implies a pending approval");
-                let decision = match outcome {
-                    ApprovalOutcome::Approved => ResumeDecision::Approve,
-                    _ => ResumeDecision::Reject {
-                        reason: reason.unwrap_or_else(|| {
-                            Arc::from(format!("rejected by {} user", self.context.channel_name))
-                        }),
-                    },
-                };
+                let decision = resume_decision(outcome, reason, self.context.channel_name);
                 Ok(Answered::Resume(Box::new(Resume {
                     pending: entry,
                     decision,
@@ -481,20 +513,40 @@ impl ShardTurns<'_> {
     /// Retire every prompt on this shard whose window has closed.
     fn sweep_expired(&self) -> Result<(), String> {
         let now = unix_now();
-        let expired: Vec<ConversationId> = self
+        let expired: Vec<SessionKey> = self
             .pending_approvals
             .borrow()
             .iter()
             .filter(|(_, entry)| entry.is_expired(now))
-            .map(|(conversation, _)| conversation.clone())
+            .map(|(session, _)| session.clone())
             .collect();
-        for conversation in expired {
-            let Some(entry) = self.pending_approvals.borrow_mut().remove(&conversation) else {
+        for session in expired {
+            let Some(entry) = self.pending_approvals.borrow_mut().remove(&session) else {
                 continue;
             };
             self.expire(entry)?;
         }
         Ok(())
+    }
+
+    fn is_administrator(&self, sender: &str) -> bool {
+        match self.context.channel_name {
+            "telegram" => self
+                .context
+                .runtime
+                .workspace_config
+                .channels
+                .telegram
+                .is_administrator(sender),
+            "feishu" => self
+                .context
+                .runtime
+                .workspace_config
+                .channels
+                .feishu
+                .is_administrator(sender),
+            _ => false,
+        }
     }
 
     /// `/clear` ends a conversation, which is the moment D3's job registry has
@@ -588,5 +640,21 @@ impl ShardTurns<'_> {
         .await;
         *self.reflection_cron.borrow_mut() = reflection;
         reflected
+    }
+}
+
+fn resume_decision(
+    outcome: ApprovalOutcome,
+    reason: Option<Arc<str>>,
+    channel_name: &str,
+) -> ResumeDecision {
+    match outcome {
+        ApprovalOutcome::Approved => ResumeDecision::Approve,
+        ApprovalOutcome::Rejected | ApprovalOutcome::Cancelled | ApprovalOutcome::Unavailable => {
+            ResumeDecision::Reject {
+                reason: reason
+                    .unwrap_or_else(|| Arc::from(format!("rejected by {channel_name} user"))),
+            }
+        }
     }
 }

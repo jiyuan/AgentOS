@@ -35,9 +35,9 @@ mod tool_call;
 
 use approval::{approve_transition, ApproveTransition};
 pub use approval_route::{
-    parse_action_data, prompt_actions, prompt_interruption, route, ApprovalOutcome, ApprovalTicket,
-    Routed, ACTIONS_KEY, APPROVE, DECISION_KEY, DENY, EXPIRES_AT_KEY, INTERRUPTION_KEY,
-    PROMPT_KIND, REASON_KEY, TICKET_KEY,
+    approval_resolver_authorized, parse_action_data, prompt_actions, prompt_interruption, route,
+    ApprovalOutcome, ApprovalTicket, Routed, ACTIONS_KEY, APPROVE, DECISION_KEY, DENY,
+    EXPIRES_AT_KEY, INTERRUPTION_KEY, PROMPT_KIND, REASON_KEY, TICKET_KEY,
 };
 use budget::{budget_exhausted_finish, record_llm_usage};
 use cancel::{cancelled_finish, unless_cancelled};

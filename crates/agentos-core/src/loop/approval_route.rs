@@ -24,7 +24,7 @@
 //! conversation's inbox (roadmap G1), so talking past a pending approval is
 //! just talking.
 
-use agentos_proto::{Envelope, InterruptionId};
+use agentos_proto::{AgentId, Envelope, InterruptionId, PrincipalKey, SessionKey};
 use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -198,6 +198,31 @@ pub fn route(pending: Option<&ApprovalTicket>, envelope: &Envelope) -> Routed {
         ApprovalOutcome::Rejected
     };
     Routed::Decides { outcome, reason }
+}
+
+/// Whether `answer` may resolve a prompt owned by `owner`.
+///
+/// The initiating principal always may answer. A configured administrator may
+/// answer only from the same channel and conversation.
+pub fn approval_resolver_authorized(
+    owner: &SessionKey,
+    answer: &Envelope,
+    active_agent: &AgentId,
+    is_administrator: bool,
+) -> bool {
+    if answer.principal_key(active_agent) == owner.principal {
+        return true;
+    }
+    if !is_administrator {
+        return false;
+    }
+    match &owner.principal {
+        PrincipalKey::V1(principal) => {
+            principal.agent_id == *active_agent
+                && principal.channel_id == answer.channel_id
+                && principal.conversation_id == answer.conversation_id
+        }
+    }
 }
 
 /// Extract `(ticket, verb, reason)` from an envelope, from its metadata if a
@@ -438,5 +463,39 @@ mod tests {
         assert_eq!(parse_action_data("open:settings"), None);
         assert_eq!(parse_action_data("approve"), None);
         assert_eq!(parse_action_data("approve:not a ticket"), None);
+    }
+
+    #[test]
+    fn resolver_is_initiator_or_same_conversation_administrator() {
+        let agent = AgentId::new("agent");
+        let mut owner = text("request").session_key(&agent);
+        owner.epoch = 7;
+        assert!(approval_resolver_authorized(
+            &owner,
+            &text("/approve k3f"),
+            &agent,
+            false,
+        ));
+        let mut participant = text("/approve k3f");
+        participant.sender = Arc::from("other-user");
+        assert!(!approval_resolver_authorized(
+            &owner,
+            &participant,
+            &agent,
+            false
+        ));
+        assert!(approval_resolver_authorized(
+            &owner,
+            &participant,
+            &agent,
+            true
+        ));
+        participant.conversation_id = ConversationId::new("other-conversation");
+        assert!(!approval_resolver_authorized(
+            &owner,
+            &participant,
+            &agent,
+            true
+        ));
     }
 }

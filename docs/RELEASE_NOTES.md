@@ -58,7 +58,15 @@ without rewriting the source file.
 **Approvals must be answered by name.** An approval prompt issues a ticket, and
 only an answer carrying that ticket decides it — `/approve <ticket>`,
 `/deny <ticket>`, or an inline button. Prompts expire (default 15 minutes) and
-an expired prompt is recorded as cancelled, not refused.
+an expired prompt is recorded as cancelled, not refused. Remote answers are
+also bound to the initiating principal; another group participant cannot
+resolve them, while a configured administrator can do so only in the same chat.
+
+**Remote ingress is explicit.** Telegram and Feishu require configured stable
+sender or conversation identifiers, administrator identifiers, or the explicit
+`allow_all_senders = true` compatibility switch. Provider events without a
+sender identity are always rejected. See
+[`REMOTE_CHANNEL_SECURITY.md`](REMOTE_CHANNEL_SECURITY.md).
 
 **Sandbox modes (Preview pending platform and MCP qualification).** `requires_isolation` was replaced by a `SandboxMode`
 (`read_only`, `workspace_write`, `full_access`) that the kernel enforces —

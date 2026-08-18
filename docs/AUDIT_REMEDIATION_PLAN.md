@@ -246,8 +246,9 @@ Primary files:
 
 Priority: P0  
 Size: L  
-Status: in progress (`ID-001` typed principal/session ownership and `ID-002`
-versioned migration implemented; `AUTH-001` remote authorization remains)
+Status: in progress (`ID-001` typed principal/session ownership, `ID-002`
+versioned migration, and `AUTH-001` remote authorization implemented;
+`AUTH-002`/`AUTH-003` policy work remains)
 Dependencies: M0 and a persistence schema-version mechanism
 
 Deliverables:
@@ -260,15 +261,21 @@ Deliverables:
 2. Use the principal for sessions, memory scopes, approval tickets, `/clear`,
    jobs, task sessions, and audit events. **Implemented for session/run state,
    memory, `/clear`, jobs, task-session files, and trace files.** Approval
-   resolver binding remains `AUTH-001`; durable safety-event identity remains
-   `AUD-001`.
+   resolver binding is implemented for initiators and configured same-chat
+   administrators; durable safety-event identity remains `AUD-001`.
 3. Replace lossy namespace encoding with injective encoding. **Implemented:**
    canonical principal/session bytes and arbitrary namespace/file components
    use unpadded base64url rather than replacement sanitization.
 4. Bind approval resolution to the principal that received the prompt and, for
    group conversations, to the initiating sender or authorized administrators.
+   **Implemented:** persistent and one-shot remote approval paths require the
+   initiating `SessionKey`, except for explicitly configured administrators in
+   the same channel and conversation.
 5. Require a sender/chat allowlist for remote channels unless an explicit
    `allow_all_senders = true` compatibility option is present.
+   **Implemented:** typed Telegram/Feishu sender, conversation, and
+   administrator lists fail closed; unattributed events remain rejected even
+   under the compatibility switch.
 6. Implement true policy narrowing over exact actions and argument constraints.
    Parent `AskUser` remains `AskUser`; constrained parent `Allow` cannot become
    unconstrained child `Allow`.
@@ -564,7 +571,7 @@ policy semantics, and new features in one PR.
 | `CI-001` | Portable spill/golden tests and macOS sandbox probe (**in progress:** implementation and required Linux/macOS sandbox jobs added; qualifying CI run pending) | TEST-001 |
 | `ID-001` | Typed principal and injective namespace (**implemented and locally verified:** principal-keyed sessions, memory, jobs, clear, task sessions, traces, and subagent forks) | ADR-001 |
 | `ID-002` | Versioned persistence migration and collision report (**implemented and locally verified:** read-only report, mandatory backup, atomic rewrite, quarantine, crash/disk-full restart, rollback snapshot, and paused-state compatibility) | ID-001 |
-| `AUTH-001` | Remote sender authentication and approval binding | ID-001 |
+| `AUTH-001` | Remote sender authentication and approval binding (**implemented and locally verified:** fail-closed sender/chat policy, unattributed-event rejection, initiator binding, and same-chat administrator override) | ID-001 |
 | `AUTH-002` | Exact policy lattice and explicit delegation grants (**in progress:** strict lattice enforced; explicit grants pending) | ADR-001 |
 | `AUTH-003` | Conservative shipped policy and command profiles | AUTH-002 |
 | `SBX-001` | Fail-closed registry and executor capability protocol (**in progress:** registry fallback removed; actual MCP server protocol pending) | ADR-001 |
@@ -627,7 +634,7 @@ Additionally:
 | Missing configured skills | P0 | M1 | Release engineering | Resolved by `REL-001`; archive smoke validates parent and subagent skill references |
 | Release archive omits workspace assets | P0 | M1 | Release engineering | Resolved by `REL-001`; required CI artifact run pending |
 | Installer/docs/wrapper mismatch | P1 | M1 | CLI/release | Resolved by `REL-002`; required CI matrix runs pending |
-| Remote ingress plus permissive tool defaults | P0 | M2, M3 | Gateway security | Open |
+| Remote ingress plus permissive tool defaults | P0 | M2, M3 | Gateway security | Remote ingress resolved by `AUTH-001`; permissive shipped tool defaults remain `AUTH-003` |
 | Cross-channel/session/sender identity collision | P0 | M2 | Identity/persistence | Resolved by `ID-001` and `ID-002`; legacy splits are reported and ambiguous rows quarantined |
 | Policy narrowing widens authority | P0 | M2 | Core authorization | Strict per-call narrowing implemented and property-tested; explicit grant model pending |
 | Sandboxed tool fallback/incompatible worker | P0 | M3 | Core sandbox | Registry fallback resolved with typed capability checks; actual MCP server isolation and platform qualification remain |

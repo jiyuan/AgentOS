@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 mod approval;
 pub mod catalog;
+mod channels;
 mod compaction;
 mod gateway;
 mod jobs;
@@ -22,6 +23,7 @@ mod spill;
 mod subagents;
 
 pub use approval::ApprovalConfig;
+pub use channels::{ChannelConfig, RemoteChannelConfig};
 pub use compaction::CompactionConfig;
 pub use gateway::GatewayConfig;
 pub use jobs::JobsConfig;
@@ -153,8 +155,8 @@ impl Default for GuardrailsConfig {
 #[serde(default)]
 pub struct ChannelsConfig {
     pub tui: ChannelConfig,
-    pub telegram: ChannelConfig,
-    pub feishu: ChannelConfig,
+    pub telegram: RemoteChannelConfig,
+    pub feishu: RemoteChannelConfig,
 }
 
 impl Default for ChannelsConfig {
@@ -164,30 +166,16 @@ impl Default for ChannelsConfig {
                 enabled: true,
                 mode: Arc::from("interactive"),
             },
-            telegram: ChannelConfig {
+            telegram: RemoteChannelConfig {
                 enabled: false,
                 mode: Arc::from("poll_once"),
+                ..RemoteChannelConfig::default()
             },
-            feishu: ChannelConfig {
+            feishu: RemoteChannelConfig {
                 enabled: false,
                 mode: Arc::from("long_connection"),
+                ..RemoteChannelConfig::default()
             },
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(default)]
-pub struct ChannelConfig {
-    pub enabled: bool,
-    pub mode: Arc<str>,
-}
-
-impl Default for ChannelConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            mode: Arc::from("disabled"),
         }
     }
 }
@@ -382,17 +370,18 @@ impl WorkspaceConfig {
     }
 
     pub fn validate_channels(&self) -> Result<(), String> {
-        validate_channel_mode("channels.tui", &self.channels.tui, &["interactive"])?;
         validate_channel_mode(
-            "channels.telegram",
-            &self.channels.telegram,
-            &["poll_once", "polling"],
+            "channels.tui",
+            self.channels.tui.enabled,
+            &self.channels.tui.mode,
+            &["interactive"],
         )?;
-        validate_channel_mode(
-            "channels.feishu",
-            &self.channels.feishu,
-            &["long_connection"],
-        )?;
+        self.channels
+            .telegram
+            .validate("channels.telegram", &["poll_once", "polling"])?;
+        self.channels
+            .feishu
+            .validate("channels.feishu", &["long_connection"])?;
         Ok(())
     }
 
@@ -602,18 +591,19 @@ impl WorkspaceConfig {
 
 fn validate_channel_mode(
     section: &str,
-    channel: &ChannelConfig,
+    enabled: bool,
+    mode: &str,
     allowed: &[&str],
 ) -> Result<(), String> {
-    if !channel.enabled {
+    if !enabled {
         return Ok(());
     }
-    if allowed.iter().any(|mode| channel.mode.as_ref() == *mode) {
+    if allowed.contains(&mode) {
         return Ok(());
     }
     Err(format!(
         "{section}.mode '{}' is not supported; expected one of {}",
-        channel.mode,
+        mode,
         allowed.join(", ")
     ))
 }

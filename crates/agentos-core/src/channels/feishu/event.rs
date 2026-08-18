@@ -1,3 +1,4 @@
+use crate::channels::auth::RemoteIngressPolicy;
 use agentos_proto::{AttachmentKind, ChannelId, ConversationId, Envelope, Message, MessageRole};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -21,7 +22,7 @@ pub(super) struct ParsedFeishuEvent {
 pub(super) fn parse_event(
     payload: &Value,
     channel_id: &ChannelId,
-    allowed_source_ids: &[Arc<str>],
+    ingress_policy: &RemoteIngressPolicy,
     receive_id_type: &str,
 ) -> Option<ParsedFeishuEvent> {
     let event_type = payload
@@ -43,7 +44,8 @@ pub(super) fn parse_event(
     let sender_id = event
         .get("sender")
         .and_then(|sender| sender.get("sender_id"));
-    if !feishu_allowed_source_matches(allowed_source_ids, sender_id) {
+    let sender_ids = feishu_sender_ids(sender_id);
+    if !ingress_policy.authorizes(&sender_ids, chat_id) {
         return None;
     }
     let raw_content = message.get("content").and_then(Value::as_str)?;
@@ -96,9 +98,7 @@ pub(super) fn parse_event(
         _ => return None,
     };
 
-    let sender = sender_id
-        .and_then(preferred_feishu_sender_id)
-        .map_or_else(|| Arc::from("feishu-user"), Arc::from);
+    let sender = Arc::from(sender_id.and_then(preferred_feishu_sender_id)?);
     let mut metadata = BTreeMap::new();
     metadata.insert(Arc::from("kind"), Value::String("feishu".to_owned()));
     if let Some(event_id) = payload
@@ -150,7 +150,7 @@ pub(super) fn parse_event(
 
 pub(super) fn feishu_drop_reason(
     payload: &Value,
-    allowed_source_ids: &[Arc<str>],
+    ingress_policy: &RemoteIngressPolicy,
 ) -> Option<String> {
     let event_type = payload
         .get("header")
@@ -185,10 +185,9 @@ pub(super) fn feishu_drop_reason(
     let sender_id = event
         .get("sender")
         .and_then(|sender| sender.get("sender_id"));
-    if !feishu_allowed_source_matches(allowed_source_ids, sender_id) {
+    if !ingress_policy.authorizes(&feishu_sender_ids(sender_id), chat_id) {
         return Some(format!(
-            "filtered by allowed sender ids: allowed={}, chat_id={}, sender_ids={}",
-            feishu_allowed_ids_summary(allowed_source_ids),
+            "filtered by remote ingress policy: chat_id={}, sender_ids={}",
             chat_id,
             feishu_sender_ids_summary(sender_id)
         ));
@@ -230,22 +229,14 @@ pub(super) fn feishu_drop_reason(
     None
 }
 
-fn feishu_allowed_source_matches(
-    allowed_source_ids: &[Arc<str>],
-    sender_id: Option<&Value>,
-) -> bool {
-    if allowed_source_ids.is_empty() {
-        return true;
-    }
-    allowed_source_ids.iter().any(|allowed| {
-        sender_id.is_some_and(|sender_id| feishu_sender_id_matches(sender_id, allowed))
-    })
-}
-
-fn feishu_sender_id_matches(sender_id: &Value, allowed: &str) -> bool {
+fn feishu_sender_ids(sender_id: Option<&Value>) -> Vec<&str> {
+    let Some(sender_id) = sender_id else {
+        return Vec::new();
+    };
     ["open_id", "user_id", "union_id"]
         .into_iter()
-        .any(|key| sender_id.get(key).and_then(Value::as_str) == Some(allowed))
+        .filter_map(|key| sender_id.get(key).and_then(Value::as_str))
+        .collect()
 }
 
 fn preferred_feishu_sender_id(sender_id: &Value) -> Option<&str> {
@@ -270,18 +261,6 @@ fn feishu_sender_ids_summary(sender_id: Option<&Value>) -> String {
         "<missing>".to_owned()
     } else {
         parts.join(",")
-    }
-}
-
-fn feishu_allowed_ids_summary(allowed_source_ids: &[Arc<str>]) -> String {
-    if allowed_source_ids.is_empty() {
-        "<unset>".to_owned()
-    } else {
-        allowed_source_ids
-            .iter()
-            .map(|value| value.as_ref())
-            .collect::<Vec<_>>()
-            .join(",")
     }
 }
 
@@ -316,6 +295,14 @@ mod tests {
         ChannelId::new("feishu")
     }
 
+    fn allowed_sender(sender_id: &str) -> RemoteIngressPolicy {
+        let config = crate::config::RemoteChannelConfig {
+            allowed_sender_ids: vec![Arc::from(sender_id)],
+            ..crate::config::RemoteChannelConfig::default()
+        };
+        RemoteIngressPolicy::from_config("feishu", &config, [], []).expect("test ingress policy")
+    }
+
     fn text_event(text: &str) -> Value {
         json!({
             "header": { "event_type": "im.message.receive_v1" },
@@ -333,8 +320,13 @@ mod tests {
 
     #[test]
     fn parses_text_message() {
-        let parsed =
-            parse_event(&text_event("hello"), &channel_id(), &[], "chat_id").expect("parsed");
+        let parsed = parse_event(
+            &text_event("hello"),
+            &channel_id(),
+            &RemoteIngressPolicy::allow_all(),
+            "chat_id",
+        )
+        .expect("parsed");
         assert_eq!(parsed.envelope.message.content.as_ref(), "hello");
         assert!(parsed.attachments.is_empty());
         assert_eq!(parsed.message_id, "om_1");
@@ -354,7 +346,13 @@ mod tests {
                 }
             }
         });
-        let parsed = parse_event(&payload, &channel_id(), &[], "chat_id").expect("parsed");
+        let parsed = parse_event(
+            &payload,
+            &channel_id(),
+            &RemoteIngressPolicy::allow_all(),
+            "chat_id",
+        )
+        .expect("parsed");
         assert!(parsed.envelope.message.content.is_empty());
         assert_eq!(parsed.attachments.len(), 1);
         let desc = &parsed.attachments[0];
@@ -377,7 +375,13 @@ mod tests {
                 }
             }
         });
-        let parsed = parse_event(&payload, &channel_id(), &[], "chat_id").expect("parsed");
+        let parsed = parse_event(
+            &payload,
+            &channel_id(),
+            &RemoteIngressPolicy::allow_all(),
+            "chat_id",
+        )
+        .expect("parsed");
         assert_eq!(parsed.attachments.len(), 1);
         let desc = &parsed.attachments[0];
         assert_eq!(desc.kind, AttachmentKind::Document);
@@ -399,20 +403,32 @@ mod tests {
                 }
             }
         });
-        assert!(parse_event(&payload, &channel_id(), &[], "chat_id").is_none());
-        let reason = feishu_drop_reason(&payload, &[]).expect("reason");
+        let policy = RemoteIngressPolicy::allow_all();
+        assert!(parse_event(&payload, &channel_id(), &policy, "chat_id").is_none());
+        let reason = feishu_drop_reason(&payload, &policy).expect("reason");
         assert!(reason.contains("unsupported message_type=audio"));
     }
 
     #[test]
     fn allowed_source_filter_applies() {
-        let allowed = [Arc::from("ou_other")];
-        assert!(parse_event(&text_event("hi"), &channel_id(), &allowed, "chat_id").is_none());
+        assert!(parse_event(
+            &text_event("hi"),
+            &channel_id(),
+            &allowed_sender("ou_other"),
+            "chat_id"
+        )
+        .is_none());
     }
 
     #[test]
     fn open_id_receive_type_uses_sender_open_id_as_conversation() {
-        let parsed = parse_event(&text_event("hi"), &channel_id(), &[], "open_id").expect("parsed");
+        let parsed = parse_event(
+            &text_event("hi"),
+            &channel_id(),
+            &RemoteIngressPolicy::allow_all(),
+            "open_id",
+        )
+        .expect("parsed");
         assert_eq!(parsed.envelope.conversation_id.as_str(), "ou_a");
     }
 
@@ -430,7 +446,35 @@ mod tests {
                 }
             }
         });
-        let parsed = parse_event(&payload, &channel_id(), &[], "open_id").expect("parsed");
+        let parsed = parse_event(
+            &payload,
+            &channel_id(),
+            &RemoteIngressPolicy::allow_all(),
+            "open_id",
+        )
+        .expect("parsed");
         assert_eq!(parsed.envelope.conversation_id.as_str(), "oc_1");
+    }
+
+    #[test]
+    fn unattributed_event_is_rejected_even_when_allow_all_is_explicit() {
+        let payload = json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "message": {
+                    "chat_id": "oc_1",
+                    "message_id": "om_6",
+                    "message_type": "text",
+                    "content": json!({ "text": "hi" }).to_string(),
+                }
+            }
+        });
+        assert!(parse_event(
+            &payload,
+            &channel_id(),
+            &RemoteIngressPolicy::allow_all(),
+            "chat_id"
+        )
+        .is_none());
     }
 }

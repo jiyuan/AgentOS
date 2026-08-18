@@ -1,6 +1,7 @@
 use super::event::{feishu_drop_reason, parse_event, ParsedFeishuEvent};
 use super::proto::{header_value, pong_frame, success_frame, FeishuFrame};
 use super::websocket::WebSocketConnection;
+use crate::channels::auth::RemoteIngressPolicy;
 use agentos_interfaces::ChannelError;
 use agentos_proto::ChannelId;
 use serde_json::Value;
@@ -29,7 +30,7 @@ impl FeishuLongConnection {
     pub(super) async fn receive_next_event(
         &mut self,
         channel_id: &ChannelId,
-        allowed_source_ids: &[Arc<str>],
+        ingress_policy: &RemoteIngressPolicy,
         receive_id_type: &str,
         log_receive_errors: bool,
     ) -> Result<Option<ParsedFeishuEvent>, ChannelError> {
@@ -66,13 +67,12 @@ impl FeishuLongConnection {
                 })?;
             let started = Instant::now();
             self.ack_event(&frame, started).await?;
-            if let Some(parsed) =
-                parse_event(&payload, channel_id, allowed_source_ids, receive_id_type)
+            if let Some(parsed) = parse_event(&payload, channel_id, ingress_policy, receive_id_type)
             {
                 return Ok(Some(parsed));
             }
             if log_receive_errors {
-                if let Some(reason) = feishu_drop_reason(&payload, allowed_source_ids) {
+                if let Some(reason) = feishu_drop_reason(&payload, ingress_policy) {
                     eprintln!("feishu event dropped: {reason}");
                 }
             }

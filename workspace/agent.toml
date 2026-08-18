@@ -78,10 +78,20 @@ mode = "interactive"
 [channels.telegram]
 enabled = false
 mode = "poll_once"
+# Remote ingress fails closed unless at least one stable sender/chat id is
+# allowed, or allow_all_senders is explicitly enabled for compatibility.
+allowed_sender_ids = []
+allowed_conversation_ids = []
+administrator_ids = []
+allow_all_senders = false
 
 [channels.feishu]
 enabled = false
 mode = "long_connection"
+allowed_sender_ids = []
+allowed_conversation_ids = []
+administrator_ids = []
+allow_all_senders = false
 
 # Sizes a deployment has real reason to change. Omit the section to keep the
 # defaults; every key here is optional and an unknown key fails the load.

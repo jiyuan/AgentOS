@@ -1,4 +1,6 @@
 use crate::channels::attachments::{file_size, AttachmentStore};
+use crate::channels::auth::RemoteIngressPolicy;
+use crate::config::RemoteChannelConfig;
 use crate::http::shared_client;
 use crate::r#loop::{parse_action_data, DECISION_KEY, TICKET_KEY};
 use agentos_interfaces::{Channel, ChannelError, Egress, StreamEgress};
@@ -25,7 +27,7 @@ const DEFAULT_API_BASE: &str = "https://api.telegram.org";
 pub struct TelegramChannel {
     token: Arc<str>,
     id: ChannelId,
-    allowed_chat_id: Option<Arc<str>>,
+    ingress_policy: RemoteIngressPolicy,
     offset: Option<i64>,
     log_receive_errors: bool,
     attachments: AttachmentStore,
@@ -109,17 +111,28 @@ impl StreamEgress for TelegramStreamEgress {
 }
 
 impl TelegramChannel {
-    pub fn from_env() -> Result<Self, ChannelError> {
+    pub fn from_env(config: &RemoteChannelConfig) -> Result<Self, ChannelError> {
         let token = env::var("AGENTOS_TELEGRAM_BOT_TOKEN")
             .map_err(|_| ChannelError::Backend(Arc::from("missing AGENTOS_TELEGRAM_BOT_TOKEN")))?;
         // An empty value means "no allowlist" (accept any chat), same as the
         // variable being unset. Without this, an empty override would make
         // `parse_update` reject every inbound message.
-        let allowed_chat_id = env::var("AGENTOS_TELEGRAM_CHAT_ID")
+        let allowed_chat_ids = env::var("AGENTOS_TELEGRAM_CHAT_ID")
             .ok()
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty())
-            .map(Arc::from);
+            .into_iter()
+            .flat_map(|value| split_ids(&value))
+            .collect::<Vec<_>>();
+        let allowed_sender_ids = env::var("AGENTOS_TELEGRAM_ALLOWED_SENDER_ID")
+            .ok()
+            .into_iter()
+            .flat_map(|value| split_ids(&value))
+            .collect::<Vec<_>>();
+        let ingress_policy = RemoteIngressPolicy::from_config(
+            "telegram",
+            config,
+            allowed_sender_ids,
+            allowed_chat_ids,
+        )?;
         let api_base = env::var("AGENTOS_TELEGRAM_API_BASE")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -133,7 +146,7 @@ impl TelegramChannel {
         Ok(Self {
             token: Arc::clone(&token),
             id: ChannelId::new("telegram"),
-            allowed_chat_id,
+            ingress_policy,
             offset: None,
             log_receive_errors: false,
             attachments: AttachmentStore::from_env("telegram"),
@@ -301,8 +314,7 @@ impl Channel for TelegramChannel {
         let updates = response.get("result")?.as_array()?;
         for update in updates {
             let update_id = update.get("update_id")?.as_i64()?;
-            let Some(parsed) = parse_update(update, &self.id, self.allowed_chat_id.as_deref())
-            else {
+            let Some(parsed) = parse_update(update, &self.id, &self.ingress_policy) else {
                 continue;
             };
             let attachments = match self.download_attachments(
@@ -481,14 +493,15 @@ struct ParsedUpdate {
 fn parse_update(
     update: &Value,
     channel_id: &ChannelId,
-    allowed_chat_id: Option<&str>,
+    ingress_policy: &RemoteIngressPolicy,
 ) -> Option<ParsedUpdate> {
     if let Some(callback) = update.get("callback_query") {
-        return parse_callback_query(update, callback, channel_id, allowed_chat_id);
+        return parse_callback_query(update, callback, channel_id, ingress_policy);
     }
     let message = update.get("message")?;
     let chat_id = chat_id_string(message.get("chat")?)?;
-    if allowed_chat_id.is_some_and(|allowed| allowed != chat_id) {
+    let sender = message.get("from")?.get("id")?.as_i64()?.to_string();
+    if !ingress_policy.authorizes(&[sender.as_str()], &chat_id) {
         return None;
     }
 
@@ -504,19 +517,6 @@ fn parse_update(
         return None;
     }
 
-    let sender = message
-        .get("from")
-        .and_then(|from| {
-            from.get("id")
-                .and_then(Value::as_i64)
-                .map(|id| id.to_string())
-                .or_else(|| {
-                    from.get("username")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                })
-        })
-        .map_or_else(|| Arc::from("telegram-user"), Arc::from);
     let update_id = update.get("update_id")?.as_i64()?;
     let message_id = message.get("message_id").and_then(Value::as_i64);
     let message_id_str = message_id
@@ -534,7 +534,7 @@ fn parse_update(
         envelope: Envelope {
             channel_id: channel_id.clone(),
             conversation_id: ConversationId::new(chat_id),
-            sender,
+            sender: Arc::from(sender),
             message: Message::text(MessageRole::User, text),
             metadata,
         },
@@ -554,7 +554,7 @@ fn parse_callback_query(
     update: &Value,
     callback: &Value,
     channel_id: &ChannelId,
-    allowed_chat_id: Option<&str>,
+    ingress_policy: &RemoteIngressPolicy,
 ) -> Option<ParsedUpdate> {
     let data = callback.get("data").and_then(Value::as_str)?;
     let (decision, ticket) = parse_action_data(data)?;
@@ -562,16 +562,10 @@ fn parse_callback_query(
         .get("message")
         .and_then(|message| message.get("chat"))?;
     let chat_id = chat_id_string(chat)?;
-    if allowed_chat_id.is_some_and(|allowed| allowed != chat_id) {
+    let sender = callback.get("from")?.get("id")?.as_i64()?.to_string();
+    if !ingress_policy.authorizes(&[sender.as_str()], &chat_id) {
         return None;
     }
-    let sender = callback
-        .get("from")
-        .and_then(|from| from.get("id").and_then(Value::as_i64))
-        .map_or_else(
-            || Arc::from("telegram-user"),
-            |id| Arc::from(id.to_string()),
-        );
     let update_id = update.get("update_id")?.as_i64()?;
 
     let mut metadata = BTreeMap::new();
@@ -587,7 +581,7 @@ fn parse_callback_query(
         envelope: Envelope {
             channel_id: channel_id.clone(),
             conversation_id: ConversationId::new(chat_id),
-            sender,
+            sender: Arc::from(sender),
             // Echoed so the transcript and the gateway log read as the command
             // the press stands for, rather than as an empty message.
             message: Message::text(MessageRole::User, format!("/{decision} {ticket}")),
@@ -681,6 +675,14 @@ fn chat_id_string(chat: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn split_ids(raw: &str) -> Vec<Arc<str>> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(Arc::from)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -689,6 +691,14 @@ mod tests {
 
     fn channel_id() -> ChannelId {
         ChannelId::new("telegram")
+    }
+
+    fn allowed_chat(chat_id: &str) -> RemoteIngressPolicy {
+        let config = RemoteChannelConfig {
+            allowed_conversation_ids: vec![Arc::from(chat_id)],
+            ..RemoteChannelConfig::default()
+        };
+        RemoteIngressPolicy::from_config("telegram", &config, [], []).expect("test ingress policy")
     }
 
     /// A button press carries the prompt's ticket structurally, so the router
@@ -705,7 +715,8 @@ mod tests {
                 "data": format!("approve:{ticket}"),
             }
         });
-        let parsed = parse_update(&update, &channel_id(), None).expect("envelope");
+        let parsed = parse_update(&update, &channel_id(), &RemoteIngressPolicy::allow_all())
+            .expect("envelope");
         assert_eq!(parsed.envelope.conversation_id.as_str(), "99");
         assert_eq!(parsed.callback_query_id.as_deref(), Some("cbq-1"));
         assert_eq!(
@@ -744,7 +755,7 @@ mod tests {
                 "data": "open:settings",
             }
         });
-        assert!(parse_update(&update, &channel_id(), None).is_none());
+        assert!(parse_update(&update, &channel_id(), &RemoteIngressPolicy::allow_all()).is_none());
     }
 
     /// The chat allowlist covers button presses too — otherwise a stranger who
@@ -760,8 +771,8 @@ mod tests {
                 "data": "approve:k3f",
             }
         });
-        assert!(parse_update(&update, &channel_id(), Some("100")).is_none());
-        assert!(parse_update(&update, &channel_id(), Some("99")).is_some());
+        assert!(parse_update(&update, &channel_id(), &allowed_chat("100")).is_none());
+        assert!(parse_update(&update, &channel_id(), &allowed_chat("99")).is_some());
     }
 
     #[test]
@@ -814,10 +825,24 @@ mod tests {
                 "text": "hello world"
             }
         });
-        let parsed = parse_update(&update, &channel_id(), None).expect("envelope");
+        let parsed = parse_update(&update, &channel_id(), &RemoteIngressPolicy::allow_all())
+            .expect("envelope");
         assert_eq!(parsed.envelope.message.content.as_ref(), "hello world");
         assert!(parsed.attachments.is_empty());
         assert_eq!(parsed.message_id_str, "10");
+    }
+
+    #[test]
+    fn unattributed_update_is_rejected_even_when_allow_all_is_explicit() {
+        let update = json!({
+            "update_id": 1,
+            "message": {
+                "message_id": 10,
+                "chat": { "id": 99 },
+                "text": "hello world"
+            }
+        });
+        assert!(parse_update(&update, &channel_id(), &RemoteIngressPolicy::allow_all()).is_none());
     }
 
     #[test]
@@ -827,6 +852,7 @@ mod tests {
             "message": {
                 "message_id": 11,
                 "chat": { "id": 99 },
+                "from": { "id": 7 },
                 "caption": "look at this",
                 "photo": [
                     { "file_id": "small", "file_unique_id": "u1", "width": 90, "height": 60, "file_size": 1000 },
@@ -834,7 +860,8 @@ mod tests {
                 ]
             }
         });
-        let parsed = parse_update(&update, &channel_id(), None).expect("envelope");
+        let parsed = parse_update(&update, &channel_id(), &RemoteIngressPolicy::allow_all())
+            .expect("envelope");
         assert_eq!(parsed.envelope.message.content.as_ref(), "look at this");
         assert_eq!(parsed.attachments.len(), 1);
         let desc = &parsed.attachments[0];
@@ -851,6 +878,7 @@ mod tests {
             "message": {
                 "message_id": 12,
                 "chat": { "id": 99 },
+                "from": { "id": 7 },
                 "document": {
                     "file_id": "doc-1",
                     "file_name": "report.pdf",
@@ -859,7 +887,8 @@ mod tests {
                 }
             }
         });
-        let parsed = parse_update(&update, &channel_id(), None).expect("envelope");
+        let parsed = parse_update(&update, &channel_id(), &RemoteIngressPolicy::allow_all())
+            .expect("envelope");
         assert!(parsed.envelope.message.content.is_empty());
         assert_eq!(parsed.attachments.len(), 1);
         let desc = &parsed.attachments[0];
@@ -873,9 +902,9 @@ mod tests {
     fn parse_update_drops_empty_message() {
         let update = json!({
             "update_id": 4,
-            "message": { "message_id": 13, "chat": { "id": 99 } }
+            "message": { "message_id": 13, "chat": { "id": 99 }, "from": { "id": 7 } }
         });
-        assert!(parse_update(&update, &channel_id(), None).is_none());
+        assert!(parse_update(&update, &channel_id(), &RemoteIngressPolicy::allow_all()).is_none());
     }
 
     #[test]
@@ -885,10 +914,11 @@ mod tests {
             "message": {
                 "message_id": 14,
                 "chat": { "id": 99 },
+                "from": { "id": 7 },
                 "text": "hi"
             }
         });
-        assert!(parse_update(&update, &channel_id(), Some("100")).is_none());
-        assert!(parse_update(&update, &channel_id(), Some("99")).is_some());
+        assert!(parse_update(&update, &channel_id(), &allowed_chat("100")).is_none());
+        assert!(parse_update(&update, &channel_id(), &allowed_chat("99")).is_some());
     }
 }

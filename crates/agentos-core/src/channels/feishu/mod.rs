@@ -1,4 +1,6 @@
 use crate::channels::attachments::{file_size, AttachmentStore};
+use crate::channels::auth::RemoteIngressPolicy;
+use crate::config::RemoteChannelConfig;
 use crate::http::shared_client;
 use agentos_interfaces::{Channel, ChannelError, Egress, StreamEgress};
 use agentos_proto::{Attachment, AttachmentKind, ChannelId, Envelope};
@@ -36,7 +38,7 @@ pub struct FeishuChannel {
     id: ChannelId,
     api_base: Arc<str>,
     receive_id_type: Arc<str>,
-    allowed_source_ids: Vec<Arc<str>>,
+    ingress_policy: RemoteIngressPolicy,
     tenant_token: Arc<Mutex<Option<CachedTenantToken>>>,
     long_connection: Option<FeishuLongConnection>,
     log_receive_errors: bool,
@@ -71,7 +73,7 @@ pub(super) struct CachedTenantToken {
 }
 
 impl FeishuChannel {
-    pub fn from_env() -> Result<Self, ChannelError> {
+    pub fn from_env(config: &RemoteChannelConfig) -> Result<Self, ChannelError> {
         let app_id = env::var("AGENTOS_FEISHU_APP_ID")
             .map_err(|_| ChannelError::Backend(Arc::from("missing AGENTOS_FEISHU_APP_ID")))?;
         let app_secret = env::var("AGENTOS_FEISHU_APP_SECRET")
@@ -80,7 +82,12 @@ impl FeishuChannel {
             env::var("AGENTOS_FEISHU_API_BASE").unwrap_or_else(|_| DEFAULT_API_BASE.to_owned());
         let receive_id_type =
             env::var("AGENTOS_FEISHU_RECEIVE_ID_TYPE").unwrap_or_else(|_| "chat_id".to_owned());
-        let allowed_source_ids = feishu_allowed_source_ids_from_env();
+        let ingress_policy = RemoteIngressPolicy::from_config(
+            "feishu",
+            config,
+            feishu_allowed_source_ids_from_env(),
+            [],
+        )?;
         // The channel and its egress share one token cache: two caches would
         // mean two `tenant_access_token` round trips and, worse, a send racing
         // a receive to refresh the same expiring token.
@@ -96,7 +103,7 @@ impl FeishuChannel {
             id: ChannelId::new("feishu"),
             api_base: Arc::clone(&api_base),
             receive_id_type: Arc::clone(&receive_id_type),
-            allowed_source_ids,
+            ingress_policy,
             tenant_token: Arc::clone(&tenant_token),
             long_connection: None,
             log_receive_errors: false,
@@ -264,7 +271,7 @@ impl FeishuChannel {
             }
         }
         let channel_id = self.id.clone();
-        let allowed_source_ids = self.allowed_source_ids.clone();
+        let ingress_policy = self.ingress_policy.clone();
         let receive_id_type = Arc::clone(&self.receive_id_type);
         let log_receive_errors = self.log_receive_errors;
         let connection = match self.long_connection().await {
@@ -277,7 +284,7 @@ impl FeishuChannel {
         let parsed = match connection
             .receive_next_event(
                 &channel_id,
-                &allowed_source_ids,
+                &ingress_policy,
                 receive_id_type.as_ref(),
                 log_receive_errors,
             )
@@ -552,7 +559,7 @@ mod tests {
             id: ChannelId::new("feishu"),
             api_base: Arc::from(DEFAULT_API_BASE),
             receive_id_type: Arc::from("chat_id"),
-            allowed_source_ids: Vec::new(),
+            ingress_policy: RemoteIngressPolicy::allow_all(),
             tenant_token: Arc::new(Mutex::new(None)),
             long_connection: None,
             log_receive_errors: false,

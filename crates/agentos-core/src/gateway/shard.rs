@@ -141,7 +141,13 @@ impl Router {
     /// is the one thing sharding must not allow.
     pub fn shard_of(&self, session_key: &SessionKey) -> usize {
         let mut hasher = DefaultHasher::new();
-        session_key.hash(&mut hasher);
+        match &session_key.principal {
+            agentos_proto::PrincipalKey::V1(principal) => {
+                principal.agent_id.hash(&mut hasher);
+                principal.channel_id.hash(&mut hasher);
+                principal.conversation_id.hash(&mut hasher);
+            }
+        }
         (hasher.finish() % self.shards.len() as u64) as usize
     }
 
@@ -414,6 +420,23 @@ mod tests {
             assert_eq!(router.shard_of(&key), first);
         }
         assert!(first < 4);
+    }
+
+    #[test]
+    fn group_participants_share_a_shard_without_sharing_session_keys() {
+        let agent = AgentId::new("gateway-test");
+        let (router, _rx) = shard_set(&config(8), agent.clone());
+        let initiator = envelope("group", "request");
+        let mut administrator = initiator.clone();
+        administrator.sender = Arc::from("administrator");
+        let initiator_key = initiator.session_key(&agent);
+        let administrator_key = administrator.session_key(&agent);
+        assert_ne!(initiator_key, administrator_key);
+        assert_eq!(
+            router.shard_of(&initiator_key),
+            router.shard_of(&administrator_key),
+            "same-chat administrators must reach the shard holding the initiator's prompt"
+        );
     }
 
     /// The item's exit condition, at shard level: one conversation's slow turn

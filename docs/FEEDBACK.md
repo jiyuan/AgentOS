@@ -697,3 +697,23 @@
 - **Actual Behavior**: The first complete migration module contained 891 non-test lines and was rejected by `scripts/check-module-size.sh`.
 - **Root Cause**: Report aggregation, legacy parsing helpers, and migration execution were initially placed in one module while establishing the end-to-end transaction.
 - **Suggested Fix**: Split analysis/report helpers as soon as the migration boundary stabilizes. The helpers now live in `memory/migration/report.rs`, and the module-size check passes.
+
+## [2026-08-18 22:43] ORCHESTRATION [ESCALATE]
+
+- **Agent**: main-codex
+- **Task**: Implement the `AUTH-001` remote sender authentication and approval-binding slice.
+- **Guideline Violated**: ORCHESTRATION > Subagent Delegation & Creation
+- **Expected Behavior**: Delegate work involving more than two sequential tool calls to a matching subagent.
+- **Actual Behavior**: Work was performed locally because the active runtime instructions only permit spawning subagents when the user explicitly requests delegation.
+- **Root Cause**: Higher-priority runtime instructions conflict with the repository's automatic delegation threshold, and this conflict has recurred in more than three sessions without a repository-level resolution.
+- **Suggested Fix**: Amend the repository guideline to recognize runtimes where subagent spawning requires explicit user consent; this recurring conflict now requires human review.
+
+## [2026-08-18 22:43] ORCHESTRATION
+
+- **Agent**: main-codex
+- **Task**: Follow the repository Resolution Chain before implementing `AUTH-001`.
+- **Guideline Violated**: ORCHESTRATION > Resolution Chain and STRUCTURE
+- **Expected Behavior**: Consult `orchestration/AGENTLIST.md`, `orchestration/SKILLLIST.md`, and `orchestration/TOOLLIST.md` before selecting the implementation path.
+- **Actual Behavior**: None of the three documented registry paths exists in this checkout, so the implementation proceeded using the codebase inventory and native Rust tooling.
+- **Root Cause**: The documented repository structure and the checked-in filesystem have drifted.
+- **Suggested Fix**: Add the three registries at their documented paths or amend the Resolution Chain to name the actual project discovery mechanism.
