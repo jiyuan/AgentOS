@@ -63,7 +63,7 @@ async fn golden_plain_reply() {
     .expect("a plain reply run finishes");
 
     let transcript = session
-        .load(&ConversationId::new(CONVERSATION))
+        .load(&support::user_session_key())
         .await
         .expect("session loads");
     scenario_golden("plain_reply", &llm, &transcript, &outcome);
@@ -102,7 +102,7 @@ async fn golden_skill_prelude() {
     .expect("a run with a populated catalog finishes");
 
     let transcript = session
-        .load(&ConversationId::new(CONVERSATION))
+        .load(&support::user_session_key())
         .await
         .expect("session loads");
     scenario_golden("skill_prelude", &llm, &transcript, &outcome);
@@ -133,7 +133,7 @@ async fn golden_tool_call_allowed() {
     .expect("an allowed tool call finishes");
 
     let transcript = session
-        .load(&ConversationId::new(CONVERSATION))
+        .load(&support::user_session_key())
         .await
         .expect("session loads");
     scenario_golden("tool_call_allowed", &llm, &transcript, &outcome);
@@ -173,7 +173,7 @@ async fn golden_tool_call_batch() {
     .expect("a batch runs cleanly");
 
     let transcript = session
-        .load(&ConversationId::new(CONVERSATION))
+        .load(&support::user_session_key())
         .await
         .expect("session loads");
     support::assert_golden("tool_call_batch", &scenario(&llm, &transcript, &outcome));
@@ -263,7 +263,7 @@ async fn golden_approval_pause_and_resume() {
     .expect("an approved run resumes");
 
     let transcript = session
-        .load(&ConversationId::new(CONVERSATION))
+        .load(&support::user_session_key())
         .await
         .expect("session loads");
     support::assert_golden(
@@ -344,7 +344,7 @@ async fn golden_subagent_delegation() {
     .expect("delegation finishes");
 
     let transcript = session
-        .load(&ConversationId::new(CONVERSATION))
+        .load(&support::user_session_key())
         .await
         .expect("session loads");
     support::assert_golden(
@@ -369,9 +369,10 @@ async fn golden_cron_ephemeral_scope() {
     // 7b52e7d). The golden pins both halves.
     let session = InMemorySession::default();
     let conversation = ConversationId::new(CONVERSATION);
+    let session_key = support::user_session_key();
     session
         .append(
-            &conversation,
+            &session_key,
             vec![
                 Item {
                     message: Message::text(MessageRole::User, "earlier chat message"),
@@ -408,7 +409,7 @@ async fn golden_cron_ephemeral_scope() {
         .await
         .expect("an ephemeral run finishes");
 
-    let transcript = session.load(&conversation).await.expect("session loads");
+    let transcript = session.load(&session_key).await.expect("session loads");
     scenario_golden("cron_ephemeral_scope", &llm, &transcript, &outcome);
 }
 
@@ -423,10 +424,10 @@ async fn golden_compaction_checkpoint() {
     // first two turns hides them from the model without anything having been
     // deleted — the shape compaction (C3) will write.
     let session = InMemorySession::default();
-    let conversation = ConversationId::new(CONVERSATION);
+    let session_key = support::user_session_key();
     session
         .append(
-            &conversation,
+            &session_key,
             vec![
                 Item {
                     message: Message::text(MessageRole::User, "first question"),
@@ -459,6 +460,6 @@ async fn golden_compaction_checkpoint() {
     .await
     .expect("a checkpointed run finishes");
 
-    let transcript = session.load(&conversation).await.expect("session loads");
+    let transcript = session.load(&session_key).await.expect("session loads");
     scenario_golden("compaction_checkpoint", &llm, &transcript, &outcome);
 }

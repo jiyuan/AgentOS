@@ -1,5 +1,7 @@
 use agentos_interfaces::orchestrator::MemoryFragment;
-use agentos_proto::{AgentId, ConversationId, Namespace, RunId, TaskId};
+use agentos_proto::{
+    encode_base64url, AgentId, ConversationId, Namespace, PrincipalKey, RunId, TaskId,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -27,12 +29,15 @@ impl MemoryStore {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "id")]
 pub enum MemoryOwner {
     User(Arc<str>),
     Agent(AgentId),
     Task(TaskId),
+    Principal(PrincipalKey),
+    /// Legacy conversation-only owner. ID-002 migrates persisted rows to
+    /// `Principal` and reports ambiguous legacy collisions.
     Conversation(ConversationId),
     Shared,
 }
@@ -43,18 +48,31 @@ impl MemoryOwner {
             Self::User(_) => "user",
             Self::Agent(_) => "agent",
             Self::Task(_) => "task",
+            Self::Principal(_) => "principal",
             Self::Conversation(_) => "conversation",
             Self::Shared => "shared",
         }
     }
 
-    pub(crate) fn id(&self) -> &str {
+    pub(crate) fn encoded_id(&self) -> String {
         match self {
-            Self::User(id) => id,
-            Self::Agent(id) => id.as_str(),
-            Self::Task(id) => id.as_str(),
-            Self::Conversation(id) => id.as_str(),
-            Self::Shared => "global",
+            Self::User(id) => scope_component(id, "global"),
+            Self::Agent(id) => scope_component(id.as_str(), "global"),
+            Self::Task(id) => scope_component(id.as_str(), "global"),
+            Self::Principal(principal) => principal.storage_key(),
+            Self::Conversation(id) => scope_component(id.as_str(), "global"),
+            Self::Shared => "global".to_owned(),
+        }
+    }
+
+    pub(crate) fn metadata_id(&self) -> String {
+        match self {
+            Self::User(id) => id.to_string(),
+            Self::Agent(id) => id.as_str().to_owned(),
+            Self::Task(id) => id.as_str().to_owned(),
+            Self::Principal(principal) => principal.storage_key(),
+            Self::Conversation(id) => id.as_str().to_owned(),
+            Self::Shared => "global".to_owned(),
         }
     }
 }
@@ -106,7 +124,7 @@ impl MemoryScope {
             "{}/{}/{}/{}/{}",
             self.visibility.as_str(),
             self.owner.kind(),
-            scope_component(self.owner.id(), "global"),
+            self.owner.encoded_id(),
             self.store.as_str(),
             self.domain_name()
         ))
@@ -125,6 +143,8 @@ pub struct MemoryCaller {
     pub agent_id: AgentId,
     pub task_id: TaskId,
     pub conversation_id: ConversationId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_key: Option<PrincipalKey>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_id: Option<Arc<str>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -186,6 +206,8 @@ pub struct EpisodeRecord {
     pub active_agent: AgentId,
     pub conversation_id: ConversationId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_key: Option<PrincipalKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_id: Option<Arc<str>>,
     pub outcome: EpisodeOutcome,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -230,5 +252,18 @@ pub(crate) fn scope_component(value: &str, fallback: &str) -> String {
     if trimmed.is_empty() {
         return fallback.to_owned();
     }
-    trimmed.replace('/', "_")
+    format!("id_{}", encode_base64url(trimmed.as_bytes()))
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::scope_component;
+
+    #[test]
+    fn namespace_components_do_not_collapse_distinct_ids() {
+        assert_ne!(
+            scope_component("a/b", "fallback"),
+            scope_component("a_b", "fallback")
+        );
+    }
 }

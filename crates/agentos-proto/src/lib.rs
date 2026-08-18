@@ -10,8 +10,9 @@ pub mod usage;
 
 pub use envelope::Envelope;
 pub use ids::{
-    AgentId, ChannelId, ConversationId, InterruptionId, Namespace, RecordId, RunId, SchemaVersion,
-    SpanId, TaskId, ToolCallId,
+    encode_base64url, AgentId, ChannelId, ConversationId, InterruptionId, Namespace, PrincipalKey,
+    PrincipalKeyV1, RecordId, RunId, SchemaVersion, SenderId, SenderIdentity, SessionKey, SpanId,
+    TaskId, ToolCallId,
 };
 pub use message::{Attachment, AttachmentKind, Message, MessageRole};
 pub use request::{RequestHeader, RequestSection, RequestSource};

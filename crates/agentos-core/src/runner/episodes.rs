@@ -2,7 +2,9 @@ use super::{task_id_for_state, RunnerDeps};
 use crate::memory::{EpisodeOutcome, EpisodeRecord};
 use crate::r#loop::RunError;
 use agentos_interfaces::RunState;
-use agentos_proto::{AgentId, ConversationId, Envelope, MessageRole, RunId, SpanKind, TaskId};
+use agentos_proto::{
+    AgentId, ConversationId, Envelope, MessageRole, PrincipalKey, RunId, SpanKind, TaskId,
+};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -14,6 +16,7 @@ pub(super) struct EpisodeSeed {
     task_id: TaskId,
     active_agent: AgentId,
     conversation_id: ConversationId,
+    principal_key: Option<PrincipalKey>,
     user_id: Option<Arc<str>>,
     user_content: Arc<str>,
 }
@@ -30,6 +33,7 @@ impl EpisodeSeed {
             task_id,
             active_agent: active_agent.clone(),
             conversation_id: input.conversation_id.clone(),
+            principal_key: Some(input.principal_key(active_agent)),
             user_id: Some(Arc::clone(&input.sender)),
             user_content: Arc::clone(&input.message.content),
         }
@@ -44,6 +48,7 @@ impl EpisodeSeed {
                 .unwrap_or_else(|| task_id_for_state(state)),
             active_agent: state.active_agent.clone(),
             conversation_id: conversation_id.clone(),
+            principal_key: state.session_key.as_ref().map(|key| key.principal.clone()),
             user_id: user_id_from_state(state),
             user_content: state
                 .transcript
@@ -162,6 +167,7 @@ pub(super) async fn record_error_episode(
         task_id: seed.task_id.clone(),
         active_agent: seed.active_agent.clone(),
         conversation_id: seed.conversation_id.clone(),
+        principal_key: seed.principal_key.clone(),
         user_id: seed.user_id.clone(),
         outcome,
         tools_used: Vec::new(),
@@ -218,6 +224,7 @@ fn episode_from_state(
             .unwrap_or_else(|| task_id_for_state(state)),
         active_agent: state.active_agent.clone(),
         conversation_id: conversation_id.clone(),
+        principal_key: state.session_key.as_ref().map(|key| key.principal.clone()),
         user_id: user_id_from_state(state),
         outcome,
         tools_used,

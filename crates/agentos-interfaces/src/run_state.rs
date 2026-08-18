@@ -1,8 +1,8 @@
 use crate::orchestrator::{SubAgentSpec, SubOrchSpec};
 use crate::session::Transcript;
 use agentos_proto::{
-    AgentId, ChannelId, ConversationId, InterruptionId, RunId, SchemaVersion, TaskId, ToolCall,
-    TraceEvent, TraceSpan, Usage,
+    AgentId, ChannelId, ConversationId, InterruptionId, RunId, SchemaVersion, SessionKey, TaskId,
+    ToolCall, TraceEvent, TraceSpan, Usage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -57,6 +57,10 @@ pub enum ApprovalStatus {
 pub struct RunState {
     pub run_id: RunId,
     pub active_agent: AgentId,
+    /// The complete principal and epoch owning every persisted artifact for
+    /// this run. Legacy states omit it and are handled by the ID-002 migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_key: Option<SessionKey>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<TaskId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -86,6 +90,7 @@ impl RunState {
         Self {
             run_id,
             active_agent,
+            session_key: None,
             task_id: None,
             task_session_id: None,
             transcript: Transcript::default(),

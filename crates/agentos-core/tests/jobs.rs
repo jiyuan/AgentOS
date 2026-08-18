@@ -15,8 +15,8 @@ use agentos_core::tools::{JobKillTool, JobOutputTool, JobStatusTool, ToolRegistr
 use agentos_interfaces::orchestrator::{Orchestrator, OrchestratorError, Plan, RunContext};
 use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
 use agentos_proto::{
-    ChannelId, ConversationId, Envelope, Message, MessageRole, RunId, ToolCall, ToolCallId,
-    ToolResult, ToolStatus,
+    AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole, RunId, SessionKey,
+    ToolCall, ToolCallId, ToolResult, ToolStatus,
 };
 use async_trait::async_trait;
 use serde_json::{json, value::RawValue, Value};
@@ -43,6 +43,10 @@ fn envelope_in(conversation: &str, text: &str) -> Envelope {
         message: Message::text(MessageRole::User, text),
         metadata,
     }
+}
+
+fn session_key(conversation: &str) -> SessionKey {
+    envelope_in(conversation, "").session_key(&AgentId::new("golden-agent"))
 }
 
 /// Calls the slow tool once, then reports what came back.
@@ -157,7 +161,7 @@ async fn a_tool_past_its_deadline_becomes_a_job_that_keeps_running() {
     );
 
     // The run is over and the job is still going: that is the whole item.
-    let conversation = ConversationId::new("conv-a");
+    let conversation = session_key("conv-a");
     let running = jobs.list(&conversation);
     assert_eq!(running.len(), 1);
     assert_eq!(running[0].state, JobState::Running);
@@ -239,8 +243,8 @@ async fn one_conversations_job_is_invisible_to_another() {
     .await
     .expect("promotion is not a failure");
 
-    let owner = ConversationId::new("conv-a");
-    let intruder = ConversationId::new("conv-b");
+    let owner = session_key("conv-a");
+    let intruder = session_key("conv-b");
     let job = jobs
         .list(&owner)
         .first()
@@ -293,7 +297,7 @@ async fn a_conversation_out_of_job_slots_degrades_to_the_deadline() {
         "expected D2's deadline result, got: {}",
         output.message.content
     );
-    assert_eq!(jobs.list(&ConversationId::new("conv-a")).len(), 1);
+    assert_eq!(jobs.list(&session_key("conv-a")).len(), 1);
 }
 
 fn runner_deps_for<'a>(

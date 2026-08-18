@@ -801,7 +801,7 @@ where
         inbox_capacity: gateway_config.inbox_capacity,
         idle_interval: DEFAULT_IDLE_INTERVAL,
     };
-    let (router, inbounds) = shard_set(&shard_config);
+    let (router, inbounds) = shard_set(&shard_config, runtime.active_agent.clone());
     let egress = channel.egress();
     let stream_egress = gateway_streaming_enabled()
         .then(|| channel.stream_egress())
@@ -883,7 +883,7 @@ where
             slash::parse(&input.message.content),
             Parsed::Cmd(SlashCommand::Stop)
         ) {
-            let stopped = match router.stop(&input.conversation_id).await {
+            let stopped = match router.stop(&input).await {
                 Ok(stopped) => stopped,
                 Err(err) => {
                     log_line(config, &format!("{channel_name} stop failed: {err}"))?;

@@ -1,6 +1,6 @@
 //! The registry itself: what a job is, and the bounds it runs under.
 
-use agentos_proto::ConversationId;
+use agentos_proto::SessionKey;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -11,9 +11,9 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-/// Jobs one conversation may have running at once.
+/// Jobs one typed session may have running at once.
 ///
-/// A cap per conversation rather than per process: the failure this prevents is
+/// A cap per session rather than per process: the failure this prevents is
 /// one model spawning work in a loop, and a global cap would let that starve
 /// every *other* conversation instead of only its own.
 pub const DEFAULT_MAX_CONCURRENT_JOBS: usize = 4;
@@ -31,7 +31,7 @@ impl JobId {
     }
 
     /// Rebuild an id from model-supplied text. Never trusted as a capability:
-    /// every lookup is fenced by conversation, so a guessed id reaches nothing.
+    /// every lookup is fenced by session principal, so a guessed id reaches nothing.
     pub fn parse(raw: &str) -> Self {
         Self(Arc::from(raw))
     }
@@ -88,7 +88,7 @@ pub struct JobSpec {
     pub kind: Arc<str>,
     /// Human- and model-facing description of what this job is doing.
     pub label: Arc<str>,
-    pub conversation_id: ConversationId,
+    pub session_key: SessionKey,
     /// Bytes of output retained. `None` takes the registry's default.
     pub output_limit_bytes: Option<usize>,
 }
@@ -187,7 +187,7 @@ impl Job {
     }
 }
 
-/// Background work, fenced by conversation.
+/// Background work, fenced by typed session principal.
 pub struct JobRegistry {
     jobs: Mutex<BTreeMap<JobId, Job>>,
     next_id: AtomicU64,
@@ -246,8 +246,7 @@ impl JobRegistry {
             let running = jobs
                 .values()
                 .filter(|job| {
-                    job.spec.conversation_id == spec.conversation_id
-                        && job.state == JobState::Running
+                    job.spec.session_key == spec.session_key && job.state == JobState::Running
                 })
                 .count();
             if running >= self.max_concurrent {
@@ -276,7 +275,7 @@ impl JobRegistry {
         info!(
             job_id = id.as_str(),
             kind = spec.kind.as_ref(),
-            conversation_id = spec.conversation_id.as_str(),
+            session_key = spec.session_key.storage_key(),
             "job started"
         );
 
@@ -298,22 +297,18 @@ impl JobRegistry {
         Ok(id)
     }
 
-    /// Snapshot of one job, if it belongs to `conversation_id`.
-    pub fn status(
-        &self,
-        conversation_id: &ConversationId,
-        id: &JobId,
-    ) -> Result<JobSnapshot, JobError> {
+    /// Snapshot of one job, if it belongs to `session_key`.
+    pub fn status(&self, session_key: &SessionKey, id: &JobId) -> Result<JobSnapshot, JobError> {
         let jobs = self.lock();
-        let job = Self::owned(&jobs, conversation_id, id)?;
+        let job = Self::owned(&jobs, session_key, id)?;
         Ok(job.snapshot(id))
     }
 
-    /// Every job this conversation owns, oldest first.
-    pub fn list(&self, conversation_id: &ConversationId) -> Vec<JobSnapshot> {
+    /// Every job this session owns, oldest first.
+    pub fn list(&self, session_key: &SessionKey) -> Vec<JobSnapshot> {
         self.lock()
             .iter()
-            .filter(|(_, job)| job.spec.conversation_id == *conversation_id)
+            .filter(|(_, job)| job.spec.session_key == *session_key)
             .map(|(id, job)| job.snapshot(id))
             .collect()
     }
@@ -324,12 +319,12 @@ impl JobRegistry {
     /// how much it has seen, and asks for the rest.
     pub fn output(
         &self,
-        conversation_id: &ConversationId,
+        session_key: &SessionKey,
         id: &JobId,
         offset: usize,
     ) -> Result<String, JobError> {
         let jobs = self.lock();
-        let job = Self::owned(&jobs, conversation_id, id)?;
+        let job = Self::owned(&jobs, session_key, id)?;
         let output = job
             .output
             .lock()
@@ -346,11 +341,11 @@ impl JobRegistry {
 
     /// Cancel a job. Idempotent on an already-finished one, which reports
     /// [`JobError::AlreadyFinished`] rather than pretending it killed anything.
-    pub fn kill(&self, conversation_id: &ConversationId, id: &JobId) -> Result<(), JobError> {
+    pub fn kill(&self, session_key: &SessionKey, id: &JobId) -> Result<(), JobError> {
         let mut jobs = self.lock();
         let job = jobs
             .get_mut(id)
-            .filter(|job| job.spec.conversation_id == *conversation_id)
+            .filter(|job| job.spec.session_key == *session_key)
             .ok_or_else(|| JobError::Unknown(id.clone()))?;
         if job.state.is_terminal() {
             return Err(JobError::AlreadyFinished(id.clone()));
@@ -370,17 +365,17 @@ impl JobRegistry {
     /// checked, so a job that finishes in the gap is not missed.
     pub async fn wait_for(
         &self,
-        conversation_id: &ConversationId,
+        session_key: &SessionKey,
         id: &JobId,
         timeout: std::time::Duration,
     ) -> Result<Option<JobSnapshot>, JobError> {
         let (finished, settled) = {
             let jobs = self.lock();
-            let job = Self::owned(&jobs, conversation_id, id)?;
+            let job = Self::owned(&jobs, session_key, id)?;
             (Arc::clone(&job.finished), job.state.is_terminal())
         };
         if settled {
-            return self.status(conversation_id, id).map(Some);
+            return self.status(session_key, id).map(Some);
         }
 
         let notified = finished.notified();
@@ -390,28 +385,26 @@ impl JobRegistry {
         // between.
         notified.as_mut().enable();
         if self
-            .status(conversation_id, id)
+            .status(session_key, id)
             .is_ok_and(|snapshot| snapshot.state.is_terminal())
         {
-            return self.status(conversation_id, id).map(Some);
+            return self.status(session_key, id).map(Some);
         }
 
         match tokio::time::timeout(timeout, notified).await {
-            Ok(()) => self.status(conversation_id, id).map(Some),
+            Ok(()) => self.status(session_key, id).map(Some),
             Err(_elapsed) => Ok(None),
         }
     }
 
-    /// Cancel and forget every job a conversation owns.
+    /// Cancel and forget every job a session owns.
     ///
-    /// Called when a conversation ends. Nothing calls it yet — the runtime has
-    /// no notion of a conversation ending until G1 introduces the actor that
-    /// owns one — so this is the seam G1 plugs into, tested but not yet wired.
-    pub fn dispose_conversation(&self, conversation_id: &ConversationId) -> usize {
+    /// Called when the gateway clears a principal's session.
+    pub fn dispose_session(&self, session_key: &SessionKey) -> usize {
         let mut jobs = self.lock();
         let doomed: Vec<JobId> = jobs
             .iter()
-            .filter(|(_, job)| job.spec.conversation_id == *conversation_id)
+            .filter(|(_, job)| job.spec.session_key == *session_key)
             .map(|(id, _)| id.clone())
             .collect();
         for id in &doomed {
@@ -421,7 +414,7 @@ impl JobRegistry {
         }
         if !doomed.is_empty() {
             info!(
-                conversation_id = conversation_id.as_str(),
+                session_key = session_key.storage_key(),
                 jobs = doomed.len(),
                 "conversation disposed; jobs cancelled"
             );
@@ -460,11 +453,11 @@ impl JobRegistry {
 
     fn owned<'a>(
         jobs: &'a BTreeMap<JobId, Job>,
-        conversation_id: &ConversationId,
+        session_key: &SessionKey,
         id: &JobId,
     ) -> Result<&'a Job, JobError> {
         jobs.get(id)
-            .filter(|job| job.spec.conversation_id == *conversation_id)
+            .filter(|job| job.spec.session_key == *session_key)
             .ok_or_else(|| JobError::Unknown(id.clone()))
     }
 
@@ -480,13 +473,23 @@ impl JobRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentos_proto::{AgentId, ChannelId, ConversationId, PrincipalKey, SenderIdentity};
     use std::time::Duration;
+
+    fn session_key(conversation: &str) -> SessionKey {
+        SessionKey::initial(PrincipalKey::v1(
+            AgentId::new("agent"),
+            ChannelId::new("test"),
+            ConversationId::new(conversation),
+            SenderIdentity::identified("user"),
+        ))
+    }
 
     fn spec(conversation: &str, label: &str) -> JobSpec {
         JobSpec {
             kind: Arc::from("test"),
             label: Arc::from(label),
-            conversation_id: ConversationId::new(conversation),
+            session_key: session_key(conversation),
             output_limit_bytes: None,
         }
     }
@@ -508,7 +511,7 @@ mod tests {
         // The whole point of the item: `start` returns immediately and the work
         // keeps running.
         let registry = Arc::new(JobRegistry::default());
-        let conversation = ConversationId::new("conv-a");
+        let conversation = session_key("conv-a");
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
 
         let id = registry
@@ -554,7 +557,7 @@ mod tests {
     #[tokio::test]
     async fn reading_from_an_offset_returns_only_what_is_new() {
         let registry = Arc::new(JobRegistry::default());
-        let conversation = ConversationId::new("conv-a");
+        let conversation = session_key("conv-a");
         let id = registry
             .start(spec("conv-a", "chatty"), |sink, _cancel| async move {
                 sink.append("first\n");
@@ -592,7 +595,7 @@ mod tests {
             })
             .expect("room");
 
-        let intruder = ConversationId::new("conv-b");
+        let intruder = session_key("conv-b");
         assert!(matches!(
             registry.status(&intruder, &id),
             Err(JobError::Unknown(_))
@@ -608,15 +611,44 @@ mod tests {
         assert!(registry.list(&intruder).is_empty());
 
         // And the owner still sees it, so the fence is the reason, not a bug.
-        let owner = ConversationId::new("conv-a");
+        let owner = session_key("conv-a");
         assert!(registry.status(&owner, &id).is_ok());
         assert_eq!(registry.list(&owner).len(), 1);
     }
 
     #[tokio::test]
+    async fn a_job_is_invisible_to_the_same_conversation_on_another_channel() {
+        let registry = Arc::new(JobRegistry::default());
+        let owner = session_key("42");
+        let intruder = SessionKey::initial(PrincipalKey::v1(
+            AgentId::new("agent"),
+            ChannelId::new("other-channel"),
+            ConversationId::new("42"),
+            SenderIdentity::identified("user"),
+        ));
+        let id = registry
+            .start(
+                JobSpec {
+                    kind: Arc::from("test"),
+                    label: Arc::from("private"),
+                    session_key: owner.clone(),
+                    output_limit_bytes: None,
+                },
+                |_sink, cancel| async move {
+                    cancel.cancelled().await;
+                    Ok(Arc::from("stopped"))
+                },
+            )
+            .expect("room");
+
+        assert!(registry.status(&intruder, &id).is_err());
+        assert!(registry.status(&owner, &id).is_ok());
+    }
+
+    #[tokio::test]
     async fn killing_a_job_stops_it_and_is_not_repeatable() {
         let registry = Arc::new(JobRegistry::default());
-        let conversation = ConversationId::new("conv-a");
+        let conversation = session_key("conv-a");
         let id = registry
             .start(spec("conv-a", "endless"), |_sink, cancel| async move {
                 cancel.cancelled().await;
@@ -649,8 +681,8 @@ mod tests {
         // The G1 seam. Nothing calls this yet, so its contract is only
         // guaranteed by this test.
         let registry = Arc::new(JobRegistry::default());
-        let doomed = ConversationId::new("conv-a");
-        let survivor = ConversationId::new("conv-b");
+        let doomed = session_key("conv-a");
+        let survivor = session_key("conv-b");
         // A drop guard rather than a flag set after `cancelled()`: cancelling
         // *drops* the work future, so code after an await point in it never
         // runs. Observing the drop is what proves the work actually stopped.
@@ -690,7 +722,7 @@ mod tests {
         })
         .await;
 
-        assert_eq!(registry.dispose_conversation(&doomed), 1);
+        assert_eq!(registry.dispose_session(&doomed), 1);
         until(|| dropped.load(Ordering::Relaxed)).await;
 
         // Forgotten, not merely cancelled.
@@ -710,7 +742,7 @@ mod tests {
         // "never happened", and a producer with side effects needs to know
         // which it gets.
         let registry = Arc::new(JobRegistry::default());
-        let conversation = ConversationId::new("conv-a");
+        let conversation = session_key("conv-a");
         let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let id = registry
@@ -760,7 +792,7 @@ mod tests {
     #[tokio::test]
     async fn a_finished_job_frees_its_slot() {
         let registry = Arc::new(JobRegistry::new(1, DEFAULT_JOB_OUTPUT_BYTES));
-        let conversation = ConversationId::new("conv-a");
+        let conversation = session_key("conv-a");
         let id = registry
             .start(spec("conv-a", "quick"), |_sink, _cancel| async move {
                 Ok(Arc::from("done"))
@@ -783,7 +815,7 @@ mod tests {
     #[tokio::test]
     async fn output_past_the_cap_is_discarded_and_flagged() {
         let registry = Arc::new(JobRegistry::default());
-        let conversation = ConversationId::new("conv-a");
+        let conversation = session_key("conv-a");
         let mut spec = spec("conv-a", "loud");
         spec.output_limit_bytes = Some(8);
         let id = registry
@@ -812,7 +844,7 @@ mod tests {
     #[tokio::test]
     async fn a_failing_job_records_why() {
         let registry = Arc::new(JobRegistry::default());
-        let conversation = ConversationId::new("conv-a");
+        let conversation = session_key("conv-a");
         let id = registry
             .start(spec("conv-a", "doomed"), |_sink, _cancel| async move {
                 Err(Arc::from("the command exited 1"))

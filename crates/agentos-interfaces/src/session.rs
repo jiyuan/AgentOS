@@ -1,4 +1,4 @@
-use agentos_proto::{ConversationId, Message};
+use agentos_proto::{Message, SessionKey};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -26,16 +26,16 @@ pub struct Transcript {
 
 #[async_trait]
 pub trait Session: Send + Sync {
-    /// Load the transcript for a conversation before a run starts.
+    /// Load the transcript for a principal's session epoch before a run starts.
     ///
-    /// Missing conversations should return an empty transcript rather than an
+    /// Missing sessions should return an empty transcript rather than an
     /// error.
-    async fn load(&self, conv_id: &ConversationId) -> Result<Transcript, SessionError>;
+    async fn load(&self, session_key: &SessionKey) -> Result<Transcript, SessionError>;
 
     /// Append items after a run progresses.
     ///
     /// Implementations must preserve item ordering exactly as supplied.
-    async fn append(&self, conv_id: &ConversationId, items: Vec<Item>) -> Result<(), SessionError>;
+    async fn append(&self, session_key: &SessionKey, items: Vec<Item>) -> Result<(), SessionError>;
 
     /// Seed `child_id` with the first `boundary` items of `source`, returning
     /// how many were copied.
@@ -78,14 +78,14 @@ pub trait Session: Send + Sync {
     /// can copy a prefix without moving it through memory.
     async fn fork(
         &self,
-        source: &ConversationId,
+        source: &SessionKey,
         boundary: usize,
-        child_id: &ConversationId,
+        child_id: &SessionKey,
     ) -> Result<usize, SessionError> {
         if source == child_id {
             return Err(SessionError::Backend(Arc::from(format!(
-                "cannot fork conversation '{}' onto itself",
-                source.as_str()
+                "cannot fork session '{}' onto itself",
+                source.storage_key()
             ))));
         }
         let existing = self.load(child_id).await?;
@@ -93,7 +93,7 @@ pub trait Session: Send + Sync {
             return Err(SessionError::Backend(Arc::from(format!(
                 "fork target '{}' already holds {} items; seeding it would interleave two \
                  histories",
-                child_id.as_str(),
+                child_id.storage_key(),
                 existing.items.len()
             ))));
         }

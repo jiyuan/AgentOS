@@ -223,7 +223,9 @@ impl ShardTurns<'_> {
                     model_controller: Some(&self.context.runtime.model_controller),
                     session_usage: Some(&self.context.session_usage),
                     agent_id: &self.context.runtime.active_agent,
+                    channel_id: &input.channel_id,
                     conversation_id: &input.conversation_id,
+                    sender: &input.sender,
                 };
                 let reply = slash::render(cmd, &ctx).await;
                 return self.reply(&input, &reply).await;
@@ -505,13 +507,13 @@ impl ShardTurns<'_> {
             .context
             .runtime
             .session
-            .clear_session(&input.conversation_id)
+            .clear_session(&input.session_key(&self.context.runtime.active_agent))
             .map_err(|err| format!("failed to clear {channel_name} conversation history: {err}"))?;
         let jobs = self
             .context
             .runtime
             .jobs()
-            .dispose_conversation(&input.conversation_id);
+            .dispose_session(&input.session_key(&self.context.runtime.active_agent));
         log_line(
             config,
             &format!(

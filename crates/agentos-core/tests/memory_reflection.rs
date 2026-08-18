@@ -11,7 +11,9 @@ use agentos_core::memory::{
     MemoryStore, MemoryVisibility, ReflectionParams, SqliteStore,
 };
 use agentos_interfaces::memory::Query;
-use agentos_proto::{AgentId, ConversationId, RunId, TaskId};
+use agentos_proto::{
+    AgentId, ChannelId, ConversationId, PrincipalKey, RunId, SenderIdentity, TaskId,
+};
 use std::sync::Arc;
 
 fn episode(conversation: &str, run: &str, summary: &str) -> EpisodeRecord {
@@ -20,6 +22,7 @@ fn episode(conversation: &str, run: &str, summary: &str) -> EpisodeRecord {
         task_id: TaskId::new("t"),
         active_agent: AgentId::new("agent"),
         conversation_id: ConversationId::new(conversation),
+        principal_key: None,
         user_id: None,
         // A succeeded multi-step tool run is recordable (not trivial) and a
         // promotable successful trajectory.
@@ -37,6 +40,7 @@ fn caller(conversation: &str) -> MemoryCaller {
         agent_id: AgentId::new("agent"),
         task_id: TaskId::new("t"),
         conversation_id: ConversationId::new(conversation),
+        principal_key: None,
         user_id: None,
         allowed_shared_domains: Vec::new(),
         audit_read_access: false,
@@ -109,4 +113,47 @@ async fn reflect_all_is_noop_without_episodes() {
         .expect("reflect_all on empty store");
     assert!(report.promoted_records.is_empty());
     assert_eq!(report.episode_candidates, 0);
+}
+
+#[tokio::test]
+async fn reflect_all_preserves_a_typed_principal_owner() {
+    let store = Arc::new(SqliteStore::open_in_memory().expect("sqlite opens"));
+    let manager = MemoryManager::new_sqlite(store);
+    let principal = PrincipalKey::v1(
+        AgentId::new("agent"),
+        ChannelId::new("telegram"),
+        ConversationId::new("42"),
+        SenderIdentity::identified("alice"),
+    );
+    for run in ["r1", "r2"] {
+        let mut record = episode("42", run, "typed reflection");
+        record.principal_key = Some(principal.clone());
+        manager
+            .record_episode(record)
+            .await
+            .expect("record episode");
+    }
+
+    let report = manager
+        .reflect_all(&AgentId::new("agent"), &ReflectionParams::default())
+        .await
+        .expect("reflect typed owner");
+    assert_eq!(report.promoted_records.len(), 1);
+
+    let mut typed_caller = caller("42");
+    typed_caller.principal_key = Some(principal.clone());
+    let records = manager
+        .read_scoped(
+            &typed_caller,
+            MemoryScope::new(
+                MemoryStore::Semantic,
+                MemoryOwner::Principal(principal),
+                MemoryVisibility::Private,
+                None,
+            ),
+            &Query::filter(10),
+        )
+        .await
+        .expect("read typed semantic scope");
+    assert_eq!(records.len(), 1);
 }

@@ -330,13 +330,18 @@ impl MemoryManager {
             agent_id: episode.active_agent.clone(),
             task_id: episode.task_id.clone(),
             conversation_id: episode.conversation_id.clone(),
+            principal_key: episode.principal_key.clone(),
             user_id: episode.user_id.clone(),
             allowed_shared_domains: Vec::new(),
             audit_read_access: false,
         };
         let scope = MemoryScope::new(
             MemoryStore::Episodic,
-            MemoryOwner::Conversation(episode.conversation_id.clone()),
+            episode
+                .principal_key
+                .clone()
+                .map(MemoryOwner::Principal)
+                .unwrap_or_else(|| MemoryOwner::Conversation(episode.conversation_id.clone())),
             MemoryVisibility::Private,
             None,
         );
@@ -692,6 +697,11 @@ pub fn memory_caller_from_context(
         agent_id: ctx.system.active_agent.clone(),
         task_id: ctx.system.task_id.clone(),
         conversation_id,
+        principal_key: ctx
+            .state
+            .session_key
+            .as_ref()
+            .map(|key| key.principal.clone()),
         user_id,
         allowed_shared_domains,
         audit_read_access: audit_read_access_from_context(ctx),
@@ -808,6 +818,7 @@ mod tests {
             agent_id: AgentId::new("default"),
             task_id: TaskId::new("task-1"),
             conversation_id: ConversationId::new("chat-1"),
+            principal_key: None,
             user_id: None,
             allowed_shared_domains: Vec::new(),
             audit_read_access: false,

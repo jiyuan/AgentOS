@@ -45,7 +45,11 @@ pub struct ReflectionRequest {
 
 impl ReflectionRequest {
     pub fn for_conversation(caller: &MemoryCaller) -> Self {
-        let owner = MemoryOwner::Conversation(caller.conversation_id.clone());
+        let owner = caller
+            .principal_key
+            .clone()
+            .map(MemoryOwner::Principal)
+            .unwrap_or_else(|| MemoryOwner::Conversation(caller.conversation_id.clone()));
         Self {
             episode_scope: MemoryScope::new(
                 MemoryStore::Episodic,
@@ -134,9 +138,9 @@ pub trait MemoryMaintenance: Send + Sync {
 
     fn rebuild_lexical_index(&self) -> Result<LexicalIndexReport, MemoryError>;
 
-    /// Distinct conversation owner ids that hold active episodic records — the
+    /// Distinct typed owners that hold active episodic records — the
     /// set of scopes [`MemoryManager::reflect_all`] sweeps on a maintenance tick.
-    fn episodic_conversation_owners(&self) -> Result<Vec<Arc<str>>, MemoryError>;
+    fn episodic_owners(&self) -> Result<Vec<MemoryOwner>, MemoryError>;
 }
 
 impl MemoryManager {
@@ -259,14 +263,25 @@ impl MemoryManager {
         let Some(maintenance) = self.maintenance() else {
             return Ok(ReflectionReport::default());
         };
-        let owners = maintenance.episodic_conversation_owners()?;
+        let owners = maintenance.episodic_owners()?;
         let mut combined = ReflectionReport::default();
         for owner in owners {
-            let conversation = agentos_proto::ConversationId::new(owner.as_ref());
+            let (conversation, principal_key) = match &owner {
+                MemoryOwner::Principal(agentos_proto::PrincipalKey::V1(principal)) => (
+                    principal.conversation_id.clone(),
+                    Some(agentos_proto::PrincipalKey::V1(principal.clone())),
+                ),
+                MemoryOwner::Conversation(conversation) => (conversation.clone(), None),
+                MemoryOwner::User(_)
+                | MemoryOwner::Agent(_)
+                | MemoryOwner::Task(_)
+                | MemoryOwner::Shared => continue,
+            };
             let caller = MemoryCaller {
                 agent_id: agent_id.clone(),
                 task_id: agentos_proto::TaskId::new("memory-maintenance"),
                 conversation_id: conversation,
+                principal_key,
                 user_id: None,
                 allowed_shared_domains: Vec::new(),
                 audit_read_access: false,
@@ -429,24 +444,45 @@ impl MemoryManager {
 }
 
 impl MemoryMaintenance for SqliteStore {
-    fn episodic_conversation_owners(&self) -> Result<Vec<Arc<str>>, MemoryError> {
+    fn episodic_owners(&self) -> Result<Vec<MemoryOwner>, MemoryError> {
         let conn = self.memory_conn()?;
         let mut stmt = conn
             .prepare(
-                "SELECT DISTINCT owner_id FROM memory_records \
-                 WHERE store = 'episodic' AND owner_kind = 'conversation' \
+                "SELECT DISTINCT owner_kind, owner_id, metadata_json FROM memory_records \
+                 WHERE store = 'episodic' AND owner_kind IN ('conversation', 'principal') \
                  AND status = 'active' AND owner_id IS NOT NULL AND owner_id <> ''",
             )
             .map_err(memory_sqlite_error)?;
-        let owners = stmt
-            .query_map([], |row| row.get::<_, String>(0))
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
             .map_err(memory_sqlite_error)?
-            .collect::<Result<Vec<String>, _>>()
-            .map_err(memory_sqlite_error)?
-            .into_iter()
-            .map(Arc::from)
-            .collect();
-        Ok(owners)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(memory_sqlite_error)?;
+        let mut owners = std::collections::BTreeSet::new();
+        for (kind, id, metadata_json) in rows {
+            let metadata: BTreeMap<Arc<str>, Value> =
+                serde_json::from_str(&metadata_json).map_err(memory_json_error)?;
+            if let Some(owner) = metadata
+                .get("owner")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(memory_json_error)?
+            {
+                owners.insert(owner);
+            } else if kind == "conversation" {
+                owners.insert(MemoryOwner::Conversation(
+                    agentos_proto::ConversationId::new(id),
+                ));
+            }
+        }
+        Ok(owners.into_iter().collect())
     }
 
     fn mark_record_status(

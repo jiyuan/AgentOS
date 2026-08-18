@@ -15,8 +15,8 @@ use agentos_interfaces::orchestrator::{Orchestrator, OrchestratorError, Plan, Ru
 use agentos_interfaces::session::Session;
 use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
 use agentos_proto::{
-    ChannelId, ConversationId, Envelope, Message, MessageRole, RunId, ToolCall, ToolCallId,
-    ToolResult, ToolStatus,
+    AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole, RunId, ToolCall,
+    ToolCallId, ToolResult, ToolStatus,
 };
 use async_trait::async_trait;
 use serde_json::{json, value::RawValue, Value};
@@ -178,7 +178,7 @@ async fn a_batch_is_written_back_as_paired_turns() {
         .expect("a batch runs cleanly");
 
     let transcript = session
-        .load(&ConversationId::new(CONVERSATION))
+        .load(&envelope("").session_key(&AgentId::new("golden-agent")))
         .await
         .expect("session loads");
     let shape: Vec<(String, usize)> = transcript

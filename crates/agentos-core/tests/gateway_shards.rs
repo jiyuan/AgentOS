@@ -17,8 +17,8 @@ use agentos_core::tools::ToolRegistry;
 use agentos_interfaces::orchestrator::{Orchestrator, OrchestratorError, Plan, RunContext};
 use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
 use agentos_proto::{
-    ChannelId, ConversationId, Envelope, Message, MessageRole, RunId, ToolCall, ToolCallId,
-    ToolResult, ToolStatus,
+    AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole, RunId, ToolCall,
+    ToolCallId, ToolResult, ToolStatus,
 };
 use async_trait::async_trait;
 use serde_json::{json, value::RawValue};
@@ -295,7 +295,7 @@ async fn one_slow_conversation_does_not_stall_another() {
         inbox_capacity: 8,
         idle_interval: Duration::from_secs(3600),
     };
-    let (router, mut inbounds) = shard_set(&config);
+    let (router, mut inbounds) = shard_set(&config, AgentId::new("gateway-test"));
     let inbound = inbounds.pop().expect("one shard");
 
     let driver = async {

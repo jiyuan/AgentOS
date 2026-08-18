@@ -2,7 +2,7 @@ use super::{RunnerDeps, RunnerError};
 use crate::task_workspace::TaskWorkspace;
 use agentos_interfaces::session::Item;
 use agentos_interfaces::RunState;
-use agentos_proto::{Envelope, TaskId};
+use agentos_proto::{encode_base64url, Envelope, SessionKey, TaskId};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -22,7 +22,7 @@ pub(super) fn activate_for_run<'a>(
         return Ok(None);
     };
     let task_id = task_id_for_run(state, input);
-    let session_id = Arc::from(sanitize_file_stem(state.run_id.as_str()));
+    let session_id = Arc::from(session_file_stem(state));
     workspace.init_task(&task_id)?;
     state.task_id = Some(task_id.clone());
     state.task_session_id = Some(Arc::clone(&session_id));
@@ -66,7 +66,7 @@ pub(super) fn activate_for_resume<'a>(
         .unwrap_or_else(|| task_id_for_state(state));
     let session_id = Arc::from(format!(
         "{}-resume-{}",
-        sanitize_file_stem(state.run_id.as_str()),
+        session_file_stem(state),
         state.trace_events.len()
     ));
     workspace.init_task(&task_id)?;
@@ -103,7 +103,7 @@ pub(super) fn active<'a>(
         session_id: state
             .task_session_id
             .clone()
-            .unwrap_or_else(|| Arc::from(sanitize_file_stem(state.run_id.as_str()))),
+            .unwrap_or_else(|| Arc::from(session_file_stem(state))),
     })
 }
 
@@ -160,12 +160,51 @@ pub(super) fn task_id_for_state(state: &RunState) -> TaskId {
     }
 }
 
-pub(super) fn sanitize_file_stem(input: &str) -> String {
-    input
-        .chars()
-        .map(|ch| match ch {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '.' | '_' | '-' | ':' => ch,
-            _ => '_',
-        })
-        .collect()
+pub(super) fn session_file_stem(state: &RunState) -> String {
+    let principal = state
+        .session_key
+        .as_ref()
+        .map(SessionKey::storage_key)
+        .unwrap_or_else(|| "legacy".to_owned());
+    format!(
+        "{principal}_run_{}",
+        encode_base64url(state.run_id.as_str().as_bytes())
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::session_file_stem;
+    use agentos_interfaces::RunState;
+    use agentos_proto::{
+        AgentId, ChannelId, ConversationId, PrincipalKey, RunId, SenderIdentity, SessionKey,
+    };
+
+    fn state(run_id: &str, channel: &str) -> RunState {
+        let agent = AgentId::new("agent");
+        let mut state = RunState::new(RunId::new(run_id), agent.clone());
+        state.session_key = Some(SessionKey::initial(PrincipalKey::v1(
+            agent,
+            ChannelId::new(channel),
+            ConversationId::new("conversation"),
+            SenderIdentity::identified("user"),
+        )));
+        state
+    }
+
+    #[test]
+    fn session_file_stems_do_not_collapse_distinct_ids() {
+        assert_ne!(
+            session_file_stem(&state("a/b", "telegram")),
+            session_file_stem(&state("a_b", "telegram"))
+        );
+    }
+
+    #[test]
+    fn task_sessions_are_principal_scoped() {
+        assert_ne!(
+            session_file_stem(&state("same-run", "telegram")),
+            session_file_stem(&state("same-run", "feishu"))
+        );
+    }
 }

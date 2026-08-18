@@ -8,10 +8,10 @@
 
 use crate::memory::{Memory, MemoryError, Query, QueryType, Record, Selector};
 use crate::session::{Item, Session, SessionError, Transcript};
-use agentos_proto::{ConversationId, Namespace, RecordId};
+use agentos_proto::{Namespace, RecordId, SessionKey};
 use async_trait::async_trait;
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 // ---------------------------------------------------------------------------
 // Memory
@@ -143,9 +143,9 @@ impl Memory for MockMemory {
 // Session
 // ---------------------------------------------------------------------------
 
-/// In-memory [`Session`] mock backed by a `BTreeMap` of conversations.
+/// In-memory [`Session`] mock backed by a `BTreeMap` of principal session keys.
 pub struct MockSession {
-    transcripts: Mutex<BTreeMap<ConversationId, Transcript>>,
+    transcripts: Mutex<BTreeMap<SessionKey, Transcript>>,
 }
 
 impl MockSession {
@@ -155,11 +155,11 @@ impl MockSession {
         }
     }
 
-    pub fn with_transcript(self, conv_id: impl Into<Arc<str>>, transcript: Transcript) -> Self {
+    pub fn with_transcript(self, session_key: SessionKey, transcript: Transcript) -> Self {
         self.transcripts
             .lock()
             .expect("MockSession transcripts lock not poisoned")
-            .insert(ConversationId::new(conv_id), transcript);
+            .insert(session_key, transcript);
         self
     }
 }
@@ -172,23 +172,23 @@ impl Default for MockSession {
 
 #[async_trait]
 impl Session for MockSession {
-    async fn load(&self, conv_id: &ConversationId) -> Result<Transcript, SessionError> {
+    async fn load(&self, session_key: &SessionKey) -> Result<Transcript, SessionError> {
         Ok(self
             .transcripts
             .lock()
             .expect("MockSession transcripts lock not poisoned")
-            .get(conv_id)
+            .get(session_key)
             .cloned()
             .unwrap_or_default())
     }
 
-    async fn append(&self, conv_id: &ConversationId, items: Vec<Item>) -> Result<(), SessionError> {
+    async fn append(&self, session_key: &SessionKey, items: Vec<Item>) -> Result<(), SessionError> {
         let mut transcripts = self
             .transcripts
             .lock()
             .expect("MockSession transcripts lock not poisoned");
         transcripts
-            .entry(conv_id.clone())
+            .entry(session_key.clone())
             .or_default()
             .items
             .extend(items);
@@ -199,7 +199,9 @@ impl Session for MockSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentos_proto::{Message, MessageRole};
+    use agentos_proto::{
+        AgentId, ChannelId, ConversationId, Message, MessageRole, PrincipalKey, SenderIdentity,
+    };
 
     #[tokio::test]
     async fn mock_memory_round_trips_and_forgets() {
@@ -241,7 +243,12 @@ mod tests {
     #[tokio::test]
     async fn mock_session_appends_and_loads() {
         let session = MockSession::new();
-        let conv = ConversationId::new("conv-1");
+        let conv = SessionKey::initial(PrincipalKey::v1(
+            AgentId::new("agent"),
+            ChannelId::new("test"),
+            ConversationId::new("conv-1"),
+            SenderIdentity::identified("user"),
+        ));
         session
             .append(
                 &conv,

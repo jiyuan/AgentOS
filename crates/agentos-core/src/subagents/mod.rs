@@ -14,7 +14,9 @@ use agentos_interfaces::guardrail::{InputGuardrail, OutputGuardrail, ToolGuardra
 use agentos_interfaces::orchestrator::{Orchestrator, SubAgentSpec};
 use agentos_interfaces::session::Session;
 use agentos_llm::Llm;
-use agentos_proto::{AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole, RunId};
+use agentos_proto::{
+    AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole, RunId, SessionKey,
+};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -207,7 +209,7 @@ pub struct SubAgentInvocation {
 /// The point in a parent conversation a child is branched from.
 #[derive(Clone, Debug)]
 pub struct ParentSeed {
-    pub conversation_id: ConversationId,
+    pub session_key: SessionKey,
     /// Items of the parent's log to copy. Taken from the parent's *in-memory*
     /// transcript, which is the delegation point as the parent sees it; the
     /// store holds a prefix of that, because the turn in flight is not
@@ -405,7 +407,7 @@ impl SubAgentInvocation {
             // target that already holds items, which is exactly the second
             // turn of a sub-agent whose conversation id is stable.
             if definition.seed_from_parent {
-                seed_from_parent(session, parent_seed.as_ref(), &input).await;
+                seed_from_parent(session, parent_seed.as_ref(), &input, &definition.agent_id).await;
             }
             let input_guardrails = definition
                 .input_guardrails
@@ -621,7 +623,12 @@ impl SubAgentInvocation {
 /// ephemeral input has no conversation to seed, and a target that already
 /// holds items is the second and every later turn of a sub-agent whose
 /// conversation id is stable across a conversation.
-async fn seed_from_parent(session: &dyn Session, seed: Option<&ParentSeed>, input: &Envelope) {
+async fn seed_from_parent(
+    session: &dyn Session,
+    seed: Option<&ParentSeed>,
+    input: &Envelope,
+    child_agent: &AgentId,
+) {
     let Some(seed) = seed else {
         return;
     };
@@ -633,19 +640,20 @@ async fn seed_from_parent(session: &dyn Session, seed: Option<&ParentSeed>, inpu
     {
         return;
     }
+    let child_session_key = input.session_key(child_agent);
     match session
-        .fork(&seed.conversation_id, seed.boundary, &input.conversation_id)
+        .fork(&seed.session_key, seed.boundary, &child_session_key)
         .await
     {
         Ok(items) => tracing::info!(
-            parent_conversation = seed.conversation_id.as_str(),
-            child_conversation = input.conversation_id.as_str(),
+            parent_session = seed.session_key.storage_key(),
+            child_session = child_session_key.storage_key(),
             items,
             "sub-agent conversation seeded from parent"
         ),
         Err(error) => tracing::debug!(
-            parent_conversation = seed.conversation_id.as_str(),
-            child_conversation = input.conversation_id.as_str(),
+            parent_session = seed.session_key.storage_key(),
+            child_session = child_session_key.storage_key(),
             error = %error,
             "sub-agent conversation not seeded; starting from its own history"
         ),

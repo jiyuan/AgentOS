@@ -657,3 +657,23 @@
 - **Actual Behavior**: Work was performed locally because the active runtime instructions only permit spawning subagents when the user explicitly requests delegation.
 - **Root Cause**: Higher-priority runtime instructions conflict with the repository's automatic delegation threshold, and the user did not explicitly authorize subagent spawning.
 - **Suggested Fix**: Amend the repository guideline to account for environments where subagent spawning is gated by explicit user consent.
+
+## [2026-08-18 20:03] ORCHESTRATION [RESOLVED]
+
+- **Agent**: main-codex
+- **Task**: Implement the `ID-001` typed-principal and injective-namespace slice.
+- **Guideline Violated**: ORCHESTRATION > Subagent Delegation & Creation
+- **Expected Behavior**: Delegate work involving more than two sequential tool calls to a matching subagent.
+- **Actual Behavior**: Work was performed locally because the active runtime instructions only permit spawning subagents when the user explicitly requests delegation.
+- **Root Cause**: Higher-priority runtime instructions conflict with the repository's automatic delegation threshold, and the user did not explicitly authorize subagent spawning.
+- **Suggested Fix**: Amend the repository guideline to account for environments where subagent spawning is gated by explicit user consent.
+
+## [2026-08-18 20:05] TOOL [RESOLVED]
+
+- **Agent**: main-codex
+- **Task**: Audit the `ID-001` diff for stale conversation-keyed ownership text.
+- **Guideline Violated**: GUIDELINES > Efficiency / shell escaping
+- **Expected Behavior**: Pass search text to the shell without command-substitution syntax.
+- **Actual Behavior**: Backticks around `ConversationId` in a double-quoted command were evaluated by the shell, producing a harmless `command not found` before the search completed.
+- **Root Cause**: Markdown-style code quoting was copied into a shell command without accounting for command substitution.
+- **Suggested Fix**: Use single-quoted search patterns or omit backticks in shell queries. The search was rerun with safe quoting and no workspace state was changed.

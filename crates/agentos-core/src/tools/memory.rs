@@ -383,6 +383,14 @@ fn parse_owner(caller: &MemoryCaller, input: &str) -> Result<MemoryOwner, ToolEr
     let (kind, explicit_id) = trimmed.split_once(':').unwrap_or((trimmed, ""));
     match kind {
         "user" => {
+            if let Some(principal_key) = &caller.principal_key {
+                if !explicit_id.is_empty() && caller.user_id.as_deref() != Some(explicit_id) {
+                    return Err(ToolError::Failed(Arc::from(
+                        "typed memory cannot select another sender's user scope",
+                    )));
+                }
+                return Ok(MemoryOwner::Principal(principal_key.clone()));
+            }
             let id = if explicit_id.is_empty() {
                 caller
                     .user_id
@@ -417,10 +425,16 @@ fn parse_owner(caller: &MemoryCaller, input: &str) -> Result<MemoryOwner, ToolEr
 
 fn caller_default_owner(caller: &MemoryCaller) -> MemoryOwner {
     caller
-        .user_id
+        .principal_key
         .clone()
-        .map(MemoryOwner::User)
-        .unwrap_or_else(|| MemoryOwner::Conversation(caller.conversation_id.clone()))
+        .map(MemoryOwner::Principal)
+        .unwrap_or_else(|| {
+            caller
+                .user_id
+                .clone()
+                .map(MemoryOwner::User)
+                .unwrap_or_else(|| MemoryOwner::Conversation(caller.conversation_id.clone()))
+        })
 }
 
 fn context_default_owner(ctx: &RunContext<'_>, caller: &MemoryCaller) -> Option<MemoryOwner> {
@@ -433,8 +447,18 @@ fn context_default_owner(ctx: &RunContext<'_>, caller: &MemoryCaller) -> Option<
     match metadata.get("memory_default_owner").and_then(Value::as_str) {
         Some("agent") => Some(MemoryOwner::Agent(caller.agent_id.clone())),
         Some("task") => Some(MemoryOwner::Task(caller.task_id.clone())),
-        Some("conversation") => Some(MemoryOwner::Conversation(caller.conversation_id.clone())),
-        Some("user") => caller.user_id.clone().map(MemoryOwner::User),
+        Some("conversation") => Some(
+            caller
+                .principal_key
+                .clone()
+                .map(MemoryOwner::Principal)
+                .unwrap_or_else(|| MemoryOwner::Conversation(caller.conversation_id.clone())),
+        ),
+        Some("user") => caller
+            .principal_key
+            .clone()
+            .map(MemoryOwner::Principal)
+            .or_else(|| caller.user_id.clone().map(MemoryOwner::User)),
         Some("shared") => Some(MemoryOwner::Shared),
         _ => None,
     }
@@ -498,6 +522,7 @@ fn fallback_caller() -> MemoryCaller {
         agent_id: AgentId::new("memory-tool"),
         task_id: TaskId::new("memory-tool"),
         conversation_id: ConversationId::new("memory-tool"),
+        principal_key: None,
         user_id: None,
         allowed_shared_domains: Vec::new(),
         audit_read_access: false,

@@ -475,7 +475,8 @@ async fn run_tui_loop(
                 continue;
             }
             Some(TuiInput::Slash(SlashCommand::Clear)) => {
-                let removed = session.clear_session(&channel.conversation_id)?;
+                let clear_envelope = channel.envelope(String::new());
+                let removed = session.clear_session(&clear_envelope.session_key(active_agent))?;
                 println!("{}", slash::format_clear(removed, "TUI"));
                 turn = 1;
                 continue;
@@ -490,7 +491,9 @@ async fn run_tui_loop(
                     model_controller: channel.model_controller.as_ref(),
                     session_usage: Some(&session_usage),
                     agent_id: active_agent,
+                    channel_id: &channel.id,
                     conversation_id: &channel.conversation_id,
+                    sender: "user",
                 };
                 println!("{}", slash::render(cmd, &ctx).await);
                 continue;

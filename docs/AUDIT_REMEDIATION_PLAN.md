@@ -246,17 +246,26 @@ Primary files:
 
 Priority: P0  
 Size: L  
-Status: planned  
+Status: in progress (`ID-001` typed principal/session ownership and injective
+encoding implemented; `ID-002` migration and `AUTH-001` remote authorization
+remain)
 Dependencies: M0 and a persistence schema-version mechanism
 
 Deliverables:
 
 1. Introduce a versioned principal/session key containing agent or tenant,
    channel, conversation, and sender where authorization requires sender
-   identity.
+   identity. **Implemented:** `PrincipalKeyV1`, `SenderIdentity`, and
+   epoch-bearing `SessionKey` are shared protocol types with canonical
+   length-prefixed bytes and stable storage names.
 2. Use the principal for sessions, memory scopes, approval tickets, `/clear`,
-   jobs, task sessions, and audit events.
-3. Replace lossy namespace encoding with injective encoding.
+   jobs, task sessions, and audit events. **Implemented for session/run state,
+   memory, `/clear`, jobs, task-session files, and trace files.** Approval
+   resolver binding remains `AUTH-001`; durable safety-event identity remains
+   `AUD-001`.
+3. Replace lossy namespace encoding with injective encoding. **Implemented:**
+   canonical principal/session bytes and arbitrary namespace/file components
+   use unpadded base64url rather than replacement sanitization.
 4. Bind approval resolution to the principal that received the prompt and, for
    group conversations, to the initiating sender or authorized administrators.
 5. Require a sender/chat allowlist for remote channels unless an explicit
@@ -546,11 +555,11 @@ policy semantics, and new features in one PR.
 | Slice | Scope | Depends on |
 |---|---|---|
 | `ADR-001` | Resolve narrowing, sandbox, identity, request, audit, clear, and streaming contracts (**complete:** [`ADR-001`](adr/ADR-001-remediation-contracts.md)) | — |
-| `TEST-001` | Add red tests for the P0/P1 audit findings (**in progress:** strict policy-narrowing and no-body-invocation sandbox regressions landed) | ADR-001 |
+| `TEST-001` | Add red tests for the P0/P1 audit findings (**in progress:** identity isolation, strict policy-narrowing, and no-body-invocation sandbox regressions landed) | ADR-001 |
 | `REL-001` | Self-contained release workspace and documentation (**implemented:** complete static workspace/docs plus clean-room archive checker; qualifying CI run pending) | TEST-001 |
 | `REL-002` | Installer/wrapper contract and clean-room smoke (**implemented:** XDG defaults, wrapper diagnostics, pathless resume, and Linux/macOS source/artifact install smoke; qualifying CI runs pending) | REL-001 |
 | `CI-001` | Portable spill/golden tests and macOS sandbox probe (**in progress:** implementation and required Linux/macOS sandbox jobs added; qualifying CI run pending) | TEST-001 |
-| `ID-001` | Typed principal and injective namespace | ADR-001 |
+| `ID-001` | Typed principal and injective namespace (**implemented and locally verified:** principal-keyed sessions, memory, jobs, clear, task sessions, traces, and subagent forks) | ADR-001 |
 | `ID-002` | Versioned persistence migration and collision report | ID-001 |
 | `AUTH-001` | Remote sender authentication and approval binding | ID-001 |
 | `AUTH-002` | Exact policy lattice and explicit delegation grants (**in progress:** strict lattice enforced; explicit grants pending) | ADR-001 |
@@ -616,7 +625,7 @@ Additionally:
 | Release archive omits workspace assets | P0 | M1 | Release engineering | Resolved by `REL-001`; required CI artifact run pending |
 | Installer/docs/wrapper mismatch | P1 | M1 | CLI/release | Resolved by `REL-002`; required CI matrix runs pending |
 | Remote ingress plus permissive tool defaults | P0 | M2, M3 | Gateway security | Open |
-| Cross-channel/session/sender identity collision | P0 | M2 | Identity/persistence | Open |
+| Cross-channel/session/sender identity collision | P0 | M2 | Identity/persistence | Resolved by `ID-001`; legacy persistence migration remains `ID-002` |
 | Policy narrowing widens authority | P0 | M2 | Core authorization | Strict per-call narrowing implemented and property-tested; explicit grant model pending |
 | Sandboxed tool fallback/incompatible worker | P0 | M3 | Core sandbox | Registry fallback resolved with typed capability checks; actual MCP server isolation and platform qualification remain |
 | Task/path traversal and symlink escape | P1 | M3 | Core filesystem | Open |

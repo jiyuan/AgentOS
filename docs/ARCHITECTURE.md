@@ -360,7 +360,12 @@ telemetry, and silently never sent.
   compaction and retries the step exactly once. A second consecutive overflow
   finishes the run with a truncation notice delivered as a normal `Plan::Reply`,
   so output guardrails still run on it.
-- **Fork.** `Session::fork(source, boundary, child_id)` branches a conversation
+- **Identity.** Every persisted transcript is addressed by `SessionKey`, which
+  combines a versioned `PrincipalKey` (agent, channel, conversation, and sender)
+  with an epoch. Its storage name is unpadded base64url over canonical,
+  length-prefixed bytes, so equal conversation text on different trust
+  boundaries cannot share a log.
+- **Fork.** `Session::fork(source, boundary, child_id)` branches a typed session
   from a prefix of another. `boundary` is a length, not a range: checkpoints name
   the span they hide by absolute position, so copying from 0 is what makes the
   child's projection equal the projection of the parent's prefix. The SQLite
@@ -561,23 +566,25 @@ Memory namespaces are derived from typed scope rather than arbitrary strings:
 
 Examples:
 
-- `private/user/terminal/episodic/general`
-- `private/agent/main-agent/semantic/agentos`
-- `private/task/main/working/general`
-- `shared/shared/global/semantic/agentos`
+- `private/user/id_<base64url>/episodic/general`
+- `private/agent/id_<base64url>/semantic/id_<base64url>`
+- `private/task/id_<base64url>/working/general`
+- `shared/shared/global/semantic/id_<base64url>`
 - `shared/shared/global/procedural/general`
-- `private/conversation/terminal/episodic/general`
+- `private/principal/pk1_<base64url>/episodic/general`
 
 Caller view includes:
 
 - active agent private memory;
 - active task memory;
-- current conversation/user memory;
+- current principal/user memory;
 - allowed shared domains;
 - explicitly delegated parent fragments.
 
-The manager rejects cross-user, cross-agent, and cross-task access unless
-explicitly delegated.
+The manager rejects cross-principal, cross-user, cross-agent, and cross-task
+access unless explicitly delegated. `conversation` owners remain readable only
+as a legacy representation pending the `ID-002` migration; new run-scoped
+memory is owned by the complete principal.
 
 ### Hydration
 

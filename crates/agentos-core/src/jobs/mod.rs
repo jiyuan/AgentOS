@@ -11,23 +11,23 @@
 //!
 //! # Owner fencing
 //!
-//! Every job belongs to exactly one [`ConversationId`], and every registry
-//! operation takes the conversation asking. A job started in one conversation
-//! is invisible to every other — not merely unlisted but unreadable and
-//! unkillable, since the lookup itself is fenced. This is the same boundary the
-//! memory tool draws, and for the same reason: a model that can name an id must
-//! not be able to reach across conversations by guessing one.
+//! Every job belongs to exactly one [`agentos_proto::SessionKey`], and every
+//! registry operation takes the complete session principal asking. A job
+//! started for one agent, channel, conversation, sender, and epoch is invisible
+//! to every other principal — not merely unlisted but unreadable and unkillable,
+//! since the lookup itself is fenced. This is the same boundary the memory tool
+//! draws, and for the same reason: a model that can name an id must not be able
+//! to reach across trust boundaries by guessing one.
 //!
 //! # Where the handles live, and why that is temporary
 //!
-//! Jobs outlive a run, so their handles cannot live in `RunState`. They belong
-//! to a conversation actor — roadmap item G1, which does not exist yet — so for
-//! now the registry is owned by [`crate::runtime::AgentRuntime`] and keyed by
-//! conversation, which is the fallback the roadmap sanctions.
+//! Jobs outlive a run, so their handles cannot live in `RunState`. The registry
+//! is owned by [`crate::runtime::AgentRuntime`] and each handle is keyed by its
+//! typed session principal.
 //!
-//! One consequence is visible in the API: [`JobRegistry::dispose_conversation`]
-//! exists and is tested, but nothing calls it, because nothing in the runtime
-//! yet knows when a conversation ends. G1 is what will call it.
+//! One consequence is visible in the API: [`JobRegistry::dispose_session`]
+//! cancels and forgets exactly that principal's jobs when the gateway handles
+//! `/clear`.
 
 mod registry;
 

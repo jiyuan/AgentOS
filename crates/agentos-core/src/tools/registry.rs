@@ -3,13 +3,11 @@ use super::isolation::{
 };
 use super::McpTool;
 use crate::jobs::{JobId, JobRegistry, JobSnapshot, JobSpec, JobState};
-use crate::memory::conversation_id_from_context;
 use crate::tools::exec::DEFAULT_MAX_OUTPUT_BYTES;
 use agentos_interfaces::mcp::{McpClient, McpError, McpServer};
 use agentos_interfaces::orchestrator::RunContext;
 use agentos_interfaces::tool::{Tool, ToolError, ToolSpec};
-use agentos_proto::ConversationId;
-use agentos_proto::{ToolCall, ToolResult, ToolStatus};
+use agentos_proto::{SessionKey, ToolCall, ToolResult, ToolStatus};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -267,7 +265,7 @@ impl ToolRegistry {
         // A job belongs to a conversation, and there is no safe default owner:
         // guessing one would put a job somewhere another conversation might
         // reach it. Without an owner, this call is simply not promotable.
-        let conversation_id = conversation_id_from_context(ctx)?;
+        let session_key = ctx.state.session_key.clone()?;
 
         // Deliberately `Tool::call`, not `call_with_context`: the job outlives
         // the borrow the context is built from. `[jobs].promotable` is an
@@ -278,7 +276,7 @@ impl ToolRegistry {
         let spec = JobSpec {
             kind: Arc::from("tool"),
             label: Arc::clone(&call.name),
-            conversation_id: conversation_id.clone(),
+            session_key: session_key.clone(),
             output_limit_bytes: None,
         };
         let id = match jobs.start(spec, move |sink, _cancel| async move {
@@ -304,13 +302,10 @@ impl ToolRegistry {
             }
         };
 
-        match jobs.wait_for(&conversation_id, &id, deadline).await {
-            Ok(Some(snapshot)) => Some(Ok(finished_job_result(
-                call,
-                jobs,
-                &conversation_id,
-                &snapshot,
-            ))),
+        match jobs.wait_for(&session_key, &id, deadline).await {
+            Ok(Some(snapshot)) => {
+                Some(Ok(finished_job_result(call, jobs, &session_key, &snapshot)))
+            }
             Ok(None) => Some(Ok(promoted_result(call, &id, deadline))),
             // The job vanished mid-wait, which only disposal does.
             Err(error) => Some(Ok(ToolResult {
@@ -348,11 +343,11 @@ fn promoted_result(call: &ToolCall, id: &JobId, deadline: Duration) -> ToolResul
 fn finished_job_result(
     call: &ToolCall,
     jobs: &JobRegistry,
-    conversation_id: &ConversationId,
+    session_key: &SessionKey,
     snapshot: &JobSnapshot,
 ) -> ToolResult {
     let content = jobs
-        .output(conversation_id, &snapshot.id, 0)
+        .output(session_key, &snapshot.id, 0)
         .unwrap_or_default();
     let mut metadata = BTreeMap::new();
     if snapshot.output_truncated {

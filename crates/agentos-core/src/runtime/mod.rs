@@ -178,10 +178,9 @@ impl AgentRuntime {
 
     /// This runtime's background jobs (roadmap item D3).
     ///
-    /// Exposed so a caller that knows a conversation has ended can call
-    /// [`JobRegistry::dispose_conversation`]. The sharded gateway (G1) does
-    /// that on `/clear`, which is the one point where a conversation is
-    /// declared over — its jobs belong to a history that no longer exists.
+    /// Exposed so a caller that knows a typed session has ended can call
+    /// [`JobRegistry::dispose_session`]. The sharded gateway does that on
+    /// `/clear`, which is the point where those jobs' owning history ends.
     pub fn jobs(&self) -> &Arc<JobRegistry> {
         &self.jobs
     }
@@ -254,9 +253,8 @@ impl AgentRuntime {
         );
         let memory_manager =
             build_memory_manager(&workspace_config, session.clone(), semantic_factory)?;
-        // One registry for the whole runtime, keyed by conversation. Jobs
-        // outlive a run, so nothing narrower can own them until G1 introduces
-        // the conversation actor that should.
+        // One registry for the whole runtime, with every entry fenced by its
+        // typed session principal. Jobs outlive the run that created them.
         let jobs = Arc::new(JobRegistry::new(
             workspace_config.jobs.max_concurrent,
             workspace_config.jobs.output_limit_bytes,

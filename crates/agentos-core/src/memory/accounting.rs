@@ -1,4 +1,3 @@
-use super::scope::scope_component;
 use super::{MemoryCaller, MemoryError, MemoryScope};
 use agentos_proto::{Namespace, RecordId};
 use serde_json::Value;
@@ -62,7 +61,11 @@ pub(super) fn managed_metadata(
     );
     metadata.insert(
         Arc::from("owner_id"),
-        Value::String(scope_component(scope.owner.id(), "global")),
+        Value::String(scope.owner.metadata_id()),
+    );
+    metadata.insert(
+        Arc::from("owner"),
+        serde_json::to_value(&scope.owner).unwrap_or(Value::Null),
     );
     metadata.insert(
         Arc::from("visibility"),

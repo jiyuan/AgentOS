@@ -19,6 +19,11 @@ pub(super) fn authorize_scope(
 
     match &scope.owner {
         MemoryOwner::User(user_id) => {
+            if caller.principal_key.is_some() {
+                return Err(unauthorized(
+                    "legacy user memory requires ID-002 migration to a typed principal",
+                ));
+            }
             let caller_user = caller
                 .user_id
                 .as_deref()
@@ -30,11 +35,20 @@ pub(super) fn authorize_scope(
             }
         }
         MemoryOwner::Conversation(conversation_id) => {
-            if conversation_id == &caller.conversation_id {
+            if caller.principal_key.is_none() && conversation_id == &caller.conversation_id {
                 Ok(())
             } else {
                 Err(unauthorized(
                     "conversation memory belongs to a different conversation",
+                ))
+            }
+        }
+        MemoryOwner::Principal(principal_key) => {
+            if caller.principal_key.as_ref() == Some(principal_key) {
+                Ok(())
+            } else {
+                Err(unauthorized(
+                    "principal memory belongs to a different caller",
                 ))
             }
         }
@@ -78,17 +92,23 @@ pub(super) fn hydration_scopes(
     let domain = request.domain.clone();
     let mut scopes = Vec::new();
     for store in stores {
-        if let Some(user_id) = &caller.user_id {
-            scopes.push(MemoryScope::new(
-                store,
-                MemoryOwner::User(Arc::clone(user_id)),
-                MemoryVisibility::Private,
-                domain.clone(),
-            ));
+        if caller.principal_key.is_none() {
+            if let Some(user_id) = &caller.user_id {
+                scopes.push(MemoryScope::new(
+                    store,
+                    MemoryOwner::User(Arc::clone(user_id)),
+                    MemoryVisibility::Private,
+                    domain.clone(),
+                ));
+            }
         }
         scopes.push(MemoryScope::new(
             store,
-            MemoryOwner::Conversation(caller.conversation_id.clone()),
+            caller
+                .principal_key
+                .clone()
+                .map(MemoryOwner::Principal)
+                .unwrap_or_else(|| MemoryOwner::Conversation(caller.conversation_id.clone())),
             MemoryVisibility::Private,
             domain.clone(),
         ));

@@ -18,8 +18,7 @@ use agentos_interfaces::orchestrator::{
 use agentos_interfaces::session::Session;
 use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
 use agentos_proto::{
-    AgentId, ConversationId, Message, MessageRole, RunId, ToolCall, ToolCallId, ToolResult,
-    ToolStatus,
+    AgentId, Message, MessageRole, RunId, ToolCall, ToolCallId, ToolResult, ToolStatus,
 };
 use async_trait::async_trait;
 use serde_json::value::RawValue;
@@ -28,7 +27,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
-use support::{runner_deps, user_envelope, CONVERSATION};
+use support::{runner_deps, user_envelope, user_session_key};
 
 const SLOW_TOOL: &str = "slow";
 
@@ -161,7 +160,7 @@ async fn cancelling_mid_tool_stops_the_run_and_keeps_its_work() {
     // The first tool's result survived: the run finished rather than erroring,
     // so the runner appended its new items to the session.
     let transcript = session
-        .load(&ConversationId::new(CONVERSATION))
+        .load(&user_session_key())
         .await
         .expect("session loads");
     assert!(

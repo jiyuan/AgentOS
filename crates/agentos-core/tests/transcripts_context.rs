@@ -38,17 +38,19 @@ use support::{
 async fn manager_with_fact(fact: &str) -> Arc<MemoryManager> {
     let store = Arc::new(SqliteStore::open_in_memory().expect("sqlite opens in memory"));
     let manager = Arc::new(MemoryManager::new_sqlite(store));
+    let principal_key = support::user_session_key().principal;
     let caller = agentos_core::memory::MemoryCaller {
         agent_id: AgentId::new("golden-agent"),
         task_id: agentos_proto::TaskId::new("golden-task"),
         conversation_id: ConversationId::new(CONVERSATION),
+        principal_key: Some(principal_key.clone()),
         user_id: None,
         allowed_shared_domains: Vec::new(),
         audit_read_access: false,
     };
     let scope = MemoryScope::new(
         MemoryStore::Semantic,
-        MemoryOwner::Conversation(ConversationId::new(CONVERSATION)),
+        MemoryOwner::Principal(principal_key),
         MemoryVisibility::Private,
         None,
     );
@@ -96,7 +98,7 @@ async fn golden_memory_hydration() {
     .expect("a hydrated run finishes");
 
     let transcript = session
-        .load(&ConversationId::new(CONVERSATION))
+        .load(&support::user_session_key())
         .await
         .expect("session loads");
     scenario_golden("memory_hydration", &llm, &transcript, &outcome);
@@ -194,7 +196,7 @@ async fn golden_tool_result_spilled() {
     .expect("an oversized tool result finishes the run");
 
     let transcript = session
-        .load(&ConversationId::new(CONVERSATION))
+        .load(&support::user_session_key())
         .await
         .expect("session loads");
 
@@ -279,7 +281,7 @@ async fn elision_reaches_the_model_but_not_the_log() {
     // The log is untouched. Elision is a view over it, recomputed each turn,
     // so a later compaction could still show these bytes in full.
     let transcript = session
-        .load(&ConversationId::new(CONVERSATION))
+        .load(&support::user_session_key())
         .await
         .expect("session loads");
     let logged = transcript

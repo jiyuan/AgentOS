@@ -15,7 +15,7 @@
           "id": "memory",
           "messages": 1,
           "sources": [
-            "private/conversation/golden-conversation/semantic/general/record-1"
+            "private/principal/pk1_AAEAAAAAAAAADGdvbGRlbi1hZ2VudAAAAAAAAAAOZ29sZGVuLWNoYW5uZWwAAAAAAAAAE2dvbGRlbi1jb252ZXJzYXRpb24BAAAAAAAAAAR1c2Vy/semantic/general/record-1"
           ],
           "tokens": 64
         },

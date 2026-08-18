@@ -24,17 +24,16 @@
 //!
 //! # Fencing
 //!
-//! Every tool here resolves the calling conversation from the run context and
-//! passes it to the registry, which refuses to look up a job owned by anyone
-//! else. A call arriving without a context — [`Tool::call`] rather than
+//! Every tool here resolves the calling session principal from the run context
+//! and passes it to the registry, which refuses to look up a job owned by
+//! anyone else. A call arriving without a context — [`Tool::call`] rather than
 //! [`Tool::call_with_context`] — is refused outright: there is no safe default
 //! owner, and inventing one would be a way across the fence.
 
 use crate::jobs::{JobError, JobId, JobRegistry, JobSnapshot};
-use crate::memory::conversation_id_from_context;
 use agentos_interfaces::orchestrator::RunContext;
 use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
-use agentos_proto::{ConversationId, ToolCall, ToolResult, ToolStatus};
+use agentos_proto::{SessionKey, ToolCall, ToolResult, ToolStatus};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, value::RawValue, Value};
@@ -42,7 +41,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// Refused when a job tool is called without a run context.
-const NO_OWNER: &str = "job tools need the conversation they were called from; this call arrived \
+const NO_OWNER: &str = "job tools need the typed session they were called from; this call arrived \
      without one, so there is no way to tell which jobs it may see";
 
 #[derive(Debug, Deserialize)]
@@ -57,7 +56,7 @@ struct JobRef {
     offset: Option<usize>,
 }
 
-/// Report on one job, or list every job this conversation owns.
+/// Report on one job, or list every job this typed session owns.
 pub struct JobStatusTool {
     jobs: Arc<JobRegistry>,
 }
@@ -120,17 +119,17 @@ impl Tool for JobStatusTool {
         args: &RawValue,
         ctx: &RunContext<'_>,
     ) -> Result<ToolResult, ToolError> {
-        let (conversation_id, parsed) = owner_and_args(ctx, args)?;
+        let (session_key, parsed) = owner_and_args(ctx, args)?;
         match parsed.job_id {
             Some(id) => {
                 let id = JobId::parse(&id);
-                match self.jobs.status(&conversation_id, &id) {
+                match self.jobs.status(&session_key, &id) {
                     Ok(snapshot) => Ok(ok(call, render(&snapshot), snapshot_metadata(&snapshot))),
                     Err(error) => Ok(failed(call, &error)),
                 }
             }
             None => {
-                let jobs = self.jobs.list(&conversation_id);
+                let jobs = self.jobs.list(&session_key);
                 let content = if jobs.is_empty() {
                     "No background jobs in this conversation.".to_owned()
                 } else {
@@ -176,13 +175,13 @@ impl Tool for JobOutputTool {
         args: &RawValue,
         ctx: &RunContext<'_>,
     ) -> Result<ToolResult, ToolError> {
-        let (conversation_id, parsed) = owner_and_args(ctx, args)?;
+        let (session_key, parsed) = owner_and_args(ctx, args)?;
         let Some(id) = parsed.job_id else {
             return Ok(failed_text(call, "job_output needs a job_id"));
         };
         let id = JobId::parse(&id);
         let offset = parsed.offset.unwrap_or(0);
-        match self.jobs.output(&conversation_id, &id, offset) {
+        match self.jobs.output(&session_key, &id, offset) {
             Ok(output) => {
                 let mut metadata = BTreeMap::new();
                 metadata.insert(Arc::from("offset"), Value::from(offset));
@@ -227,12 +226,12 @@ impl Tool for JobKillTool {
         args: &RawValue,
         ctx: &RunContext<'_>,
     ) -> Result<ToolResult, ToolError> {
-        let (conversation_id, parsed) = owner_and_args(ctx, args)?;
+        let (session_key, parsed) = owner_and_args(ctx, args)?;
         let Some(id) = parsed.job_id else {
             return Ok(failed_text(call, "job_kill needs a job_id"));
         };
         let id = JobId::parse(&id);
-        match self.jobs.kill(&conversation_id, &id) {
+        match self.jobs.kill(&session_key, &id) {
             Ok(()) => Ok(ok(call, format!("Stopped job `{id}`."), BTreeMap::new())),
             Err(error) => Ok(failed(call, &error)),
         }
@@ -244,12 +243,15 @@ impl Tool for JobKillTool {
 fn owner_and_args(
     ctx: &RunContext<'_>,
     args: &RawValue,
-) -> Result<(ConversationId, JobRef), ToolError> {
-    let conversation_id =
-        conversation_id_from_context(ctx).ok_or_else(|| ToolError::Failed(Arc::from(NO_OWNER)))?;
+) -> Result<(SessionKey, JobRef), ToolError> {
+    let session_key = ctx
+        .state
+        .session_key
+        .clone()
+        .ok_or_else(|| ToolError::Failed(Arc::from(NO_OWNER)))?;
     let parsed: JobRef = serde_json::from_str(args.get())
         .map_err(|err| ToolError::Failed(err.to_string().into()))?;
-    Ok((conversation_id, parsed))
+    Ok((session_key, parsed))
 }
 
 fn render(snapshot: &JobSnapshot) -> String {

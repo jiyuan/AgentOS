@@ -866,7 +866,7 @@ the parent run and, today, the gateway.
 ### D3. Background job registry (F9)
 
 An owner-fenced registry: a producer declares kind, label, output cap, and an
-owning conversation, and returns cancel/done/read-output hooks. Model-facing
+owning typed session principal, and returns cancel/done/read-output hooks. Model-facing
 `job_start` / `job_status` / `job_output` / `job_kill` tools. A call that exceeds
 its D2 deadline is **promoted** to a job rather than lost.
 
@@ -877,10 +877,10 @@ its D2 deadline is **promoted** to a job rather than lost.
 - Depends: D2.
 - Risk: jobs outlive a run, so their handles cannot live in `RunState`. They
   belong to the conversation actor (G1) — build D3 after G1 if the ordering
-  allows, or park handles in a runtime-owned registry keyed by conversation.
+  allows, or park handles in a runtime-owned registry keyed by typed session.
 - Verify: `cargo test -p agentos-core jobs`; a job survives its originating run,
   reports output incrementally, is killable, and is cancelled when its owning
-  conversation is disposed; a job owned by conversation A is not visible to B.
+  session is disposed; a job owned by principal A is not visible to B.
 - Exit: long work is observable and cancellable instead of blocking or failing.
 - **Status: done, with `job_start` deliberately omitted** (2026-08-16). An
   owner-fenced registry, three model-facing tools, and promotion from D2's
@@ -915,10 +915,9 @@ its D2 deadline is **promoted** to a job rather than lost.
     `Plan` variant, not here.**
   - **Fencing does not distinguish "missing" from "not yours."** Both are
     `JobError::Unknown`, because saying which one it is tells a caller that
-    another conversation's job exists. The conversation is resolved through the
-    *same* helper the memory tool uses — `conversation_id_from_context`, moved
-    to one definition — since two copies of a security boundary are two chances
-    to drift.
+    another principal's job exists. The complete `SessionKey` is resolved from
+    `RunState`, so agent, channel, conversation, sender, and epoch all participate
+    in the ownership check.
   - **A job cancelled before its first poll never runs at all.** `start` queues
     work on the executor rather than running it, so killing a job in the turn
     that started it means the work never executed a line. Pinned by
@@ -934,16 +933,13 @@ its D2 deadline is **promoted** to a job rather than lost.
   - **A full job table degrades to D2 rather than refusing.** Out of slots, the
     call runs inline under its deadline. A busy conversation gets the previous
     behaviour instead of losing the tool.
-  - **The concurrency cap is per conversation**, not per process: the failure
+  - **The concurrency cap is per typed session**, not per process: the failure
     it prevents is one model spawning work in a loop, and a global cap would
     let that starve every *other* conversation instead of only its own.
-  - **`dispose_conversation` exists, is tested, and has no caller.** The
-    roadmap's Risk line is real — jobs belong to the conversation actor, and G1
-    does not exist — so the registry is runtime-owned and keyed by
-    conversation, which is the fallback the item sanctions. **G1 must call
-    `AgentRuntime::jobs().dispose_conversation()` when a conversation ends**, or
-    a long-lived gateway leaks cancelled-but-unreaped job entries.
-    *Resolved by G1:* the sharded gateway calls it on `/clear`.
+  - **`dispose_session` is principal-scoped and wired.** The registry remains
+    runtime-owned, but the sharded gateway calls
+    `AgentRuntime::jobs().dispose_session()` on `/clear`, cancelling and
+    reclaiming only the exact typed session's entries.
   - **`runtime/mod.rs` was split**: the job registry pushed it to 813 LOC, so
     MCP registration moved to `runtime/mcp_config.rs` — the most self-contained
     thing in the file, reading one config section and producing tool specs.

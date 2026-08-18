@@ -1,7 +1,7 @@
 use super::{record_matches_query, MemoryError};
 use agentos_interfaces::memory::{Memory, Query, Record, Selector};
 use agentos_interfaces::session::{Item, Session, SessionError, Transcript};
-use agentos_proto::{ConversationId, Namespace, RecordId};
+use agentos_proto::{Namespace, RecordId, SessionKey};
 use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -62,26 +62,26 @@ impl Memory for InMemoryMemory {
 
 #[derive(Default)]
 pub struct InMemorySession {
-    transcripts: Mutex<BTreeMap<ConversationId, Transcript>>,
+    transcripts: Mutex<BTreeMap<SessionKey, Transcript>>,
 }
 
 #[async_trait]
 impl Session for InMemorySession {
-    async fn load(&self, conv_id: &ConversationId) -> Result<Transcript, SessionError> {
+    async fn load(&self, session_key: &SessionKey) -> Result<Transcript, SessionError> {
         let transcripts = self
             .transcripts
             .lock()
             .map_err(|_| SessionError::Backend(Arc::from("in-memory session lock poisoned")))?;
-        Ok(transcripts.get(conv_id).cloned().unwrap_or_default())
+        Ok(transcripts.get(session_key).cloned().unwrap_or_default())
     }
 
-    async fn append(&self, conv_id: &ConversationId, items: Vec<Item>) -> Result<(), SessionError> {
+    async fn append(&self, session_key: &SessionKey, items: Vec<Item>) -> Result<(), SessionError> {
         let mut transcripts = self
             .transcripts
             .lock()
             .map_err(|_| SessionError::Backend(Arc::from("in-memory session lock poisoned")))?;
         transcripts
-            .entry(conv_id.clone())
+            .entry(session_key.clone())
             .or_default()
             .items
             .extend(items);

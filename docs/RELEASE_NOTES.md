@@ -42,6 +42,16 @@ slow tool no longer stalls everybody else. Within a conversation everything stay
 serial. A message sent mid-run steers the run at its next planning step instead
 of queueing behind it.
 
+**Typed principal identity.** Session, memory, gateway actor, background-job,
+`/clear`, subagent-fork, task-session, and trace ownership now uses a versioned
+principal containing agent, channel, conversation, and sender plus a session
+epoch. Canonical length-prefixed bytes and unpadded base64url storage names
+replace collision-prone replacement sanitization. This deliberately changes
+the public `Session` trait from `ConversationId` to `SessionKey` and adds
+`RunState.session_key`, so external struct literals must provide that optional
+field. Legacy SQLite rows and paused states require the pending `ID-002`
+migration before they are visible to the new runtime.
+
 **Approvals must be answered by name.** An approval prompt issues a ticket, and
 only an answer carrying that ticket decides it — `/approve <ticket>`,
 `/deny <ticket>`, or an inline button. Prompts expire (default 15 minutes) and

@@ -3,7 +3,7 @@ use super::{
 };
 use agentos_interfaces::memory::{Memory, Query, Record, Selector};
 use agentos_interfaces::session::{Item, Session, SessionError, Transcript};
-use agentos_proto::{ConversationId, Namespace, RecordId};
+use agentos_proto::{Namespace, RecordId, SessionKey};
 use async_trait::async_trait;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde_json::Value;
@@ -142,11 +142,11 @@ impl SqliteStore {
             .map_err(|_| SessionError::Backend(Arc::from("sqlite store lock poisoned")))
     }
 
-    pub fn clear_session(&self, conv_id: &ConversationId) -> Result<usize, SessionError> {
+    pub fn clear_session(&self, session_key: &SessionKey) -> Result<usize, SessionError> {
         let conn = self.session_conn()?;
         conn.execute(
             "DELETE FROM session_items WHERE conversation_id = ?1",
-            params![conv_id.as_str()],
+            params![session_key.storage_key()],
         )
         .map_err(session_sqlite_error)
     }
@@ -494,7 +494,7 @@ impl SqliteStore {
 
 #[async_trait]
 impl Session for SqliteStore {
-    async fn load(&self, conv_id: &ConversationId) -> Result<Transcript, SessionError> {
+    async fn load(&self, session_key: &SessionKey) -> Result<Transcript, SessionError> {
         let conn = self.session_conn()?;
         let mut stmt = conn
             .prepare(
@@ -505,7 +505,9 @@ impl Session for SqliteStore {
             )
             .map_err(session_sqlite_error)?;
         let rows = stmt
-            .query_map(params![conv_id.as_str()], |row| row.get::<_, String>(0))
+            .query_map(params![session_key.storage_key()], |row| {
+                row.get::<_, String>(0)
+            })
             .map_err(session_sqlite_error)?;
 
         let mut transcript = Transcript::default();
@@ -518,7 +520,7 @@ impl Session for SqliteStore {
         Ok(transcript)
     }
 
-    async fn append(&self, conv_id: &ConversationId, items: Vec<Item>) -> Result<(), SessionError> {
+    async fn append(&self, session_key: &SessionKey, items: Vec<Item>) -> Result<(), SessionError> {
         if items.is_empty() {
             return Ok(());
         }
@@ -528,7 +530,7 @@ impl Session for SqliteStore {
         let next_ordinal = tx
             .query_row(
                 "SELECT COALESCE(MAX(ordinal) + 1, 0) FROM session_items WHERE conversation_id = ?1",
-                params![conv_id.as_str()],
+                params![session_key.storage_key()],
                 |row| row.get::<_, i64>(0),
             )
             .optional()
@@ -542,7 +544,7 @@ impl Session for SqliteStore {
             let item_json = serde_json::to_string(&item).map_err(session_json_error)?;
             tx.execute(
                 "INSERT INTO session_items (conversation_id, ordinal, item_json) VALUES (?1, ?2, ?3)",
-                params![conv_id.as_str(), next_ordinal + offset, item_json],
+                params![session_key.storage_key(), next_ordinal + offset, item_json],
             )
             .map_err(session_sqlite_error)?;
         }
@@ -562,14 +564,14 @@ impl Session for SqliteStore {
     /// look and the write.
     async fn fork(
         &self,
-        source: &ConversationId,
+        source: &SessionKey,
         boundary: usize,
-        child_id: &ConversationId,
+        child_id: &SessionKey,
     ) -> Result<usize, SessionError> {
         if source == child_id {
             return Err(SessionError::Backend(Arc::from(format!(
-                "cannot fork conversation '{}' onto itself",
-                source.as_str()
+                "cannot fork session '{}' onto itself",
+                source.storage_key()
             ))));
         }
         let boundary = i64::try_from(boundary).unwrap_or(i64::MAX);
@@ -579,7 +581,7 @@ impl Session for SqliteStore {
         let existing: i64 = tx
             .query_row(
                 "SELECT COUNT(*) FROM session_items WHERE conversation_id = ?1",
-                params![child_id.as_str()],
+                params![child_id.storage_key()],
                 |row| row.get(0),
             )
             .map_err(session_sqlite_error)?;
@@ -587,7 +589,7 @@ impl Session for SqliteStore {
             return Err(SessionError::Backend(Arc::from(format!(
                 "fork target '{}' already holds {existing} items; seeding it would interleave \
                  two histories",
-                child_id.as_str()
+                child_id.storage_key()
             ))));
         }
 
@@ -597,7 +599,7 @@ impl Session for SqliteStore {
                  SELECT ?1, ordinal, item_json FROM session_items \
                  WHERE conversation_id = ?2 AND ordinal < ?3 \
                  ORDER BY ordinal ASC",
-                params![child_id.as_str(), source.as_str(), boundary],
+                params![child_id.storage_key(), source.storage_key(), boundary],
             )
             .map_err(session_sqlite_error)?;
         tx.commit().map_err(session_sqlite_error)?;
@@ -699,13 +701,14 @@ fn fts_match_query(input: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentos_proto::{AgentId, TaskId};
+    use agentos_proto::{AgentId, ConversationId, TaskId};
 
     fn caller() -> MemoryCaller {
         MemoryCaller {
             agent_id: AgentId::new("alice"),
             task_id: TaskId::new("t1"),
             conversation_id: ConversationId::new("c1"),
+            principal_key: None,
             user_id: None,
             allowed_shared_domains: Vec::new(),
             audit_read_access: false,

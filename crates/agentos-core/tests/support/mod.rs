@@ -37,7 +37,8 @@ use agentos_interfaces::session::Transcript;
 use agentos_interfaces::tool::ToolSpec;
 use agentos_llm::{Llm, LlmError};
 use agentos_proto::{
-    AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole, ToolCall, ToolCallId,
+    AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole, SessionKey, ToolCall,
+    ToolCallId,
 };
 use async_trait::async_trait;
 use serde_json::{json, value::RawValue, Value};
@@ -172,6 +173,10 @@ pub fn user_envelope(text: &str) -> Envelope {
         message: Message::text(MessageRole::User, text),
         metadata: BTreeMap::new(),
     }
+}
+
+pub fn user_session_key() -> SessionKey {
+    user_envelope("").session_key(&AgentId::new("golden-agent"))
 }
 
 /// An assistant reply carrying one tool call, as a provider would return it.

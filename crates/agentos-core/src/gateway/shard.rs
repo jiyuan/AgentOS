@@ -29,7 +29,7 @@
 
 use super::inbox::{Admitted, Inbox, DEFAULT_INBOX_CAPACITY};
 use crate::r#loop::Steering;
-use agentos_proto::{ConversationId, Envelope, Message};
+use agentos_proto::{AgentId, Envelope, Message, SessionKey};
 use async_trait::async_trait;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use std::collections::HashMap;
@@ -80,10 +80,10 @@ pub enum RouteError {
 #[derive(Debug)]
 enum Dispatch {
     /// Ordinary inbound input.
-    Input(Envelope),
+    Input(SessionKey, Envelope),
     /// Cancel whatever this conversation is running, and report whether there
     /// was anything to cancel.
-    Stop(ConversationId, oneshot::Sender<bool>),
+    Stop(SessionKey, oneshot::Sender<bool>),
 }
 
 /// One turn's worth of work, handed to a [`TurnHandler`] on the shard thread.
@@ -130,6 +130,7 @@ pub trait TurnHandler {
 #[derive(Clone)]
 pub struct Router {
     shards: Vec<mpsc::Sender<Dispatch>>,
+    active_agent: AgentId,
 }
 
 impl Router {
@@ -138,9 +139,9 @@ impl Router {
     /// A stable hash, not round-robin: a conversation must land on the same
     /// shard every time or its runs could overlap on different threads, which
     /// is the one thing sharding must not allow.
-    pub fn shard_of(&self, conversation: &ConversationId) -> usize {
+    pub fn shard_of(&self, session_key: &SessionKey) -> usize {
         let mut hasher = DefaultHasher::new();
-        conversation.as_str().hash(&mut hasher);
+        session_key.hash(&mut hasher);
         (hasher.finish() % self.shards.len() as u64) as usize
     }
 
@@ -151,8 +152,10 @@ impl Router {
     /// are polled alongside it rather than awaited by it — so a full queue
     /// means genuine saturation and the backpressure is the correct answer.
     pub async fn deliver(&self, envelope: Envelope) -> Result<(), RouteError> {
-        let shard = self.shard_of(&envelope.conversation_id);
-        self.send(shard, Dispatch::Input(envelope)).await
+        let session_key = envelope.session_key(&self.active_agent);
+        let shard = self.shard_of(&session_key);
+        self.send(shard, Dispatch::Input(session_key, envelope))
+            .await
     }
 
     /// Cancel whatever `conversation` is running.
@@ -160,10 +163,11 @@ impl Router {
     /// Reports whether there was a run to cancel: "stopping" and "nothing was
     /// running" are different answers, and a user who typed `/stop` because the
     /// agent looked stuck needs to be told which one they got.
-    pub async fn stop(&self, conversation: &ConversationId) -> Result<bool, RouteError> {
-        let shard = self.shard_of(conversation);
+    pub async fn stop(&self, envelope: &Envelope) -> Result<bool, RouteError> {
+        let session_key = envelope.session_key(&self.active_agent);
+        let shard = self.shard_of(&session_key);
         let (answer, stopped) = oneshot::channel();
-        self.send(shard, Dispatch::Stop(conversation.clone(), answer))
+        self.send(shard, Dispatch::Stop(session_key, answer))
             .await?;
         stopped.await.map_err(|_| RouteError::ShardGone { shard })
     }
@@ -190,7 +194,7 @@ pub struct ShardInbound(mpsc::Receiver<Dispatch>);
 /// Build a router plus one inbound queue per shard.
 ///
 /// The caller starts a thread per queue and calls [`run_shard`] on it.
-pub fn shard_set(config: &ShardConfig) -> (Router, Vec<ShardInbound>) {
+pub fn shard_set(config: &ShardConfig, active_agent: AgentId) -> (Router, Vec<ShardInbound>) {
     let shards = config.shards.max(1);
     let mut senders = Vec::with_capacity(shards);
     let mut receivers = Vec::with_capacity(shards);
@@ -199,7 +203,13 @@ pub fn shard_set(config: &ShardConfig) -> (Router, Vec<ShardInbound>) {
         senders.push(tx);
         receivers.push(ShardInbound(rx));
     }
-    (Router { shards: senders }, receivers)
+    (
+        Router {
+            shards: senders,
+            active_agent,
+        },
+        receivers,
+    )
 }
 
 /// Drive one shard until its queue closes and its in-flight turns finish.
@@ -213,12 +223,12 @@ pub async fn run_shard<H: TurnHandler>(
     handler: &H,
 ) {
     let ShardInbound(mut inbound) = inbound;
-    let mut conversations: HashMap<ConversationId, Inbox> = HashMap::new();
+    let mut conversations: HashMap<SessionKey, Inbox> = HashMap::new();
     let mut running = FuturesUnordered::new();
     // Conversations that may have claimable work. Cheaper than rescanning the
     // whole map on every event, and correct because the only two ways work can
     // become claimable are an arrival and a completion.
-    let mut ready: Vec<ConversationId> = Vec::new();
+    let mut ready: Vec<SessionKey> = Vec::new();
     let mut open = true;
 
     loop {
@@ -251,13 +261,12 @@ pub async fn run_shard<H: TurnHandler>(
         tokio::select! {
             biased;
             dispatch = inbound.recv(), if open => match dispatch {
-                Some(Dispatch::Input(envelope)) => {
-                    let conversation = envelope.conversation_id.clone();
+                Some(Dispatch::Input(session_key, envelope)) => {
                     let inbox = conversations
-                        .entry(conversation.clone())
+                        .entry(session_key.clone())
                         .or_insert_with(|| Inbox::bounded(config.inbox_capacity));
                     if inbox.admit(envelope) == Admitted::NextTurn {
-                        ready.push(conversation);
+                        ready.push(session_key);
                     }
                 }
                 Some(Dispatch::Stop(conversation, answer)) => {
@@ -285,10 +294,10 @@ pub async fn run_shard<H: TurnHandler>(
 /// Close out a finished turn: retire the run, recover anything it never
 /// claimed, and re-queue the conversation if it still has work.
 fn finish_turn(
-    conversations: &mut HashMap<ConversationId, Inbox>,
-    conversation: &ConversationId,
+    conversations: &mut HashMap<SessionKey, Inbox>,
+    conversation: &SessionKey,
     input: Envelope,
-    ready: &mut Vec<ConversationId>,
+    ready: &mut Vec<SessionKey>,
 ) {
     let Some(inbox) = conversations.get_mut(conversation) else {
         return;
@@ -326,7 +335,7 @@ fn unanswered(input: &Envelope, message: Message) -> Envelope {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentos_proto::{ChannelId, MessageRole};
+    use agentos_proto::{ChannelId, ConversationId, MessageRole};
     use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::rc::Rc;
@@ -340,6 +349,11 @@ mod tests {
             message: Message::text(MessageRole::User, text),
             metadata: BTreeMap::new(),
         }
+    }
+
+    fn dispatch(envelope: Envelope) -> Dispatch {
+        let session_key = envelope.session_key(&AgentId::new("gateway-test"));
+        Dispatch::Input(session_key, envelope)
     }
 
     fn config(shards: usize) -> ShardConfig {
@@ -393,10 +407,11 @@ mod tests {
     /// two of its runs overlap on different threads.
     #[test]
     fn routing_is_stable_per_conversation() {
-        let (router, _rx) = shard_set(&config(4));
-        let first = router.shard_of(&ConversationId::new("alice"));
+        let (router, _rx) = shard_set(&config(4), AgentId::new("gateway-test"));
+        let key = envelope("alice", "").session_key(&AgentId::new("gateway-test"));
+        let first = router.shard_of(&key);
         for _ in 0..16 {
-            assert_eq!(router.shard_of(&ConversationId::new("alice")), first);
+            assert_eq!(router.shard_of(&key), first);
         }
         assert!(first < 4);
     }
@@ -414,10 +429,10 @@ mod tests {
         };
         let (tx, rx) = mpsc::channel(8);
         let rx = ShardInbound(rx);
-        tx.send(Dispatch::Input(envelope("slow", "grind")))
+        tx.send(dispatch(envelope("slow", "grind")))
             .await
             .expect("queued");
-        tx.send(Dispatch::Input(envelope("quick", "hello")))
+        tx.send(dispatch(envelope("quick", "hello")))
             .await
             .expect("queued");
         drop(tx);
@@ -445,7 +460,7 @@ mod tests {
         };
         let (tx, rx) = mpsc::channel(8);
         let rx = ShardInbound(rx);
-        tx.send(Dispatch::Input(envelope("conv", "first")))
+        tx.send(dispatch(envelope("conv", "first")))
             .await
             .expect("queued");
 
@@ -453,7 +468,7 @@ mod tests {
             while !*started.borrow() {
                 tokio::task::yield_now().await;
             }
-            tx.send(Dispatch::Input(envelope("conv", "second")))
+            tx.send(dispatch(envelope("conv", "second")))
                 .await
                 .expect("queued");
             drop(tx);
