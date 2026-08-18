@@ -121,7 +121,7 @@ enabled = true
 # its oldest turns first. Above the 80% at which oversized tool output is
 # elided for free, so pruning always gets the first attempt. 84 is measured,
 # not chosen: the token estimator's worst under-estimate is 18.8%
-# (docs/token-calibration.md), and 100 / 1.188 = 84, so a request estimated at
+# (docs/TOKEN_CALIBRATION.md), and 100 / 1.188 = 84, so a request estimated at
 # 84% of the window is at most 100% of it in truth. Re-derive it with
 # `agentos-gateway calibrate` if this machine changes provider — the figure
 # above was measured against an OpenAI-family tokenizer.

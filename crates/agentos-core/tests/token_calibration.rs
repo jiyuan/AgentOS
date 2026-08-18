@@ -1,6 +1,6 @@
 //! Roadmap C1's accuracy check, replayed offline.
 //!
-//! `docs/token-calibration.md` and `tests/golden/token_calibration.json` record
+//! `docs/TOKEN_CALIBRATION.md` and `tests/golden/token_calibration.json` record
 //! what a real provider counted for each case in
 //! `prompt::calibration::corpus()`. This test re-scores today's estimator
 //! against those recorded counts, so the measurement keeps its value long after
@@ -19,7 +19,7 @@ const RECORD: &str = concat!(
 
 const RERECORD: &str = "re-record with `cargo run -p agentos-cli --bin agentos-gateway -- \
                         calibrate` (this spends real provider calls) and commit \
-                        docs/token-calibration.md alongside it";
+                        docs/TOKEN_CALIBRATION.md alongside it";
 
 fn recorded() -> Calibration {
     let body = std::fs::read_to_string(RECORD)
@@ -68,14 +68,14 @@ fn rescored() -> Vec<Sample> {
         .collect()
 }
 
-/// The prose report says what the record says. `docs/token-calibration.md` is
+/// The prose report says what the record says. `docs/TOKEN_CALIBRATION.md` is
 /// what a reader actually opens; a hand-edited number in it would be a measured
 /// figure that was never measured.
 #[test]
 fn the_checked_in_report_matches_the_record() {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../docs/token-calibration.md"
+        "/../../docs/TOKEN_CALIBRATION.md"
     );
     let existing = std::fs::read_to_string(path)
         .unwrap_or_else(|err| panic!("{path} is missing: {err}; {RERECORD}"));
@@ -88,7 +88,7 @@ fn the_checked_in_report_matches_the_record() {
     .expect("the report keeps its markers");
     assert_eq!(
         existing, expected,
-        "docs/token-calibration.md no longer matches the recorded samples; regenerate it with \
+        "docs/TOKEN_CALIBRATION.md no longer matches the recorded samples; regenerate it with \
          `cargo run -p agentos-cli --bin agentos-gateway -- calibrate --check > /dev/null` or \
          {RERECORD}"
     );

@@ -89,8 +89,8 @@ agentos-gateway config --config workspace/agent.toml
 ```
 
 Every key `agent.toml` accepts — with its type, default, and what it does — is
-in [`config-catalog.md`](config-catalog.md), and every built-in tool with its
-sandbox mode and deadline is in [`tool-catalog.md`](tool-catalog.md). Both are
+in [`CONFIG_CATALOG.md`](CONFIG_CATALOG.md), and every built-in tool with its
+sandbox mode and deadline is in [`TOOL_CATALOG.md`](TOOL_CATALOG.md). Both are
 generated from the code by `agentos-gateway catalog`, so they cannot describe a
 version of the runtime that no longer exists.
 

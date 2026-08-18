@@ -219,7 +219,7 @@ Subcommands:
   restart    Stop then start the gateway service.
   status     Report whether the gateway service is running.
   config     Print the effective workspace config used by the gateway.
-  catalog    Regenerate docs/config-catalog.md and docs/tool-catalog.md from
+  catalog    Regenerate docs/CONFIG_CATALOG.md and docs/TOOL_CATALOG.md from
              the code. `--check` verifies they are current without writing,
              which is what CI runs; `--root=PATH` names the repository.
   calibrate  Measure the token estimator against the configured provider's own

@@ -15,8 +15,8 @@ use agentos_core::tools::ToolRegistry;
 use std::path::{Path, PathBuf};
 
 /// Where the catalogs live, relative to the repository root.
-const CONFIG_CATALOG: &str = "docs/config-catalog.md";
-const TOOL_CATALOG: &str = "docs/tool-catalog.md";
+const CONFIG_CATALOG: &str = "docs/CONFIG_CATALOG.md";
+const TOOL_CATALOG: &str = "docs/TOOL_CATALOG.md";
 
 /// Header for a catalog file that does not exist yet, so the first run creates
 /// something with the markers rather than failing on their absence.

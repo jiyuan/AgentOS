@@ -1,5 +1,64 @@
 # Release Notes
 
+## v0.6.0
+
+The current development version. Two roadmaps landed since v0.5.0:
+[`FEATURE_ROADMAP.md`](FEATURE_ROADMAP.md) in full, and
+[`TRANSFER_ROADMAP.md`](TRANSFER_ROADMAP.md) except its last item.
+
+**Streaming.** Native SSE decoding for OpenAI, Anthropic, and DeepSeek, wired
+through the run loop, both orchestrators, the TUI, and edit-in-place message
+egress on Telegram and Feishu. Ollama uses the single-chunk fallback.
+
+**One authority over the provider request.** A new `prompt` module is the only
+path from a run's context to the messages a provider sees. Every contribution is
+a named section and every request records what it was made of, which closed a
+bug where hydrated memory was retrieved, counted, and then never sent.
+
+**Bounded conversations.** The session log became append-only, with what the
+model sees computed as a projection over it. Oversized tool output spills to a
+file behind a locator instead of being truncated away; under context pressure
+recorded results are elided; beyond that the oldest span is summarized into a
+checkpoint; and a provider that rejects a request for length triggers one forced
+compaction and one retry. Token pressure is estimated per request and the
+estimator has been calibrated against a live provider.
+
+**Deadlines and control.** Every tool call has a deadline and runs without
+blocking a Tokio worker. Every run carries a cancellation token, and a sub-agent
+tree cancels with its parent. A tool that would exceed its deadline can be
+promoted to a background job that outlives the turn, with `job_status`,
+`job_output`, and `job_kill` to manage it. `/stop` abandons a turn while keeping
+the work it already finished.
+
+**Gateway concurrency.** Conversations are now actors: each is assigned by stable
+hash to one of `[gateway].shards` worker threads, so a conversation waiting on a
+slow tool no longer stalls everybody else. Within a conversation everything stays
+serial. A message sent mid-run steers the run at its next planning step instead
+of queueing behind it.
+
+**Approvals must be answered by name.** An approval prompt issues a ticket, and
+only an answer carrying that ticket decides it — `/approve <ticket>`,
+`/deny <ticket>`, or an inline button. Prompts expire (default 15 minutes) and
+an expired prompt is recorded as cancelled, not refused.
+
+**Real sandboxing.** `requires_isolation` was replaced by a `SandboxMode`
+(`read_only`, `workspace_write`, `full_access`) that the kernel enforces —
+Landlock on Linux, Seatbelt on macOS — inherited by every descendant process.
+Where no backend exists, a sandboxed tool fails rather than running unrestricted.
+
+**Correctness and hygiene.** Every tool call in a multi-call response is now
+kept and drained one per turn instead of the first being run and the rest
+dropped. One config pass moved the remaining hardcoded limits into `agent.toml`.
+The config and tool catalogs are generated from the code and checked in CI.
+Three load-bearing invariants are asserted in debug builds. A conversation can be
+forked from a prefix of another. Memory gained reflection sweeps, real
+embeddings, and the first extension crate, `agentos-memory-vector`.
+
+**Other.** OpenAI migrated to the Responses API exclusively; Anthropic replies
+are capped at each model's published output limit; reply-integrity checks reject
+provider responses that lost information; the email PII guardrail no longer
+matches URLs; Feishu reconnects back off; trace records carry `emitted_unix`.
+
 ## v0.5.0
 
 Released 2026-05-19.

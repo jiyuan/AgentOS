@@ -37,7 +37,7 @@
 //! agentos-gateway calibrate --check    # re-check the estimator offline
 //! ```
 //!
-//! The live run writes `docs/token-calibration.md` and the recorded samples in
+//! The live run writes `docs/TOKEN_CALIBRATION.md` and the recorded samples in
 //! `crates/agentos-core/tests/golden/token_calibration.json`. From then on
 //! `tests/token_calibration.rs` replays those samples offline, so a change to
 //! the estimator's constants is measured against a real provider's numbers
@@ -50,7 +50,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, value::RawValue};
 use std::sync::Arc;
 
-/// Bounds of the generated block in `docs/token-calibration.md`. The prose
+/// Bounds of the generated block in `docs/TOKEN_CALIBRATION.md`. The prose
 /// around them is written by hand and kept; only what sits between them is
 /// replaced. Spliced with [`crate::config::catalog::splice`], which the
 /// generated catalogs already use for the same job.
@@ -394,7 +394,7 @@ pub fn summarize(samples: &[Sample]) -> Summary {
     }
 }
 
-/// The human-readable record, written to `docs/token-calibration.md`.
+/// The human-readable record, written to `docs/TOKEN_CALIBRATION.md`.
 pub fn report_markdown(calibration: &Calibration) -> String {
     let notes: Vec<(&str, &str)> = corpus()
         .iter()

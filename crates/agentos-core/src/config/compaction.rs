@@ -7,7 +7,7 @@
 //!
 //! # Where the default trigger comes from
 //!
-//! 84 is measured, not chosen. C1's accuracy check (`docs/token-calibration.md`,
+//! 84 is measured, not chosen. C1's accuracy check (`docs/TOKEN_CALIBRATION.md`,
 //! regenerate with `agentos-gateway calibrate`) found the estimator's worst
 //! meaningful **under**-estimate to be 18.8%, on a request made almost entirely
 //! of code — symbol-dense ASCII tokenizes worse than the 4:1 rate `prompt::tokens`

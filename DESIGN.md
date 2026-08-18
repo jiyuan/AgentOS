@@ -37,6 +37,10 @@ Plan variants:
 
 - `Reply`: terminal assistant output.
 - `CallTool`: execute a local or MCP-backed tool.
+- `CallTools`: a batch of calls the model asked for in one response. The batch is
+  queued on the run state and drained one call per turn, so each crosses
+  `Approve` on its own and results append in the order asked for. No new state,
+  no new transition.
 - `Handoff`: switch the active agent and continue planning.
 - `Delegate`: run a sub-agent and return its result to the parent.
 - `Escalate`: run a configured sub-orchestrator template.
@@ -46,10 +50,22 @@ Guardrail and approval placement:
 - Input guardrails run in `Start`; tool guardrails run in `Act`; output guardrails run before a terminal reply finishes.
 - Every non-terminal action crosses `Approve`. `allow` proceeds to `Act`, `deny` terminates with a policy error, and `ask_user` serializes a paused `RunState` for later resume.
 - Sub-agent permissions can only narrow the parent's; every sub-agent tool call re-enters the loop at `Approve`.
+- An approval prompt issues a ticket, and only an answer naming that ticket decides it. Anything else stays ordinary input.
+- `Plan` is also where input that arrived mid-run is claimed: the previous turn has been observed and the next request has not been assembled yet.
+
+## The request
+
+One module, `crates/agentos-core/src/prompt/`, is the only path from a run's context to the messages a provider sees. Every contribution is a named section, and every call returns a manifest recorded in the trace, so "what did the model see" is answered from the trace rather than by re-reading the code.
+
+The session log beneath it is append-only. What the model sees is a *projection* over that log: a checkpoint item summarizes an inclusive range of earlier positions and the projection folds that range out. Compaction, tool-output elision, and conversation fork are therefore all reads, never rewrites — which is what keeps the record of what actually happened intact while what the model reads shrinks.
+
+Pressure is estimated per request, relieved first by eliding already-spilled tool output and then, if that is not enough, by summarizing the oldest span. A provider that rejects a request for length is the one trigger that is never an estimate: the loop forces one compaction and retries once.
 
 ## Gateway
 
-The gateway has two layers. `Gateway` remains a bounded `mpsc` ingress queue for cron tasks and other producers that already have an `Envelope`. `GatewayService` sits above that queue and drives channel-facing work: receive an inbound envelope from a `Channel`, run it through the runner, send the final reply back through the same channel, and send approval prompts for paused runs. This keeps channel adapters thin and keeps LLM-backed or deterministic orchestrators behind the same runner boundary.
+The gateway has three layers. `Gateway` remains a bounded `mpsc` ingress queue for cron tasks and other producers that already have an `Envelope`. `GatewayService` sits above that queue and drives channel-facing work: receive an inbound envelope from a `Channel`, run it through the runner, send the final reply back through the same channel, and send approval prompts for paused runs.
+
+Above both, conversations are actors. Each has a bounded `Inbox` and is assigned by stable hash to one of `[gateway].shards` OS threads, each running its own `current_thread` runtime, so one conversation waiting on a slow tool does not stall any other. Within a conversation everything stays strictly serial — two concurrent runs would both load the transcript and the second write-back would clobber the first. The run-loop future is `!Send` (sub-agent execution drives a `LocalSet`), so thread-per-core is the scaling model, adopted deliberately rather than by omission.
 
 ## Safety Rings
 
@@ -67,7 +83,7 @@ request; every delegation's effective policy reaches no action its parent
 cannot; and every tool result in the transcript follows an assistant item
 carrying its call id.
 
-These are **not a fourth ring**. They are compiled out of release builds
+These are **not a fifth ring**. They are compiled out of release builds
 entirely, so they protect development rather than deployment — a violation is a
 bug in the core, not a state a deployment can reach by configuration. Each
 states a relationship between two pieces of authoritative state rather than
@@ -76,4 +92,6 @@ the panic.
 
 ## Status
 
-The scaffold milestone is complete. The active baseline includes the typed loop and trace shape, concrete approval with serializable paused runs, reference tools and guardrails, SQLite session and scoped memory storage with hydration and reflection, Telegram and Feishu reference channels, configured sub-agents and sub-orchestrator templates, static and stdio MCP registration, kernel-sandboxed subprocess execution for tools that declare a mode, and runtime path injection with an enforced extension boundary. Remaining architecture work and open decisions are tracked in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/PLAN.md`](docs/PLAN.md).
+The scaffold milestone is complete. The active baseline includes the typed loop and trace shape; concrete approval with serializable paused runs and ticket-correlated prompts; one prompt-assembly authority with projection, spill, elision, compaction, and overflow recovery; reference tools and guardrails with per-call deadlines and background-job promotion; run cancellation and mid-run steering; per-conversation actors sharded across threads; SQLite session and scoped memory storage with hydration and reflection; streaming across three providers and both chat channels; Telegram and Feishu reference channels; configured sub-agents and sub-orchestrator templates; static and stdio MCP registration; kernel-sandboxed subprocess execution for tools that declare a mode; and runtime path injection with an enforced extension boundary.
+
+Remaining architecture work and open decisions are tracked in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); current sequencing is [`docs/TRANSFER_ROADMAP.md`](docs/TRANSFER_ROADMAP.md).

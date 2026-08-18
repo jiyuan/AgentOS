@@ -8,6 +8,12 @@ all four phases complete as of 2026-06-12) and from [`PLAN.md`](PLAN.md) (invari
 and config-authority milestones). It supersedes the net-new-feature items in
 `PLAN.md` "Later Work"; that section now points here.
 
+**This roadmap is complete** (2026-06-18, two explicitly-deferred follow-ups —
+see the Status section). Work after it is tracked in
+[`TRANSFER_ROADMAP.md`](TRANSFER_ROADMAP.md), which is the current roadmap. The
+Baseline below describes the tree as of 2026-06-12 and is kept as the record of
+what this roadmap set out to change, not as a description of the runtime today.
+
 Scope and audience: this roadmap targets a **single-operator deployment** — the
 runtime the author actually runs (TUI + Telegram/Feishu gateway), not a
 third-party framework release. Items are sequenced for "things I use day-to-day"
@@ -21,7 +27,7 @@ baseline.
 
 The architecture is healthy and feature-complete for its current milestones: typed
 run loop, concrete `Approve`, policy narrowing, scoped memory with hydration,
-import boundary, and the §16 verification matrix all pass. The gaps this roadmap
+import boundary, and the §18 verification matrix all pass. The gaps this roadmap
 addresses:
 
 - **No streaming.** The `Llm` trait (`crates/agentos-llm/src/lib.rs`) exposes only
@@ -36,7 +42,7 @@ addresses:
 - **Memory infra exists but is idle.** `MemoryManager`, the `Memory`/`Session`
   traits, and `reflect()` (`crates/agentos-core/src/memory/reflection.rs`) are
   implemented with SQLite plus optional sqlite-vec / Qdrant indexes, but the
-  open decisions in [`ARCHITECTURE.md §17`](ARCHITECTURE.md) — default episode
+  open decisions in [`ARCHITECTURE.md §19`](ARCHITECTURE.md) — default episode
   recording, scheduled reflection, which vector backend leads — are unresolved, so
   the smart-memory paths don't run in a default deployment.
 
@@ -44,7 +50,7 @@ addresses:
 
 These apply to every item below; they are not repeated per-item.
 
-- Re-run the [`ARCHITECTURE.md §16`](ARCHITECTURE.md) verification matrix before
+- Re-run the [`ARCHITECTURE.md §18`](ARCHITECTURE.md) verification matrix before
   claiming any item done: `cargo fmt --all --check`, `cargo check --workspace`,
   `cargo test --workspace`, `bash scripts/check-import-boundaries.sh`,
   `scripts/check-module-size.sh`.
@@ -183,7 +189,7 @@ optional incremental egress (edit-in-place for Telegram/Feishu, append for TUI).
 
 ## Track B — Memory Intelligence
 
-Goal: resolve the [`ARCHITECTURE.md §17`](ARCHITECTURE.md) memory open-decisions
+Goal: resolve the [`ARCHITECTURE.md §19`](ARCHITECTURE.md) memory open-decisions
 for a single-operator deployment and make reflection/episodes actually *run*.
 
 ### B1. Default episode recording
@@ -191,7 +197,7 @@ for a single-operator deployment and make reflection/episodes actually *run*.
 Decide and wire a sane default recording policy — record failures, denials,
 approvals, multi-step tool workflows, sub-agent workflows, explicit corrections,
 and explicit memory writes; skip trivial one-turn replies (already specified in
-[`ARCHITECTURE.md §11`](ARCHITECTURE.md) "Episode Recording"). Make it config-gated
+[`ARCHITECTURE.md §13`](ARCHITECTURE.md) "Episode Recording"). Make it config-gated
 under `[memory]` so it can be disabled.
 
 - Files: `crates/agentos-core/src/memory/`, `config/mod.rs`, `workspace/agent.toml`.
@@ -286,7 +292,7 @@ It doubles as the backend Track B3 needs.
 - Effort: M–L.
 - Verify: `cargo check --workspace` with the vector backend selected in
   `agent.toml`; `cargo tree` shows the extension depended on **only** by
-  `agentos-cli`; the §16 matrix stays green.
+  `agentos-cli`; the §18 matrix stays green.
 - Exit: a real extension crate is wired and selectable by config; core has no edge
   to it.
 - **Status: done** (`605f16e`). The natural extension trait was `SemanticIndex`
@@ -298,7 +304,7 @@ It doubles as the backend Track B3 needs.
   `AgentRuntime::build_with(paths, semantic_factory)`: the **CLI** owns the
   `Fn(&str) -> Option<Arc<dyn SemanticIndex>>` factory (`"vector"` → the
   extension), so only `agentos-cli` depends on the extension — core never names
-  it. `cargo tree` confirms the edge; the §16 matrix is green.
+  it. `cargo tree` confirms the edge; the §18 matrix is green.
 
 ### C2. Link-time factory registry (conditional)
 
@@ -391,3 +397,6 @@ deployment:
   except two explicitly-deferred follow-ups: C2 (link-time registry, not needed
   for one extension) and making real embeddings the *persistent* default (inject
   the embedder into core `sqlite_vec`). Verification matrix green.
+- 2026-08-17: doc pass. Both deferred follow-ups are still open and are now also
+  listed in [`ARCHITECTURE.md §17`](ARCHITECTURE.md). No feature-roadmap item
+  reopened.

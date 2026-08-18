@@ -29,8 +29,8 @@ This installs AgentOS into:
 ## Install from a release bundle
 
 ```sh
-tar -xzf agentos-v0.2.0-<platform>-<arch>.tar.gz
-cd agentos-v0.2.0-<platform>-<arch>
+tar -xzf agentos-v<version>-<platform>-<arch>.tar.gz
+cd agentos-v<version>-<platform>-<arch>
 scripts/install-agentos.sh
 ```
 

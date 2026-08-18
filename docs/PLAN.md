@@ -1,10 +1,15 @@
 # Agent OS Development Plan
 
-Last reconstructed: 2026-05-13
+Last reconstructed: 2026-05-13. Snapshot refreshed: 2026-08-17.
 
-This plan reflects the current codebase and the architectural audit performed on
-2026-05-13. It intentionally replaces earlier phase-status claims that no longer
-match the implementation.
+This plan is the record of the 2026-05-13 architectural audit and the invariant
+and config-authority milestones it opened. **All three of its milestones are
+complete**; the findings below are kept for their rationale and their exit
+criteria, not as a description of open work.
+
+Current sequencing lives in [`TRANSFER_ROADMAP.md`](TRANSFER_ROADMAP.md); the
+current architecture reference is [`ARCHITECTURE.md`](ARCHITECTURE.md). Where
+this document and either of those disagree, they are current.
 
 ## Current Snapshot
 
@@ -22,19 +27,28 @@ AgentOS is a Rust workspace with these active crates:
 The runtime currently supports:
 
 - Typed loop states: `Start`, `Plan`, `Approve`, `Act`, `Observe`, `Paused`,
-  and `Finish`.
-- Concrete approval policy with `allow`, `deny`, and `ask_user`.
+  and `Finish`. No state or transition has been added since.
+- Concrete approval policy with `allow`, `deny`, and `ask_user`, plus
+  ticket-correlated approval prompts with expiry.
 - Tool execution through `ToolRegistry`, including built-in `shell`, `http`,
-  `file`, `memory`, cron, skill validation, and MCP-backed tools.
+  `file`, `memory`, cron, job, skill validation, and MCP-backed tools — each
+  with a deadline and a declared sandbox mode.
 - Reference guardrails: `PiiFilter`, `MaxOutputLength`, and
   `ShellCommandAllowlist`.
-- SQLite-backed session and memory storage, plus optional semantic indexes.
+- One prompt-assembly module owning every provider request, with transcript
+  projection, token-pressure estimation, tool-output spill and elision, span
+  compaction, context-overflow recovery, and session fork.
+- SQLite-backed session and memory storage, plus optional semantic indexes
+  (`sqlite_vec`, Qdrant, or the `agentos-memory-vector` extension).
 - Workspace skills loaded from `workspace/skills`.
 - Configured sub-agents and sub-orchestrator templates loaded from
   `workspace/subagents/*.toml` and `workspace/suborchs/*.toml`.
-- Telegram and Feishu channel adapters.
+- Telegram and Feishu channel adapters with streamed edit-in-place egress.
 - Static and stdio MCP tool registration.
-- Subprocess isolation support for tools marked `requires_isolation`.
+- Kernel-sandboxed child processes (Landlock on Linux, Seatbelt on macOS) for
+  tools that declare a `SandboxMode` other than `full_access`.
+- Run cancellation, mid-run steering, background jobs, and per-conversation
+  actors sharded across threads.
 - Packaging and install scripts for source and release bundles.
 
 ## Verification Baseline
@@ -309,18 +323,23 @@ Net-new *feature* work (LLM streaming, memory intelligence, the extension
 ecosystem) now lives in [`FEATURE_ROADMAP.md`](FEATURE_ROADMAP.md). The items
 below are the remaining architecture/hardening tasks tracked by this plan.
 
-These items are useful but should wait until the invariant and config milestones
-are complete:
+The invariant and config milestones are now complete, so these are unblocked.
+Status as of 2026-08-17:
 
-- Harden stdio MCP toward the selected production MCP protocol, including
-  initialization, shutdown, stderr propagation, and lifecycle observability.
-- Broaden subprocess isolation beyond the reference shell worker if more tools
-  require isolation.
-- Decide whether built-in deterministic skill planners should remain in core or
-  move behind a skill-extension surface.
-- Revisit semantic memory defaults after config authority is stable.
-- Refresh release notes and user docs once the effective runtime contract is
-  settled.
+- **Open.** Harden stdio MCP toward the selected production MCP protocol,
+  including initialization, shutdown, stderr propagation, and lifecycle
+  observability.
+- **Done** (`TRANSFER_ROADMAP.md` X2). Isolation is no longer a bare subprocess:
+  a tool declares a `SandboxMode` and the kernel enforces it, for any tool that
+  spawns a child, not only the reference shell worker.
+- **Open.** Decide whether built-in deterministic skill planners should remain in
+  core or move behind a skill-extension surface.
+- **Open.** Revisit semantic memory defaults. Retrieval, reflection, and the
+  vector extension all exist; hydration, episode recording, and reflection each
+  still default to off.
+- **Done.** Release notes and user docs were refreshed for v0.6.0
+  (2026-08-17), and the config and tool catalogs are now generated from the
+  code rather than written by hand.
 
 ## Ongoing Verification Matrix
 
@@ -329,16 +348,24 @@ Run before claiming a milestone complete:
 ```sh
 cargo fmt --all --check
 cargo check --workspace
+cargo clippy --workspace -- -D warnings
 cargo test --workspace
 bash scripts/check-import-boundaries.sh
-scripts/check-module-size.sh
+bash scripts/check-module-size.sh
+bash scripts/check-catalogs.sh
 ```
+
+This matrix is wired into CI (`.github/workflows/ci.yml`) and is restated, with
+the per-area test commands, in [`ARCHITECTURE.md §18`](ARCHITECTURE.md).
 
 Run when public interfaces change:
 
 ```sh
-cargo semver-checks check-release -p agentos-interfaces
+cargo semver-checks check-release -p agentos-interfaces --baseline-rev HEAD
 ```
+
+The interface crates are unpublished, so the crates.io baseline cannot be
+fetched; `--baseline-rev` is required.
 
 Run when tool, approval, or sub-agent policy behavior changes:
 

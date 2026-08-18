@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 /// The human-readable record. Checked in, so the measured numbers are readable
 /// without re-running anything.
-const REPORT: &str = "docs/token-calibration.md";
+const REPORT: &str = "docs/TOKEN_CALIBRATION.md";
 /// The machine-readable record `tests/token_calibration.rs` replays.
 const RECORD: &str = "crates/agentos-core/tests/golden/token_calibration.json";
 

@@ -22,7 +22,7 @@
 //!
 //! This module used to claim it was never dangerously low. **It is.** C1's
 //! accuracy check measured it against a live provider
-//! (`docs/token-calibration.md`) and found:
+//! (`docs/TOKEN_CALIBRATION.md`) and found:
 //!
 //! - Chinese prose **+32%** — one token per wide character is well above what a
 //!   byte-pair encoder actually charges for CJK. Safe, and the single largest

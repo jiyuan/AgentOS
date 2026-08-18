@@ -9,8 +9,11 @@ transferable ideas from the DeepSeek Harness, verified against the tree at
 (streaming, memory intelligence, extension ecosystem), and [`PLAN.md`](PLAN.md)
 (invariant and config-authority milestones).
 
-Where this roadmap disagrees with a "done" claim in another document, this one is
-current: F1 and F8 below both contradict [`ARCHITECTURE.md §15`](ARCHITECTURE.md).
+Where this roadmap disagreed with a "done" claim in another document, this one
+was current: F1 and F8 below both contradicted `ARCHITECTURE.md`'s status
+section as drafted. That contradiction is resolved —
+[`ARCHITECTURE.md`](ARCHITECTURE.md) was re-consolidated against this work on
+2026-08-17.
 
 Scope and audience: the same single-operator deployment `FEATURE_ROADMAP.md`
 targets — TUI plus the Telegram/Feishu gateway. Items are sequenced by what
@@ -47,7 +50,7 @@ Five facts about the current tree that this roadmap exists to change:
 
 These apply to every item; they are not repeated per-item.
 
-- Re-run the [`ARCHITECTURE.md §16`](ARCHITECTURE.md) verification matrix before
+- Re-run the [`ARCHITECTURE.md §18`](ARCHITECTURE.md) verification matrix before
   claiming any item done: `cargo fmt --all --check`, `cargo check --workspace`,
   `cargo test --workspace`, `bash scripts/check-import-boundaries.sh`,
   `scripts/check-module-size.sh`.
@@ -185,7 +188,7 @@ assembles a message vector by hand afterwards.
     from `PromptManifest` + `RunState`: the manifest records which sections
     contributed and how much, not their content, and `memory_fragments` live
     only on the transient `RunContext`. Closing this needs a decision the
-    implementation cannot make on its own — [`ARCHITECTURE.md §14`](ARCHITECTURE.md)
+    implementation cannot make on its own — [`ARCHITECTURE.md §16`](ARCHITECTURE.md)
     forbids full memory bodies in traces, so "model-visible ⟺ logged" has to
     land in the session rather than the trace, which changes every golden and
     interacts with C3's compaction. Tracked as P3 below.
@@ -213,7 +216,7 @@ assembles a message vector by hand afterwards.
 P1 made assembly single-authority but not reconstructable. Decide where the
 assembled non-transcript sections are recorded so a past request can be rebuilt:
 in the session (the harness's rule, and what fork/resume/compaction need) or in
-the trace (cheaper, but [`ARCHITECTURE.md §14`](ARCHITECTURE.md) forbids full
+the trace (cheaper, but [`ARCHITECTURE.md §16`](ARCHITECTURE.md) forbids full
 memory bodies there). Resolve that tension before C3, which rewrites the history
 any reconstruction would read.
 
@@ -376,7 +379,7 @@ otherwise be guessing at.
     `openai:gpt-5.4-mini`. `agentos-gateway calibrate` sends the fixed corpus in
     `prompt::calibration` through the ordinary `Llm::complete_messages` path and
     records the provider's own `input_tokens` per case; the result is
-    `docs/token-calibration.md` and `tests/golden/token_calibration.json`.
+    `docs/TOKEN_CALIBRATION.md` and `tests/golden/token_calibration.json`.
     Measured error, estimate against provider count:
 
     | Class | Error |
@@ -1408,7 +1411,7 @@ every one. Verified: `cargo fmt --all --check`, `cargo clippy --workspace
 
 ### X4. Generated catalogs (F13)
 
-Generate `docs/config-catalog.md` from the config structs and a tool catalog from
+Generate `docs/CONFIG_CATALOG.md` from the config structs and a tool catalog from
 registered `ToolSpec`s, between edit markers, and verify freshness in CI beside
 `check-import-boundaries.sh`. This roadmap's own opening — two documented
 baselines that the tree contradicts — is the argument.
@@ -1423,7 +1426,7 @@ baselines that the tree contradicts — is the argument.
 `config/undocumented.txt` (the debt ratchet), `bin/agentos-gateway/catalog.rs`
 (`agentos-gateway catalog [--check]`), `scripts/check-catalogs.sh`, a CI step
 beside the boundary and module-size checks, and `tests/catalog_freshness.rs`.
-Generated: `docs/config-catalog.md` (148 keys) and `docs/tool-catalog.md`.
+Generated: `docs/CONFIG_CATALOG.md` (148 keys) and `docs/TOOL_CATALOG.md`.
 Verified: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --
 -D warnings`, 545 tests, import boundaries, module sizes, catalogs current.
 Semver: nothing public changed shape — all six crates report no update
@@ -1690,5 +1693,28 @@ in this roadmap.
 
 ## Status
 
-Not started. Update each item with a **Status** line and its commit as it lands,
-matching the convention in [`FEATURE_ROADMAP.md`](FEATURE_ROADMAP.md).
+Complete except X7. Every item T1 through X6 carries a **Status** line in its own
+section with the outcome and any deviation from the plan; this is the summary.
+
+| Phase | Items | State |
+|---|---|---|
+| 0 — test floor | T1 | done (2026-08-15) |
+| 1 — one authority over the request | P1, P3, P2 | done (2026-08-15) |
+| 2 — bounding a conversation's lifetime | C1, C2, C3, C4 | done (2026-08-16; C1 accuracy check and C3 trigger measured 2026-08-17) |
+| 3 — deadlines and control | D1, D2, D3 | done (2026-08-16) |
+| 4 — gateway concurrency and approval correlation | G1, G2 | done |
+| 5 — correctness and hygiene | X1, X2, X3, X4, X5, X6 | done (X5, X6 on 2026-08-17) |
+| 5 — remaining | **X7** (folded collaboration state) | **not started** |
+
+Three items were completed with a documented deviation, all recorded in their own
+Status lines: T1 (one exit criterion deferred to P1), D2 (one exception to the
+Verify grep), and D3 (`job_start` deliberately omitted). X1 shipped option (b),
+batching, rather than the (a) the roadmap recommended.
+
+The baseline facts this roadmap opened with no longer hold. Memory hydration
+reaches the model through a named prompt section; the transcript is projected
+rather than replayed whole; every tool call has a deadline and every run a
+cancellation token; an approval is decided only by an answer naming its ticket;
+and conversations run concurrently across shard threads.
+[`ARCHITECTURE.md`](ARCHITECTURE.md) was re-consolidated against this work on
+2026-08-17 and no longer contradicts it.

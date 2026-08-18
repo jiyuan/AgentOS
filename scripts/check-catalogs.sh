@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fail when the generated catalogs no longer match the code (roadmap X4).
 #
-# `docs/config-catalog.md` and `docs/tool-catalog.md` are derived from the
+# `docs/CONFIG_CATALOG.md` and `docs/TOOL_CATALOG.md` are derived from the
 # config structs and the built-in `ToolSpec`s. Adding a config key, changing a
 # default, or editing a tool's description without regenerating leaves the docs
 # describing a tree that no longer exists — which is the failure this roadmap
@@ -23,5 +23,5 @@ fi
 echo
 echo "The generated catalogs are out of date."
 echo "Run: cargo run -p agentos-cli --bin agentos-gateway -- catalog"
-echo "and commit docs/config-catalog.md and docs/tool-catalog.md."
+echo "and commit docs/CONFIG_CATALOG.md and docs/TOOL_CATALOG.md."
 exit 1

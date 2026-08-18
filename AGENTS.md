@@ -8,22 +8,40 @@ Agent OS is an agent-agnostic runtime written in Rust. It has three layers: an i
 agentos/
 ├── crates/
 │   ├── agentos-interfaces/   # Public traits — the extension API. Zero internal deps.
-│   ├── agentos-proto/        # Wire types (Message, ToolCall, Envelope, Span). Serde only.
-│   ├── agentos-core/         # Kernel: run loop, gateway, orchestrator, approve, hooks.
-│   │   ├── loop/             # RunLoopState enum and transitions.
-│   │   ├── gateway/          # Channel multiplexer (bounded mpsc).
-│   │   ├── orchestrator/     # Default orchestrator impl.
+│   ├── agentos-proto/        # Wire types (Message, ToolCall, Envelope, Span, RequestHeader). Serde only.
+│   ├── agentos-core/         # Kernel: run loop, prompt assembly, gateway, orchestrators, approve.
+│   │   ├── loop/             # RunLoopState enum and transitions; cancellation, steering, batches.
+│   │   ├── prompt/           # The one authority over a provider request: assembly, projection,
+│   │   │                     #   token estimation, elision, compaction.
+│   │   ├── gateway/          # Bounded ingress queue, per-conversation inbox, shard threads.
+│   │   ├── orchestrator/     # builtin.max (tool-selecting) and builtin.min (LLM fallback).
 │   │   ├── approve/          # Concrete policy engine (NOT a trait).
-│   │   ├── runtime/          # Tokio setup, tracing, error types.
-│   │   └── hooks/            # Lifecycle hook dispatch.
+│   │   ├── guardrails/       # Input, tool, and output content checks.
+│   │   ├── runner/           # Envelope → run driving, task sessions, episode recording.
+│   │   ├── runtime/          # AgentRuntime construction, RuntimePaths, tool/MCP wiring.
+│   │   ├── config/           # agent.toml parse/validate + generated catalog rendering.
+│   │   ├── memory/           # MemoryManager, scope, SQLite/sqlite-vec/Qdrant, reflection.
+│   │   ├── tools/            # Registry, deadlines, built-ins, MCP adapters, memory tool.
+│   │   ├── jobs/             # Background work outliving the turn that started it.
+│   │   ├── spill/            # Oversized tool output persisted behind an opaque locator.
+│   │   ├── sandbox/          # Kernel write limits: Landlock (Linux), Seatbelt (macOS).
+│   │   ├── skills/           # Workspace skill loading, validation, deterministic planners.
+│   │   ├── subagents/        # Sub-agent execution (LocalSet).
+│   │   ├── channels/         # Telegram and Feishu reference adapters.
+│   │   ├── crons/            # Persisted scheduled tasks.
+│   │   ├── hooks/            # Lifecycle hook dispatch.
+│   │   └── invariants.rs     # Debug-build assertions over load-bearing relationships.
 │   ├── agentos-llm/          # LLM client trait + provider adapters.
-│   │   └── providers/        # openai/ (Responses), anthropic/, deepseek/, ollama/
-│   └── agentos-cli/          # Binary entry point.
+│   │   └── providers/        # openai/ (Responses API), anthropic, deepseek, ollama
+│   └── agentos-cli/          # TUI + one-shot channel entry points.
+│       └── bin/agentos-gateway/  # Persistent gateway: start/stop/status/config/catalog/calibrate.
 ├── workspace/                # Agent-owned config and data. Not a Cargo crate.
-│   └── agent.toml            # Agent wiring: orchestrator, memory, channels, policy.
+│   └── agent.toml            # Agent wiring: orchestrator, memory, channels, policy, limits.
 ├── extensions/               # Compiled-in extension crates (selected via agent.toml).
 │   ├── orchestrators/        # (empty placeholder — no orchestrator extension yet)
 │   └── memory/
+│       └── agentos-memory-vector/  # SemanticIndex impl; wired in by agentos-cli only.
+├── docs/                     # ARCHITECTURE.md, roadmaps, generated catalogs, user docs.
 ├── DESIGN.md                 # Loop state machine diagram and safety architecture.
 └── BENCHMARKS.md             # Performance targets and results.
 ```
@@ -48,9 +66,14 @@ cargo test -p agentos-interfaces                          # Interface contract t
 cargo test -p agentos-core                                # Core unit + integration tests.
 cargo test --workspace                                    # Full test suite.
 cargo bench -p agentos-core                               # Loop overhead benchmarks.
-cargo semver-checks check-release -p agentos-interfaces   # Catch breaking interface changes.
+bash scripts/check-import-boundaries.sh                    # Core must not depend on workspace/extensions.
+bash scripts/check-module-size.sh                         # 800-LOC ceiling (cfg(test) excluded).
 bash scripts/check-catalogs.sh                            # docs/*-catalog.md still match the code.
+cargo semver-checks check-release -p agentos-interfaces --baseline-rev HEAD
 ```
+
+The interface crates are unpublished, so `semver-checks` needs `--baseline-rev`;
+without it the crates.io baseline lookup fails. CI runs every command above.
 
 Run the most targeted test first. For example, if you changed `crates/agentos-core/loop/`, run `cargo test -p agentos-core` before running the full workspace suite.
 
@@ -66,6 +89,9 @@ These rules are load-bearing. Violating any of them breaks the extension model o
 - **Guardrails ≠ Approve.** Guardrails check content (input/tool/output). Approve checks permission (allow/deny/ask_user). Both are required at their designated points in the loop.
 - **Sub-agent policies only narrow.** `Policy::narrow(&parent, &child)` returns `Err` on any widening attempt. Every tool call in a sub-agent re-enters the loop at the Approve state — no shortcuts, including for MCP-originated calls.
 - **All channels are bounded.** Every `tokio::mpsc` channel must use `channel(cap)`, never `unbounded_channel()`.
+- **One authority over the request.** `crates/agentos-core/src/prompt/` is the only path from a `RunContext` to the messages a provider sees. Never build a message vector at a call site; add a named `SectionId` instead. Every request records what it was made of in a `RequestHeader`.
+- **The session log is append-only.** Nothing in it is rewritten or deleted. Compaction, elision, and fork are all *projections* over the log (`prompt/projection.rs`), never mutations of it.
+- **Isolation is a kernel boundary.** A tool declares a `SandboxMode` (`read_only`, `workspace_write`, `full_access`). Anything but `full_access` runs in a child process under Landlock/Seatbelt. Declaring a narrower mode on a tool that never spawns a child would be a claim the kernel is not making. Where no backend exists, a sandboxed tool fails rather than running unsandboxed.
 
 ## Code conventions
 
@@ -93,12 +119,15 @@ These rules are load-bearing. Violating any of them breaks the extension model o
   - `Policy::narrow` property test: random parent/child pairs, verify no widening.
   - `max_turns`: adversarial orchestrator returning `Plan::CallTool` every turn → assert `MaxTurnsExceeded`.
   - Import boundary: a deliberately broken `Cargo.toml` adding `workspace` as a dep → CI rejects.
+  - Golden transcripts (`tests/transcripts.rs`, `tests/golden/`): a scripted LLM fixture drives a complete run and the assembled requests, session items, and outcome are pinned as one artifact. Re-record deliberately (see `tests/support/mod.rs`), never to make a test pass.
+  - Generated catalogs (`tests/catalog_freshness.rs`): a config field or `ToolSpec` change without a regenerated catalog fails.
 
 ## PR conventions
 
 - Title format: `[crate-name] short description` (e.g. `[agentos-core] add tool guardrail pipeline`).
 - Run `cargo fmt --all` and `cargo clippy --workspace -- -D warnings` before committing.
-- If you changed `agentos-interfaces`, run `cargo semver-checks check-release -p agentos-interfaces` and note any breaking changes in the PR body.
+- If you changed `agentos-interfaces`, run `cargo semver-checks check-release -p agentos-interfaces --baseline-rev HEAD` and note any breaking changes in the PR body.
+- If you changed a config field's type, default, or doc comment, or a built-in `ToolSpec`, run `cargo run -p agentos-cli --bin agentos-gateway -- catalog` and commit the regenerated `docs/CONFIG_CATALOG.md` and `docs/TOOL_CATALOG.md`.
 - If you changed wire types in `agentos-proto`, verify downstream crates still compile with `cargo check --workspace`.
 
 ## Key files
@@ -111,3 +140,8 @@ These rules are load-bearing. Violating any of them breaks the extension model o
 | `crates/agentos-interfaces/src/` | Every public trait. Read this first when writing an extension. |
 | `crates/agentos-core/src/loop/` | `RunLoopState` enum and `step()` transitions. The heart of the system. |
 | `crates/agentos-core/src/approve/` | Policy engine: `Policy` rules with `allow`, `deny`, `ask_user` verbs. Built from `[policy]` in `agent.toml` by `runtime::phase5_policy`. |
+| `crates/agentos-core/src/prompt/` | The single authority over what a provider request contains. |
+| `crates/agentos-core/src/invariants.rs` | Debug-build assertions over three load-bearing relationships. Compiled out of release builds. |
+| `docs/ARCHITECTURE.md` | Full architecture reference: extension boundary, config authority, memory model, verification matrix. |
+| `docs/TRANSFER_ROADMAP.md` | Most recent work, with per-item rationale and status. |
+| `docs/CONFIG_CATALOG.md`, `docs/TOOL_CATALOG.md` | Generated from the code by `agentos-gateway catalog`. Edit the doc comment on the field, not the table. |

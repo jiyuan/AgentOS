@@ -8,15 +8,23 @@ Highlights:
 
 - a typed run loop (`Start → Plan → Approve → Act → Observe`) with serializable
   paused runs
-- a concrete approval policy plus input/output/tool guardrails
+- a concrete approval policy plus input/output/tool guardrails, with approval
+  prompts that only the ticket they issued can answer
+- one module that assembles every provider request, and a manifest on each
+  request recording what went into it
+- an append-only session log with projected views: tool-output spill, elision
+  under context pressure, span compaction, and conversation fork
 - pluggable extension traits (`Channel`, `Tool`, `Skill`, `McpClient`,
-  `Memory`, `Session`, `Orchestrator`)
+  `Memory`, `Session`, `SemanticIndex`, `Orchestrator`)
 - sub-agents and routing whose permissions can only narrow the parent's
 - scoped three-layer memory (session, working, long-term) on a SQLite reference
-  backend
-- static and stdio MCP-backed tools, with subprocess isolation for tools marked
-  `requires_isolation`
-- an interactive TUI and a persistent gateway for Telegram and Feishu
+  backend, with optional vector retrieval
+- static and stdio MCP-backed tools, kernel-sandboxed (Landlock/Seatbelt) for
+  tools that declare a `SandboxMode`
+- per-tool deadlines, run cancellation, mid-run steering, and background jobs
+  for work that outlives a turn
+- an interactive TUI and a persistent gateway for Telegram and Feishu that runs
+  conversations concurrently
 
 ## Quick start
 
@@ -31,8 +39,8 @@ scripts/install-agentos.sh --from-source
 From a packaged release bundle:
 
 ```sh
-tar -xzf agentos-v0.2.0-<platform>-<arch>.tar.gz
-cd agentos-v0.2.0-<platform>-<arch>
+tar -xzf agentos-v<version>-<platform>-<arch>.tar.gz
+cd agentos-v<version>-<platform>-<arch>
 scripts/install-agentos.sh
 ~/.local/bin/agentos tui
 ```
@@ -47,19 +55,23 @@ crates must never depend on workspace or extension content.
 
 - `agentos-proto`: serializable wire and domain types.
 - `agentos-interfaces`: public extension traits and shared run-state types.
-- `agentos-core`: run loop, runner, gateway service, approval engine,
-  guardrails, reference tools, memory/session stores, sub-agent execution,
-  channel adapters, and config parsing.
+- `agentos-core`: run loop, prompt assembly, runner, gateway service, approval
+  engine, guardrails, reference tools, memory/session stores, sub-agent
+  execution, sandboxing, background jobs, channel adapters, and config parsing.
 - `agentos-llm`: provider-neutral LLM facade and provider adapters.
 - `agentos-cli`: TUI, one-shot channel entry points, persistent gateway, and
   runtime path construction.
 
 Four independent safety rings protect every run: the type system enumerates
 valid control flow, guardrails inspect content, the concrete `Approve` engine
-allows/denies/pauses boundary actions, and subprocess isolation contains tools
-that request it. Workspace-owned content (`agent.toml`, `skills/`,
-`subagents/`, `suborchs/`, `crons/`, `tasks/`, runtime state) is loaded as data
-through config, never linked as a dependency.
+allows/denies/pauses boundary actions, and a kernel sandbox (Landlock on Linux,
+Seatbelt on macOS) contains the child processes of tools that declare a
+`SandboxMode`. Three further relationships the rings depend on are asserted in
+debug builds and compiled out of release ones.
+
+Workspace-owned content (`agent.toml`, `skills/`, `subagents/`, `suborchs/`,
+`crons/`, `tasks/`, runtime state) is loaded as data through config, never
+linked as a dependency.
 
 See the [Architecture Design Document](docs/ARCHITECTURE.md) for the full run
 loop model, memory architecture, and extension boundary.
@@ -77,6 +89,7 @@ loop model, memory architecture, and extension boundary.
 - [User Guide](docs/USER_GUIDE.md)
 - [Architecture Design Document](docs/ARCHITECTURE.md)
 - [Skills Guide](docs/SKILLS.md)
+- [Config catalog](docs/CONFIG_CATALOG.md) and [tool catalog](docs/TOOL_CATALOG.md) — generated from the code
 - [Release Notes](docs/RELEASE_NOTES.md)
 
 ## Release artifacts

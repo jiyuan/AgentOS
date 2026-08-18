@@ -403,9 +403,12 @@ and 4.3 landed without touching the public `Llm` trait. Open follow-ups
 carried out of this roadmap:
 
 - Delete the deprecated `runtime::load_workspace_config()` wrapper after one
-  release (Phase 2.3 note; equivalence tests are the gate).
-- Making the loop future `Send` (or formally adopting thread-per-core) — the
-  `!Send` finding recorded in `BENCHMARKS.md`.
+  release (Phase 2.3 note; equivalence tests are the gate). Still present at
+  `runtime/mod.rs`, still covered by `tests/config_loader.rs`.
+- ~~Making the loop future `Send` (or formally adopting thread-per-core)~~ —
+  **resolved** by [`TRANSFER_ROADMAP.md`](TRANSFER_ROADMAP.md) G1: thread-per-core
+  is now the deliberate scaling model, and `gateway/shard.rs` is the concurrency
+  bench's shape promoted to product. The loop future stays `!Send`.
 - `env.rs` / `lib.rs` startup-path `Result<_, String>` hygiene in
   `agentos-llm` (out of 4.3's scope).
 - Link-time extension registry design doc, if out-of-tree extension demand

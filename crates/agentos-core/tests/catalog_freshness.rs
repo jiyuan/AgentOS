@@ -32,14 +32,14 @@ fn the_config_catalog_matches_the_config_structs() {
             );
         }
     };
-    let path = repo_file("docs/config-catalog.md");
+    let path = repo_file("docs/CONFIG_CATALOG.md");
     let existing = std::fs::read_to_string(&path)
         .unwrap_or_else(|err| panic!("{} is missing: {err}; {REGENERATE}", path.display()));
     let expected = catalog::splice(&existing, catalog::BEGIN_MARKER, catalog::END_MARKER, &body)
         .expect("the catalog keeps its markers");
     assert_eq!(
         existing, expected,
-        "docs/config-catalog.md is stale; {REGENERATE}"
+        "docs/CONFIG_CATALOG.md is stale; {REGENERATE}"
     );
 }
 
@@ -52,7 +52,7 @@ fn the_tool_catalog_matches_the_registered_specs() {
     }
     let body = catalog::tool_markdown(&registry.specs());
 
-    let path = repo_file("docs/tool-catalog.md");
+    let path = repo_file("docs/TOOL_CATALOG.md");
     let existing = std::fs::read_to_string(&path)
         .unwrap_or_else(|err| panic!("{} is missing: {err}; {REGENERATE}", path.display()));
     let expected = catalog::splice(
@@ -64,7 +64,7 @@ fn the_tool_catalog_matches_the_registered_specs() {
     .expect("the catalog keeps its markers");
     assert_eq!(
         existing, expected,
-        "docs/tool-catalog.md is stale; {REGENERATE}"
+        "docs/TOOL_CATALOG.md is stale; {REGENERATE}"
     );
 }
 
@@ -72,7 +72,7 @@ fn the_tool_catalog_matches_the_registered_specs() {
 /// tool this build does not have.
 #[test]
 fn every_built_in_tool_has_a_row() {
-    let catalog = std::fs::read_to_string(repo_file("docs/tool-catalog.md"))
+    let catalog = std::fs::read_to_string(repo_file("docs/TOOL_CATALOG.md"))
         .expect("the tool catalog exists");
     for name in BUILTIN_TOOL_NAMES {
         assert!(
