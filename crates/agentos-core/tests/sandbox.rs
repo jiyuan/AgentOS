@@ -73,12 +73,45 @@ async fn a_sandboxed_tool_never_runs_in_process_without_an_executor() {
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn seatbelt_availability_requires_successful_profile_application() {
+    let applied = std::process::Command::new("/usr/bin/sandbox-exec")
+        .args(["-p", "(version 1)\n(allow default)", "/usr/bin/true"])
+        .output()
+        .is_ok_and(|output| output.status.success());
+
+    assert_eq!(
+        matches!(
+            availability(),
+            agentos_core::sandbox::Availability::Enforced("seatbelt")
+        ),
+        applied,
+        "binary presence alone must not count as an enforced Seatbelt backend"
+    );
+}
+
 /// Skip with a reason, or return the mechanism doing the enforcing.
 macro_rules! enforced_or_skip {
     ($test:literal) => {
         match availability() {
-            agentos_core::sandbox::Availability::Enforced(mechanism) => mechanism,
+            agentos_core::sandbox::Availability::Enforced(mechanism) => {
+                if let Ok(required) = std::env::var("AGENTOS_REQUIRE_SANDBOX") {
+                    assert_eq!(
+                        mechanism, required,
+                        "{} requires the configured sandbox backend",
+                        $test
+                    );
+                }
+                mechanism
+            }
             agentos_core::sandbox::Availability::Unavailable(reason) => {
+                if let Ok(required) = std::env::var("AGENTOS_REQUIRE_SANDBOX") {
+                    panic!(
+                        "{} requires sandbox backend '{}', but it is unavailable: {reason}",
+                        $test, required
+                    );
+                }
                 eprintln!("skipping {}: {reason}", $test);
                 return;
             }

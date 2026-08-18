@@ -52,7 +52,9 @@ an expired prompt is recorded as cancelled, not refused.
 Landlock on Linux, Seatbelt on macOS — inherited by every descendant process.
 The registry now refuses missing executors, unavailable backends, unsupported
 modes or protocols, and worker failures without invoking the in-process tool
-body. `SBX-001` still tracks required platform jobs and isolation of the actual
+body. macOS availability now requires `sandbox-exec` to apply a permissive
+profile and a read-only profile to deny a control write; binary presence alone
+does not qualify the backend. `SBX-001` still tracks isolation of the actual
 stdio MCP server process.
 
 **Correctness and hygiene.** Every tool call in a multi-call response is now

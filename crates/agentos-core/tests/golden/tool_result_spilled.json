@@ -24,17 +24,17 @@
     {
       "context_budget_tokens": 4096,
       "pressure_percent": 6,
-      "prompt_estimated_tokens": 248,
+      "prompt_estimated_tokens": 283,
       "sections": [
         {
-          "chars": 792,
+          "chars": 930,
           "id": "transcript",
           "messages": 3,
-          "tokens": 217
+          "tokens": 252
         }
       ],
       "tool_tokens": 31,
-      "total_chars": 792,
+      "total_chars": 930,
       "total_messages": 3
     }
   ],

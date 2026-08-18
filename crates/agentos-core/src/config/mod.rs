@@ -799,9 +799,6 @@ stages = [
                 Arc::from("skill-creator"),
                 Arc::from("web-research"),
                 Arc::from("audit-skill"),
-                Arc::from("email-digest"),
-                Arc::from("rss-digest"),
-                Arc::from("fetch-arxiv-paper-list"),
             ]
         );
         assert!(

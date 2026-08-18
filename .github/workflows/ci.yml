@@ -40,12 +40,33 @@ jobs:
   test:
     name: workspace tests
     runs-on: ubuntu-latest
+    env:
+      # Enforcement tests must exercise Landlock in CI; an unavailable backend
+      # is a failed platform claim, not a successful skip.
+      AGENTOS_REQUIRE_SANDBOX: landlock
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
         run: cargo test --workspace
+
+  macos-test:
+    name: macOS workspace tests + bench smoke
+    runs-on: macos-latest
+    env:
+      # `availability()` performs a real permissive/restrictive profile probe.
+      # Requiring the result here prevents binary presence or a skipped suite
+      # from qualifying macOS support.
+      AGENTOS_REQUIRE_SANDBOX: seatbelt
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run workspace tests with real Seatbelt enforcement
+        run: cargo test --workspace
+      - name: Smoke-run benches on macOS
+        run: cargo bench -p agentos-core -- --test
 
   bench-smoke:
     name: bench compile + smoke

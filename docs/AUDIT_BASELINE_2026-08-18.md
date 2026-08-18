@@ -35,6 +35,19 @@ The two test failures are named work rather than new hidden exceptions:
    GNU `touch -d`; macOS `touch` rejects that syntax. This is M1/`CI-001`'s
    portable timestamp-fixture item.
 
+The subsequent `CI-001` slice resolves both recorded failures: the resource
+assertion follows the shipped three-skill list and the spill fixture uses
+Rust's portable `File::set_modified`. It also fixes the uncounted Seatbelt
+false positive by probing profile application and denied writes. In the Codex
+desktop containment environment the real probe reports Seatbelt unavailable,
+so local enforcement tests skip honestly; required Linux/macOS CI jobs convert
+such a skip into failure before the platform can qualify.
+
+Post-slice local verification is green for `cargo test --workspace` and
+`cargo bench -p agentos-core -- --test`; the core library now reports 375
+passing tests. This is evidence that the baseline blockers are closed, not a
+substitute for the newly required Landlock and Seatbelt CI runs.
+
 Because `cargo bench -p agentos-core --locked -- --test` runs library tests
 before the bench binaries, the same two failures also prevent the required
 aggregate bench-smoke command from reaching its harnesses.

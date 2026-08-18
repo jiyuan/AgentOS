@@ -147,6 +147,18 @@ async fn hydrated_memory_reaches_the_model() {
 // 9. Oversized tool result: spilled, not destroyed
 // ---------------------------------------------------------------------------
 
+#[test]
+fn golden_temp_paths_have_a_stable_character_count() {
+    let short = support::temp_tree("x");
+    let long = support::temp_tree("a-much-longer-label");
+
+    assert_eq!(
+        short.path().to_string_lossy().chars().count(),
+        long.path().to_string_lossy().chars().count(),
+        "golden token counts must not depend on a fixture label's path length"
+    );
+}
+
 /// Roadmap item C2. Before it, output past the inline cap was cut and the
 /// remainder destroyed. Now the full text goes to the spill store and the
 /// transcript keeps a preview plus a locator, so the golden pins both what the

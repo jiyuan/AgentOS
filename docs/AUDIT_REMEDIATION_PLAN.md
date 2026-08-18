@@ -186,7 +186,7 @@ Primary files:
 
 Priority: P0  
 Size: M  
-Status: planned; missing default skill names partially repaired by `224f070`  
+Status: in progress; missing default skill names were partially repaired by `224f070`, and `CI-001` portability/probe changes are implemented pending required CI runs
 Dependencies: M0
 
 Deliverables:
@@ -200,9 +200,13 @@ Deliverables:
    of requiring the private `agentos-gateway` binary on `PATH`.
 4. Make `agentos resume` handle an omitted state path without a `set -u` failure.
 5. Replace the GNU-only `touch -d` test setup with a portable Rust mechanism.
+   **Implemented:** the fixture uses `File::set_modified`.
 6. Make spill golden fixtures independent of absolute temporary-path length.
+   **Implemented:** golden temp paths have a fixed displayed width before
+   request accounting and are redacted before comparison.
 7. Probe actual Seatbelt profile application on macOS; presence of
-   `/usr/bin/sandbox-exec` alone is not availability.
+   `/usr/bin/sandbox-exec` alone is not availability. **Implemented:** a cached
+   permissive-profile and denied-write probe determines availability.
 8. Add a clean-room source and release-artifact smoke job.
 
 Acceptance criteria:
@@ -534,7 +538,7 @@ policy semantics, and new features in one PR.
 | `TEST-001` | Add red tests for the P0/P1 audit findings (**in progress:** strict policy-narrowing and no-body-invocation sandbox regressions landed) | ADR-001 |
 | `REL-001` | Self-contained release workspace and documentation | TEST-001 |
 | `REL-002` | Installer/wrapper contract and clean-room smoke | REL-001 |
-| `CI-001` | Portable spill/golden tests and macOS sandbox probe | TEST-001 |
+| `CI-001` | Portable spill/golden tests and macOS sandbox probe (**in progress:** implementation and required Linux/macOS sandbox jobs added; qualifying CI run pending) | TEST-001 |
 | `ID-001` | Typed principal and injective namespace | ADR-001 |
 | `ID-002` | Versioned persistence migration and collision report | ID-001 |
 | `AUTH-001` | Remote sender authentication and approval binding | ID-001 |

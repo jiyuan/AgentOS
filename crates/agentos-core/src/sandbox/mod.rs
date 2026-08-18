@@ -39,10 +39,9 @@ use thiserror::Error;
 
 #[cfg(target_os = "linux")]
 mod linux;
-// Not gated on the target: the Seatbelt backend is string building and one
-// `Path::exists`, so compiling and unit-testing it everywhere is the only
-// verification available for a platform the CI machine is not. Only its use is
-// conditional.
+// Not gated on the target: profile construction is platform-neutral and is
+// unit-tested everywhere. The process probe is only selected by `availability`
+// on macOS.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod macos;
 

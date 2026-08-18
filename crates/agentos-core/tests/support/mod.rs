@@ -255,11 +255,28 @@ impl Drop for TempTree {
 /// golden that redacts this path still pins the *character count* of the
 /// content that carried it, and a `ThreadId` that renders as one digit on one
 /// run and two on the next would make that count depend on test scheduling.
+/// The whole displayed path is padded to a fixed width as well, so a different
+/// `TMPDIR` cannot perturb request token counts before the path is redacted.
 pub fn temp_tree(label: &str) -> TempTree {
+    const DISPLAY_CHARS: usize = 180;
     let mut hasher = DefaultHasher::new();
     (std::process::id(), std::thread::current().id()).hash(&mut hasher);
-    let root =
-        std::env::temp_dir().join(format!("agentos-golden-{label}-{:016x}", hasher.finish()));
+    let base = std::env::temp_dir();
+    let mut component = format!("agentos-golden-{label}-{:016x}", hasher.finish());
+    let occupied = base.join(&component).to_string_lossy().chars().count();
+    let padding = DISPLAY_CHARS.checked_sub(occupied).unwrap_or_else(|| {
+        panic!(
+            "temporary root is too long for stable golden paths: {}",
+            base.display()
+        )
+    });
+    component.extend(std::iter::repeat_n('_', padding));
+    let root = base.join(component);
+    assert_eq!(
+        root.to_string_lossy().chars().count(),
+        DISPLAY_CHARS,
+        "golden temp path width is stable"
+    );
     std::fs::create_dir_all(&root).expect("a temp tree is creatable");
     TempTree(root)
 }

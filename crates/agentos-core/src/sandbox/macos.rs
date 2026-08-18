@@ -11,29 +11,64 @@
 //! is allowed would have to enumerate every path a shell command legitimately
 //! touches, and would deny by accident rather than by decision.
 //!
-//! **Verified by construction, not by running.** This module is compiled and
-//! unit-tested on every platform, not just macOS — it is string building and
-//! one `Path::exists`, so there is no reason for the profile builder or the
-//! quote escaping to go unchecked on the machine that happens to run CI. What
-//! cannot be checked anywhere but macOS is whether Seatbelt then honours the
-//! profile, and the enforcement suite skips with a reason where
-//! [`super::availability`] does not report it. `sandbox-exec` is also deprecated by Apple, still present
-//! and still the only unprivileged option — if it is removed, `availability`
-//! starts reporting unavailable and tools declaring a sandbox stop running
-//! rather than quietly running unsandboxed.
+//! Profile construction is unit-tested on every platform. On macOS,
+//! [`super::availability`] additionally runs and caches a real probe: a
+//! permissive profile must start successfully and a read-only profile must
+//! deny a control write. Binary presence alone is not support. `sandbox-exec`
+//! is deprecated by Apple but remains the only unprivileged option; removal or
+//! profile-application failure makes sandboxed tools fail closed.
 
 use super::{Availability, Sandbox};
+use agentos_interfaces::tool::SandboxMode;
 use std::path::Path;
+use std::process::Command;
+use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Apple's profile interpreter. Deprecated, present on every supported release.
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
 pub(super) fn availability() -> Availability {
-    if Path::new(SANDBOX_EXEC).exists() {
-        Availability::Enforced("seatbelt")
-    } else {
-        Availability::Unavailable("this machine has no /usr/bin/sandbox-exec")
+    static PROBED: OnceLock<Availability> = OnceLock::new();
+    *PROBED.get_or_init(probe_availability)
+}
+
+fn probe_availability() -> Availability {
+    if !Path::new(SANDBOX_EXEC).exists() {
+        return Availability::Unavailable("this machine has no /usr/bin/sandbox-exec");
     }
+
+    let permissive = Command::new(SANDBOX_EXEC)
+        .args(["-p", "(version 1)\n(allow default)", "/usr/bin/true"])
+        .output();
+    if !permissive.is_ok_and(|output| output.status.success()) {
+        return Availability::Unavailable("sandbox-exec cannot apply a Seatbelt profile");
+    }
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let target = std::env::temp_dir().join(format!(
+        ".agentos-seatbelt-probe-{}-{nonce}",
+        std::process::id()
+    ));
+    if std::fs::write(&target, b"control").is_err() {
+        return Availability::Unavailable("Seatbelt probe cannot write its control file");
+    }
+    let _ = std::fs::remove_file(&target);
+
+    let sandbox = Sandbox::new(SandboxMode::ReadOnly, std::env::temp_dir());
+    let denied = Command::new(SANDBOX_EXEC)
+        .args(["-p", &profile(&sandbox), "/usr/bin/touch"])
+        .arg(&target)
+        .output();
+    let restriction_held = denied.is_ok_and(|output| !output.status.success()) && !target.exists();
+    let _ = std::fs::remove_file(&target);
+    if !restriction_held {
+        return Availability::Unavailable("Seatbelt probe did not deny a forbidden write");
+    }
+
+    Availability::Enforced("seatbelt")
 }
 
 /// Put the command inside `sandbox-exec -p <profile>`.
@@ -68,7 +103,6 @@ fn escape(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentos_interfaces::tool::SandboxMode;
     use std::path::PathBuf;
 
     /// The order matters: a profile that allowed writes before denying them

@@ -607,3 +607,23 @@
 - **Actual Behavior**: A broad patch hunk matched the first `Status: planned` line and temporarily wrote the M3 status into M2.
 - **Root Cause**: The patch context did not include the milestone heading, so repeated status text was ambiguous.
 - **Suggested Fix**: Include the section heading in patches to repeated documentation fields and verify the exact surrounding section immediately afterward. The milestone statuses were corrected and re-read in the same session.
+
+## [2026-08-18 17:12] EFFICIENCY [RESOLVED]
+
+- **Agent**: main-codex
+- **Task**: Run the two focused core regressions for the `CI-001` portability slice.
+- **Guideline Violated**: GUIDELINES > Efficiency
+- **Expected Behavior**: Each exact Cargo test filter should be invoked in a supported command form.
+- **Actual Behavior**: One Cargo invocation supplied two positional test filters, so Cargo rejected the second argument before running either test.
+- **Root Cause**: The command treated Cargo's single `TESTNAME` filter as repeatable.
+- **Suggested Fix**: Run exact filters as separate Cargo commands or use one shared substring filter. The two tests were rerun separately and passed.
+
+## [2026-08-18 17:14] TOOL [RESOLVED]
+
+- **Agent**: main-codex
+- **Task**: Parse the modified GitHub Actions workflow as YAML.
+- **Guideline Violated**: GUIDELINES > Consistency
+- **Expected Behavior**: The repository's system Ruby should parse the workflow with its installed Psych API.
+- **Actual Behavior**: The first validation used the newer `aliases:` keyword, which macOS system Ruby 2.6 does not support.
+- **Root Cause**: The one-off command assumed a newer Psych method signature than the workspace host provides.
+- **Suggested Fix**: Use the lowest-common-denominator `YAML.load_file(path)` call for syntax validation unless alias control is required. The compatible command was rerun successfully.
