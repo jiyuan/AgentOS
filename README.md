@@ -105,5 +105,5 @@ Packaged releases are written to `dist/` by `scripts/package-release.sh`.
 Each archive contains the binaries, static runtime workspace, and complete
 linked documentation set. From a source checkout,
 `scripts/check-release-archive.py <archive>` verifies those references and
-completes an offline `builtin.echo` turn after extracting the bundle to a
-temporary directory.
+completes direct-archive, source-install, and packaged-install offline
+`builtin.echo` turns under isolated temporary homes.

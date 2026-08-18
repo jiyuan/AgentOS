@@ -255,8 +255,8 @@ Gateway persistent channel precedence:
 Diagnostic commands:
 
 ```sh
-agentos-gateway config --config workspace/agent.toml   # effective config
-agentos-gateway catalog --check                        # catalogs still match the code
+agentos config                    # installed effective config and sandbox status
+scripts/check-catalogs.sh         # source catalogs still match the code
 ```
 
 ## 7. Run Loop Model
@@ -431,7 +431,7 @@ AgentOS uses four independent safety rings:
    `full_access` is the default and means no sandbox — the honest declaration for
    a tool that does its work in-process, where the only available restriction
    would apply to the whole agent permanently; such tools are bounded by rings 2
-   and 3 instead. Reads and network are not restricted. `agentos-gateway config`
+   and 3 instead. Reads and network are not restricted. `agentos config`
    prints which mechanism (if any) this machine enforces with.
 
 ### Checked invariants

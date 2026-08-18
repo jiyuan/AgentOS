@@ -1297,7 +1297,7 @@ this kernel reports Landlock ABI 6 — and is proven load-bearing: making
     ring covers which.
   - **A sandbox that cannot be built fails the call.** Not a warning: the
     alternative to a failed sandbox is running the tool with everything it asked
-    not to have. `agentos-gateway config` prints
+    not to have. `agentos config` prints
     `sandbox.enforcement=landlock|seatbelt|<reason>` so an operator learns this
     at startup rather than from a failed tool call.
   - **The macOS backend is compiled and unit-tested on Linux.** It is string
@@ -1338,13 +1338,13 @@ the directory listing limit. Fold in the new keys from C1–C3, D2, and G1.
   under its ceiling); `runtime/mod.rs`; `workspace/agent.toml`.
 - Effort: S. Depends: whichever of C1–C3, D2, G1 have landed.
 - Verify: `cargo test -p agentos-core --test config_loader`; an out-of-range
-  value fails loud at load; `agentos-gateway config` prints every new key.
+  value fails loud at load; `agentos config` prints every new key.
 - Exit: no `DEFAULT_*` constant governs a value an operator has reason to change.
 
 **Status: done.** New `config/spill.rs` (`[spill].root`, `.retention_days` —
 the keys C2 deferred here) and `[compaction].model` (deferred by C3);
 `[limits]` gained `directory_list_entries`, `file_read_bytes`,
-`file_read_max_bytes` and `tool_output_bytes`. `agentos-gateway config` prints
+`file_read_max_bytes` and `tool_output_bytes`. `agentos config` prints
 every one. Verified: `cargo fmt --all --check`, `cargo clippy --workspace
 --all-targets -- -D warnings`, 530 tests, import boundaries, module sizes.
 

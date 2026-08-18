@@ -152,7 +152,8 @@ Commands:
   gateway-restart       Restart the persistent gateway.
   gateway-stop          Stop the persistent gateway.
   gateway-status        Show gateway status.
-  resume PATH           Resume a paused run.
+  config                Show effective runtime configuration and sandbox status.
+  resume [PATH]         Resume a paused run; defaults to the standard state path.
 
 Options:
   --env-file PATH       Load environment from PATH.
@@ -186,10 +187,17 @@ while [[ $# -gt 0 ]]; do
       mode="gateway-status"
       shift
       ;;
+    config)
+      mode="config"
+      shift
+      ;;
     resume)
       mode="resume"
-      resume_path="$2"
-      shift 2
+      shift
+      if [[ $# -gt 0 && "$1" != --* ]]; then
+        resume_path="$1"
+        shift
+      fi
       ;;
     --env-file)
       env_file="$2"
@@ -234,10 +242,17 @@ done
 
 load_env_file "$env_file"
 
+# The selected home locates this script, its binaries, and its .env. Keep that
+# anchor authoritative even when the example .env contains `AGENTOS_HOME=`.
+export AGENTOS_HOME="$agentos_home"
+
 export AGENTOS_AGENT_CONFIG_PATH="${AGENTOS_AGENT_CONFIG_PATH:-$agentos_home/workspace/agent.toml}"
 export AGENTOS_SESSION_DB_PATH="${AGENTOS_SESSION_DB_PATH:-$agentos_home/workspace/agentos.sqlite}"
 export AGENTOS_RUN_STATE_PATH="${AGENTOS_RUN_STATE_PATH:-$agentos_home/workspace/runs/cli-run-1.json}"
 export AGENTOS_TOOL_WORKER_PATH="${AGENTOS_TOOL_WORKER_PATH:-$tool_worker_bin}"
+if [[ "$mode" == "resume" && -z "$resume_path" ]]; then
+  resume_path="$AGENTOS_RUN_STATE_PATH"
+fi
 
 mkdir -p "$(dirname "$AGENTOS_SESSION_DB_PATH")" "$(dirname "$AGENTOS_RUN_STATE_PATH")" "$(dirname "$gateway_pid_path")" "$(dirname "$gateway_log_path")"
 
@@ -255,6 +270,9 @@ case "$mode" in
     ;;
   gateway-status)
     exec "$gateway_bin" status --pid-path "$gateway_pid_path" --log-path "$gateway_log_path" --config "$AGENTOS_AGENT_CONFIG_PATH" --session-db-path "$AGENTOS_SESSION_DB_PATH"
+    ;;
+  config)
+    exec "$gateway_bin" config --pid-path "$gateway_pid_path" --log-path "$gateway_log_path" --config "$AGENTOS_AGENT_CONFIG_PATH" --session-db-path "$AGENTOS_SESSION_DB_PATH"
     ;;
   tui)
     exec "$cli_bin" ${cli_args[@]+"${cli_args[@]}"}

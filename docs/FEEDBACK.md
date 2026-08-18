@@ -647,3 +647,13 @@
 - **Actual Behavior**: Work was performed locally because the active runtime instructions only permit spawning subagents when the user explicitly requests delegation.
 - **Root Cause**: Higher-priority runtime instructions conflict with the repository's automatic delegation threshold, and the user did not explicitly authorize subagent spawning.
 - **Suggested Fix**: Amend the repository guideline to account for environments where subagent spawning is gated by explicit user consent.
+
+## [2026-08-18 19:28] ORCHESTRATION [RESOLVED]
+
+- **Agent**: main-codex
+- **Task**: Implement the `REL-002` installer and installed-wrapper contract slice.
+- **Guideline Violated**: ORCHESTRATION > Subagent Delegation & Creation
+- **Expected Behavior**: Delegate work involving more than two sequential tool calls to a matching subagent.
+- **Actual Behavior**: Work was performed locally because the active runtime instructions only permit spawning subagents when the user explicitly requests delegation.
+- **Root Cause**: Higher-priority runtime instructions conflict with the repository's automatic delegation threshold, and the user did not explicitly authorize subagent spawning.
+- **Suggested Fix**: Amend the repository guideline to account for environments where subagent spawning is gated by explicit user consent.

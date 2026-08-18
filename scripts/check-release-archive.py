@@ -200,20 +200,168 @@ def smoke_offline_echo(root: Path) -> None:
         )
 
 
+def clean_runtime_env() -> dict[str, str]:
+    env = os.environ.copy()
+    for name in [
+        "PREFIX",
+        "BINDIR",
+        "XDG_BIN_HOME",
+        "XDG_DATA_HOME",
+        "AGENTOS_HOME",
+        "AGENTOS_ENV_FILE",
+        "AGENTOS_AGENT_CONFIG_PATH",
+        "AGENTOS_SESSION_DB_PATH",
+        "AGENTOS_RUN_STATE_PATH",
+        "AGENTOS_TOOL_WORKER_PATH",
+        "AGENTOS_GATEWAY_PID_PATH",
+        "AGENTOS_GATEWAY_LOG_PATH",
+    ]:
+        env.pop(name, None)
+    env.update(
+        {
+            "AGENTOS_NO_ENV_OVERRIDE": "1",
+            "AGENTOS_LLM_PROVIDER": "builtin.echo",
+            "AGENTOS_LLM_MODEL": "builtin.echo",
+            "AGENTOS_LLM_MODEL_HIGH": "",
+            "AGENTOS_LLM_MODEL_MEDIUM": "",
+            "AGENTOS_LLM_MODEL_LOW": "",
+            "AGENTOS_TUI_STREAM": "0",
+            "OPENAI_API_KEY": "",
+            "ANTHROPIC_API_KEY": "",
+            "DEEPSEEK_API_KEY": "",
+            "OLLAMA_HOST": "",
+        }
+    )
+    return env
+
+
+def run_wrapper(wrapper: Path, home: Path, *args: str, input_text: str | None = None):
+    env = clean_runtime_env()
+    env["HOME"] = str(home)
+    return subprocess.run(
+        [str(wrapper), *args],
+        input=input_text,
+        text=True,
+        cwd=home.parent,
+        env=env,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+
+
+def smoke_installed_wrapper(
+    root: Path,
+    temporary: Path,
+    label: str,
+    install_args: tuple[str, ...] = (),
+) -> None:
+    fake_home = temporary / f"{label}-home"
+    fake_home.mkdir()
+    install_env = clean_runtime_env()
+    install_env["HOME"] = str(fake_home)
+    install = subprocess.run(
+        [str(root / "scripts/install-agentos.sh"), *install_args],
+        text=True,
+        cwd=root,
+        env=install_env,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    if install.returncode != 0:
+        fail(
+            f"clean-room install exited {install.returncode}\n"
+            f"stdout:\n{install.stdout}\nstderr:\n{install.stderr}"
+        )
+
+    wrapper = fake_home / ".local/bin/agentos"
+    installed_home = fake_home / ".local/share/agentos"
+    if not os.access(wrapper, os.X_OK):
+        fail(f"installer did not create the documented wrapper: {wrapper}")
+    if not (installed_home / "workspace/agent.toml").is_file():
+        fail(f"installer did not create the documented runtime home: {installed_home}")
+    leaked_state = [
+        path
+        for path in [
+            installed_home / "workspace/agentos.sqlite",
+            installed_home / "workspace/main",
+            installed_home / "workspace/traces/telegram-gateway.jsonl",
+        ]
+        if path.exists()
+    ]
+    if leaked_state:
+        fail(f"{label} install copied runtime state: {', '.join(map(str, leaked_state))}")
+
+    config = run_wrapper(wrapper, fake_home, "config")
+    expected_config_lines = [
+        f"config.path={installed_home / 'workspace/agent.toml'}",
+        f"paths.home={installed_home}",
+    ]
+    if config.returncode != 0 or any(
+        line not in config.stdout.splitlines() for line in expected_config_lines
+    ):
+        fail(
+            f"installed `agentos config` contract failed\n"
+            f"stdout:\n{config.stdout}\nstderr:\n{config.stderr}"
+        )
+
+    status = run_wrapper(wrapper, fake_home, "gateway-status")
+    if status.returncode != 0 or status.stdout.strip() != "AgentOS gateway status: stopped":
+        fail(
+            f"installed `agentos gateway-status` contract failed\n"
+            f"stdout:\n{status.stdout}\nstderr:\n{status.stderr}"
+        )
+
+    resume = run_wrapper(wrapper, fake_home, "resume")
+    default_state = installed_home / "workspace/runs/cli-run-1.json"
+    resume_output = f"{resume.stdout}\n{resume.stderr}"
+    if resume.returncode == 0 or str(default_state) not in resume_output:
+        fail(
+            f"pathless resume did not fail deterministically at {default_state}\n"
+            f"stdout:\n{resume.stdout}\nstderr:\n{resume.stderr}"
+        )
+    if "unbound variable" in resume_output:
+        fail(f"pathless resume triggered a shell nounset failure: {resume_output}")
+
+    marker = "installed release offline echo smoke"
+    echo = run_wrapper(wrapper, fake_home, "tui", input_text=f"{marker}\n/exit\n")
+    if echo.returncode != 0 or marker not in echo.stdout:
+        fail(
+            f"installed offline echo contract failed\n"
+            f"stdout:\n{echo.stdout}\nstderr:\n{echo.stderr}"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("archive", type=Path)
+    parser.add_argument(
+        "--source-root",
+        type=Path,
+        help="also smoke a source install using its existing release binaries",
+    )
     args = parser.parse_args()
     archive = args.archive.resolve()
     if not archive.is_file():
         fail(f"archive not found: {archive}")
 
     with tempfile.TemporaryDirectory(prefix="agentos-release-check-") as temporary:
-        root = extract_archive(archive, Path(temporary))
+        temporary_path = Path(temporary)
+        root = extract_archive(archive, temporary_path)
         require_paths(root)
         verify_workspace_references(root)
         verify_document_links(root)
         smoke_offline_echo(root)
+        smoke_installed_wrapper(root, temporary_path, "archive")
+        if args.source_root is not None:
+            source_root = args.source_root.resolve()
+            smoke_installed_wrapper(
+                source_root,
+                temporary_path,
+                "source",
+                ("--from-source", "--skip-build"),
+            )
     print(f"release archive is self-contained: {archive}")
 
 

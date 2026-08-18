@@ -26,6 +26,11 @@ This installs AgentOS into:
 - binaries: `~/.local/bin`
 - runtime home: `~/.local/share/agentos`
 
+If `XDG_DATA_HOME` is set, the runtime home is
+`$XDG_DATA_HOME/agentos`. Override the paths independently with `--bindir` and
+`--home`, or use `--prefix PATH` to install under `PATH/bin` and
+`PATH/share/agentos`.
+
 ## Install from a release bundle
 
 ```sh
@@ -101,6 +106,13 @@ AGENTOS_FEISHU_ALLOWED_ID=...
 ## Verify install
 
 ```sh
+~/.local/bin/agentos config
 ~/.local/bin/agentos gateway-status
-~/.local/bin/agentos tui
+printf 'offline install smoke\n/exit\n' | \
+  AGENTOS_LLM_PROVIDER=builtin.echo ~/.local/bin/agentos tui
 ```
+
+`agentos gateway-status` prints `AgentOS gateway status: stopped` before the
+gateway has been started. `agentos resume` without a path uses
+`~/.local/share/agentos/workspace/runs/cli-run-1.json`; if it does not exist,
+the command exits non-zero and names that path.

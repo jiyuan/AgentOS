@@ -186,7 +186,7 @@ Primary files:
 
 Priority: P0  
 Size: M  
-Status: in progress; `REL-001` archive self-containment and `CI-001` portability/probe changes are implemented pending required CI runs; installer/wrapper behavior remains in `REL-002`
+Status: implementation complete; `REL-001`, `REL-002`, and `CI-001` await qualifying Linux/macOS CI runs
 Dependencies: M0
 
 Deliverables:
@@ -197,10 +197,16 @@ Deliverables:
    static workspace assets, the complete documentation tree, `DESIGN.md`, and
    `BENCHMARKS.md`; the artifact checker resolves their references.
 2. Choose one install layout. Prefer the XDG paths already documented:
-   `~/.local/bin/agentos` and `~/.local/share/agentos`.
+   `~/.local/bin/agentos` and `~/.local/share/agentos`. **Implemented:** these
+   are the defaults; `XDG_DATA_HOME`, independent path overrides, and an
+   explicit `--prefix` remain supported.
 3. Expose diagnostics through the installed wrapper (`agentos config`) instead
    of requiring the private `agentos-gateway` binary on `PATH`.
+   **Implemented:** the wrapper delegates to the bundled gateway diagnostic
+   with its installed config and runtime paths.
 4. Make `agentos resume` handle an omitted state path without a `set -u` failure.
+   **Implemented:** it uses `workspace/runs/cli-run-1.json` and a missing file
+   produces a deterministic typed error naming that path.
 5. Replace the GNU-only `touch -d` test setup with a portable Rust mechanism.
    **Implemented:** the fixture uses `File::set_modified`.
 6. Make spill golden fixtures independent of absolute temporary-path length.
@@ -209,9 +215,10 @@ Deliverables:
 7. Probe actual Seatbelt profile application on macOS; presence of
    `/usr/bin/sandbox-exec` alone is not availability. **Implemented:** a cached
    permissive-profile and denied-write probe determines availability.
-8. Add a clean-room source and release-artifact smoke job. **Partially
-   implemented:** CI builds an archive and runs its offline echo smoke from an
-   extracted temporary directory; source/install smoke remains in `REL-002`.
+8. Add a clean-room source and release-artifact smoke job. **Implemented:** the
+   Linux/macOS CI matrix tests the extracted archive directly, installs from
+   both archive and source into isolated homes, checks wrapper diagnostics and
+   resume behavior, and completes offline echo turns.
 
 Acceptance criteria:
 
@@ -541,7 +548,7 @@ policy semantics, and new features in one PR.
 | `ADR-001` | Resolve narrowing, sandbox, identity, request, audit, clear, and streaming contracts (**complete:** [`ADR-001`](adr/ADR-001-remediation-contracts.md)) | — |
 | `TEST-001` | Add red tests for the P0/P1 audit findings (**in progress:** strict policy-narrowing and no-body-invocation sandbox regressions landed) | ADR-001 |
 | `REL-001` | Self-contained release workspace and documentation (**implemented:** complete static workspace/docs plus clean-room archive checker; qualifying CI run pending) | TEST-001 |
-| `REL-002` | Installer/wrapper contract and clean-room smoke | REL-001 |
+| `REL-002` | Installer/wrapper contract and clean-room smoke (**implemented:** XDG defaults, wrapper diagnostics, pathless resume, and Linux/macOS source/artifact install smoke; qualifying CI runs pending) | REL-001 |
 | `CI-001` | Portable spill/golden tests and macOS sandbox probe (**in progress:** implementation and required Linux/macOS sandbox jobs added; qualifying CI run pending) | TEST-001 |
 | `ID-001` | Typed principal and injective namespace | ADR-001 |
 | `ID-002` | Versioned persistence migration and collision report | ID-001 |
@@ -607,7 +614,7 @@ Additionally:
 |---|---:|---|---|---|
 | Missing configured skills | P0 | M1 | Release engineering | Resolved by `REL-001`; archive smoke validates parent and subagent skill references |
 | Release archive omits workspace assets | P0 | M1 | Release engineering | Resolved by `REL-001`; required CI artifact run pending |
-| Installer/docs/wrapper mismatch | P1 | M1 | CLI/release | Open |
+| Installer/docs/wrapper mismatch | P1 | M1 | CLI/release | Resolved by `REL-002`; required CI matrix runs pending |
 | Remote ingress plus permissive tool defaults | P0 | M2, M3 | Gateway security | Open |
 | Cross-channel/session/sender identity collision | P0 | M2 | Identity/persistence | Open |
 | Policy narrowing widens authority | P0 | M2 | Core authorization | Strict per-call narrowing implemented and property-tested; explicit grant model pending |

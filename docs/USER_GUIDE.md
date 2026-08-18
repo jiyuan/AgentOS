@@ -50,7 +50,7 @@ The `shell` tool runs sandboxed: it may write beneath the workspace and the
 temporary directory, and nowhere else, enforced by the kernel rather than by
 the tool's own good behaviour. Which programs it will accept at all is a
 separate question, decided by `[guardrails].shell_allowlist`. Run
-`agentos-gateway config` to see whether this machine can enforce a sandbox —
+`agentos config` to see whether this machine can enforce a sandbox —
 where it cannot, a sandboxed tool fails rather than running unrestricted.
 
 The gateway runs conversations concurrently: each is pinned to one of
@@ -85,14 +85,14 @@ The gateway uses:
 To inspect the loaded runtime configuration, run:
 
 ```sh
-agentos-gateway config --config workspace/agent.toml
+agentos config
 ```
 
 Every key `agent.toml` accepts — with its type, default, and what it does — is
 in [`CONFIG_CATALOG.md`](CONFIG_CATALOG.md), and every built-in tool with its
 sandbox mode and deadline is in [`TOOL_CATALOG.md`](TOOL_CATALOG.md). Both are
-generated from the code by `agentos-gateway catalog`, so they cannot describe a
-version of the runtime that no longer exists.
+generated from the code by the private gateway binary's catalog command, so
+they cannot describe a version of the runtime that no longer exists.
 
 Gateway persistent channel selection uses this precedence:
 

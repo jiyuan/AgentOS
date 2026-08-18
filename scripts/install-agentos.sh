@@ -2,9 +2,16 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-prefix="${PREFIX:-$HOME/.agentos}"
-bindir="${BINDIR:-$prefix/bin}"
-agentos_home="${AGENTOS_HOME:-$prefix/share/agentos}"
+prefix="${PREFIX:-}"
+if [[ -n "$prefix" ]]; then
+  default_bindir="$prefix/bin"
+  default_agentos_home="$prefix/share/agentos"
+else
+  default_bindir="$HOME/.local/bin"
+  default_agentos_home="${XDG_DATA_HOME:-$HOME/.local/share}/agentos"
+fi
+bindir="${BINDIR:-$default_bindir}"
+agentos_home="${AGENTOS_HOME:-$default_agentos_home}"
 from_source=0
 skip_build=0
 rust_toolchain="${AGENTOS_RUST_TOOLCHAIN:-stable}"
@@ -18,15 +25,17 @@ Install AgentOS from a source checkout or a packaged release bundle.
 Options:
   --from-source       Build binaries from the current source checkout.
   --skip-build        Do not build source binaries; require existing artifacts.
-  --prefix PATH       Installation prefix. Default: ~/.agentos
-  --bindir PATH       Binary install directory. Default: <prefix>/bin
-  --home PATH         AgentOS runtime home. Default: <prefix>/share/agentos
+  --prefix PATH       Set bindir to PATH/bin and runtime home to PATH/share/agentos.
+  --bindir PATH       Binary install directory. Default: ~/.local/bin
+  --home PATH         AgentOS runtime home. Default: $XDG_DATA_HOME/agentos or
+                      ~/.local/share/agentos
   -h, --help          Show this help.
 
 Environment:
-  PREFIX              Installation prefix override.
+  PREFIX              Set both install paths from one prefix.
   BINDIR              Binary install directory override.
   AGENTOS_HOME        AgentOS runtime home override.
+  XDG_DATA_HOME       Base data directory when PREFIX and AGENTOS_HOME are unset.
   AGENTOS_RUST_TOOLCHAIN  Rust toolchain for source builds. Default: stable
 USAGE
 }
