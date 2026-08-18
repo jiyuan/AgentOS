@@ -17,12 +17,12 @@ agentos/
 │   │   ├── runtime/          # Tokio setup, tracing, error types.
 │   │   └── hooks/            # Lifecycle hook dispatch.
 │   ├── agentos-llm/          # LLM client trait + provider adapters.
-│   │   └── providers/        # openai/, anthropic/, ollama/
+│   │   └── providers/        # openai/ (Responses), anthropic/, deepseek/, ollama/
 │   └── agentos-cli/          # Binary entry point.
 ├── workspace/                # Agent-owned config and data. Not a Cargo crate.
 │   └── agent.toml            # Agent wiring: orchestrator, memory, channels, policy.
 ├── extensions/               # Compiled-in extension crates (selected via agent.toml).
-│   ├── orchestrators/
+│   ├── orchestrators/        # (empty placeholder — no orchestrator extension yet)
 │   └── memory/
 ├── DESIGN.md                 # Loop state machine diagram and safety architecture.
 └── BENCHMARKS.md             # Performance targets and results.
@@ -109,5 +109,5 @@ These rules are load-bearing. Violating any of them breaks the extension model o
 | `DESIGN.md` | Loop state machine diagram and four-ring safety architecture. |
 | `BENCHMARKS.md` | Loop overhead target: ≤2ms per turn excluding LLM/tool latency. |
 | `crates/agentos-interfaces/src/` | Every public trait. Read this first when writing an extension. |
-| `crates/agentos-core/loop/` | `RunLoopState` enum and `step()` transitions. The heart of the system. |
-| `crates/agentos-core/approve/` | Policy engine. YAML policy with `allow`, `deny`, `ask_user` verbs. |
+| `crates/agentos-core/src/loop/` | `RunLoopState` enum and `step()` transitions. The heart of the system. |
+| `crates/agentos-core/src/approve/` | Policy engine: `Policy` rules with `allow`, `deny`, `ask_user` verbs. Built from `[policy]` in `agent.toml` by `runtime::phase5_policy`. |

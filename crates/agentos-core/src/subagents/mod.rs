@@ -248,11 +248,6 @@ impl SubAgentRegistry {
         }
     }
 
-    pub fn with_channel_capacity(mut self, channel_capacity: usize) -> Self {
-        self.channel_capacity = channel_capacity.max(1);
-        self
-    }
-
     pub fn with_trace_sink(mut self, trace_sink: Arc<dyn TraceSink>) -> Self {
         self.trace_sink = Some(trace_sink);
         self

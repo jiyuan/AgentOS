@@ -507,17 +507,6 @@ impl MemoryManager {
             .collect())
     }
 
-    pub async fn forget_scoped(
-        &self,
-        caller: &MemoryCaller,
-        scope: MemoryScope,
-        selector: Selector,
-    ) -> Result<usize, MemoryError> {
-        authorize_scope(caller, &scope, MemoryOperation::Forget)?;
-        self.forget_scoped_with_reason(caller, scope, selector, Arc::from("managed_forget"))
-            .await
-    }
-
     pub async fn forget_scoped_with_reason(
         &self,
         caller: &MemoryCaller,

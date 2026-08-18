@@ -73,10 +73,6 @@ pub enum Availability {
 }
 
 impl Availability {
-    pub fn is_enforced(self) -> bool {
-        matches!(self, Self::Enforced(_))
-    }
-
     pub fn describe(self) -> &'static str {
         match self {
             Self::Enforced(mechanism) => mechanism,

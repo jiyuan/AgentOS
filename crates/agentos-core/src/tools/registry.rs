@@ -122,15 +122,6 @@ impl ToolRegistry {
         self
     }
 
-    pub async fn register_mcp_server(
-        &mut self,
-        server: McpServer,
-        client: Arc<dyn McpClient>,
-    ) -> Result<Vec<ToolSpec>, ToolRegistryError> {
-        self.register_mcp_server_filtered(server, client, |_| true)
-            .await
-    }
-
     pub async fn register_mcp_server_filtered(
         &mut self,
         server: McpServer,

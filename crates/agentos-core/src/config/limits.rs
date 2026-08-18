@@ -98,11 +98,6 @@ impl LimitsConfig {
     pub fn tool_timeout(&self) -> Duration {
         Duration::from_millis(self.tool_timeout_ms)
     }
-
-    /// The `file` tool's read bounds, as the tool takes them.
-    pub fn file_read(&self) -> (usize, usize) {
-        (self.file_read_bytes, self.file_read_max_bytes)
-    }
 }
 
 /// Reject a misconfigured section at load, not at the first oversized tool
