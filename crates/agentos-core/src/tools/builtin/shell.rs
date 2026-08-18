@@ -104,9 +104,9 @@ impl Tool for ShellTool {
             stdin: None,
             timeout: Duration::from_millis(SHELL_TIMEOUT_MS),
             max_output_bytes: self.max_output_bytes,
-            // The mode this tool declares in its own spec, enforced here
-            // because a shell command is run directly rather than through the
-            // isolation worker when no worker is configured.
+            // The mode this tool declares in its own spec. Direct callers get
+            // the same restriction, while registry calls fail closed unless a
+            // compatible isolation worker is configured first.
             sandbox: &Sandbox::new(SHELL_SANDBOX, workspace_root()),
         })
         .await;

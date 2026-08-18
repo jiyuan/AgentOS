@@ -597,3 +597,13 @@
 - **Actual Behavior**: The pipeline isolated logs and PID artifacts but inherited the checkout's `AGENTOS_HOME`; its 50-task run appended session and memory-access state to the ignored `workspace/agentos.sqlite`.
 - **Root Cause**: `_build_gateway_env` pins provider and channel variables but does not set a temporary `AGENTOS_HOME`, while the gateway now derives persistence paths exclusively from that home.
 - **Suggested Fix**: Give each pipeline cycle a temporary AgentOS home populated with the minimum runtime assets, pass that home to the gateway, record storage from it, and remove it after the structured result is written. Track this with the gateway/hermetic CI work in `CI-002`.
+
+## [2026-08-18 16:47] TOOL [RESOLVED]
+
+- **Agent**: main-codex
+- **Task**: Update audit-remediation milestone status after implementing the fail-closed sandbox registry slice.
+- **Guideline Violated**: GUIDELINES > Correctness / FEEDBACK > What Gets Recorded
+- **Expected Behavior**: The status edit should mark M3 in progress while leaving the separate M2 identity milestone unchanged.
+- **Actual Behavior**: A broad patch hunk matched the first `Status: planned` line and temporarily wrote the M3 status into M2.
+- **Root Cause**: The patch context did not include the milestone heading, so repeated status text was ambiguous.
+- **Suggested Fix**: Include the section heading in patches to repeated documentation fields and verify the exact surrounding section immediately afterward. The milestone statuses were corrected and re-read in the same session.

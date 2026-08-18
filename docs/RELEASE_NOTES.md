@@ -47,11 +47,13 @@ only an answer carrying that ticket decides it — `/approve <ticket>`,
 `/deny <ticket>`, or an inline button. Prompts expire (default 15 minutes) and
 an expired prompt is recorded as cancelled, not refused.
 
-**Sandbox modes (Preview pending fail-closed enforcement).** `requires_isolation` was replaced by a `SandboxMode`
+**Sandbox modes (Preview pending platform and MCP qualification).** `requires_isolation` was replaced by a `SandboxMode`
 (`read_only`, `workspace_write`, `full_access`) that the kernel enforces —
 Landlock on Linux, Seatbelt on macOS — inherited by every descendant process.
-The intended contract is that a missing or incompatible backend refuses the
-call before the tool body runs. `SBX-001` tracks enforcement of that contract.
+The registry now refuses missing executors, unavailable backends, unsupported
+modes or protocols, and worker failures without invoking the in-process tool
+body. `SBX-001` still tracks required platform jobs and isolation of the actual
+stdio MCP server process.
 
 **Correctness and hygiene.** Every tool call in a multi-call response is now
 kept and drained one per turn instead of the first being run and the rest

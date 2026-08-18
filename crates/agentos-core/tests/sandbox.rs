@@ -8,12 +8,70 @@
 //! Run with `-- --nocapture` to see which of these actually ran.
 
 use agentos_core::sandbox::{availability, Sandbox};
-use agentos_core::tools::call_isolated_subprocess;
 use agentos_core::tools::exec::{run, Exec, DEFAULT_MAX_OUTPUT_BYTES};
-use agentos_interfaces::tool::SandboxMode;
-use agentos_proto::{ToolCall, ToolCallId};
+use agentos_core::tools::{
+    call_isolated_subprocess, IsolationError, ToolRegistry, ToolRegistryError,
+};
+use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
+use agentos_proto::{ToolCall, ToolCallId, ToolResult, ToolStatus};
+use async_trait::async_trait;
+use serde_json::{json, value::RawValue};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
+
+struct SandboxedRecorder {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for SandboxedRecorder {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: Arc::from("sandboxed_recorder"),
+            description: Arc::from("Records whether its body ran."),
+            input_schema: json!({"type": "object"}),
+            sandbox: SandboxMode::ReadOnly,
+            timeout_ms: None,
+        }
+    }
+
+    async fn call(&self, call: &ToolCall, _args: &RawValue) -> Result<ToolResult, ToolError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolResult {
+            call_id: call.id.clone(),
+            status: ToolStatus::Succeeded,
+            content: Arc::from("body ran"),
+            metadata: BTreeMap::new(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_sandboxed_tool_never_runs_in_process_without_an_executor() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = ToolRegistry::new();
+    registry.register(SandboxedRecorder {
+        calls: Arc::clone(&calls),
+    });
+    let call = ToolCall {
+        id: ToolCallId::new("call-no-executor"),
+        name: Arc::from("sandboxed_recorder"),
+        args: RawValue::from_string("{}".to_owned()).expect("static args are valid JSON"),
+    };
+
+    let error = registry
+        .call(&call)
+        .await
+        .expect_err("the missing executor must refuse the call");
+    assert!(matches!(
+        error,
+        ToolRegistryError::Isolation(IsolationError::ExecutorUnavailable { .. })
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
 
 /// Skip with a reason, or return the mechanism doing the enforcing.
 macro_rules! enforced_or_skip {

@@ -421,15 +421,18 @@ AgentOS uses four independent safety rings:
 3. **Approve.** Concrete policy allows, denies, or pauses boundary actions.
    `Approve` is not an extension trait.
 4. **Isolation.** A tool declares a `SandboxMode` — `read_only`,
-   `workspace_write`, or `full_access`. Anything but `full_access` runs the tool
-   in a child process whose filesystem writes the kernel refuses: Landlock on
-   Linux, Seatbelt on macOS, inherited by every descendant. `full_access` is the
-   default and means no sandbox — the honest declaration for a tool that does its
-   work in-process, where the only available restriction would apply to the whole
-   agent permanently; such tools are bounded by rings 2 and 3 instead. Reads and
-   network are not restricted. Where no backend exists, a sandboxed tool fails
-   rather than running unsandboxed, and `agentos-gateway config` prints which
-   mechanism (if any) this machine enforces with.
+   `workspace_write`, or `full_access`. Anything but `full_access` requires a
+   configured executor whose advertised modes and versioned execution protocol
+   match the tool. `ToolRegistry` checks executor presence, the probed kernel
+   backend, mode, and protocol before any tool body can run. The child process's
+   filesystem writes are then refused by Landlock on Linux or Seatbelt on macOS,
+   inherited by every descendant. Missing or incompatible executors and worker
+   failures are typed isolation errors; none fall back to in-process execution.
+   `full_access` is the default and means no sandbox — the honest declaration for
+   a tool that does its work in-process, where the only available restriction
+   would apply to the whole agent permanently; such tools are bounded by rings 2
+   and 3 instead. Reads and network are not restricted. `agentos-gateway config`
+   prints which mechanism (if any) this machine enforces with.
 
 ### Checked invariants
 
@@ -744,9 +747,9 @@ sensitive memory bodies are never written to traces.
 The list below records implemented baselines, not unconditional Stable support.
 See [`CAPABILITY_MATRIX.md`](CAPABILITY_MATRIX.md) for current maturity,
 platform assumptions, and promotion gates. In particular, remote-channel
-production guarantees, stdio MCP, fail-closed sandboxing, subagent policy
-narrowing, provisional streaming, and real-vector memory remain Preview while
-their remediation milestones are open.
+production guarantees, actual-process stdio MCP isolation, platform sandbox
+qualification, subagent delegation grants, provisional streaming, and
+real-vector memory remain Preview while their remediation milestones are open.
 
 Completed baselines:
 

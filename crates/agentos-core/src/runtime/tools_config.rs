@@ -3,8 +3,9 @@ use crate::config::{LimitsConfig, SubAgentConfig, WorkspaceConfig};
 use crate::jobs::JobRegistry;
 use crate::memory::MemoryManager;
 use crate::tools::{
-    CronCreatorTool, CronListTool, CronRemoveTool, FileTool, HttpTool, JobKillTool, JobOutputTool,
-    JobStatusTool, MemoryTool, ShellTool, SkillValidateTool, ToolRegistry,
+    CronCreatorTool, CronListTool, CronRemoveTool, FileTool, HttpTool, IsolationProtocol,
+    JobKillTool, JobOutputTool, JobStatusTool, MemoryTool, ShellTool, SkillValidateTool,
+    ToolRegistry,
 };
 use agentos_interfaces::tool::ToolSpec;
 use serde_json::Value;
@@ -183,7 +184,10 @@ pub fn register_builtin_tool(
     limits: &LimitsConfig,
 ) -> Result<(), String> {
     match name {
-        "shell" => tools.register(ShellTool::with_output_limit(limits.tool_output_bytes)),
+        "shell" => tools.register_with_isolation_protocol(
+            ShellTool::with_output_limit(limits.tool_output_bytes),
+            IsolationProtocol::BuiltinShellV1,
+        ),
         "http" => tools.register(HttpTool),
         "file" => tools.register(FileTool::with_limits(
             limits.directory_list_entries,

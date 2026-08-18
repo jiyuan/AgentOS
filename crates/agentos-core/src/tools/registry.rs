@@ -1,9 +1,10 @@
+use super::isolation::{
+    IsolationError, IsolationExecutor, IsolationExecutorCapabilities, IsolationProtocol,
+};
 use super::McpTool;
 use crate::jobs::{JobId, JobRegistry, JobSnapshot, JobSpec, JobState};
 use crate::memory::conversation_id_from_context;
-use crate::sandbox::Sandbox;
-use crate::tools::builtin::workspace_root;
-use crate::tools::exec::{Exec, DEFAULT_MAX_OUTPUT_BYTES};
+use crate::tools::exec::DEFAULT_MAX_OUTPUT_BYTES;
 use agentos_interfaces::mcp::{McpClient, McpError, McpServer};
 use agentos_interfaces::orchestrator::RunContext;
 use agentos_interfaces::tool::{Tool, ToolError, ToolSpec};
@@ -26,6 +27,8 @@ pub enum ToolRegistryError {
     Tool(#[from] ToolError),
     #[error(transparent)]
     Mcp(#[from] McpError),
+    #[error(transparent)]
+    Isolation(#[from] IsolationError),
 }
 
 /// Deadline applied to a tool that declares none and that no deployment has
@@ -36,7 +39,8 @@ pub const DEFAULT_TOOL_TIMEOUT_MS: u64 = 60_000;
 
 pub struct ToolRegistry {
     tools: BTreeMap<Arc<str>, Arc<dyn Tool>>,
-    isolation_runner: Option<PathBuf>,
+    isolation_protocols: BTreeMap<Arc<str>, IsolationProtocol>,
+    isolation_executor: Option<IsolationExecutor>,
     default_timeout: Duration,
     timeout_overrides: BTreeMap<Arc<str>, Duration>,
     jobs: Option<Arc<JobRegistry>>,
@@ -50,7 +54,8 @@ impl Default for ToolRegistry {
     fn default() -> Self {
         Self {
             tools: BTreeMap::new(),
-            isolation_runner: None,
+            isolation_protocols: BTreeMap::new(),
+            isolation_executor: None,
             default_timeout: Duration::from_millis(DEFAULT_TOOL_TIMEOUT_MS),
             timeout_overrides: BTreeMap::new(),
             jobs: None,
@@ -113,13 +118,31 @@ impl ToolRegistry {
     where
         T: Tool + 'static,
     {
+        self.register_with_isolation_protocol(tool, IsolationProtocol::InProcess);
+    }
+
+    pub(crate) fn register_with_isolation_protocol<T>(
+        &mut self,
+        tool: T,
+        protocol: IsolationProtocol,
+    ) where
+        T: Tool + 'static,
+    {
         let spec = tool.spec();
+        self.isolation_protocols
+            .insert(Arc::clone(&spec.name), protocol);
         self.tools.insert(spec.name, Arc::new(tool));
     }
 
     pub fn with_subprocess_isolation(mut self, runner: impl Into<PathBuf>) -> Self {
-        self.isolation_runner = Some(runner.into());
+        self.isolation_executor = Some(IsolationExecutor::bundled_worker(runner.into()));
         self
+    }
+
+    pub fn isolation_capabilities(&self) -> Option<&IsolationExecutorCapabilities> {
+        self.isolation_executor
+            .as_ref()
+            .map(IsolationExecutor::capabilities)
     }
 
     pub async fn register_mcp_server_filtered(
@@ -134,7 +157,10 @@ impl ToolRegistry {
             .filter(|spec| enabled(spec))
             .collect::<Vec<_>>();
         for spec in specs.iter().cloned() {
-            self.register(McpTool::new(server.clone(), Arc::clone(&client), spec));
+            self.register_with_isolation_protocol(
+                McpTool::new(server.clone(), Arc::clone(&client), spec),
+                IsolationProtocol::McpClient,
+            );
         }
         Ok(specs)
     }
@@ -155,17 +181,7 @@ impl ToolRegistry {
         let spec = tool.spec();
         let deadline = self.deadline(&spec);
         if spec.sandbox.is_sandboxed() {
-            if let Some(runner) = &self.isolation_runner {
-                let sandbox = Sandbox::new(spec.sandbox, workspace_root());
-                return Ok(call_isolated_subprocess(
-                    runner,
-                    call,
-                    deadline,
-                    &sandbox,
-                    self.max_output_bytes,
-                )
-                .await?);
-            }
+            return self.call_isolated(&spec, call, deadline).await;
         }
         match timeout(deadline, tool.call(call, &call.args)).await {
             Ok(result) => Ok(result?),
@@ -185,17 +201,7 @@ impl ToolRegistry {
         let spec = tool.spec();
         let deadline = self.deadline(&spec);
         if spec.sandbox.is_sandboxed() {
-            if let Some(runner) = &self.isolation_runner {
-                let sandbox = Sandbox::new(spec.sandbox, workspace_root());
-                return Ok(call_isolated_subprocess(
-                    runner,
-                    call,
-                    deadline,
-                    &sandbox,
-                    self.max_output_bytes,
-                )
-                .await?);
-            }
+            return self.call_isolated(&spec, call, deadline).await;
         }
         if let Some(promoted) = self.call_promotable(tool, call, ctx, deadline).await {
             return promoted;
@@ -204,6 +210,34 @@ impl ToolRegistry {
             Ok(result) => Ok(result?),
             Err(_elapsed) => Ok(timed_out_result(call, deadline)),
         }
+    }
+
+    async fn call_isolated(
+        &self,
+        spec: &ToolSpec,
+        call: &ToolCall,
+        deadline: Duration,
+    ) -> Result<ToolResult, ToolRegistryError> {
+        let executor = self.isolation_executor.as_ref().ok_or_else(|| {
+            IsolationError::ExecutorUnavailable {
+                tool: Arc::clone(&call.name),
+                mode: spec.sandbox.as_str(),
+            }
+        })?;
+        let protocol = self
+            .isolation_protocols
+            .get(&call.name)
+            .copied()
+            .expect("every registered tool has an isolation protocol");
+        Ok(executor
+            .call(
+                call,
+                spec.sandbox,
+                protocol,
+                deadline,
+                self.max_output_bytes,
+            )
+            .await?)
     }
 
     /// Run a promotable tool as a background job, waiting out its deadline
@@ -369,80 +403,47 @@ fn timed_out_result(call: &ToolCall, deadline: Duration) -> ToolResult {
     }
 }
 
-#[derive(serde::Serialize)]
-struct IsolatedToolRequest<'a> {
-    call: &'a ToolCall,
-}
-
-/// Run one tool call inside the isolation worker.
-///
-/// Async since roadmap D2: this used to block a Tokio worker thread on
-/// `std::process` for as long as the child chose to live, which on a
-/// `current_thread` runtime meant every other conversation on that thread
-/// stopped with it.
-pub async fn call_isolated_subprocess(
-    runner: &std::path::Path,
-    call: &ToolCall,
-    timeout: Duration,
-    sandbox: &Sandbox,
-    max_output_bytes: usize,
-) -> Result<ToolResult, ToolError> {
-    let request = serde_json::to_vec(&IsolatedToolRequest { call })
-        .map_err(|err| ToolError::Failed(err.to_string().into()))?;
-    let program = runner.to_string_lossy().into_owned();
-    let output = crate::tools::exec::run(Exec {
-        program: &program,
-        args: &[],
-        cwd: None,
-        stdin: Some(&request),
-        timeout,
-        max_output_bytes,
-        sandbox,
-    })
-    .await
-    .map_err(|err| ToolError::Failed(err.to_string().into()))?;
-
-    if !output.success {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let message = stderr.trim();
-        return Err(ToolError::Failed(Arc::from(if message.is_empty() {
-            "isolated worker failed".to_owned()
-        } else {
-            message.to_owned()
-        })));
-    }
-
-    let mut result: ToolResult = serde_json::from_slice(&output.stdout)
-        .map_err(|err| ToolError::Failed(err.to_string().into()))?;
-    result.metadata.insert(
-        Arc::from("isolation"),
-        Value::String("subprocess".to_owned()),
-    );
-    // What the worker actually ran under, so a trace shows the enforcement
-    // rather than the intent.
-    result.metadata.insert(
-        Arc::from("sandbox"),
-        Value::String(sandbox.mode().as_str().to_owned()),
-    );
-    result.metadata.insert(
-        Arc::from("isolation_runner"),
-        Value::String(runner.display().to_string()),
-    );
-    Ok(result)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox::Availability;
     use agentos_interfaces::tool::SandboxMode;
     use agentos_interfaces::tool::Tool;
     use agentos_proto::ToolCallId;
     use async_trait::async_trait;
     use serde_json::{json, value::RawValue};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A tool that never returns, so only a deadline can end a call to it.
     struct NeverReturns {
         declared_timeout_ms: Option<u64>,
+    }
+
+    struct SandboxedRecorder {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for SandboxedRecorder {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: Arc::from("sandboxed_recorder"),
+                description: Arc::from("Records whether its body ran."),
+                input_schema: json!({"type": "object"}),
+                sandbox: SandboxMode::ReadOnly,
+                timeout_ms: None,
+            }
+        }
+
+        async fn call(&self, call: &ToolCall, _args: &RawValue) -> Result<ToolResult, ToolError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult {
+                call_id: call.id.clone(),
+                status: ToolStatus::Succeeded,
+                content: Arc::from("body ran"),
+                metadata: BTreeMap::new(),
+            })
+        }
     }
 
     #[async_trait]
@@ -468,6 +469,102 @@ mod tests {
             name: Arc::from("hang"),
             args: RawValue::from_string("{}".to_owned()).expect("static args are valid JSON"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_sandboxed_tool_body_never_runs_without_an_executor() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(SandboxedRecorder {
+            calls: Arc::clone(&calls),
+        });
+        let call = ToolCall {
+            id: ToolCallId::new("call-sandboxed"),
+            name: Arc::from("sandboxed_recorder"),
+            args: RawValue::from_string("{}".to_owned()).expect("static args are valid JSON"),
+        };
+
+        let error = registry
+            .call(&call)
+            .await
+            .expect_err("a missing executor must refuse the call");
+        assert!(matches!(
+            error,
+            ToolRegistryError::Isolation(IsolationError::ExecutorUnavailable { .. })
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn an_incompatible_executor_refuses_before_the_tool_body_runs() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(SandboxedRecorder {
+            calls: Arc::clone(&calls),
+        });
+        registry.isolation_executor = Some(IsolationExecutor::new(
+            PathBuf::from("unused-test-runner"),
+            IsolationExecutorCapabilities {
+                name: Arc::from("shell-only-test-executor"),
+                backend: Availability::Enforced("test-backend"),
+                modes: BTreeSet::from([SandboxMode::ReadOnly]),
+                protocols: BTreeSet::from([IsolationProtocol::BuiltinShellV1]),
+            },
+        ));
+        let call = ToolCall {
+            id: ToolCallId::new("call-incompatible"),
+            name: Arc::from("sandboxed_recorder"),
+            args: RawValue::from_string("{}".to_owned()).expect("static args are valid JSON"),
+        };
+
+        let error = registry
+            .call(&call)
+            .await
+            .expect_err("the executor does not support in-process tools");
+        assert!(matches!(
+            error,
+            ToolRegistryError::Isolation(IsolationError::UnsupportedProtocol {
+                protocol: "in_process",
+                ..
+            })
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_backend_is_a_typed_refusal() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register_with_isolation_protocol(
+            SandboxedRecorder {
+                calls: Arc::clone(&calls),
+            },
+            IsolationProtocol::BuiltinShellV1,
+        );
+        registry.isolation_executor = Some(IsolationExecutor::new(
+            PathBuf::from("unused-test-runner"),
+            IsolationExecutorCapabilities {
+                name: Arc::from("unavailable-test-executor"),
+                backend: Availability::Unavailable("test backend refused its probe"),
+                modes: BTreeSet::from([SandboxMode::ReadOnly]),
+                protocols: BTreeSet::from([IsolationProtocol::BuiltinShellV1]),
+            },
+        ));
+        let call = ToolCall {
+            id: ToolCallId::new("call-unavailable"),
+            name: Arc::from("sandboxed_recorder"),
+            args: RawValue::from_string("{}".to_owned()).expect("static args are valid JSON"),
+        };
+
+        let error = registry
+            .call(&call)
+            .await
+            .expect_err("an unavailable backend must refuse the call");
+        assert!(matches!(
+            error,
+            ToolRegistryError::Isolation(IsolationError::BackendUnavailable { .. })
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
