@@ -203,7 +203,7 @@ worker_path_env = "AGENTOS_TOOL_WORKER_PATH"
 priority = ["skills", "tools", "mcp", "llm"]
 
 [resources.skills]
-enabled = ["skill-creator", "web-research", "audit-skill", "email-digest", "rss-digest", "fetch-arxiv-paper-list"]
+enabled = ["skill-creator", "web-research", "audit-skill"]
 
 [resources.tools]
 enabled = ["file", "http", "memory", "shell", "skill_validate", "cron_create", "cron_list", "cron_remove", "job_status", "job_output", "job_kill"]
