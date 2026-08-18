@@ -11,6 +11,7 @@ pub(super) enum ApproveTransition {
         state: RunState,
         plan: Plan,
         turns: usize,
+        grant_id: Option<Arc<str>>,
     },
     /// A policy `deny` on a tool call. Recoverable: the loop records a denied
     /// `ToolResult` and lets the model observe it and replan, rather than
@@ -37,11 +38,19 @@ pub(super) enum ApproveTransition {
 }
 
 pub(super) fn approve_transition(ctx: ApproveCtx, policy: &Policy) -> ApproveTransition {
-    match policy.decide(&ctx.plan) {
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let grant_id = policy
+        .covering_grant_at(&ctx.plan, now_unix)
+        .map(|grant| Arc::clone(&grant.grant_id));
+    match policy.decide_at(&ctx.plan, now_unix) {
         PolicyDecision::Allow => ApproveTransition::Allow {
             state: ctx.state,
             plan: ctx.plan,
             turns: ctx.turns,
+            grant_id,
         },
         PolicyDecision::Deny { reason } => match ctx.plan {
             Plan::CallTool(call) => ApproveTransition::DenyTool {
@@ -88,6 +97,7 @@ fn pause_for_approval(ctx: ApproveCtx, reason: Arc<str>) -> ApproveTransition {
         id: InterruptionId::new(approval_id),
         action,
         status: ApprovalStatus::Pending,
+        authorization: None,
     });
     ApproveTransition::Pause { state }
 }

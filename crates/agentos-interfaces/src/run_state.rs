@@ -1,8 +1,8 @@
 use crate::orchestrator::{SubAgentSpec, SubOrchSpec};
 use crate::session::Transcript;
 use agentos_proto::{
-    AgentId, ChannelId, ConversationId, InterruptionId, RunId, SchemaVersion, SessionKey, TaskId,
-    ToolCall, TraceEvent, TraceSpan, Usage,
+    AgentId, ChannelId, ConversationId, DelegationGrant, InterruptionId, PrincipalKey, RunId,
+    SchemaVersion, SessionKey, TaskId, ToolCall, TraceEvent, TraceSpan, Usage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -13,6 +13,14 @@ pub struct Interruption {
     pub id: InterruptionId,
     pub action: InterruptionAction,
     pub status: ApprovalStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<ApprovalAuthorization>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalAuthorization {
+    pub authorized_by: PrincipalKey,
+    pub approved_at_unix: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -67,6 +75,10 @@ pub struct RunState {
     pub task_session_id: Option<Arc<str>>,
     pub transcript: Transcript,
     pub pending_approvals: Vec<Interruption>,
+    /// Explicit grants issued for this child run. Persisted with paused state
+    /// so expiry and exact scope survive restart.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delegation_grants: Vec<DelegationGrant>,
     /// Tool calls the model asked for that this run has not reached yet
     /// (roadmap item X1).
     ///
@@ -95,12 +107,32 @@ impl RunState {
             task_session_id: None,
             transcript: Transcript::default(),
             pending_approvals: Vec::new(),
+            delegation_grants: Vec::new(),
             queued_tool_calls: Vec::new(),
             usage: Usage::default(),
             version: SchemaVersion::default(),
             trace_spans: Vec::new(),
             trace_events: Vec::new(),
         }
+    }
+
+    pub fn authorize(
+        &mut self,
+        id: &InterruptionId,
+        authorized_by: PrincipalKey,
+        approved_at_unix: u64,
+    ) -> bool {
+        for interruption in &mut self.pending_approvals {
+            if &interruption.id == id {
+                interruption.status = ApprovalStatus::Approved;
+                interruption.authorization = Some(ApprovalAuthorization {
+                    authorized_by,
+                    approved_at_unix,
+                });
+                return true;
+            }
+        }
+        false
     }
 
     pub fn approve(&mut self, id: &InterruptionId) -> bool {
@@ -126,12 +158,28 @@ impl RunState {
         false
     }
 
-    pub fn take_approved_action(&mut self) -> Option<InterruptionAction> {
+    pub fn take_approved_action_with_authorization(
+        &mut self,
+    ) -> Option<(
+        InterruptionAction,
+        Option<ApprovalAuthorization>,
+        InterruptionId,
+    )> {
         let index = self
             .pending_approvals
             .iter()
             .position(|interruption| interruption.status == ApprovalStatus::Approved)?;
-        Some(self.pending_approvals.remove(index).action)
+        let interruption = self.pending_approvals.remove(index);
+        Some((
+            interruption.action,
+            interruption.authorization,
+            interruption.id,
+        ))
+    }
+
+    pub fn take_approved_action(&mut self) -> Option<InterruptionAction> {
+        self.take_approved_action_with_authorization()
+            .map(|(action, _, _)| action)
     }
 
     pub fn take_approved_tool_call(&mut self) -> Option<ToolCall> {

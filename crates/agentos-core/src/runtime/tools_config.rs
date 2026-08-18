@@ -8,6 +8,7 @@ use crate::tools::{
     ToolRegistry,
 };
 use agentos_interfaces::tool::ToolSpec;
+use agentos_proto::DelegationGrantScope;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -52,8 +53,20 @@ pub fn phase5_policy(config: &WorkspaceConfig, mcp_specs: &[ToolSpec]) -> Policy
     if !config.subagents.is_empty() {
         policy.rules.push(PolicyRule {
             action: PolicyAction::Delegate,
-            decision: PolicyVerb::Allow,
-            reason: None,
+            decision: if config
+                .subagents
+                .iter()
+                .any(|subagent| !subagent.delegation_grants.is_empty())
+            {
+                PolicyVerb::AskUser
+            } else {
+                PolicyVerb::Allow
+            },
+            reason: config
+                .subagents
+                .iter()
+                .any(|subagent| !subagent.delegation_grants.is_empty())
+                .then(|| Arc::from("delegation requests bounded unattended authority")),
             arg_equals: BTreeMap::new(),
         });
     }
@@ -103,16 +116,32 @@ fn policy_default_decision(input: &str) -> PolicyVerb {
 }
 
 pub(super) fn subagent_policy(subagent: &SubAgentConfig) -> Result<Policy, String> {
+    validate_delegation_grants(subagent)?;
     let mut policy = Policy::default();
     for tool in subagent
         .tools
         .iter()
         .filter(|tool| tool.as_ref() != "memory")
+        .filter(|tool| {
+            !subagent
+                .delegation_grants
+                .iter()
+                .any(|grant| grant.tool.as_ref() == tool.as_ref())
+        })
     {
         add_subagent_tool_allow_policy(&mut policy, tool);
     }
     if subagent_memory_tool_enabled(subagent) {
-        for operation in subagent_memory_operations(subagent)? {
+        for operation in subagent_memory_operations(subagent)?
+            .into_iter()
+            .filter(|operation| {
+                !subagent.delegation_grants.iter().any(|grant| {
+                    grant.tool.as_ref() == "memory"
+                        && grant.arg_equals.get("operation")
+                            == Some(&Value::String(operation.to_string()))
+                })
+            })
+        {
             match operation.as_ref() {
                 "read" => allow_tool_operation(&mut policy, "memory", "read"),
                 "write" => allow_tool_operation(&mut policy, "memory", "write"),
@@ -126,6 +155,47 @@ pub(super) fn subagent_policy(subagent: &SubAgentConfig) -> Result<Policy, Strin
         }
     }
     Ok(policy)
+}
+
+pub(super) fn subagent_delegation_grant_scopes(
+    subagent: &SubAgentConfig,
+) -> Result<Vec<DelegationGrantScope>, String> {
+    validate_delegation_grants(subagent)?;
+    Ok(subagent
+        .delegation_grants
+        .iter()
+        .map(|grant| DelegationGrantScope {
+            tool: Arc::clone(&grant.tool),
+            arg_equals: grant.arg_equals.clone(),
+        })
+        .collect())
+}
+
+fn validate_delegation_grants(subagent: &SubAgentConfig) -> Result<(), String> {
+    if subagent.delegation_grants.is_empty() {
+        return Ok(());
+    }
+    if !(1..=3600).contains(&subagent.delegation_grant_ttl_secs) {
+        return Err(format!(
+            "subagent '{}' delegation_grant_ttl_secs must be between 1 and 3600",
+            subagent.id
+        ));
+    }
+    for grant in &subagent.delegation_grants {
+        if !subagent.tools.contains(&grant.tool) {
+            return Err(format!(
+                "subagent '{}' delegation grant names undeclared tool '{}'",
+                subagent.id, grant.tool
+            ));
+        }
+        if grant.arg_equals.is_empty() {
+            return Err(format!(
+                "subagent '{}' delegation grant for '{}' requires at least one arg_equals constraint",
+                subagent.id, grant.tool
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn add_subagent_tool_allow_policy(policy: &mut Policy, tool: &str) {
@@ -320,7 +390,75 @@ mod tests {
     use crate::approve::PolicyDecision;
     use crate::memory::InMemoryMemory;
     use agentos_interfaces::orchestrator::Plan;
-    use agentos_proto::{ToolCall, ToolCallId};
+    use agentos_proto::{AgentId, ToolCall, ToolCallId};
+
+    #[test]
+    fn grant_scope_is_removed_from_lattice_policy_and_forces_delegate_approval() {
+        let mut config = WorkspaceConfig::default();
+        let child = SubAgentConfig {
+            id: Arc::from("reader"),
+            tools: vec![Arc::from("file")],
+            delegation_grants: vec![crate::config::DelegationGrantConfig {
+                tool: Arc::from("file"),
+                arg_equals: BTreeMap::from([(
+                    Arc::from("operation"),
+                    Value::String("read".to_owned()),
+                )]),
+            }],
+            ..SubAgentConfig::default()
+        };
+        let child_policy = subagent_policy(&child).expect("grant config is valid");
+        assert!(matches!(
+            child_policy.decide(&tool_plan(
+                "file",
+                serde_json::json!({"operation": "read", "path": "README.md"})
+            )),
+            PolicyDecision::Deny { .. }
+        ));
+
+        config.subagents.push(child);
+        assert!(matches!(
+            phase5_policy(&config, &[]).decide(&Plan::Delegate(
+                agentos_interfaces::orchestrator::SubAgentSpec {
+                    agent_id: AgentId::new("reader"),
+                    policy_id: Arc::from("readonly"),
+                    metadata: BTreeMap::new(),
+                }
+            )),
+            PolicyDecision::AskUser { .. }
+        ));
+    }
+
+    #[test]
+    fn blanket_or_overlong_grants_fail_configuration() {
+        let blanket = SubAgentConfig {
+            id: Arc::from("reader"),
+            tools: vec![Arc::from("file")],
+            delegation_grants: vec![crate::config::DelegationGrantConfig {
+                tool: Arc::from("file"),
+                arg_equals: BTreeMap::new(),
+            }],
+            ..SubAgentConfig::default()
+        };
+        assert!(subagent_policy(&blanket)
+            .expect_err("blanket grant must fail")
+            .contains("requires at least one"));
+
+        let overlong = SubAgentConfig {
+            delegation_grant_ttl_secs: 3601,
+            delegation_grants: vec![crate::config::DelegationGrantConfig {
+                tool: Arc::from("http"),
+                arg_equals: BTreeMap::from([(
+                    Arc::from("method"),
+                    Value::String("GET".to_owned()),
+                )]),
+            }],
+            ..SubAgentConfig::default()
+        };
+        assert!(subagent_policy(&overlong)
+            .expect_err("overlong grant must fail")
+            .contains("between 1 and 3600"));
+    }
     use serde_json::{json, value::RawValue};
 
     fn tool_plan(name: &str, args: serde_json::Value) -> Plan {

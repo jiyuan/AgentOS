@@ -34,7 +34,7 @@ pub use memory::{
 };
 pub use orchestrator::{RoutingConfig, RoutingRuleConfig, StageConfig, TemplateConfig};
 pub use spill::{SpillConfig, DEFAULT_SPILL_RELPATH};
-pub use subagents::SubAgentConfig;
+pub use subagents::{DelegationGrantConfig, SubAgentConfig};
 
 pub(crate) use orchestrator::stage_execution_order;
 
@@ -575,12 +575,19 @@ impl WorkspaceConfig {
     fn validate_template_references(&self) -> Result<(), String> {
         for template in &self.orchestrator_templates {
             for stage in &template.stages {
-                if !self.subagents.iter().any(|subagent| {
+                let subagent = self.subagents.iter().find(|subagent| {
                     subagent.id == stage.agent_id && subagent.policy_id == stage.policy_id
-                }) {
+                });
+                let Some(subagent) = subagent else {
                     return Err(format!(
                         "template '{}' stage '{}' references unknown subagent '{}' with policy '{}'",
                         template.name, stage.name, stage.agent_id, stage.policy_id
+                    ));
+                };
+                if !subagent.delegation_grants.is_empty() {
+                    return Err(format!(
+                        "template '{}' stage '{}' uses grant-backed subagent '{}'; explicit delegation grants currently require direct delegate approval",
+                        template.name, stage.name, stage.agent_id
                     ));
                 }
             }

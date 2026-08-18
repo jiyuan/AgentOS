@@ -424,14 +424,28 @@ impl ShardTurns<'_> {
                 };
                 Ok(Answered::Resume(Box::new(Resume {
                     pending: entry,
-                    decision: resume_decision(outcome.0, outcome.1, self.context.channel_name),
+                    decision: resume_decision(
+                        outcome.0,
+                        outcome.1,
+                        self.context.channel_name,
+                        input
+                            .session_key(&self.context.runtime.active_agent)
+                            .principal,
+                    ),
                 })))
             }
             Routed::Decides { outcome, reason } => {
                 let entry = pending
                     .remove(&input_key)
                     .expect("a decision implies a pending approval");
-                let decision = resume_decision(outcome, reason, self.context.channel_name);
+                let decision = resume_decision(
+                    outcome,
+                    reason,
+                    self.context.channel_name,
+                    input
+                        .session_key(&self.context.runtime.active_agent)
+                        .principal,
+                );
                 Ok(Answered::Resume(Box::new(Resume {
                     pending: entry,
                     decision,
@@ -647,9 +661,10 @@ fn resume_decision(
     outcome: ApprovalOutcome,
     reason: Option<Arc<str>>,
     channel_name: &str,
+    authorized_by: agentos_proto::PrincipalKey,
 ) -> ResumeDecision {
     match outcome {
-        ApprovalOutcome::Approved => ResumeDecision::Approve,
+        ApprovalOutcome::Approved => ResumeDecision::Approve { authorized_by },
         ApprovalOutcome::Rejected | ApprovalOutcome::Cancelled | ApprovalOutcome::Unavailable => {
             ResumeDecision::Reject {
                 reason: reason

@@ -85,6 +85,7 @@ fn policy_strategy() -> impl Strategy<Value = Policy> {
         .prop_map(|(rules, default_decision)| Policy {
             rules,
             default_decision,
+            delegation_grants: Vec::new(),
         })
 }
 
@@ -220,6 +221,7 @@ proptest! {
                 arg_equals: BTreeMap::new(),
             }],
             default_decision: PolicyVerb::Deny,
+            delegation_grants: Vec::new(),
         };
         prop_assert!(
             Policy::narrow(&parent, &child).is_err(),
@@ -241,6 +243,7 @@ proptest! {
         let child = Policy {
             rules: Vec::new(),
             default_decision: child_default.clone(),
+            delegation_grants: Vec::new(),
         };
         prop_assert!(
             Policy::narrow(&parent, &child).is_err(),

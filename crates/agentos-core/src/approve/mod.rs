@@ -1,5 +1,5 @@
 use agentos_interfaces::orchestrator::Plan;
-use agentos_proto::ToolCall;
+use agentos_proto::{DelegationGrant, ToolCall};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -46,12 +46,19 @@ pub struct PolicyRule {
 pub struct Policy {
     pub rules: Vec<PolicyRule>,
     pub default_decision: PolicyVerb,
+    /// Explicit grants are attached only after ordinary child-policy
+    /// narrowing succeeds. `Policy::narrow` never uses them as evidence that
+    /// a widening child policy is acceptable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delegation_grants: Vec<DelegationGrant>,
 }
 
 #[derive(Debug, Error)]
 pub enum PolicyError {
     #[error("child policy widens parent permissions for {0}")]
     Widened(Arc<str>),
+    #[error("delegation grants must be attached only after strict policy narrowing")]
+    GrantBearingChild,
     #[error("invalid policy YAML at line {line}: {message}")]
     InvalidYaml { line: usize, message: Arc<str> },
 }
@@ -61,6 +68,7 @@ impl Default for Policy {
         Self {
             rules: Vec::new(),
             default_decision: PolicyVerb::Deny,
+            delegation_grants: Vec::new(),
         }
     }
 }
@@ -78,6 +86,7 @@ impl Policy {
                 })
                 .collect(),
             default_decision: PolicyVerb::Deny,
+            delegation_grants: Vec::new(),
         }
     }
 
@@ -93,10 +102,15 @@ impl Policy {
                 })
                 .collect(),
             default_decision: PolicyVerb::Deny,
+            delegation_grants: Vec::new(),
         }
     }
 
     pub fn decide(&self, plan: &Plan) -> PolicyDecision {
+        self.decide_at(plan, unix_now())
+    }
+
+    pub fn decide_at(&self, plan: &Plan, now_unix: u64) -> PolicyDecision {
         if matches!(plan, Plan::Reply(_) | Plan::ResumeSubAgent { .. }) {
             return PolicyDecision::Allow;
         }
@@ -109,11 +123,15 @@ impl Policy {
         if let Plan::CallTools(calls) = plan {
             return calls
                 .iter()
-                .map(|call| self.decide(&Plan::CallTool(call.clone())))
+                .map(|call| self.decide_at(&Plan::CallTool(call.clone()), now_unix))
                 .reduce(strictest)
                 .unwrap_or_else(|| PolicyDecision::Deny {
                     reason: Arc::from("empty tool batch"),
                 });
+        }
+
+        if self.covering_grant_at(plan, now_unix).is_some() {
+            return PolicyDecision::Allow;
         }
 
         let tool_args = match plan {
@@ -132,6 +150,22 @@ impl Policy {
         default_policy_decision(&self.default_decision, plan)
     }
 
+    pub fn covering_grant_at(&self, plan: &Plan, now_unix: u64) -> Option<&DelegationGrant> {
+        let Plan::CallTool(call) = plan else {
+            return None;
+        };
+        self.delegation_grants.iter().find(|grant| {
+            !grant.transitive
+                && grant.is_active_at(now_unix)
+                && grant.scopes.iter().any(|scope| scope.covers(call))
+        })
+    }
+
+    pub fn with_delegation_grants(mut self, grants: Vec<DelegationGrant>) -> Self {
+        self.delegation_grants = grants;
+        self
+    }
+
     fn tool_has_arg_constraints(&self, tool_name: &Arc<str>) -> bool {
         self.rules.iter().any(|rule| {
             if rule.arg_equals.is_empty() {
@@ -146,7 +180,10 @@ impl Policy {
     }
 
     pub fn narrow(parent: &Self, child: &Self) -> Result<Self, PolicyError> {
-        if parent == child {
+        if !child.delegation_grants.is_empty() {
+            return Err(PolicyError::GrantBearingChild);
+        }
+        if parent.rules == child.rules && parent.default_decision == child.default_decision {
             return Ok(child.clone());
         }
 
@@ -204,6 +241,13 @@ impl Policy {
 
         Ok(child.clone())
     }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
 }
 
 fn decision_covers(parent: &PolicyVerb, child: &PolicyVerb) -> bool {
@@ -382,7 +426,10 @@ pub fn tool_call_approval_id(call: &ToolCall) -> Arc<str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentos_proto::ToolCallId;
+    use agentos_proto::{
+        AgentId, ChannelId, ConversationId, DelegationGrantScope, PrincipalKey, RunId,
+        SchemaVersion, SenderIdentity, ToolCallId,
+    };
     use serde_json::value::RawValue;
 
     fn tool_call(name: &str, args_json: &str) -> Plan {
@@ -418,6 +465,7 @@ mod tests {
                 },
             ],
             default_decision: PolicyVerb::Deny,
+            delegation_grants: Vec::new(),
         };
         assert!(!policy.tool_has_arg_constraints(&Arc::from("shell")));
         assert!(policy.tool_has_arg_constraints(&Arc::from("file")));
@@ -434,6 +482,7 @@ mod tests {
                 arg_equals: BTreeMap::from([(Arc::from("k"), Value::from("v"))]),
             }],
             default_decision: PolicyVerb::Deny,
+            delegation_grants: Vec::new(),
         };
         assert!(policy.tool_has_arg_constraints(&Arc::from("anything")));
     }
@@ -464,6 +513,7 @@ mod tests {
                 },
             ],
             default_decision: PolicyVerb::Deny,
+            delegation_grants: Vec::new(),
         }
     }
 
@@ -489,6 +539,54 @@ mod tests {
     }
 
     #[test]
+    fn explicit_grant_allows_only_its_exact_scope_before_expiry() {
+        let base = Policy::default();
+        let grant = DelegationGrant {
+            version: SchemaVersion::default(),
+            grant_id: Arc::from("grant-1"),
+            authorized_by: PrincipalKey::v1(
+                AgentId::new("parent"),
+                ChannelId::new("cli"),
+                ConversationId::new("conversation"),
+                SenderIdentity::identified("operator"),
+            ),
+            parent_run_id: RunId::new("parent-run"),
+            delegatee: AgentId::new("child"),
+            policy_id: Arc::from("child-policy"),
+            issued_at_unix: 10,
+            expires_at_unix: 20,
+            transitive: false,
+            scopes: vec![DelegationGrantScope {
+                tool: Arc::from("file"),
+                arg_equals: BTreeMap::from([(Arc::from("operation"), Value::from("read"))]),
+            }],
+        };
+        let granted = base.clone().with_delegation_grants(vec![grant]);
+        let read = tool_call("file", r#"{"operation":"read","path":"a"}"#);
+        let write = tool_call("file", r#"{"operation":"write","path":"a"}"#);
+
+        assert_eq!(granted.decide_at(&read, 10), PolicyDecision::Allow);
+        assert!(matches!(
+            granted.decide_at(&write, 10),
+            PolicyDecision::Deny { .. }
+        ));
+        assert!(matches!(
+            granted.decide_at(&read, 20),
+            PolicyDecision::Deny { .. }
+        ));
+        let mut transitive = granted.clone();
+        transitive.delegation_grants[0].transitive = true;
+        assert!(matches!(
+            transitive.decide_at(&read, 10),
+            PolicyDecision::Deny { .. }
+        ));
+        assert!(matches!(
+            Policy::narrow(&Policy::default(), &granted),
+            Err(PolicyError::GrantBearingChild)
+        ));
+    }
+
+    #[test]
     fn narrow_rejects_child_rule_that_drops_parent_argument_constraints() {
         let parent = Policy {
             rules: vec![PolicyRule {
@@ -498,6 +596,7 @@ mod tests {
                 arg_equals: BTreeMap::from([(Arc::from("operation"), Value::from("read"))]),
             }],
             default_decision: PolicyVerb::Deny,
+            delegation_grants: Vec::new(),
         };
         let child = Policy::allow_tools(["file"]);
 
@@ -525,6 +624,7 @@ mod tests {
                 },
             ],
             default_decision: PolicyVerb::Deny,
+            delegation_grants: Vec::new(),
         };
         let child = Policy::allow_tools(["file"]);
 

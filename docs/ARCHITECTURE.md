@@ -475,6 +475,15 @@ code it checks, and each has a test that violates it and observes the panic.
 - Child guardrails can be inherited from the parent runtime.
 - Every sub-agent tool call re-enters the loop at `Approve`, including
   MCP-originated calls.
+- Unattended authority outside the parent lattice is represented only by a
+  versioned `DelegationGrant`. Grant scopes are removed from the ordinary
+  child policy before `Policy::narrow` runs; attaching a grant-bearing policy
+  to `Policy::narrow` is an error.
+- A configured grant forces delegation through `AskUser`. The approving
+  principal, parent run, exact tool/argument constraints, issue time, expiry,
+  child identity, and non-transitive flag are persisted with the child run.
+  Grant issuance and use are also recorded in the run trace. Empty constraints
+  and lifetimes outside 1–3600 seconds fail configuration.
 
 ## 11. Tools, Skills, MCP, and Resources
 
@@ -518,6 +527,19 @@ or sub-orchestrator templates. Each sub-agent declares:
 - memory domains;
 - max turns;
 - guardrail inheritance.
+- optional exact delegation-grant scopes and a grant lifetime.
+
+For example, this permits only `file` reads for five minutes after an
+authorized principal approves the delegation; it does not turn the child
+policy itself into an allowlist:
+
+```toml
+tools = ["file"]
+delegation_grant_ttl_secs = 300
+delegation_grants = [
+  { tool = "file", arg_equals = { operation = "read" } },
+]
+```
 
 Routing rules can dispatch directly, delegate to a sub-agent, or escalate to a
 template. Templates live in `suborchs/*.toml` and define ordered stages that
@@ -767,7 +789,7 @@ The list below records implemented baselines, not unconditional Stable support.
 See [`CAPABILITY_MATRIX.md`](CAPABILITY_MATRIX.md) for current maturity,
 platform assumptions, and promotion gates. In particular, remote-channel
 production guarantees, actual-process stdio MCP isolation, platform sandbox
-qualification, subagent delegation grants, provisional streaming, and
+qualification, provisional streaming, and
 real-vector memory remain Preview while their remediation milestones are open.
 
 Completed baselines:

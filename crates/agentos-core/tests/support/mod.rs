@@ -233,6 +233,7 @@ pub fn tool_policy(tools: &[&str], verb: PolicyVerb) -> Policy {
             })
             .collect(),
         default_decision: PolicyVerb::Deny,
+        delegation_grants: Vec::new(),
     }
 }
 

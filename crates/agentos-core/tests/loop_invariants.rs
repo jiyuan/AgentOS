@@ -17,7 +17,8 @@ use agentos_interfaces::session::{Item, Transcript};
 use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
 use agentos_interfaces::RunState;
 use agentos_proto::{
-    AgentId, Message, MessageRole, RunId, ToolCall, ToolCallId, ToolResult, ToolStatus,
+    AgentId, ChannelId, ConversationId, Message, MessageRole, PrincipalKey, RunId, SenderIdentity,
+    ToolCall, ToolCallId, ToolResult, ToolStatus,
 };
 use async_trait::async_trait;
 use serde_json::value::RawValue;
@@ -219,7 +220,13 @@ async fn paused_run_state_json_round_trips_and_resumes_with_trace_continuity() {
 
     // Approve and resume the restored state to completion.
     let approval_id = restored.pending_approvals[0].id.clone();
-    assert!(restored.approve(&approval_id));
+    let authorized_by = PrincipalKey::v1(
+        AgentId::new("invariant-agent"),
+        ChannelId::new("test"),
+        ConversationId::new("test"),
+        SenderIdentity::identified("operator"),
+    );
+    assert!(restored.authorize(&approval_id, authorized_by, 1));
     let mut current = resume_approved(restored).expect("approved state resumes");
     let finished = loop {
         current = current

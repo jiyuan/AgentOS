@@ -439,6 +439,7 @@ mod tests {
                 rule(PolicyAction::Tool(Arc::from("file")), PolicyVerb::Allow),
             ],
             default_decision: PolicyVerb::Deny,
+            delegation_grants: Vec::new(),
         };
         // Strictly less: one of the parent's two tools, and asking rather than
         // allowing outright.
@@ -448,6 +449,7 @@ mod tests {
                 PolicyVerb::AskUser,
             )],
             default_decision: PolicyVerb::Deny,
+            delegation_grants: Vec::new(),
         };
         delegation_narrows(&parent, &child);
     }
@@ -461,6 +463,7 @@ mod tests {
                 PolicyVerb::Allow,
             )],
             default_decision: PolicyVerb::Deny,
+            delegation_grants: Vec::new(),
         };
         let child = Policy {
             rules: vec![rule(
@@ -468,6 +471,7 @@ mod tests {
                 PolicyVerb::Allow,
             )],
             default_decision: PolicyVerb::Deny,
+            delegation_grants: Vec::new(),
         };
         delegation_narrows(&parent, &child);
     }
@@ -478,10 +482,12 @@ mod tests {
         let parent = Policy {
             rules: Vec::new(),
             default_decision: PolicyVerb::AskUser,
+            delegation_grants: Vec::new(),
         };
         let child = Policy {
             rules: Vec::new(),
             default_decision: PolicyVerb::Allow,
+            delegation_grants: Vec::new(),
         };
         delegation_narrows(&parent, &child);
     }
@@ -491,6 +497,7 @@ mod tests {
         let parent = Policy {
             rules: vec![rule(PolicyAction::Any, PolicyVerb::AskUser)],
             default_decision: PolicyVerb::Deny,
+            delegation_grants: Vec::new(),
         };
         let child = Policy {
             rules: vec![rule(
@@ -498,6 +505,7 @@ mod tests {
                 PolicyVerb::AskUser,
             )],
             default_decision: PolicyVerb::Deny,
+            delegation_grants: Vec::new(),
         };
         delegation_narrows(&parent, &child);
     }
@@ -524,6 +532,7 @@ mod tests {
                 )]),
             }],
             default_decision: PolicyVerb::Deny,
+            delegation_grants: Vec::new(),
         };
         let child = Policy::allow_tools(["file"]);
         delegation_narrows(&parent, &child);

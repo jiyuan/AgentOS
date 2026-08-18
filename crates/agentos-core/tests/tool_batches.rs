@@ -121,6 +121,7 @@ fn policy(verb: PolicyVerb) -> Policy {
             arg_equals: BTreeMap::new(),
         }],
         default_decision: PolicyVerb::Deny,
+        delegation_grants: Vec::new(),
     }
 }
 
@@ -218,6 +219,7 @@ async fn every_call_in_a_batch_crosses_approve() {
     let deny = Policy {
         rules: Vec::new(),
         default_decision: PolicyVerb::Deny,
+        delegation_grants: Vec::new(),
     };
     let deps = support::runner_deps(&orchestrator, &session, &deny, Some(&tools), None);
 

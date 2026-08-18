@@ -1683,6 +1683,7 @@ the result in the PR.
 | X1 (b) | `Plan` gains `CallTools`; `RunState` gains `queued_tool_calls` | **Verified**: interfaces major (`enum_variant_added`, `constructible_struct_adds_field`), proto and llm unchanged |
 | X2 | `ToolSpec.requires_isolation: bool` → `sandbox: SandboxMode` | **Verified**: interfaces major (`struct_pub_field_missing` plus the new field), proto and llm unchanged. `agentos-core` also major (`McpToolConfig.sandbox`, `Exec.sandbox`, `ExecError::Sandbox`) with no external consumers |
 | X6 | `Session::fork` as a defaulted method | Additive |
+| AUTH-002 | `RunState` persists delegation grants and `Interruption` persists approval authorization | **Verified**: interfaces major (`constructible_struct_adds_field`); the existing `ApprovalStatus::Approved` variant and `RunState::approve` signature remain compatible |
 
 `Approve`, `RunLoopState`, and the guardrail traits are unchanged by every item
 in this roadmap.
@@ -1714,3 +1715,14 @@ cancellation token; an approval is decided only by an answer naming its ticket;
 and conversations run concurrently across shard threads.
 [`ARCHITECTURE.md`](ARCHITECTURE.md) was re-consolidated against this work on
 2026-08-17 and no longer contradicts it.
+
+## Audit remediation continuation (2026-08-18)
+
+`AUTH-002` is complete. `Policy::narrow` still evaluates only the strict
+parent/child lattice. A separately configured delegation scope is removed from
+that child policy, forces principal-bound approval of the delegation, and then
+issues a versioned grant containing its authorizer, exact tool/argument region,
+parent run, child identity, issue/expiry times, and explicit non-transitive
+flag. The grant survives paused-child serialization, and unmatched or expired
+calls fall back to the strictly narrowed policy. The next slice is `AUTH-003`,
+conservative shipped policy and command profiles.

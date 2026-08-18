@@ -444,7 +444,11 @@ where
 /// decides, `y` approves — meant any input at all authorised a tool call, which
 /// is exactly the ambient authority the item removes. Input that is not an
 /// answer is reported and the wait continues; `None` means the channel closed.
-async fn await_approval<C>(channel: &mut C, ticket: &ApprovalTicket) -> Option<ResumeDecision>
+async fn await_approval<C>(
+    channel: &mut C,
+    ticket: &ApprovalTicket,
+    active_agent: &AgentId,
+) -> Option<ResumeDecision>
 where
     C: Channel,
 {
@@ -454,7 +458,11 @@ where
             Routed::Decides {
                 outcome: ApprovalOutcome::Approved,
                 ..
-            } => return Some(ResumeDecision::Approve),
+            } => {
+                return Some(ResumeDecision::Approve {
+                    authorized_by: answer.session_key(active_agent).principal,
+                })
+            }
             Routed::Decides { reason, .. } => {
                 return Some(ResumeDecision::Reject {
                     reason: reason.unwrap_or_else(|| Arc::from("rejected by user")),
@@ -562,7 +570,7 @@ async fn run_tui_loop(
                     continue;
                 };
 
-                let Some(decision) = await_approval(channel, &ticket).await else {
+                let Some(decision) = await_approval(channel, &ticket, active_agent).await else {
                     eprintln!("paused run saved: {}", state_path.display());
                     return Ok(());
                 };
@@ -612,7 +620,15 @@ where
                 |reason| Arc::from(reason.as_str()),
             ),
         },
-        Some("approve") | None => ResumeDecision::Approve,
+        Some("approve") | None => ResumeDecision::Approve {
+            authorized_by: paused
+                .state
+                .session_key
+                .as_ref()
+                .ok_or("paused run has no session principal")?
+                .principal
+                .clone(),
+        },
         Some(other) => {
             return Err(format!("unknown resume decision: {other}").into());
         }

@@ -248,6 +248,12 @@ async fn golden_approval_pause_and_resume() {
         .first()
         .map(|approval| approval.id.clone())
         .expect("a paused run carries the approval it is waiting on");
+    let authorized_by = state
+        .session_key
+        .as_ref()
+        .expect("paused run has a session principal")
+        .principal
+        .clone();
 
     let resumed = resume_run(
         PausedRun {
@@ -256,7 +262,7 @@ async fn golden_approval_pause_and_resume() {
             state,
         },
         &approval_id,
-        ResumeDecision::Approve,
+        ResumeDecision::Approve { authorized_by },
         &deps,
     )
     .await
@@ -332,6 +338,7 @@ async fn golden_subagent_delegation() {
             arg_equals: BTreeMap::new(),
         }],
         default_decision: PolicyVerb::Deny,
+        delegation_grants: Vec::new(),
     };
     let deps = runner_deps(&parent, session.as_ref(), &policy, None, Some(&subagents));
 

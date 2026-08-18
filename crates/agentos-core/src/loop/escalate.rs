@@ -156,7 +156,7 @@ pub(super) async fn execute_escalate(
             "suborch_stage_call_started",
             suborch_stage_agent_telemetry_fields(spec, &stage_name, &stage_agent),
         );
-        let result = match execute_delegate(state, deps, &stage_agent).await {
+        let result = match execute_delegate(state, deps, &stage_agent, None).await {
             Ok(DelegateOutcome::Finished(result)) => result,
             Ok(DelegateOutcome::Paused(paused)) => {
                 let mut fields =

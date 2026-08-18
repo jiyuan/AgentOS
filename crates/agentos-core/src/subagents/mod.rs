@@ -15,7 +15,8 @@ use agentos_interfaces::orchestrator::{Orchestrator, SubAgentSpec};
 use agentos_interfaces::session::Session;
 use agentos_llm::Llm;
 use agentos_proto::{
-    AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole, RunId, SessionKey,
+    AgentId, ChannelId, ConversationId, DelegationGrant, DelegationGrantScope, Envelope, Message,
+    MessageRole, RunId, SessionKey,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -24,6 +25,8 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::task::LocalSet;
 use tokio_util::sync::CancellationToken;
+
+mod grants;
 
 #[derive(Debug, Error)]
 pub enum SubAgentError {
@@ -42,6 +45,17 @@ pub enum SubAgentError {
     Run(Arc<str>),
     #[error("sub-agent paused unexpectedly")]
     Paused,
+    #[error("sub-agent '{agent_id:?}' requires an explicitly approved delegation grant")]
+    GrantRequiresApproval { agent_id: AgentId },
+    #[error("invalid persisted delegation grant '{grant_id}' for sub-agent '{agent_id:?}'")]
+    InvalidGrant {
+        grant_id: Arc<str>,
+        agent_id: AgentId,
+    },
+    #[error(
+        "delegation request does not match configured grant scopes for sub-agent '{agent_id:?}'"
+    )]
+    GrantRequestMismatch { agent_id: AgentId },
 }
 
 pub struct SubAgentDefinition {
@@ -64,6 +78,8 @@ pub struct SubAgentDefinition {
     /// see. Turn it on for the sub-agent that needs the discussion so far —
     /// a reviewer, an editor — not for the one that fetches a URL.
     pub seed_from_parent: bool,
+    pub delegation_grant_scopes: Vec<DelegationGrantScope>,
+    pub delegation_grant_ttl_secs: u64,
 }
 
 impl SubAgentDefinition {
@@ -85,6 +101,8 @@ impl SubAgentDefinition {
             output_guardrails: Vec::new(),
             tool_guardrails: Vec::new(),
             seed_from_parent: false,
+            delegation_grant_scopes: Vec::new(),
+            delegation_grant_ttl_secs: 300,
         }
     }
 
@@ -105,6 +123,16 @@ impl SubAgentDefinition {
 
     pub fn with_seed_from_parent(mut self, seed_from_parent: bool) -> Self {
         self.seed_from_parent = seed_from_parent;
+        self
+    }
+
+    pub fn with_delegation_grants(
+        mut self,
+        scopes: Vec<DelegationGrantScope>,
+        ttl_secs: u64,
+    ) -> Self {
+        self.delegation_grant_scopes = scopes;
+        self.delegation_grant_ttl_secs = ttl_secs;
         self
     }
 
@@ -204,6 +232,7 @@ pub struct SubAgentInvocation {
     /// definition asks for it (roadmap X6). Supplied by the loop, which is
     /// what holds the parent run; whether it is used is the definition's call.
     parent_seed: Option<ParentSeed>,
+    delegation_grants: Vec<DelegationGrant>,
 }
 
 /// The point in a parent conversation a child is branched from.
@@ -303,50 +332,13 @@ impl SubAgentRegistry {
             Arc::new(definition),
         );
     }
-
-    pub fn prepare(
-        &self,
-        spec: &SubAgentSpec,
-        parent_policy: &Policy,
-        input: Envelope,
-        run_id: RunId,
-    ) -> Result<SubAgentInvocation, SubAgentError> {
-        let definition = self
-            .definitions
-            .get(&(spec.agent_id.clone(), Arc::clone(&spec.policy_id)))
-            .cloned()
-            .ok_or_else(|| SubAgentError::Unknown {
-                agent_id: spec.agent_id.clone(),
-                policy_id: Arc::clone(&spec.policy_id),
-            })?;
-        let child_policy = Policy::narrow(parent_policy, &definition.policy)?;
-        // X5: state the security property over the policy the child run is
-        // actually handed, rather than trusting that the call above produced
-        // it. Independent of how `narrow` decides individual rules.
-        #[cfg(debug_assertions)]
-        crate::invariants::delegation_narrows(parent_policy, &child_policy);
-        Ok(SubAgentInvocation {
-            definition,
-            policy: child_policy,
-            input,
-            run_id,
-            channel_capacity: self.channel_capacity,
-            trace_sink: self.trace_sink.clone(),
-            task_workspace: self.task_workspace.clone(),
-            session: self.session.clone(),
-            spill: self.spill.clone(),
-            tool_result_inline_bytes: self.tool_result_inline_bytes,
-            summarizer: self.summarizer.clone(),
-            compaction_config: self.compaction_config,
-            // A fresh token until the caller links it to a parent run; the
-            // loop always does.
-            cancel: CancellationToken::new(),
-            parent_seed: None,
-        })
-    }
 }
 
 impl SubAgentInvocation {
+    pub fn delegation_grants(&self) -> &[DelegationGrant] {
+        &self.delegation_grants
+    }
+
     /// Tie this child run to `parent`, so cancelling the parent cancels it.
     pub fn with_cancel(mut self, parent: &CancellationToken) -> Self {
         self.cancel = parent.child_token();
@@ -370,7 +362,10 @@ impl SubAgentInvocation {
             .map_err(|_| SubAgentError::ChannelClosed)?;
 
         let definition = self.definition;
-        let child_policy = self.policy;
+        let delegation_grants = self.delegation_grants;
+        let child_policy = self
+            .policy
+            .with_delegation_grants(delegation_grants.clone());
         let run_id = self.run_id;
         let trace_sink = self.trace_sink;
         let task_workspace = self.task_workspace;
@@ -464,7 +459,8 @@ impl SubAgentInvocation {
                 stream_sink: None,
             };
             let result = match run_envelope(input, run_id, &deps).await {
-                Ok(RunOutcome::Finished { state, output }) => {
+                Ok(RunOutcome::Finished { mut state, output }) => {
+                    state.delegation_grants = delegation_grants.clone();
                     Ok(SubAgentRun::Finished(SubAgentRunOutput {
                         agent_id: definition.agent_id.clone(),
                         policy_id: Arc::clone(&definition.policy_id),
@@ -472,13 +468,16 @@ impl SubAgentInvocation {
                         message: output.message,
                     }))
                 }
-                Ok(RunOutcome::Paused(state)) => Ok(SubAgentRun::Paused(SubAgentPausedRun {
-                    agent_id: definition.agent_id.clone(),
-                    policy_id: Arc::clone(&definition.policy_id),
-                    channel_id: child_channel_id,
-                    conversation_id: child_conversation_id,
-                    state,
-                })),
+                Ok(RunOutcome::Paused(mut state)) => {
+                    state.delegation_grants = delegation_grants;
+                    Ok(SubAgentRun::Paused(SubAgentPausedRun {
+                        agent_id: definition.agent_id.clone(),
+                        policy_id: Arc::clone(&definition.policy_id),
+                        channel_id: child_channel_id,
+                        conversation_id: child_conversation_id,
+                        state,
+                    }))
+                }
                 Err(err) => Err(SubAgentError::Run(Arc::from(err.to_string()))),
             };
             output_tx
@@ -504,7 +503,10 @@ impl SubAgentInvocation {
         decision: ResumeDecision,
     ) -> Result<SubAgentRun, SubAgentError> {
         let definition = self.definition;
-        let child_policy = self.policy;
+        let delegation_grants = self.delegation_grants;
+        let child_policy = self
+            .policy
+            .with_delegation_grants(delegation_grants.clone());
         let trace_sink = self.trace_sink;
         let task_workspace = self.task_workspace;
         let injected_session = self.session;
@@ -589,7 +591,8 @@ impl SubAgentInvocation {
                     state: paused.state,
                 };
                 match resume_run(paused_run, &child_approval_id, decision, &deps).await {
-                    Ok(RunOutcome::Finished { state, output }) => {
+                    Ok(RunOutcome::Finished { mut state, output }) => {
+                        state.delegation_grants = delegation_grants.clone();
                         Ok(SubAgentRun::Finished(SubAgentRunOutput {
                             agent_id: definition.agent_id.clone(),
                             policy_id: Arc::clone(&definition.policy_id),
@@ -597,13 +600,16 @@ impl SubAgentInvocation {
                             message: output.message,
                         }))
                     }
-                    Ok(RunOutcome::Paused(state)) => Ok(SubAgentRun::Paused(SubAgentPausedRun {
-                        agent_id: definition.agent_id.clone(),
-                        policy_id: Arc::clone(&definition.policy_id),
-                        channel_id: paused.channel_id,
-                        conversation_id: paused.conversation_id,
-                        state,
-                    })),
+                    Ok(RunOutcome::Paused(mut state)) => {
+                        state.delegation_grants = delegation_grants;
+                        Ok(SubAgentRun::Paused(SubAgentPausedRun {
+                            agent_id: definition.agent_id.clone(),
+                            policy_id: Arc::clone(&definition.policy_id),
+                            channel_id: paused.channel_id,
+                            conversation_id: paused.conversation_id,
+                            state,
+                        }))
+                    }
                     Err(err) => Err(SubAgentError::Run(Arc::from(err.to_string()))),
                 }
             })
@@ -751,12 +757,33 @@ pub fn child_run_id(spec: &SubAgentSpec, parent_state: &agentos_interfaces::RunS
     ))
 }
 
+pub fn delegation_approval_label(spec: &SubAgentSpec) -> String {
+    let grant = spec
+        .metadata
+        .get(agentos_proto::DELEGATION_GRANT_SCOPES_KEY)
+        .map(|scopes| {
+            let ttl = spec
+                .metadata
+                .get(agentos_proto::DELEGATION_GRANT_TTL_KEY)
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            format!("; grant scopes={scopes}, ttl={ttl}s")
+        })
+        .unwrap_or_default();
+    format!("{} ({}){grant}", spec.agent_id.as_str(), spec.policy_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestrator::EchoOrchestrator;
+    use crate::r#loop::ApprovalAuthorization;
     use agentos_interfaces::session::Item;
     use agentos_interfaces::RunState;
-    use agentos_proto::{AgentId, Attachment, AttachmentKind, MessageRole, RunId as ProtoRunId};
+    use agentos_proto::{
+        AgentId, Attachment, AttachmentKind, InterruptionId, MessageRole, PrincipalKey,
+        RunId as ProtoRunId, SenderIdentity,
+    };
     use std::path::PathBuf;
 
     fn user_message_with_attachment() -> agentos_proto::Message {
@@ -810,6 +837,96 @@ mod tests {
         assert_eq!(envelope.message.content.as_ref(), "hi");
         assert_eq!(envelope.message.attachments.len(), 1);
         assert_eq!(envelope.message.attachments[0].name.as_ref(), "SKILL.md");
+    }
+
+    #[test]
+    fn grant_backed_child_requires_real_approval_and_persists_its_authorizer() {
+        let mut registry = SubAgentRegistry::new();
+        registry.register(
+            SubAgentDefinition::new(
+                AgentId::new("worker"),
+                "default",
+                Arc::new(EchoOrchestrator),
+                Policy::default(),
+            )
+            .with_delegation_grants(
+                vec![DelegationGrantScope {
+                    tool: Arc::from("file"),
+                    arg_equals: BTreeMap::from([(
+                        Arc::from("operation"),
+                        Value::String("read".to_owned()),
+                    )]),
+                }],
+                60,
+            ),
+        );
+        let mut spec = spec_with_prompt("read");
+        spec.metadata.insert(
+            Arc::from(agentos_proto::DELEGATION_GRANT_SCOPES_KEY),
+            serde_json::json!([{
+                "tool": "file",
+                "arg_equals": {"operation": "read"}
+            }]),
+        );
+        spec.metadata.insert(
+            Arc::from(agentos_proto::DELEGATION_GRANT_TTL_KEY),
+            Value::from(60),
+        );
+        let parent = parent_state_with_user_message();
+        let input = child_input_envelope(&spec, &parent);
+        assert!(matches!(
+            registry.prepare(
+                &spec,
+                &Policy::default(),
+                input.clone(),
+                ProtoRunId::new("child-run")
+            ),
+            Err(SubAgentError::GrantRequiresApproval { .. })
+        ));
+
+        let authorized_by = PrincipalKey::v1(
+            AgentId::new("parent-agent"),
+            ChannelId::new("cli"),
+            ConversationId::new("conversation"),
+            SenderIdentity::identified("operator"),
+        );
+        let authorization = ApprovalAuthorization {
+            authorized_by: authorized_by.clone(),
+            approved_at_unix: 100,
+            approval_id: InterruptionId::new("approval-delegate-worker-default"),
+        };
+        let invocation = registry
+            .prepare_authorized(
+                &spec,
+                &Policy::default(),
+                input,
+                ProtoRunId::new("child-run"),
+                &parent.run_id,
+                &authorization,
+            )
+            .expect("authorized grant prepares child");
+        let grants = invocation.delegation_grants();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].authorized_by, authorized_by);
+        assert_eq!(grants[0].expires_at_unix, 160);
+        assert!(!grants[0].transitive);
+
+        let mut tampered = grants.to_vec();
+        tampered[0].scopes[0]
+            .arg_equals
+            .insert(Arc::from("operation"), Value::String("write".to_owned()));
+        let input = child_input_envelope(&spec, &parent);
+        assert!(matches!(
+            registry.prepare_existing_grants(
+                &spec,
+                &Policy::default(),
+                input,
+                ProtoRunId::new("child-run"),
+                &parent.run_id,
+                tampered,
+            ),
+            Err(SubAgentError::InvalidGrant { .. })
+        ));
     }
 
     #[test]

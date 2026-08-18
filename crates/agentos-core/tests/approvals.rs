@@ -21,8 +21,8 @@ use agentos_interfaces::test_support::MockChannel;
 use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
 use agentos_interfaces::{Channel, RunState};
 use agentos_proto::{
-    ChannelId, ConversationId, Envelope, Message, MessageRole, RunId, ToolCall, ToolCallId,
-    ToolResult, ToolStatus,
+    AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole, RunId, ToolCall,
+    ToolCallId, ToolResult, ToolStatus,
 };
 use async_trait::async_trait;
 use serde_json::{json, value::RawValue, Value};
@@ -102,6 +102,7 @@ fn ask_user(tool: &str) -> Policy {
             arg_equals: BTreeMap::new(),
         }],
         default_decision: PolicyVerb::Deny,
+        delegation_grants: Vec::new(),
     }
 }
 
@@ -302,7 +303,9 @@ async fn an_answer_naming_the_prompt_approves_it() {
             channel.egress().as_ref(),
             paused.paused,
             &approval_id,
-            ResumeDecision::Approve,
+            ResumeDecision::Approve {
+                authorized_by: answer.session_key(&AgentId::new("agent")).principal,
+            },
         )
         .await
         .expect("an approved run resumes");
@@ -414,7 +417,12 @@ async fn a_run_with_nobody_to_ask_records_unavailable() {
 fn every_resume_decision_names_its_outcome() {
     let reason: Arc<str> = Arc::from("because");
     let pairs = [
-        (ResumeDecision::Approve, ApprovalOutcome::Approved),
+        (
+            ResumeDecision::Approve {
+                authorized_by: envelope("").session_key(&AgentId::new("agent")).principal,
+            },
+            ApprovalOutcome::Approved,
+        ),
         (
             ResumeDecision::Reject {
                 reason: Arc::clone(&reason),
@@ -436,7 +444,7 @@ fn every_resume_decision_names_its_outcome() {
         assert_eq!(decision.outcome(), expected);
         assert_eq!(
             expected.permits_action(),
-            matches!(decision, ResumeDecision::Approve)
+            matches!(decision, ResumeDecision::Approve { .. })
         );
     }
 }

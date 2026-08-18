@@ -418,6 +418,7 @@ fn delegating_policy() -> Policy {
             arg_equals: BTreeMap::new(),
         }],
         default_decision: PolicyVerb::Deny,
+        delegation_grants: Vec::new(),
     }
 }
 
@@ -445,6 +446,7 @@ async fn delegate_with_seeding(seed_from_parent: bool) -> (Arc<InMemorySession>,
             Policy {
                 rules: Vec::new(),
                 default_decision: PolicyVerb::Deny,
+                delegation_grants: Vec::new(),
             },
         )
         .with_seed_from_parent(seed_from_parent),

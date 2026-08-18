@@ -717,3 +717,63 @@
 - **Actual Behavior**: None of the three documented registry paths exists in this checkout, so the implementation proceeded using the codebase inventory and native Rust tooling.
 - **Root Cause**: The documented repository structure and the checked-in filesystem have drifted.
 - **Suggested Fix**: Add the three registries at their documented paths or amend the Resolution Chain to name the actual project discovery mechanism.
+
+## [2026-08-18 23:14] ORCHESTRATION [ESCALATE]
+
+- **Agent**: main-codex
+- **Task**: Implement the `AUTH-002` explicit delegation-grant slice.
+- **Guideline Violated**: ORCHESTRATION > Subagent Delegation & Creation
+- **Expected Behavior**: Delegate work involving more than two sequential tool calls to a matching subagent.
+- **Actual Behavior**: Work was performed locally because the active runtime instructions only permit spawning subagents when the user explicitly requests delegation.
+- **Root Cause**: Higher-priority runtime instructions conflict with the repository's automatic delegation threshold, and the already-escalated conflict remains unresolved.
+- **Suggested Fix**: Amend the repository guideline to recognize runtimes where subagent spawning requires explicit user consent.
+
+## [2026-08-18 23:14] TOOL [RESOLVED]
+
+- **Agent**: main-codex
+- **Task**: Regenerate the configuration catalog for `AUTH-002`.
+- **Guideline Violated**: GUIDELINES > Consistency
+- **Expected Behavior**: Every newly cataloged field has a source doc comment before catalog generation.
+- **Actual Behavior**: The first catalog run rejected `subagents.delegation_grants.tool` because its field lacked a doc comment.
+- **Root Cause**: The container type and constraint map were documented, but the nested tool-name field was missed.
+- **Suggested Fix**: Treat generated-catalog documentation as part of the config-type definition checklist. The missing comment was added and catalog generation now passes.
+
+## [2026-08-18 23:14] CONSISTENCY [RESOLVED]
+
+- **Agent**: main-codex
+- **Task**: Keep `AUTH-002` within repository module-size limits.
+- **Guideline Violated**: Code conventions > module size
+- **Expected Behavior**: New non-test Rust modules stay below the enforced 800-line ceiling.
+- **Actual Behavior**: Initial grant preparation pushed `subagents/mod.rs` over the limit, and moving approval-label code later pushed `runner.rs` to 810 lines.
+- **Root Cause**: Grant issuance and presentation were first added at their call sites before their stable boundaries were extracted.
+- **Suggested Fix**: Extract cohesive grant preparation into `subagents/grants.rs` and keep grant-label rendering with the subagent domain. Both module-size checks now pass.
+
+## [2026-08-18 23:14] CORRECTNESS [RESOLVED]
+
+- **Agent**: main-codex
+- **Task**: Verify the delegation approval prompt discloses exact grant scope.
+- **Guideline Violated**: GUIDELINES > Correctness
+- **Expected Behavior**: The regression should assert the compact JSON fragment actually rendered by `serde_json::Value`.
+- **Actual Behavior**: The first assertion searched for literal backslashes before JSON quotes and failed even though the label contained the required scope.
+- **Root Cause**: A raw Rust string was unnecessarily escaped as if it were an ordinary string.
+- **Suggested Fix**: Use the raw-string form `r#""operation":"read""#`. The corrected regression and full workspace suite pass.
+
+## [2026-08-18 23:21] TOOL [RESOLVED]
+
+- **Agent**: main-codex
+- **Task**: Produce the final interface compatibility report for `AUTH-002`.
+- **Guideline Violated**: GUIDELINES > Correctness / verification
+- **Expected Behavior**: `cargo-semver-checks` should build the baseline and current interface crates and report compatibility changes.
+- **Actual Behavior**: The first final invocation could not update the registry index because the sandbox proxy endpoint was unavailable.
+- **Root Cause**: The semver checker creates a temporary baseline workspace whose dependency resolution required network access outside the default sandbox.
+- **Suggested Fix**: Retry the approved `cargo semver-checks` command with network escalation. The rerun completed and reported only the documented major additions to externally constructible persisted structs.
+
+## [2026-08-18 23:22] TOOL [RESOLVED]
+
+- **Agent**: main-codex
+- **Task**: Stage the verified `AUTH-002` slice.
+- **Guideline Violated**: GUIDELINES > Consistency / repository workflow
+- **Expected Behavior**: The already-approved `git add` command should update the repository index.
+- **Actual Behavior**: The default sandbox denied creation of `.git/index.lock` even though the workspace files themselves are writable.
+- **Root Cause**: This runtime exposes `.git` as read-only unless the command is explicitly escalated.
+- **Suggested Fix**: Retry the narrowly scoped, approved `git add` command with escalation. Staging then completed successfully.

@@ -18,6 +18,7 @@ mod support;
 use agentos_core::approve::Policy;
 use agentos_core::r#loop::{resume_approved, RunLoopState};
 use agentos_interfaces::RunState;
+use agentos_proto::{AgentId, ChannelId, ConversationId, PrincipalKey, SenderIdentity};
 use criterion::{criterion_group, criterion_main, Criterion};
 use std::hint::black_box;
 use support::{
@@ -42,7 +43,16 @@ fn approve_first_pending(state: &mut RunState) {
         .expect("paused run has a pending approval")
         .id
         .clone();
-    assert!(state.approve(&id), "approval id matches pending entry");
+    let authorized_by = PrincipalKey::v1(
+        AgentId::new("bench"),
+        ChannelId::new("bench"),
+        ConversationId::new("bench"),
+        SenderIdentity::identified("bench"),
+    );
+    assert!(
+        state.authorize(&id, authorized_by, 1),
+        "approval id matches pending entry"
+    );
 }
 
 fn bench_ask_user_pause_resume(c: &mut Criterion) {

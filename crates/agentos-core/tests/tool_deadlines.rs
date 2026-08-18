@@ -82,6 +82,7 @@ fn allow_hang() -> Policy {
             arg_equals: BTreeMap::new(),
         }],
         default_decision: PolicyVerb::Deny,
+        delegation_grants: Vec::new(),
     }
 }
 

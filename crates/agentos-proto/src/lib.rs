@@ -1,5 +1,6 @@
 //! Serializable wire types shared across Agent OS crates and process boundaries.
 
+pub mod delegation;
 pub mod envelope;
 pub mod ids;
 pub mod message;
@@ -8,6 +9,9 @@ pub mod tool;
 pub mod trace;
 pub mod usage;
 
+pub use delegation::{
+    DelegationGrant, DelegationGrantScope, DELEGATION_GRANT_SCOPES_KEY, DELEGATION_GRANT_TTL_KEY,
+};
 pub use envelope::Envelope;
 pub use ids::{
     decode_base64url, encode_base64url, AgentId, ChannelId, ConversationId, InterruptionId,

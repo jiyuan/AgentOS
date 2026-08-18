@@ -1,7 +1,7 @@
 use super::telemetry::{
     field_key, record_subagent_failure, record_telemetry_event, subagent_telemetry_fields,
 };
-use super::{LoopDeps, RunError};
+use super::{ApprovalAuthorization, LoopDeps, RunError};
 use crate::runner::ResumeDecision;
 use crate::subagents::{
     child_input_envelope, child_run_id, ParentSeed, SubAgentError, SubAgentPausedRun, SubAgentRun,
@@ -24,6 +24,7 @@ pub(super) async fn execute_delegate(
     state: &mut RunState,
     deps: &LoopDeps<'_>,
     spec: &SubAgentSpec,
+    approval: Option<&ApprovalAuthorization>,
 ) -> Result<DelegateOutcome, RunError> {
     let parent_id = trace::run_span_id(state);
     let mut fields = BTreeMap::new();
@@ -89,24 +90,52 @@ pub(super) async fn execute_delegate(
     // it, since the turn in flight is not persisted until it finishes, and the
     // ask itself reaches the child as its input message. Whether any of it is
     // used is the sub-agent definition's call.
-    let invocation = match subagents
-        .prepare(spec, deps.policy, input, run_id)
-        .map(|invocation| {
-            let invocation = invocation.with_cancel(&deps.cancel);
-            match state.session_key.clone() {
-                Some(session_key) => invocation.with_parent_seed(ParentSeed {
-                    session_key,
-                    boundary: state.transcript.items.len(),
-                }),
-                None => invocation,
-            }
-        }) {
+    let prepared = match approval {
+        Some(authorization) => subagents.prepare_authorized(
+            spec,
+            deps.policy,
+            input,
+            run_id,
+            &state.run_id,
+            authorization,
+        ),
+        None => subagents.prepare(spec, deps.policy, input, run_id),
+    };
+    let invocation = match prepared.map(|invocation| {
+        let invocation = invocation.with_cancel(&deps.cancel);
+        match state.session_key.clone() {
+            Some(session_key) => invocation.with_parent_seed(ParentSeed {
+                session_key,
+                boundary: state.transcript.items.len(),
+            }),
+            None => invocation,
+        }
+    }) {
         Ok(invocation) => invocation,
         Err(error) => {
             record_subagent_failure(state, deps, span_id, spec, "subagent_create_failed", &error);
             return Err(error.into());
         }
     };
+    for grant in invocation.delegation_grants() {
+        let mut grant_fields = BTreeMap::new();
+        grant_fields.insert(
+            field_key("grant_id"),
+            Value::String(grant.grant_id.to_string()),
+        );
+        grant_fields.insert(
+            field_key("expires_at_unix"),
+            Value::from(grant.expires_at_unix),
+        );
+        grant_fields.insert(field_key("scope_count"), Value::from(grant.scopes.len()));
+        trace::record_event(
+            state,
+            deps.hooks,
+            span_id.clone(),
+            "delegation_grant_issued",
+            grant_fields,
+        );
+    }
     record_telemetry_event(
         state,
         deps.hooks,
@@ -187,6 +216,7 @@ pub(super) async fn execute_resume_delegate(
     deps: &LoopDeps<'_>,
     spec: &SubAgentSpec,
     paused: SubAgentPausedRun,
+    approval: Option<&ApprovalAuthorization>,
 ) -> Result<DelegateOutcome, RunError> {
     let subagents = deps.subagents.ok_or_else(|| SubAgentError::Unknown {
         agent_id: spec.agent_id.clone(),
@@ -199,10 +229,22 @@ pub(super) async fn execute_resume_delegate(
         message: Message::text(MessageRole::User, ""),
         metadata: BTreeMap::new(),
     };
+    let grants = paused.state.delegation_grants.clone();
     let invocation = subagents
-        .prepare(spec, deps.policy, input, paused.state.run_id.clone())?
+        .prepare_existing_grants(
+            spec,
+            deps.policy,
+            input,
+            paused.state.run_id.clone(),
+            &state.run_id,
+            grants,
+        )?
         .with_cancel(&deps.cancel);
-    match Box::pin(invocation.resume(paused, ResumeDecision::Approve)).await? {
+    let authorized_by = approval
+        .map(|authorization| authorization.authorized_by.clone())
+        .or_else(|| state.session_key.as_ref().map(|key| key.principal.clone()))
+        .ok_or(SubAgentError::Paused)?;
+    match Box::pin(invocation.resume(paused, ResumeDecision::Approve { authorized_by })).await? {
         SubAgentRun::Finished(result) => {
             let parent_id = trace::run_span_id(state);
             let span_id = trace::record_span(

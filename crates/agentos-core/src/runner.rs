@@ -177,7 +177,7 @@ pub struct PausedRun {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ResumeDecision {
     /// Someone holding the prompt's ticket said yes.
-    Approve,
+    Approve { authorized_by: PrincipalKey },
     /// Someone holding the prompt's ticket said no.
     Reject { reason: Arc<str> },
     /// The prompt expired before anyone answered.
@@ -191,7 +191,7 @@ impl ResumeDecision {
     /// The outcome this decision records.
     pub fn outcome(&self) -> ApprovalOutcome {
         match self {
-            Self::Approve => ApprovalOutcome::Approved,
+            Self::Approve { .. } => ApprovalOutcome::Approved,
             Self::Reject { .. } => ApprovalOutcome::Rejected,
             Self::Cancel { .. } => ApprovalOutcome::Cancelled,
             Self::Unavailable { .. } => ApprovalOutcome::Unavailable,
@@ -277,7 +277,7 @@ fn approval_action_label(action: &InterruptionAction) -> (&'static str, String) 
         InterruptionAction::ToolCall(call) => ("tool", call.name.as_ref().to_owned()),
         InterruptionAction::Delegate(spec) => (
             "delegate",
-            format!("{} ({})", spec.agent_id.as_str(), spec.policy_id),
+            crate::subagents::delegation_approval_label(spec),
         ),
         InterruptionAction::Escalate(spec) => (
             "escalate",
@@ -443,8 +443,10 @@ pub async fn resume_run(
     let task_session = activate_task_workspace_for_resume(&mut paused.state, deps)?;
     let outcome = decision.outcome();
     match decision {
-        ResumeDecision::Approve => {
-            paused.state.approve(approval_id);
+        ResumeDecision::Approve { authorized_by } => {
+            paused
+                .state
+                .authorize(approval_id, authorized_by, crate::gateway::unix_now());
         }
         ResumeDecision::Reject { reason } => {
             paused.state.reject(approval_id, Arc::clone(&reason));
@@ -804,6 +806,27 @@ mod tests {
     use serde_json::{json, value::RawValue};
 
     #[test]
+    fn delegation_approval_label_discloses_exact_grant_scope_and_expiry() {
+        let spec = SubAgentSpec {
+            agent_id: AgentId::new("reader"),
+            policy_id: Arc::from("bounded"),
+            metadata: BTreeMap::from([
+                (
+                    Arc::from(agentos_proto::DELEGATION_GRANT_SCOPES_KEY),
+                    json!([{"tool": "file", "arg_equals": {"operation": "read"}}]),
+                ),
+                (
+                    Arc::from(agentos_proto::DELEGATION_GRANT_TTL_KEY),
+                    Value::from(300),
+                ),
+            ]),
+        };
+        let (_, label) = approval_action_label(&InterruptionAction::Delegate(spec));
+        assert!(label.contains(r#""operation":"read""#));
+        assert!(label.contains("ttl=300s"));
+    }
+
+    #[test]
     fn loading_legacy_paused_state_derives_typed_session_without_rewriting_file() {
         let path = std::env::temp_dir().join(format!(
             "agentos-paused-migration-{}.json",
@@ -876,6 +899,7 @@ mod tests {
                 },
             ],
             default_decision: PolicyVerb::Deny,
+            delegation_grants: Vec::new(),
         };
         let deps = RunnerDeps {
             orchestrator: &parent_orchestrator,
@@ -923,15 +947,26 @@ mod tests {
                 if child_state.pending_approvals.len() == 1
         ));
         let approval_id = approval.id.clone();
+        let authorized_by = paused_state
+            .session_key
+            .as_ref()
+            .expect("paused state has session key")
+            .principal
+            .clone();
 
         let paused = PausedRun {
             channel_id: ChannelId::new("telegram"),
             conversation_id: ConversationId::new("chat-1"),
             state: paused_state,
         };
-        let output = match resume_run(paused, &approval_id, ResumeDecision::Approve, &deps)
-            .await
-            .expect("resume should finish")
+        let output = match resume_run(
+            paused,
+            &approval_id,
+            ResumeDecision::Approve { authorized_by },
+            &deps,
+        )
+        .await
+        .expect("resume should finish")
         {
             RunOutcome::Finished { output, .. } => output,
             RunOutcome::Paused(_) => panic!("expected finished parent run"),
@@ -978,6 +1013,7 @@ mod tests {
                 },
             ],
             default_decision: PolicyVerb::Deny,
+            delegation_grants: Vec::new(),
         };
         let deps = RunnerDeps {
             orchestrator: &parent_orchestrator,

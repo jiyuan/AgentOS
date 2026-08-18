@@ -11,7 +11,7 @@ use agentos_interfaces::guardrail::{
 };
 use agentos_interfaces::orchestrator::{Orchestrator, Plan, RunContext, StreamSink};
 use agentos_interfaces::run_state::{ApprovalStatus, Interruption, InterruptionAction, RunState};
-use agentos_proto::{AgentId, InterruptionId, Message, SpanKind};
+use agentos_proto::{AgentId, InterruptionId, Message, PrincipalKey, SpanKind};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -133,7 +133,9 @@ pub fn resume_approved(state: RunState) -> Result<RunLoopState, RunError> {
     }
 
     let turns = resume_turns(&state);
-    let Some(action) = state.take_approved_action() else {
+    let Some((action, authorization, approval_id)) =
+        state.take_approved_action_with_authorization()
+    else {
         return Err(RunError::NotResumable);
     };
     let plan = match action {
@@ -158,6 +160,11 @@ pub fn resume_approved(state: RunState) -> Result<RunLoopState, RunError> {
         plan,
         turns,
         denied: None,
+        approval: authorization.map(|authorization| ApprovalAuthorization {
+            authorized_by: authorization.authorized_by,
+            approved_at_unix: authorization.approved_at_unix,
+            approval_id,
+        }),
     }))
 }
 
@@ -189,6 +196,14 @@ pub struct ActCtx {
     /// `Plan -> Approve -> Act -> Observe` progression intact so the model can
     /// read the denial and replan on the next turn.
     pub denied: Option<Arc<str>>,
+    pub approval: Option<ApprovalAuthorization>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ApprovalAuthorization {
+    pub authorized_by: PrincipalKey,
+    pub approved_at_unix: u64,
+    pub approval_id: InterruptionId,
 }
 
 #[derive(Debug)]
@@ -406,12 +421,37 @@ async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunErro
 /// calls whose plan was `Plan::CallTool`, `Plan::Delegate`, etc.
 async fn approve(ctx: ApproveCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunError> {
     match approve_transition(ctx, deps.policy) {
-        ApproveTransition::Allow { state, plan, turns } => Ok(RunLoopState::Act(ActCtx {
-            state,
+        ApproveTransition::Allow {
+            mut state,
             plan,
             turns,
-            denied: None,
-        })),
+            grant_id,
+        } => {
+            if let Some(grant_id) = grant_id {
+                let parent_id = trace::run_span_id(&state);
+                let span_id = trace::record_span(
+                    &mut state,
+                    parent_id,
+                    SpanKind::Approve,
+                    "delegation_grant.use",
+                    BTreeMap::new(),
+                );
+                trace::record_event(
+                    &mut state,
+                    deps.hooks,
+                    span_id,
+                    "delegation_grant_used",
+                    BTreeMap::from([(Arc::from("grant_id"), Value::String(grant_id.to_string()))]),
+                );
+            }
+            Ok(RunLoopState::Act(ActCtx {
+                state,
+                plan,
+                turns,
+                denied: None,
+                approval: None,
+            }))
+        }
         ApproveTransition::DenyTool {
             state,
             call,
@@ -422,6 +462,7 @@ async fn approve(ctx: ApproveCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, R
             plan: Plan::CallTool(call),
             turns,
             denied: Some(reason),
+            approval: None,
         })),
         ApproveTransition::Deny { reason } => Err(RunError::ApprovalDenied { reason }),
         ApproveTransition::Pause { state } => Ok(RunLoopState::Paused(state)),
@@ -435,6 +476,7 @@ async fn act(ctx: ActCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunError>
         plan,
         turns,
         denied,
+        approval,
     } = ctx;
     match plan {
         Plan::CallTool(call) => {
@@ -475,14 +517,16 @@ async fn act(ctx: ActCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunError>
             #[cfg(debug_assertions)]
             crate::invariants::tool_result_follows_its_call(&state.transcript);
         }
-        Plan::Delegate(spec) => match execute_delegate(&mut state, deps, &spec).await? {
-            DelegateOutcome::Finished(result) => {
-                state.transcript.items.push(subagent_result_item(result));
+        Plan::Delegate(spec) => {
+            match execute_delegate(&mut state, deps, &spec, approval.as_ref()).await? {
+                DelegateOutcome::Finished(result) => {
+                    state.transcript.items.push(subagent_result_item(result));
+                }
+                DelegateOutcome::Paused(paused) => {
+                    return pause_for_subagent_approval(state, spec, paused);
+                }
             }
-            DelegateOutcome::Paused(paused) => {
-                return pause_for_subagent_approval(state, spec, paused);
-            }
-        },
+        }
         Plan::Escalate(spec) => match execute_escalate(&mut state, deps, &spec).await? {
             EscalateOutcome::Finished(result) => {
                 state
@@ -525,7 +569,9 @@ async fn act(ctx: ActCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunError>
                 conversation_id: child_conversation_id,
                 state: *child_state,
             };
-            match execute_resume_delegate(&mut state, deps, &spec, paused).await? {
+            match execute_resume_delegate(&mut state, deps, &spec, paused, approval.as_ref())
+                .await?
+            {
                 DelegateOutcome::Finished(result) => {
                     state.transcript.items.push(subagent_result_item(result));
                 }
@@ -567,6 +613,7 @@ fn pause_for_subagent_approval(
             child_state: Box::new(paused.state),
         },
         status: ApprovalStatus::Pending,
+        authorization: None,
     });
     Ok(RunLoopState::Paused(state))
 }

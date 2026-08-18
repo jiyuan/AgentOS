@@ -177,6 +177,7 @@ fn parent_policy(tool_verb: Option<PolicyVerb>) -> Policy {
     Policy {
         rules,
         default_decision: PolicyVerb::Deny,
+        delegation_grants: Vec::new(),
     }
 }
 

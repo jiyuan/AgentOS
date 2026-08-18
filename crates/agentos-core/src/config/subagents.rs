@@ -1,4 +1,5 @@
 use super::normalize::{normalize_config_token, normalize_domain};
+use agentos_proto::{DelegationGrantScope, DELEGATION_GRANT_SCOPES_KEY, DELEGATION_GRANT_TTL_KEY};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -15,6 +16,14 @@ pub struct SubAgentConfig {
     pub orchestrator: Arc<str>,
     pub model_tier: Arc<str>,
     pub tools: Vec<Arc<str>>,
+    /// Exact tool-call regions that may become unattended only after the
+    /// delegation itself is approved by an authorized principal. These are
+    /// separate from the child policy and never participate in
+    /// `Policy::narrow`.
+    pub delegation_grants: Vec<DelegationGrantConfig>,
+    /// Lifetime of a grant issued from `delegation_grants`, in seconds.
+    /// Runtime validation requires 1..=3600 seconds.
+    pub delegation_grant_ttl_secs: u64,
     /// Skills (by name) this sub-agent is permitted to dispatch. Each entry
     /// must also appear in the parent runtime's `resources.skills.enabled`
     /// list — unknown names are silently dropped at build time. Skill access
@@ -65,6 +74,8 @@ impl Default for SubAgentConfig {
             orchestrator: Arc::from("builtin.max"),
             model_tier: Arc::from("medium"),
             tools: vec![Arc::from("http")],
+            delegation_grants: Vec::new(),
+            delegation_grant_ttl_secs: 300,
             skills: Vec::new(),
             memory_view: Arc::from("none"),
             memory_domains: Vec::new(),
@@ -76,6 +87,16 @@ impl Default for SubAgentConfig {
             max_output_chars: 64_000,
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct DelegationGrantConfig {
+    /// Exact tool name whose constrained calls the grant may authorize.
+    pub tool: Arc<str>,
+    /// Required equality constraints over top-level tool arguments. At least
+    /// one constraint is mandatory so a grant cannot become a blanket tool
+    /// allowlist under a different name.
+    pub arg_equals: BTreeMap<Arc<str>, Value>,
 }
 
 pub(super) fn normalize_memory_view(input: &str) -> Result<String, String> {
@@ -183,5 +204,23 @@ fn descriptive_subagent_metadata(subagent: &SubAgentConfig) -> BTreeMap<Arc<str>
         Arc::from("subagent_max_turns"),
         Value::from(subagent.max_turns as u64),
     );
+    if !subagent.delegation_grants.is_empty() {
+        let scopes = subagent
+            .delegation_grants
+            .iter()
+            .map(|grant| DelegationGrantScope {
+                tool: Arc::clone(&grant.tool),
+                arg_equals: grant.arg_equals.clone(),
+            })
+            .collect::<Vec<_>>();
+        metadata.insert(
+            Arc::from(DELEGATION_GRANT_SCOPES_KEY),
+            serde_json::to_value(scopes).expect("delegation grant scopes are serializable"),
+        );
+        metadata.insert(
+            Arc::from(DELEGATION_GRANT_TTL_KEY),
+            Value::from(subagent.delegation_grant_ttl_secs),
+        );
+    }
     metadata
 }

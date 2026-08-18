@@ -112,6 +112,7 @@ fn allow(tools: &[&str]) -> Policy {
             })
             .collect(),
         default_decision: PolicyVerb::Deny,
+        delegation_grants: Vec::new(),
     }
 }
 

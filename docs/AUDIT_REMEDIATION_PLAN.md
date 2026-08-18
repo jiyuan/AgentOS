@@ -248,7 +248,8 @@ Priority: P0
 Size: L  
 Status: in progress (`ID-001` typed principal/session ownership, `ID-002`
 versioned migration, and `AUTH-001` remote authorization implemented;
-`AUTH-002`/`AUTH-003` policy work remains)
+`AUTH-002` explicit delegation grants implemented; `AUTH-003` shipped-policy
+work remains)
 Dependencies: M0 and a persistence schema-version mechanism
 
 Deliverables:
@@ -278,9 +279,15 @@ Deliverables:
    under the compatibility switch.
 6. Implement true policy narrowing over exact actions and argument constraints.
    Parent `AskUser` remains `AskUser`; constrained parent `Allow` cannot become
-   unconstrained child `Allow`.
+   unconstrained child `Allow`. **Implemented:** ordered rule coverage proves
+   exact action/argument narrowing and rejects unprovable widening.
 7. If unattended delegation is required, model it as a separate, explicit,
    durable delegation grant rather than an exception inside `Policy::narrow`.
+   **Implemented:** grant-backed scopes are removed from the child lattice,
+   require principal-bound delegation approval, persist a versioned grant with
+   exact constraints and a 1–3600 second expiry, remain non-transitive, and
+   emit issuance/use trace events. The unified immutable safety-event store
+   remains owned by `AUD-001`.
 8. Replace the shipped blanket mutation allowlist with operation-level safe
    defaults.
 9. Provide a dry-run migration report, collision detection, backup requirement,
@@ -572,7 +579,7 @@ policy semantics, and new features in one PR.
 | `ID-001` | Typed principal and injective namespace (**implemented and locally verified:** principal-keyed sessions, memory, jobs, clear, task sessions, traces, and subagent forks) | ADR-001 |
 | `ID-002` | Versioned persistence migration and collision report (**implemented and locally verified:** read-only report, mandatory backup, atomic rewrite, quarantine, crash/disk-full restart, rollback snapshot, and paused-state compatibility) | ID-001 |
 | `AUTH-001` | Remote sender authentication and approval binding (**implemented and locally verified:** fail-closed sender/chat policy, unattributed-event rejection, initiator binding, and same-chat administrator override) | ID-001 |
-| `AUTH-002` | Exact policy lattice and explicit delegation grants (**in progress:** strict lattice enforced; explicit grants pending) | ADR-001 |
+| `AUTH-002` | Exact policy lattice and explicit delegation grants (**implemented and locally verified:** principal-approved, exact, expiring, non-transitive grants remain separate from `Policy::narrow` and persist with child state) | ADR-001 |
 | `AUTH-003` | Conservative shipped policy and command profiles | AUTH-002 |
 | `SBX-001` | Fail-closed registry and executor capability protocol (**in progress:** registry fallback removed; actual MCP server protocol pending) | ADR-001 |
 | `FS-001` | Validated path segments and no-follow containment | TEST-001 |
@@ -636,7 +643,7 @@ Additionally:
 | Installer/docs/wrapper mismatch | P1 | M1 | CLI/release | Resolved by `REL-002`; required CI matrix runs pending |
 | Remote ingress plus permissive tool defaults | P0 | M2, M3 | Gateway security | Remote ingress resolved by `AUTH-001`; permissive shipped tool defaults remain `AUTH-003` |
 | Cross-channel/session/sender identity collision | P0 | M2 | Identity/persistence | Resolved by `ID-001` and `ID-002`; legacy splits are reported and ambiguous rows quarantined |
-| Policy narrowing widens authority | P0 | M2 | Core authorization | Strict per-call narrowing implemented and property-tested; explicit grant model pending |
+| Policy narrowing widens authority | P0 | M2 | Core authorization | Resolved by `AUTH-002`: strict per-call narrowing is property-tested and separately approved grants are exact, expiring, persisted, and non-transitive |
 | Sandboxed tool fallback/incompatible worker | P0 | M3 | Core sandbox | Registry fallback resolved with typed capability checks; actual MCP server isolation and platform qualification remain |
 | Task/path traversal and symlink escape | P1 | M3 | Core filesystem | Open |
 | SSRF, inherited secrets, process descendants, unbounded ingress | P1 | M3 | Tool security | Open |
@@ -669,7 +676,7 @@ The following are not release-rescue dependencies:
 
 | Risk | Mitigation |
 |---|---|
-| True narrowing increases approval prompts or breaks existing subagents | Provide startup diagnostics, an explicit grant model, and migration notes; never preserve silent widening |
+| True narrowing increases approval prompts or breaks existing subagents | Startup diagnostics and the explicit grant model are implemented; grant-backed delegation always prompts and never preserves silent widening |
 | Principal migration finds ambiguous legacy records | Dry-run report, mandatory backup, collision quarantine, atomic/resumable migration |
 | Strict containment breaks scripts or MCP servers | Compatibility profiles may be explicit, scoped, and temporary; never silently execute unsandboxed |
 | XDG path correction strands existing installs | Detect the legacy path, provide a one-time migration command, and keep rollback metadata |

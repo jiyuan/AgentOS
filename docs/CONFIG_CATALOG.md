@@ -85,6 +85,10 @@ Every key `agent.toml` accepts, derived from the config structs. Edit the doc co
 | `subagents.orchestrator` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
 | `subagents.model_tier` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
 | `subagents.tools` | `Vec<Arc<str>>` | — | *(undocumented — see `config/undocumented.txt`)* |
+| `subagents.delegation_grants` | `Vec<DelegationGrantConfig>` | (none) | Exact tool-call regions that may become unattended only after the delegation itself is approved by an authorized principal. These are separate from the child policy and never participate in `Policy::narrow`. |
+| `subagents.delegation_grants.tool` | `Arc<str>` | — | Exact tool name whose constrained calls the grant may authorize. |
+| `subagents.delegation_grants.arg_equals` | `BTreeMap<Arc<str>, Value>` | — | Required equality constraints over top-level tool arguments. At least one constraint is mandatory so a grant cannot become a blanket tool allowlist under a different name. |
+| `subagents.delegation_grant_ttl_secs` | `u64` | — | Lifetime of a grant issued from `delegation_grants`, in seconds. Runtime validation requires 1..=3600 seconds. |
 | `subagents.skills` | `Vec<Arc<str>>` | — | Skills (by name) this sub-agent is permitted to dispatch. Each entry must also appear in the parent runtime's `resources.skills.enabled` list — unknown names are silently dropped at build time. Skill access is opt-in: an empty vector means the sub-agent cannot dispatch any skill, even if the parent has them loaded. |
 | `subagents.memory_view` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
 | `subagents.memory_domains` | `Vec<Arc<str>>` | — | *(undocumented — see `config/undocumented.txt`)* |
@@ -165,5 +169,5 @@ Every key `agent.toml` accepts, derived from the config structs. Edit the doc co
 | `spill.root` | `PathBuf` | `spill` | Where artifacts are written. Relative paths resolve against the workspace root; an absolute path is taken as given, for a deployment that wants spill on a different volume from the session database. |
 | `spill.retention_days` | `u64` | `0` | Days an artifact is kept, or `0` to keep everything.  `0` is a choice rather than a disabled feature — see the module docs. |
 
-96 of 157 keys have no description yet. They are listed in `crates/agentos-core/src/config/undocumented.txt`; writing the doc comment on the field is what removes a line from it.
+96 of 161 keys have no description yet. They are listed in `crates/agentos-core/src/config/undocumented.txt`; writing the doc comment on the field is what removes a line from it.
 <!-- END GENERATED: config -->

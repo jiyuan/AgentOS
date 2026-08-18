@@ -35,7 +35,11 @@ where
             Routed::Decides {
                 outcome: ApprovalOutcome::Approved,
                 ..
-            } => return Some(ResumeDecision::Approve),
+            } => {
+                return Some(ResumeDecision::Approve {
+                    authorized_by: answer.session_key(active_agent).principal,
+                })
+            }
             Routed::Decides { reason, .. } => {
                 return Some(ResumeDecision::Reject {
                     reason: reason.unwrap_or_else(|| Arc::from("rejected by user")),

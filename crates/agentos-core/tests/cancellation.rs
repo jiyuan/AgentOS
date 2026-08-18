@@ -115,6 +115,7 @@ fn allow_all() -> Policy {
             },
         ],
         default_decision: PolicyVerb::Deny,
+        delegation_grants: Vec::new(),
     }
 }
 
