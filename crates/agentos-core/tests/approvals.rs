@@ -11,8 +11,8 @@ use agentos_core::approve::{Policy, PolicyAction, PolicyRule, PolicyVerb};
 use agentos_core::gateway::{GatewayRun, GatewayService};
 use agentos_core::memory::InMemorySession;
 use agentos_core::r#loop::{
-    route, ApprovalOutcome, ApprovalTicket, Routed, EXPIRES_AT_KEY, INTERRUPTION_KEY, PROMPT_KIND,
-    TICKET_KEY,
+    route, ApprovalBinding, ApprovalOutcome, ApprovalTicket, Routed, EXPIRES_AT_KEY,
+    INTERRUPTION_KEY, PROMPT_KIND, TICKET_KEY,
 };
 use agentos_core::runner::{ResumeDecision, RunnerError};
 use agentos_core::tools::ToolRegistry;
@@ -31,13 +31,22 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// The sender every envelope in this file carries.
+const SENDER: &str = "user";
+
+/// An approval bound to that sender, so these tests exercise the ticket rules
+/// rather than tripping over the `AUTH-001` sender check.
+fn binding_for(ticket: &ApprovalTicket) -> ApprovalBinding {
+    ApprovalBinding::new(ticket.clone(), SENDER)
+}
+
 const GATED_TOOL: &str = "gated";
 
 fn envelope(text: &str) -> Envelope {
     Envelope {
         channel_id: ChannelId::new("approvals"),
         conversation_id: ConversationId::new("conv"),
-        sender: Arc::from("user"),
+        sender: Arc::from(SENDER),
         message: Message::text(MessageRole::User, text),
         metadata: BTreeMap::new(),
     }
@@ -227,7 +236,7 @@ async fn an_unrelated_message_does_not_decide_a_pending_approval() {
         "ok do it",
     ] {
         assert_eq!(
-            route(Some(&paused.ticket), &envelope(text)),
+            route(Some(&binding_for(&paused.ticket)), &envelope(text)),
             Routed::Unrelated,
             "{text:?} must be ordinary input, not an approval"
         );
@@ -267,7 +276,7 @@ async fn a_stale_ticket_does_not_decide_the_current_prompt() {
 
     let answer = envelope(&format!("/approve {}", first.ticket));
     assert_eq!(
-        route(Some(&second.ticket), &answer),
+        route(Some(&binding_for(&second.ticket)), &answer),
         Routed::Stale {
             ticket: first.ticket.clone()
         }
@@ -291,7 +300,7 @@ async fn an_answer_naming_the_prompt_approves_it() {
 
     let paused = pause_for_approval(&service, &channel, "g2-approve").await;
     let answer = envelope(&format!("/approve {}", paused.ticket));
-    let Routed::Decides { outcome, .. } = route(Some(&paused.ticket), &answer) else {
+    let Routed::Decides { outcome, .. } = route(Some(&binding_for(&paused.ticket)), &answer) else {
         panic!("an answer naming the prompt must decide it");
     };
     assert_eq!(outcome, ApprovalOutcome::Approved);

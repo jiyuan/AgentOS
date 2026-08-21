@@ -162,13 +162,17 @@ impl Llm for ScriptedLlm {
 // ---------------------------------------------------------------------------
 
 pub const CHANNEL: &str = "golden-channel";
+
+/// The sender every golden envelope carries. Named so an approval binding in
+/// a test can be built against the same identity the envelope will have.
+pub const SENDER: &str = "user";
 pub const CONVERSATION: &str = "golden-conversation";
 
 pub fn user_envelope(text: &str) -> Envelope {
     Envelope {
         channel_id: ChannelId::new(CHANNEL),
         conversation_id: ConversationId::new(CONVERSATION),
-        sender: Arc::from("user"),
+        sender: Arc::from(SENDER),
         message: Message::text(MessageRole::User, text),
         metadata: BTreeMap::new(),
     }

@@ -18,6 +18,7 @@ mod long_connection;
 mod proto;
 mod websocket;
 
+use crate::channels::admission::{env_flag, AdmissionPolicy};
 use egress::FeishuEgress;
 use event::{feishu_allowed_source_ids_from_env, AttachmentDescriptor};
 use long_connection::{FeishuEndpoint, FeishuLongConnection};
@@ -36,7 +37,7 @@ pub struct FeishuChannel {
     id: ChannelId,
     api_base: Arc<str>,
     receive_id_type: Arc<str>,
-    allowed_source_ids: Vec<Arc<str>>,
+    admission: AdmissionPolicy,
     tenant_token: Arc<Mutex<Option<CachedTenantToken>>>,
     long_connection: Option<FeishuLongConnection>,
     log_receive_errors: bool,
@@ -80,7 +81,22 @@ impl FeishuChannel {
             env::var("AGENTOS_FEISHU_API_BASE").unwrap_or_else(|_| DEFAULT_API_BASE.to_owned());
         let receive_id_type =
             env::var("AGENTOS_FEISHU_RECEIVE_ID_TYPE").unwrap_or_else(|_| "chat_id".to_owned());
-        let allowed_source_ids = feishu_allowed_source_ids_from_env();
+        // Fail closed. `feishu_allowed_source_matches` used to return `true`
+        // for an empty allowlist, so a deployment that never set
+        // `AGENTOS_FEISHU_ALLOWED_ID` accepted anyone who could reach the app
+        // (`AUTH-001`). `AGENTOS_FEISHU_ALLOW_ALL=1` asks for that explicitly.
+        let admission = AdmissionPolicy::new(
+            AdmissionPolicy::parse_ids(env::var("AGENTOS_FEISHU_ALLOWED_CHAT_ID").ok().as_deref()),
+            feishu_allowed_source_ids_from_env(),
+            env_flag("AGENTOS_FEISHU_ALLOW_ALL"),
+        );
+        if admission.admits_nothing() {
+            return Err(ChannelError::Backend(Arc::from(
+                "feishu is configured to accept nothing: set AGENTOS_FEISHU_ALLOWED_ID or \
+                 AGENTOS_FEISHU_ALLOWED_CHAT_ID, or set AGENTOS_FEISHU_ALLOW_ALL=1 to accept \
+                 every attributable sender",
+            )));
+        }
         // The channel and its egress share one token cache: two caches would
         // mean two `tenant_access_token` round trips and, worse, a send racing
         // a receive to refresh the same expiring token.
@@ -96,7 +112,7 @@ impl FeishuChannel {
             id: ChannelId::new("feishu"),
             api_base: Arc::clone(&api_base),
             receive_id_type: Arc::clone(&receive_id_type),
-            allowed_source_ids,
+            admission,
             tenant_token: Arc::clone(&tenant_token),
             long_connection: None,
             log_receive_errors: false,
@@ -264,7 +280,7 @@ impl FeishuChannel {
             }
         }
         let channel_id = self.id.clone();
-        let allowed_source_ids = self.allowed_source_ids.clone();
+        let admission = self.admission.clone();
         let receive_id_type = Arc::clone(&self.receive_id_type);
         let log_receive_errors = self.log_receive_errors;
         let connection = match self.long_connection().await {
@@ -277,7 +293,7 @@ impl FeishuChannel {
         let parsed = match connection
             .receive_next_event(
                 &channel_id,
-                &allowed_source_ids,
+                &admission,
                 receive_id_type.as_ref(),
                 log_receive_errors,
             )
@@ -552,7 +568,7 @@ mod tests {
             id: ChannelId::new("feishu"),
             api_base: Arc::from(DEFAULT_API_BASE),
             receive_id_type: Arc::from("chat_id"),
-            allowed_source_ids: Vec::new(),
+            admission: AdmissionPolicy::default(),
             tenant_token: Arc::new(Mutex::new(None)),
             long_connection: None,
             log_receive_errors: false,

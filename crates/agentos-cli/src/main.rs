@@ -3,7 +3,7 @@ use agentos_core::channels::{feishu::FeishuChannel, telegram::TelegramChannel};
 use agentos_core::crons::{CronSchedule, CronStore, CronTask};
 use agentos_core::gateway::{GatewayRun, GatewayService};
 use agentos_core::memory::{MemoryManager, SqliteStore};
-use agentos_core::r#loop::{route, ApprovalOutcome, ApprovalTicket, Routed};
+use agentos_core::r#loop::{route, ApprovalBinding, ApprovalOutcome, ApprovalTicket, Routed};
 use agentos_core::runner::{
     delete_paused_run, load_paused_run, save_paused_run, ResumeDecision, RunnerDeps,
 };
@@ -26,6 +26,10 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing_subscriber::EnvFilter;
+
+/// The sender the TUI stamps on every envelope. One local user, named once so
+/// the approval binding and the envelope cannot drift apart.
+const TUI_SENDER: &str = "user";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -426,9 +430,14 @@ async fn await_approval<C>(channel: &mut C, ticket: &ApprovalTicket) -> Option<R
 where
     C: Channel,
 {
+    // The TUI has one local user, so the prompt is bound to the sender this
+    // channel stamps on every envelope. Binding it anyway rather than passing
+    // the check something that always matches: the day a second sender can
+    // reach this loop, it should already be checked.
+    let binding = ApprovalBinding::new(ticket.clone(), TUI_SENDER);
     loop {
         let answer = channel.receive().await?;
-        match route(Some(ticket), &answer) {
+        match route(Some(&binding), &answer) {
             Routed::Decides {
                 outcome: ApprovalOutcome::Approved,
                 ..
@@ -440,6 +449,9 @@ where
             }
             Routed::Stale { ticket: named } => {
                 println!("That approval ({named}) is not the one waiting. Answer {ticket}.");
+            }
+            Routed::NotYours { ticket: named } => {
+                println!("Approval {named} was put to someone else.");
             }
             Routed::Unrelated => {
                 println!(
@@ -837,7 +849,7 @@ impl TuiChannel {
         Envelope {
             channel_id: self.id(),
             conversation_id: self.conversation_id.clone(),
-            sender: Arc::from("user"),
+            sender: Arc::from(TUI_SENDER),
             message: Message::text(MessageRole::User, input),
             metadata: BTreeMap::new(),
         }

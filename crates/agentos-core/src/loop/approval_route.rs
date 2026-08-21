@@ -176,21 +176,78 @@ pub enum Routed {
     /// it is not conversation input either — the sender pressed a control, not
     /// typed a message, so they get told rather than answered.
     Stale { ticket: ApprovalTicket },
+    /// Names the pending prompt, from someone it was not put to.
+    ///
+    /// Distinct from [`Routed::Stale`]: the prompt is live and the ticket is
+    /// right, but this sender is not the one being asked. Telling them so is
+    /// better than silence — a group member who pressed the button should
+    /// learn why nothing happened — and it must not decide the prompt
+    /// (`AUTH-001`).
+    NotYours { ticket: ApprovalTicket },
     /// Names no prompt at all: ordinary input.
     Unrelated,
 }
 
-/// Route `envelope` against the ticket a conversation is waiting on.
+/// A live prompt, and who may answer it.
+///
+/// Approval used to turn on the ticket alone, so in a group conversation any
+/// member who saw the prompt — or guessed a short base36 ticket — could decide
+/// another member's approval. A ticket says *which* asking; it was never meant
+/// to say *whose*.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalBinding {
+    pub ticket: ApprovalTicket,
+    /// The sender the prompt was put to: whoever sent the message that caused
+    /// the run to pause.
+    pub asked_of: Arc<str>,
+    /// Senders who may answer any prompt in this deployment, from
+    /// `[policy] approval_administrators`. Empty in the usual case.
+    pub administrators: Vec<Arc<str>>,
+}
+
+impl ApprovalBinding {
+    pub fn new(ticket: ApprovalTicket, asked_of: impl Into<Arc<str>>) -> Self {
+        Self {
+            ticket,
+            asked_of: asked_of.into(),
+            administrators: Vec::new(),
+        }
+    }
+
+    pub fn with_administrators(mut self, administrators: Vec<Arc<str>>) -> Self {
+        self.administrators = administrators;
+        self
+    }
+
+    /// Whether `sender` may answer this prompt.
+    fn answerable_by(&self, sender: &str) -> bool {
+        self.asked_of.as_ref() == sender
+            || self
+                .administrators
+                .iter()
+                .any(|admin| admin.as_ref() == sender)
+    }
+}
+
+/// Route `envelope` against the prompt a conversation is waiting on.
 ///
 /// `pending` is `None` when nothing is waiting, which is the common case; an
 /// answer arriving then is [`Routed::Stale`] rather than input, for the same
 /// reason a mismatched one is.
-pub fn route(pending: Option<&ApprovalTicket>, envelope: &Envelope) -> Routed {
+///
+/// Two things have to line up for a decision: the envelope carries the live
+/// ticket, *and* its sender is the one that was asked (or a configured
+/// administrator). The second check is what stops one participant in a group
+/// conversation from answering another's prompt.
+pub fn route(pending: Option<&ApprovalBinding>, envelope: &Envelope) -> Routed {
     let Some((ticket, decision, reason)) = answer(envelope) else {
         return Routed::Unrelated;
     };
-    if pending != Some(&ticket) {
+    let Some(pending) = pending.filter(|pending| pending.ticket == ticket) else {
         return Routed::Stale { ticket };
+    };
+    if !pending.answerable_by(&envelope.sender) {
+        return Routed::NotYours { ticket };
     }
     let outcome = if decision == APPROVE {
         ApprovalOutcome::Approved
@@ -295,11 +352,20 @@ mod tests {
     use agentos_proto::{ChannelId, ConversationId, Message, MessageRole};
     use std::collections::BTreeMap;
 
+    /// The sender every envelope in these tests carries.
+    const SENDER: &str = "user";
+
+    /// A prompt put to that sender, so these tests exercise ticket routing
+    /// rather than the sender check — which has its own tests below.
+    fn pending_for(ticket_value: &str) -> ApprovalBinding {
+        ApprovalBinding::new(ticket(ticket_value), SENDER)
+    }
+
     fn text(content: &str) -> Envelope {
         Envelope {
             channel_id: ChannelId::new("test"),
             conversation_id: ConversationId::new("conv"),
-            sender: Arc::from("user"),
+            sender: Arc::from(SENDER),
             message: Message::text(MessageRole::User, content),
             metadata: BTreeMap::new(),
         }
@@ -324,7 +390,7 @@ mod tests {
     /// approval, however affirmative it sounds.
     #[test]
     fn prose_never_decides_an_approval() {
-        let pending = ticket("k3f");
+        let pending = pending_for("k3f");
         for content in ["y", "yes", "yes, go ahead", "approve", "sure do it", "no"] {
             assert_eq!(
                 route(Some(&pending), &text(content)),
@@ -336,7 +402,7 @@ mod tests {
 
     #[test]
     fn a_slash_command_naming_the_pending_ticket_decides_it() {
-        let pending = ticket("k3f");
+        let pending = pending_for("k3f");
         assert_eq!(
             route(Some(&pending), &text("/approve k3f")),
             Routed::Decides {
@@ -357,7 +423,7 @@ mod tests {
     /// over the action-derived `InterruptionId`.
     #[test]
     fn an_answer_naming_another_prompt_is_stale() {
-        let pending = ticket("k3f");
+        let pending = pending_for("k3f");
         assert_eq!(
             route(Some(&pending), &pressed("zz9", APPROVE)),
             Routed::Stale {
@@ -376,7 +442,7 @@ mod tests {
     /// An answer with a garbled verb is a denial, not an approval.
     #[test]
     fn an_unreadable_verb_fails_closed() {
-        let pending = ticket("k3f");
+        let pending = pending_for("k3f");
         assert_eq!(
             route(Some(&pending), &pressed("k3f", "aprove")),
             Routed::Decides {
@@ -391,9 +457,100 @@ mod tests {
     /// item removes.
     #[test]
     fn a_verb_without_a_ticket_is_not_an_answer() {
-        let pending = ticket("k3f");
+        let pending = pending_for("k3f");
         assert_eq!(route(Some(&pending), &text("/approve")), Routed::Unrelated);
         assert_eq!(route(Some(&pending), &text("/deny")), Routed::Unrelated);
+    }
+
+    fn from_sender(envelope: Envelope, sender: &str) -> Envelope {
+        Envelope {
+            sender: Arc::from(sender),
+            ..envelope
+        }
+    }
+
+    /// `AUTH-001`, and the plan's acceptance criterion: "A second group
+    /// participant cannot approve or clear the initiator's state."
+    ///
+    /// The ticket is right and the prompt is live — this is not staleness. It
+    /// is the wrong person, and the answer must decide nothing.
+    #[test]
+    fn another_participant_cannot_answer_the_prompt() {
+        let pending = pending_for("k3f");
+        let answer = from_sender(text("/approve k3f"), "someone-else");
+
+        assert_eq!(
+            route(Some(&pending), &answer),
+            Routed::NotYours {
+                ticket: ticket("k3f")
+            }
+        );
+    }
+
+    /// Including by button, which is the easier path to press by accident and
+    /// the harder one to notice.
+    #[test]
+    fn another_participant_cannot_press_the_button() {
+        let pending = pending_for("k3f");
+        let answer = from_sender(pressed("k3f", APPROVE), "someone-else");
+
+        assert_eq!(
+            route(Some(&pending), &answer),
+            Routed::NotYours {
+                ticket: ticket("k3f")
+            }
+        );
+    }
+
+    #[test]
+    fn the_sender_who_was_asked_still_decides() {
+        let pending = pending_for("k3f");
+        assert!(matches!(
+            route(Some(&pending), &text("/approve k3f")),
+            Routed::Decides {
+                outcome: ApprovalOutcome::Approved,
+                ..
+            }
+        ));
+    }
+
+    /// The named exception. An administrator can unblock someone else's
+    /// prompt — deliberately configured, never the default.
+    #[test]
+    fn a_configured_administrator_may_answer_for_someone_else() {
+        let pending =
+            pending_for("k3f").with_administrators(vec![Arc::from("ops"), Arc::from("oncall")]);
+        let answer = from_sender(text("/approve k3f"), "oncall");
+
+        assert!(matches!(
+            route(Some(&pending), &answer),
+            Routed::Decides {
+                outcome: ApprovalOutcome::Approved,
+                ..
+            }
+        ));
+        // And someone who is not on that list still cannot.
+        let intruder = from_sender(text("/approve k3f"), "someone-else");
+        assert_eq!(
+            route(Some(&pending), &intruder),
+            Routed::NotYours {
+                ticket: ticket("k3f")
+            }
+        );
+    }
+
+    /// A wrong ticket from the wrong sender is stale, not `NotYours`: there is
+    /// no live prompt by that name to be excluded from.
+    #[test]
+    fn a_wrong_ticket_is_stale_whoever_sent_it() {
+        let pending = pending_for("k3f");
+        let answer = from_sender(text("/approve zz9"), "someone-else");
+        assert_eq!(
+            route(Some(&pending), &answer),
+            Routed::Stale {
+                ticket: ticket("zz9")
+            }
+        );
     }
 
     #[test]

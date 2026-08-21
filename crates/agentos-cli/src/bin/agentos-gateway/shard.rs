@@ -16,8 +16,8 @@ use agentos_core::gateway::{
     run_shard, unix_now, GatewayRun, GatewayService, ShardConfig, ShardInbound, Turn, TurnHandler,
 };
 use agentos_core::r#loop::{
-    route, ApprovalOutcome, ApprovalTicket, InputGuardrailEntry, OutputGuardrailEntry, Routed,
-    ToolGuardrailEntry,
+    route, ApprovalBinding, ApprovalOutcome, ApprovalTicket, InputGuardrailEntry,
+    OutputGuardrailEntry, Routed, ToolGuardrailEntry,
 };
 use agentos_core::runner::{PausedRun, ResumeDecision, RunnerDeps};
 use agentos_core::runtime::{AgentRuntime, RuntimeDepsScope};
@@ -110,6 +110,9 @@ enum Answered {
     Resume(Box<Resume>),
     /// It named a prompt that is over. Tell the sender; run nothing.
     Stale(ApprovalTicket),
+    /// It named the live prompt, from someone it was not put to. Tell the
+    /// sender; run nothing, and above all decide nothing.
+    NotYours(ApprovalTicket),
     /// It is ordinary input; start a run.
     Run,
 }
@@ -123,9 +126,12 @@ struct Resume {
 /// A run parked on an approval, and what it takes to answer it.
 struct PendingApproval {
     paused: PausedRun,
-    /// Names this asking. An envelope that does not carry it back is ordinary
-    /// input, however affirmative it sounds.
-    ticket: ApprovalTicket,
+    /// Names this asking, and who may answer it. An envelope that does not
+    /// carry the ticket back is ordinary input however affirmative it sounds,
+    /// and one that carries it from a different sender decides nothing — in a
+    /// group conversation the prompt belongs to the person it was put to
+    /// (`AUTH-001`).
+    binding: ApprovalBinding,
     /// Unix seconds after which the prompt stops counting, if it expires.
     expires_at: Option<u64>,
 }
@@ -203,6 +209,18 @@ impl TurnHandler for ShardTurns<'_> {
 }
 
 impl ShardTurns<'_> {
+    /// Senders who may answer any prompt, from `[policy]
+    /// approval_administrators`. Empty in the usual case, which is what makes
+    /// a prompt answerable only by the person it was put to.
+    fn approval_administrators(&self) -> Vec<Arc<str>> {
+        self.context
+            .runtime
+            .workspace_config
+            .policy
+            .approval_administrators
+            .clone()
+    }
+
     async fn handle(&self, turn: Turn) -> Result<(), String> {
         let config = &self.context.config;
         let channel_name = self.context.channel_name;
@@ -281,13 +299,24 @@ impl ShardTurns<'_> {
                     &format!(
                         "{channel_name} approval {} ({}) resolved: {}",
                         approval_id.as_str(),
-                        pending.ticket,
+                        pending.binding.ticket,
                         decision.outcome().as_str()
                     ),
                 )?;
                 service
                     .resume(egress, pending.paused, &approval_id, decision)
                     .await
+            }
+            Answered::NotYours(ticket) => {
+                return self
+                    .reply(
+                        &input,
+                        &format!(
+                            "Approval {ticket} was put to someone else in this conversation, \
+                             so only they can answer it."
+                        ),
+                    )
+                    .await;
             }
             Answered::Stale(ticket) => {
                 // A button from an asking that is over. Say so rather than
@@ -325,8 +354,10 @@ impl ShardTurns<'_> {
                 self.pending_approvals.borrow_mut().insert(
                     paused.conversation_id.clone(),
                     PendingApproval {
+                        // Bound to the sender whose message caused the pause.
+                        binding: ApprovalBinding::new(ticket, Arc::clone(&input.sender))
+                            .with_administrators(self.approval_administrators()),
                         paused,
-                        ticket,
                         expires_at,
                     },
                 );
@@ -376,17 +407,21 @@ impl ShardTurns<'_> {
             // answer is stale, and anything else is ordinary input.
             return Ok(match route(None, input) {
                 Routed::Stale { ticket } => Answered::Stale(ticket),
-                // With nothing pending, `route` cannot report a decision.
-                Routed::Unrelated | Routed::Decides { .. } => Answered::Run,
+                // With nothing pending, `route` can neither report a decision
+                // nor find a prompt this sender was not asked.
+                Routed::Unrelated | Routed::Decides { .. } | Routed::NotYours { .. } => {
+                    Answered::Run
+                }
             });
         }
 
-        let ticket = pending
+        let binding = pending
             .get(&input.conversation_id)
-            .map(|entry| entry.ticket.clone());
-        match route(ticket.as_ref(), input) {
+            .map(|entry| entry.binding.clone());
+        match route(binding.as_ref(), input) {
             Routed::Unrelated => Ok(Answered::Run),
             Routed::Stale { ticket } => Ok(Answered::Stale(ticket)),
+            Routed::NotYours { ticket } => Ok(Answered::NotYours(ticket)),
             Routed::Decides { outcome, reason } => {
                 let entry = pending
                     .remove(&input.conversation_id)
@@ -429,7 +464,7 @@ impl ShardTurns<'_> {
             &format!(
                 "{channel_name} approval {} ({}) resolved: {}",
                 approval_id.as_str(),
-                pending.ticket,
+                pending.binding.ticket,
                 ApprovalOutcome::Cancelled.as_str()
             ),
         )?;

@@ -1,3 +1,4 @@
+use crate::channels::admission::AdmissionPolicy;
 use agentos_proto::{AttachmentKind, ChannelId, ConversationId, Envelope, Message, MessageRole};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -21,7 +22,7 @@ pub(super) struct ParsedFeishuEvent {
 pub(super) fn parse_event(
     payload: &Value,
     channel_id: &ChannelId,
-    allowed_source_ids: &[Arc<str>],
+    admission: &AdmissionPolicy,
     receive_id_type: &str,
 ) -> Option<ParsedFeishuEvent> {
     let event_type = payload
@@ -43,7 +44,13 @@ pub(super) fn parse_event(
     let sender_id = event
         .get("sender")
         .and_then(|sender| sender.get("sender_id"));
-    if !feishu_allowed_source_matches(allowed_source_ids, sender_id) {
+    if !feishu_admits(
+        admission,
+        &FeishuAdmissionEvent {
+            chat_id: Some(chat_id),
+            sender_id,
+        },
+    ) {
         return None;
     }
     let raw_content = message.get("content").and_then(Value::as_str)?;
@@ -96,9 +103,9 @@ pub(super) fn parse_event(
         _ => return None,
     };
 
-    let sender = sender_id
-        .and_then(preferred_feishu_sender_id)
-        .map_or_else(|| Arc::from("feishu-user"), Arc::from);
+    // Not `unwrap_or("feishu-user")`: admission above already refused an event
+    // with no usable sender id, so there is nothing left to substitute for.
+    let sender: Arc<str> = Arc::from(sender_id.and_then(preferred_feishu_sender_id)?);
     let mut metadata = BTreeMap::new();
     metadata.insert(Arc::from("kind"), Value::String("feishu".to_owned()));
     if let Some(event_id) = payload
@@ -148,10 +155,7 @@ pub(super) fn parse_event(
     })
 }
 
-pub(super) fn feishu_drop_reason(
-    payload: &Value,
-    allowed_source_ids: &[Arc<str>],
-) -> Option<String> {
+pub(super) fn feishu_drop_reason(payload: &Value, admission: &AdmissionPolicy) -> Option<String> {
     let event_type = payload
         .get("header")
         .and_then(|header| header.get("event_type"))
@@ -185,10 +189,15 @@ pub(super) fn feishu_drop_reason(
     let sender_id = event
         .get("sender")
         .and_then(|sender| sender.get("sender_id"));
-    if !feishu_allowed_source_matches(allowed_source_ids, sender_id) {
+    if !feishu_admits(
+        admission,
+        &FeishuAdmissionEvent {
+            chat_id: Some(chat_id),
+            sender_id,
+        },
+    ) {
         return Some(format!(
-            "filtered by allowed sender ids: allowed={}, chat_id={}, sender_ids={}",
-            feishu_allowed_ids_summary(allowed_source_ids),
+            "refused by the admission policy: chat_id={}, sender_ids={}",
             chat_id,
             feishu_sender_ids_summary(sender_id)
         ));
@@ -230,16 +239,38 @@ pub(super) fn feishu_drop_reason(
     None
 }
 
-fn feishu_allowed_source_matches(
-    allowed_source_ids: &[Arc<str>],
-    sender_id: Option<&Value>,
-) -> bool {
-    if allowed_source_ids.is_empty() {
-        return true;
+/// Whether this event is admitted.
+///
+/// The empty allowlist used to return `true` — accept everyone — so a Feishu
+/// deployment that never set `AGENTOS_FEISHU_ALLOWED_ID` was open to anyone
+/// who could reach the app (`AUTH-001`). It now goes through the same
+/// [`AdmissionPolicy`] Telegram uses, which refuses an empty allowlist and
+/// refuses an unattributed event on every path.
+///
+/// The matcher is supplied because one Feishu person has three ids and an
+/// allowlist entry may name any of them.
+pub(super) fn feishu_admits(admission: &AdmissionPolicy, event: &FeishuAdmissionEvent<'_>) -> bool {
+    admission
+        .admit_matching(event.chat_id, event.attribution(), |allowed| {
+            event
+                .sender_id
+                .is_some_and(|sender_id| feishu_sender_id_matches(sender_id, allowed))
+        })
+        .is_ok()
+}
+
+/// What admission needs from a Feishu event.
+pub(super) struct FeishuAdmissionEvent<'a> {
+    pub chat_id: Option<&'a str>,
+    pub sender_id: Option<&'a Value>,
+}
+
+impl FeishuAdmissionEvent<'_> {
+    /// The id this event is attributed to, or `None` when Feishu sent no
+    /// usable sender at all.
+    fn attribution(&self) -> Option<&str> {
+        self.sender_id.and_then(preferred_feishu_sender_id)
     }
-    allowed_source_ids.iter().any(|allowed| {
-        sender_id.is_some_and(|sender_id| feishu_sender_id_matches(sender_id, allowed))
-    })
 }
 
 fn feishu_sender_id_matches(sender_id: &Value, allowed: &str) -> bool {
@@ -270,18 +301,6 @@ fn feishu_sender_ids_summary(sender_id: Option<&Value>) -> String {
         "<missing>".to_owned()
     } else {
         parts.join(",")
-    }
-}
-
-fn feishu_allowed_ids_summary(allowed_source_ids: &[Arc<str>]) -> String {
-    if allowed_source_ids.is_empty() {
-        "<unset>".to_owned()
-    } else {
-        allowed_source_ids
-            .iter()
-            .map(|value| value.as_ref())
-            .collect::<Vec<_>>()
-            .join(",")
     }
 }
 
@@ -316,6 +335,16 @@ mod tests {
         ChannelId::new("feishu")
     }
 
+    /// Open, but still refusing anything Feishu could not attribute — the
+    /// default for tests that are not about admission.
+    fn open_admission() -> AdmissionPolicy {
+        AdmissionPolicy::new(Vec::new(), Vec::new(), true)
+    }
+
+    fn only_sender(id: &str) -> AdmissionPolicy {
+        AdmissionPolicy::new(Vec::new(), vec![Arc::from(id)], false)
+    }
+
     fn text_event(text: &str) -> Value {
         json!({
             "header": { "event_type": "im.message.receive_v1" },
@@ -333,8 +362,13 @@ mod tests {
 
     #[test]
     fn parses_text_message() {
-        let parsed =
-            parse_event(&text_event("hello"), &channel_id(), &[], "chat_id").expect("parsed");
+        let parsed = parse_event(
+            &text_event("hello"),
+            &channel_id(),
+            &open_admission(),
+            "chat_id",
+        )
+        .expect("parsed");
         assert_eq!(parsed.envelope.message.content.as_ref(), "hello");
         assert!(parsed.attachments.is_empty());
         assert_eq!(parsed.message_id, "om_1");
@@ -354,7 +388,8 @@ mod tests {
                 }
             }
         });
-        let parsed = parse_event(&payload, &channel_id(), &[], "chat_id").expect("parsed");
+        let parsed =
+            parse_event(&payload, &channel_id(), &open_admission(), "chat_id").expect("parsed");
         assert!(parsed.envelope.message.content.is_empty());
         assert_eq!(parsed.attachments.len(), 1);
         let desc = &parsed.attachments[0];
@@ -377,7 +412,8 @@ mod tests {
                 }
             }
         });
-        let parsed = parse_event(&payload, &channel_id(), &[], "chat_id").expect("parsed");
+        let parsed =
+            parse_event(&payload, &channel_id(), &open_admission(), "chat_id").expect("parsed");
         assert_eq!(parsed.attachments.len(), 1);
         let desc = &parsed.attachments[0];
         assert_eq!(desc.kind, AttachmentKind::Document);
@@ -399,20 +435,59 @@ mod tests {
                 }
             }
         });
-        assert!(parse_event(&payload, &channel_id(), &[], "chat_id").is_none());
-        let reason = feishu_drop_reason(&payload, &[]).expect("reason");
+        assert!(parse_event(&payload, &channel_id(), &open_admission(), "chat_id").is_none());
+        let reason = feishu_drop_reason(&payload, &open_admission()).expect("reason");
         assert!(reason.contains("unsupported message_type=audio"));
     }
 
     #[test]
     fn allowed_source_filter_applies() {
-        let allowed = [Arc::from("ou_other")];
-        assert!(parse_event(&text_event("hi"), &channel_id(), &allowed, "chat_id").is_none());
+        let admission = only_sender("ou_other");
+        assert!(parse_event(&text_event("hi"), &channel_id(), &admission, "chat_id").is_none());
+        // And the sender that *is* allowlisted gets through, so the filter is
+        // shown to discriminate rather than merely refuse.
+        let mine = only_sender("ou_a");
+        assert!(parse_event(&text_event("hi"), &channel_id(), &mine, "chat_id").is_some());
+    }
+
+    /// `AUTH-001`. An empty allowlist used to mean "accept everyone".
+    #[test]
+    fn an_empty_allowlist_accepts_nothing() {
+        let closed = AdmissionPolicy::default();
+        assert!(closed.admits_nothing());
+        assert!(parse_event(&text_event("hi"), &channel_id(), &closed, "chat_id").is_none());
+        let reason = feishu_drop_reason(&text_event("hi"), &closed).expect("a reason");
+        assert!(reason.contains("admission policy"), "{reason}");
+    }
+
+    /// An event Feishu sent no usable sender id for is refused even when the
+    /// channel is open, rather than arriving as `feishu-user`.
+    #[test]
+    fn an_unattributed_event_is_refused_on_an_open_channel() {
+        let payload = json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": {} },
+                "message": {
+                    "chat_id": "oc_1",
+                    "message_id": "om_1",
+                    "message_type": "text",
+                    "content": json!({ "text": "hi" }).to_string(),
+                }
+            }
+        });
+        assert!(parse_event(&payload, &channel_id(), &open_admission(), "chat_id").is_none());
     }
 
     #[test]
     fn open_id_receive_type_uses_sender_open_id_as_conversation() {
-        let parsed = parse_event(&text_event("hi"), &channel_id(), &[], "open_id").expect("parsed");
+        let parsed = parse_event(
+            &text_event("hi"),
+            &channel_id(),
+            &open_admission(),
+            "open_id",
+        )
+        .expect("parsed");
         assert_eq!(parsed.envelope.conversation_id.as_str(), "ou_a");
     }
 
@@ -430,7 +505,8 @@ mod tests {
                 }
             }
         });
-        let parsed = parse_event(&payload, &channel_id(), &[], "open_id").expect("parsed");
+        let parsed =
+            parse_event(&payload, &channel_id(), &open_admission(), "open_id").expect("parsed");
         assert_eq!(parsed.envelope.conversation_id.as_str(), "oc_1");
     }
 }

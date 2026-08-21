@@ -1,3 +1,4 @@
+use crate::channels::admission::{env_flag, AdmissionPolicy};
 use crate::channels::attachments::{file_size, AttachmentStore};
 use crate::http::shared_client;
 use crate::r#loop::{parse_action_data, DECISION_KEY, TICKET_KEY};
@@ -25,7 +26,7 @@ const DEFAULT_API_BASE: &str = "https://api.telegram.org";
 pub struct TelegramChannel {
     token: Arc<str>,
     id: ChannelId,
-    allowed_chat_id: Option<Arc<str>>,
+    admission: AdmissionPolicy,
     offset: Option<i64>,
     log_receive_errors: bool,
     attachments: AttachmentStore,
@@ -112,14 +113,23 @@ impl TelegramChannel {
     pub fn from_env() -> Result<Self, ChannelError> {
         let token = env::var("AGENTOS_TELEGRAM_BOT_TOKEN")
             .map_err(|_| ChannelError::Backend(Arc::from("missing AGENTOS_TELEGRAM_BOT_TOKEN")))?;
-        // An empty value means "no allowlist" (accept any chat), same as the
-        // variable being unset. Without this, an empty override would make
-        // `parse_update` reject every inbound message.
-        let allowed_chat_id = env::var("AGENTOS_TELEGRAM_CHAT_ID")
-            .ok()
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty())
-            .map(Arc::from);
+        // An unset or empty allowlist admits *nothing*. It used to mean
+        // "accept any chat", so a deployment that forgot the variable — or
+        // typo'd it, which parses the same — exposed the agent to anyone who
+        // could find the bot (`AUTH-001`). `AGENTOS_TELEGRAM_ALLOW_ALL=1` is
+        // the explicit way to ask for an open channel.
+        let admission = AdmissionPolicy::new(
+            AdmissionPolicy::parse_ids(env::var("AGENTOS_TELEGRAM_CHAT_ID").ok().as_deref()),
+            AdmissionPolicy::parse_ids(env::var("AGENTOS_TELEGRAM_SENDER_ID").ok().as_deref()),
+            env_flag("AGENTOS_TELEGRAM_ALLOW_ALL"),
+        );
+        if admission.admits_nothing() {
+            return Err(ChannelError::Backend(Arc::from(
+                "telegram is configured to accept nothing: set AGENTOS_TELEGRAM_CHAT_ID or \
+                 AGENTOS_TELEGRAM_SENDER_ID, or set AGENTOS_TELEGRAM_ALLOW_ALL=1 to accept \
+                 every attributable sender",
+            )));
+        }
         let api_base = env::var("AGENTOS_TELEGRAM_API_BASE")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -133,7 +143,7 @@ impl TelegramChannel {
         Ok(Self {
             token: Arc::clone(&token),
             id: ChannelId::new("telegram"),
-            allowed_chat_id,
+            admission,
             offset: None,
             log_receive_errors: false,
             attachments: AttachmentStore::from_env("telegram"),
@@ -301,8 +311,7 @@ impl Channel for TelegramChannel {
         let updates = response.get("result")?.as_array()?;
         for update in updates {
             let update_id = update.get("update_id")?.as_i64()?;
-            let Some(parsed) = parse_update(update, &self.id, self.allowed_chat_id.as_deref())
-            else {
+            let Some(parsed) = parse_update(update, &self.id, &self.admission) else {
                 continue;
             };
             let attachments = match self.download_attachments(
@@ -481,16 +490,13 @@ struct ParsedUpdate {
 fn parse_update(
     update: &Value,
     channel_id: &ChannelId,
-    allowed_chat_id: Option<&str>,
+    admission: &AdmissionPolicy,
 ) -> Option<ParsedUpdate> {
     if let Some(callback) = update.get("callback_query") {
-        return parse_callback_query(update, callback, channel_id, allowed_chat_id);
+        return parse_callback_query(update, callback, channel_id, admission);
     }
     let message = update.get("message")?;
     let chat_id = chat_id_string(message.get("chat")?)?;
-    if allowed_chat_id.is_some_and(|allowed| allowed != chat_id) {
-        return None;
-    }
 
     let attachments = collect_attachment_descriptors(message);
     let text = message
@@ -504,19 +510,20 @@ fn parse_update(
         return None;
     }
 
-    let sender = message
-        .get("from")
-        .and_then(|from| {
-            from.get("id")
-                .and_then(Value::as_i64)
-                .map(|id| id.to_string())
-                .or_else(|| {
-                    from.get("username")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                })
-        })
-        .map_or_else(|| Arc::from("telegram-user"), Arc::from);
+    // No `map_or_else(|| "telegram-user", ..)`: a message Telegram did not
+    // attribute is refused below rather than filed under an invented person.
+    let sender = message.get("from").and_then(|from| {
+        from.get("id")
+            .and_then(Value::as_i64)
+            .map(|id| id.to_string())
+            .or_else(|| {
+                from.get("username")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+    });
+    admission.admit(Some(&chat_id), sender.as_deref()).ok()?;
+    let sender: Arc<str> = Arc::from(sender?);
     let update_id = update.get("update_id")?.as_i64()?;
     let message_id = message.get("message_id").and_then(Value::as_i64);
     let message_id_str = message_id
@@ -554,7 +561,7 @@ fn parse_callback_query(
     update: &Value,
     callback: &Value,
     channel_id: &ChannelId,
-    allowed_chat_id: Option<&str>,
+    admission: &AdmissionPolicy,
 ) -> Option<ParsedUpdate> {
     let data = callback.get("data").and_then(Value::as_str)?;
     let (decision, ticket) = parse_action_data(data)?;
@@ -562,16 +569,14 @@ fn parse_callback_query(
         .get("message")
         .and_then(|message| message.get("chat"))?;
     let chat_id = chat_id_string(chat)?;
-    if allowed_chat_id.is_some_and(|allowed| allowed != chat_id) {
-        return None;
-    }
+    // A button press decides an approval, so an unattributable one matters
+    // more than an unattributable message, not less.
     let sender = callback
         .get("from")
         .and_then(|from| from.get("id").and_then(Value::as_i64))
-        .map_or_else(
-            || Arc::from("telegram-user"),
-            |id| Arc::from(id.to_string()),
-        );
+        .map(|id| id.to_string());
+    admission.admit(Some(&chat_id), sender.as_deref()).ok()?;
+    let sender: Arc<str> = Arc::from(sender?);
     let update_id = update.get("update_id")?.as_i64()?;
 
     let mut metadata = BTreeMap::new();
@@ -687,6 +692,16 @@ mod tests {
     use egress::inline_keyboard;
     use serde_json::json;
 
+    /// Admission for tests that are not about admission: open, but still
+    /// refusing anything the transport could not attribute.
+    fn open_admission() -> AdmissionPolicy {
+        AdmissionPolicy::new(Vec::new(), Vec::new(), true)
+    }
+
+    fn only_chat(chat: &str) -> AdmissionPolicy {
+        AdmissionPolicy::new(vec![Arc::from(chat)], Vec::new(), false)
+    }
+
     fn channel_id() -> ChannelId {
         ChannelId::new("telegram")
     }
@@ -705,7 +720,7 @@ mod tests {
                 "data": format!("approve:{ticket}"),
             }
         });
-        let parsed = parse_update(&update, &channel_id(), None).expect("envelope");
+        let parsed = parse_update(&update, &channel_id(), &open_admission()).expect("envelope");
         assert_eq!(parsed.envelope.conversation_id.as_str(), "99");
         assert_eq!(parsed.callback_query_id.as_deref(), Some("cbq-1"));
         assert_eq!(
@@ -744,7 +759,7 @@ mod tests {
                 "data": "open:settings",
             }
         });
-        assert!(parse_update(&update, &channel_id(), None).is_none());
+        assert!(parse_update(&update, &channel_id(), &open_admission()).is_none());
     }
 
     /// The chat allowlist covers button presses too — otherwise a stranger who
@@ -760,8 +775,57 @@ mod tests {
                 "data": "approve:k3f",
             }
         });
-        assert!(parse_update(&update, &channel_id(), Some("100")).is_none());
-        assert!(parse_update(&update, &channel_id(), Some("99")).is_some());
+        assert!(parse_update(&update, &channel_id(), &only_chat("100")).is_none());
+        assert!(parse_update(&update, &channel_id(), &only_chat("99")).is_some());
+    }
+
+    /// `AUTH-001`. A message Telegram did not attribute used to arrive under
+    /// the literal sender `telegram-user`, which reads like a person and is
+    /// not one.
+    #[test]
+    fn a_message_with_no_sender_is_refused_even_on_an_open_channel() {
+        let update = json!({
+            "update_id": 9,
+            "message": {
+                "message_id": 1,
+                "chat": { "id": 99 },
+                "text": "who am I?"
+            }
+        });
+        assert!(parse_update(&update, &channel_id(), &open_admission()).is_none());
+    }
+
+    /// The same for a button press, which decides an approval.
+    #[test]
+    fn a_button_press_with_no_sender_is_refused() {
+        let update = json!({
+            "update_id": 10,
+            "callback_query": {
+                "id": "cb-1",
+                "data": "agentos:approve:ticket-1",
+                "message": { "chat": { "id": 99 } }
+            }
+        });
+        assert!(parse_update(&update, &channel_id(), &open_admission()).is_none());
+    }
+
+    /// A sender allowlist keeps out someone who is in an allowed chat.
+    #[test]
+    fn a_sender_outside_the_allowlist_is_refused_in_an_allowed_chat() {
+        let admission = AdmissionPolicy::new(vec![Arc::from("99")], vec![Arc::from("7")], false);
+        let from = |id: i64| {
+            json!({
+                "update_id": 11,
+                "message": {
+                    "message_id": 2,
+                    "chat": { "id": 99 },
+                    "from": { "id": id },
+                    "text": "hello"
+                }
+            })
+        };
+        assert!(parse_update(&from(7), &channel_id(), &admission).is_some());
+        assert!(parse_update(&from(8), &channel_id(), &admission).is_none());
     }
 
     #[test]
@@ -814,7 +878,7 @@ mod tests {
                 "text": "hello world"
             }
         });
-        let parsed = parse_update(&update, &channel_id(), None).expect("envelope");
+        let parsed = parse_update(&update, &channel_id(), &open_admission()).expect("envelope");
         assert_eq!(parsed.envelope.message.content.as_ref(), "hello world");
         assert!(parsed.attachments.is_empty());
         assert_eq!(parsed.message_id_str, "10");
@@ -827,6 +891,7 @@ mod tests {
             "message": {
                 "message_id": 11,
                 "chat": { "id": 99 },
+                "from": { "id": 7 },
                 "caption": "look at this",
                 "photo": [
                     { "file_id": "small", "file_unique_id": "u1", "width": 90, "height": 60, "file_size": 1000 },
@@ -834,7 +899,7 @@ mod tests {
                 ]
             }
         });
-        let parsed = parse_update(&update, &channel_id(), None).expect("envelope");
+        let parsed = parse_update(&update, &channel_id(), &open_admission()).expect("envelope");
         assert_eq!(parsed.envelope.message.content.as_ref(), "look at this");
         assert_eq!(parsed.attachments.len(), 1);
         let desc = &parsed.attachments[0];
@@ -851,6 +916,7 @@ mod tests {
             "message": {
                 "message_id": 12,
                 "chat": { "id": 99 },
+                "from": { "id": 7 },
                 "document": {
                     "file_id": "doc-1",
                     "file_name": "report.pdf",
@@ -859,7 +925,7 @@ mod tests {
                 }
             }
         });
-        let parsed = parse_update(&update, &channel_id(), None).expect("envelope");
+        let parsed = parse_update(&update, &channel_id(), &open_admission()).expect("envelope");
         assert!(parsed.envelope.message.content.is_empty());
         assert_eq!(parsed.attachments.len(), 1);
         let desc = &parsed.attachments[0];
@@ -875,7 +941,7 @@ mod tests {
             "update_id": 4,
             "message": { "message_id": 13, "chat": { "id": 99 } }
         });
-        assert!(parse_update(&update, &channel_id(), None).is_none());
+        assert!(parse_update(&update, &channel_id(), &open_admission()).is_none());
     }
 
     #[test]
@@ -885,10 +951,11 @@ mod tests {
             "message": {
                 "message_id": 14,
                 "chat": { "id": 99 },
+                "from": { "id": 7 },
                 "text": "hi"
             }
         });
-        assert!(parse_update(&update, &channel_id(), Some("100")).is_none());
-        assert!(parse_update(&update, &channel_id(), Some("99")).is_some());
+        assert!(parse_update(&update, &channel_id(), &only_chat("100")).is_none());
+        assert!(parse_update(&update, &channel_id(), &only_chat("99")).is_some());
     }
 }

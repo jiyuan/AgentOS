@@ -2,18 +2,24 @@
 
 - Status: accepted; partially implemented
 - Date: 2026-08-21
-- Milestone: M3 (`ID-001` landed; `ID-002` and `AUTH-001` outstanding)
+- Milestone: M3 (`ID-001`, `ID-002`, `AUTH-001` landed; deliverable 2 partly
+  outstanding)
 
 ## What is implemented
 
-`Principal` exists in `agentos-proto` with both encodings, and memory scopes,
+`Principal` exists in `agentos-proto` with both encodings. Memory scopes,
 episode records, attachment path segments, and the memory tool's owner
-resolution are keyed by it. What is *not* yet done: sessions, approval tickets,
-`/clear`, jobs, and task sessions still key on a bare `ConversationId`
-(`AUTH-001` and the milestone's deliverable 2), and no migration exists for
-data written under the old namespaces (`ID-002`). Until that lands, memory
-written before this change is unreachable rather than merged — which is the
-failure mode this ADR asks for, but it is a real one.
+resolution are keyed by it; `agentos-gateway migrate` moves data written under
+the old namespaces, reporting what the old encoding made ambiguous rather than
+guessing. Both remote channels fail closed on identity and refuse an
+unattributed event on every path, and an approval prompt is answerable only by
+the sender it was put to or a configured administrator.
+
+What is *not* yet done: sessions, `/clear`, jobs, and task sessions still key
+on a bare `ConversationId` rather than a principal, so state isolation there
+rests on the conversation id being unique — which it is per channel, and is not
+across them. That is the rest of the milestone's deliverable 2, and it is where
+the `Session` trait's semver break lives.
 
 ## Context
 

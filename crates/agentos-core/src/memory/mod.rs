@@ -9,6 +9,7 @@ mod accounting;
 mod authorize;
 mod hybrid;
 mod in_memory;
+pub mod migrate;
 mod qdrant;
 mod query;
 mod reflection;

@@ -33,7 +33,7 @@ something that no longer exists — the two-way ratchet
 |---|---|---|---|---|---|
 | Typed run loop (`Start`→`Plan`→`Approve`→`Act`→`Observe`→`Finish`) | Stable | all | — | State *ordering* is not compiler-enforced; a hand-built `ActCtx` reaches `Act` with no `Approve` pass (M6) | integration, golden |
 | Pause / resume over a serialized `RunState` | Stable | all | — | Paused-run state is written with plain `fs::write`: no temp+rename, no fsync, mode 0644 (M8) | integration, golden |
-| Ticketed approval | Stable | all | `[policy]` | Tickets are minted from a clock-seeded counter and bound to no principal, so any member of an allowed chat can answer another user's prompt (M3) | integration |
+| Ticketed approval | Stable | all | `[policy]` | A prompt is answerable only by the sender it was put to, or a `[policy] approval_administrators` entry. Tickets are still minted from a clock-seeded counter rather than a CSPRNG | unit, integration |
 | Policy engine (`allow` / `deny` / `ask_user`) | Stable | all | `[policy]` | — | unit, integration |
 | Sub-agent policy narrowing | **Preview** | all | `[[subagents]]` | Narrowing is by tool name only; a sub-agent naming a tool the parent gates behind `ask_user` receives it as a blanket `allow` ([ADR-0001](adr/0001-POLICY_NARROWING.md), M3) | unit, integration, property |
 | Input / tool / output guardrails | Stable | all | `[guardrails]` | Output guardrails run after streaming has already forwarded chunks; see *Provisional streaming* | unit, integration |
@@ -122,8 +122,8 @@ parsing, streaming assembly, and retry behavior.
 |---|---|---|---|---|---|
 | TUI | Stable | all | — | — | integration |
 | One-shot CLI | Stable | all | — | — | integration |
-| Telegram | **Preview** | all | `[[channels]]`, bot token | **Fails open**: accepts every chat when `AGENTOS_TELEGRAM_CHAT_ID` is unset, and has no sender allowlist at all. The update offset lives only in process memory and advances *before* the run, so a crash both replays and loses (M3, M8) | unit |
-| Feishu | **Preview** | all | `[[channels]]`, app credentials | **Fails open**: an empty allowlist returns `true`. Reads `event_id` and never dedupes on it (M3, M8) | unit |
+| Telegram | **Preview** | all | `[[channels]]`, bot token, an allowlist | Fails closed on identity, with a sender allowlist. The update offset still lives only in process memory and advances *before* the run, so a crash both replays and loses (M8) | unit |
+| Feishu | **Preview** | all | `[[channels]]`, app credentials, an allowlist | Fails closed on identity. Still reads `event_id` and never dedupes on it (M8) | unit |
 | Attachments | **Preview** | all | — | Downloads are unbounded (M4). Path components are now injectively encoded, so two conversations can no longer share a directory | unit |
 
 ## Orchestration and workspace

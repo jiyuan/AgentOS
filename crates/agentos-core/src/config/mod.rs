@@ -114,6 +114,13 @@ impl Default for AgentConfig {
 pub struct PolicyConfig {
     pub default: Arc<str>,
     pub allowlist: Vec<Arc<str>>,
+    /// Senders who may answer any approval prompt, not only their own.
+    ///
+    /// Empty by default: a prompt is answerable by the person it was put to.
+    /// In a group conversation that is what stops one participant deciding
+    /// another's approval. Name a sender id here only when someone genuinely
+    /// needs to unblock other people's prompts.
+    pub approval_administrators: Vec<Arc<str>>,
 }
 
 impl Default for PolicyConfig {
@@ -121,6 +128,7 @@ impl Default for PolicyConfig {
         Self {
             default: Arc::from("deny"),
             allowlist: Vec::new(),
+            approval_administrators: Vec::new(),
         }
     }
 }

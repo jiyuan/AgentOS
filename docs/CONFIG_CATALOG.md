@@ -15,6 +15,7 @@ Every key `agent.toml` accepts, derived from the config structs. Edit the doc co
 | `policy` | `PolicyConfig` | (table) | The authorization default and the tools exempt from it. |
 | `policy.default` | `Arc<str>` | `deny` | *(undocumented — see `config/undocumented.txt`)* |
 | `policy.allowlist` | `Vec<Arc<str>>` | (empty) | *(undocumented — see `config/undocumented.txt`)* |
+| `policy.approval_administrators` | `Vec<Arc<str>>` | (empty) | Senders who may answer any approval prompt, not only their own.  Empty by default: a prompt is answerable by the person it was put to. In a group conversation that is what stops one participant deciding another's approval. Name a sender id here only when someone genuinely needs to unblock other people's prompts. |
 | `guardrails` | `GuardrailsConfig` | (table) | Content checks applied to input, tool calls, and output. |
 | `guardrails.shell_allowlist` | `Vec<Arc<str>>` | `["printf","echo","pwd","ls","find","cat","head","tail"]` | Programs the shell tool guardrail permits in a call's `command` field. Each entry is a bare program name — arguments belong in the structured args array, not here. Defaults to `DEFAULT_SHELL_ALLOWLIST`. |
 | `guardrails.shell_profiles` | `Vec<ShellProfileConfig>` | (none) | Programs whose structured args array is checked too, not only the program name. Required for anything that can be argued into running other code. Defaults to `default_shell_profiles`. |
@@ -167,5 +168,5 @@ Every key `agent.toml` accepts, derived from the config structs. Edit the doc co
 | `spill.root` | `PathBuf` | `spill` | Where artifacts are written. Relative paths resolve against the workspace root; an absolute path is taken as given, for a deployment that wants spill on a different volume from the session database. |
 | `spill.retention_days` | `u64` | `0` | Days an artifact is kept, or `0` to keep everything.  `0` is a choice rather than a disabled feature — see the module docs. |
 
-102 of 159 keys have no description yet. They are listed in `crates/agentos-core/src/config/undocumented.txt`; writing the doc comment on the field is what removes a line from it.
+102 of 160 keys have no description yet. They are listed in `crates/agentos-core/src/config/undocumented.txt`; writing the doc comment on the field is what removes a line from it.
 <!-- END GENERATED: config -->

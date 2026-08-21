@@ -5,14 +5,17 @@ use agentos_core::crons::{CronSchedule, CronStore, MemoryMaintenanceCron};
 use agentos_core::gateway::{
     shard_set, GatewayRun, GatewayService, Router, ShardConfig, DEFAULT_IDLE_INTERVAL,
 };
-use agentos_core::memory::MemoryManager;
+use agentos_core::memory::migrate::{self, MigrationSettings};
+use agentos_core::memory::{MemoryManager, SqliteStore};
 use agentos_core::runner::ResumeDecision;
 use agentos_core::runtime::{AgentRuntime, RuntimePaths};
 use agentos_core::sandbox;
 use agentos_interfaces::orchestrator::StreamSink;
 use agentos_interfaces::{Channel, Egress, StreamEgress};
 use agentos_llm::env as agentos_env;
-use agentos_proto::{ConversationId, Envelope, Message, MessageRole, RunId, SpanKind};
+use agentos_proto::{
+    AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole, RunId, SpanKind,
+};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -198,6 +201,7 @@ fn run() -> Result<(), String> {
             calibrate::run(&root, check)
         }
         "serve" => serve(&config),
+        "migrate" => migrate(&config),
         "-h" | "--help" | "help" => {
             usage();
             Ok(())
@@ -209,7 +213,7 @@ fn run() -> Result<(), String> {
 fn usage() {
     eprintln!(
         "\
-Usage: agentos-gateway <start|stop|restart|status|config|catalog|calibrate> [OPTIONS]
+Usage: agentos-gateway <start|stop|restart|status|config|catalog|calibrate|migrate> [OPTIONS]
 
 Manage the AgentOS gateway as a persistent background service.
 
@@ -226,6 +230,14 @@ Subcommands:
              counts and record the result (roadmap C1). Spends real requests.
              `--check` re-scores today's estimator against the recorded counts
              offline, spending nothing; `--root=PATH` names the repository.
+  migrate    Move memory written before typed principals onto principal-keyed
+             namespaces (`ID-002`). Reports and changes nothing by default.
+             `--apply` performs it, and needs `--backup PATH` (or an explicit
+             `--no-backup`) because it rewrites the database in place.
+             `--channel NAME` names the channel legacy conversations arrived
+             on, which the old rows do not record; `--agent NAME` likewise.
+             `--assume-literal-underscores` accepts the literal reading of ids
+             the old encoder made ambiguous — see the report before using it.
 
 All workspace paths derive from $AGENTOS_HOME (set in .env or the process env).
 If unset, $AGENTOS_HOME defaults to the parent dir of the loaded .env file,
@@ -279,6 +291,13 @@ where
             // rather than a runtime path.
             "--check" => {}
             option if option.starts_with("--root=") => {}
+            // `migrate`'s own options, parsed the same way and for the same
+            // reason: they describe a one-off operation, not the service.
+            "--apply" | "--no-backup" | "--assume-literal-underscores" => {}
+            option
+                if option.starts_with("--channel=")
+                    || option.starts_with("--agent=")
+                    || option.starts_with("--backup=") => {}
             "-h" | "--help" => {
                 usage();
                 std::process::exit(0);
@@ -1115,6 +1134,100 @@ fn runtime_paths(config: &ServiceConfig) -> RuntimePaths {
         skills_dir: config.home.join("workspace/skills"),
         cron_dir: config.home.join("workspace/crons"),
     }
+}
+
+/// Move memory written before typed principals onto principal-keyed
+/// namespaces.
+///
+/// Reports by default and applies only when asked, because it rewrites rows in
+/// place and the report is the part that needs reading: the old encoding lost
+/// information, so some namespaces cannot be migrated without a human deciding
+/// what they meant.
+fn migrate(config: &ServiceConfig) -> Result<(), String> {
+    let flags: Vec<String> = env::args().skip(2).collect();
+    let has = |name: &str| flags.iter().any(|flag| flag == name);
+    let value = |name: &str| {
+        flags
+            .iter()
+            .find_map(|flag| flag.strip_prefix(&format!("{name}=")).map(str::to_owned))
+    };
+
+    let db_path = session_path(config);
+    if !db_path.exists() {
+        return Err(format!("no database at {}", db_path.display()));
+    }
+    let workspace_config = WorkspaceConfig::load(&agent_config_path(config))
+        .map_err(|err| format!("failed to load workspace config: {err}"))?;
+
+    let settings = MigrationSettings {
+        agent: AgentId::new(
+            value("--agent").unwrap_or_else(|| workspace_config.agent.id.to_string()),
+        ),
+        // No default. Every legacy conversation namespace needs a channel, the
+        // rows do not record one, and guessing would put two channels'
+        // conversations under one principal — the exact failure the identity
+        // work exists to remove.
+        channel: ChannelId::new(value("--channel").ok_or_else(|| {
+            "--channel NAME is required: legacy rows record no channel, and it cannot be inferred"
+                .to_owned()
+        })?),
+        assume_literal_underscores: has("--assume-literal-underscores"),
+    };
+
+    let store = SqliteStore::open(&db_path)
+        .map_err(|err| format!("failed to open {}: {err}", db_path.display()))?;
+    let version = migrate::schema_version(&store)
+        .map_err(|err| format!("failed to read the schema version: {err}"))?;
+    println!("database: {}", db_path.display());
+    println!("schema version: {version}");
+
+    let plan = migrate::plan(&store, &settings)
+        .map_err(|err| format!("failed to plan the migration: {err}"))?;
+    print!("{}", plan.report());
+
+    if !has("--apply") {
+        println!("\nNothing was changed. Re-run with --apply to perform this migration.");
+        return Ok(());
+    }
+    if plan.rewrites.is_empty() {
+        println!("\nNothing to apply.");
+        return Ok(());
+    }
+
+    // A backup, or a deliberate statement that none is wanted. The migration
+    // is atomic, so a crash cannot corrupt the database — but a *correct*
+    // migration the operator did not intend is equally unrecoverable, and that
+    // is what a backup is for.
+    match value("--backup") {
+        Some(backup) => {
+            let backup = PathBuf::from(backup);
+            std::fs::copy(&db_path, &backup)
+                .map_err(|err| format!("failed to write backup {}: {err}", backup.display()))?;
+            println!("\nbackup: {}", backup.display());
+        }
+        None if has("--no-backup") => {
+            println!("\nproceeding without a backup, as requested");
+        }
+        None => {
+            return Err(
+                "--backup PATH is required with --apply (or pass --no-backup deliberately)"
+                    .to_owned(),
+            );
+        }
+    }
+
+    let moved = migrate::apply(&store, &plan)
+        .map_err(|err| format!("the migration was rolled back: {err}"))?;
+    println!("moved {moved} record(s)");
+    if plan.blocked.is_empty() {
+        println!("schema version is now {}", migrate::IDENTITY_SCHEMA_VERSION);
+    } else {
+        println!(
+            "{} namespace(s) still need a decision, so the schema version stays at {version}",
+            plan.blocked.len()
+        );
+    }
+    Ok(())
 }
 
 fn session_path(config: &ServiceConfig) -> PathBuf {

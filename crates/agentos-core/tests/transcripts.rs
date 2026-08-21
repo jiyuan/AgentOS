@@ -18,7 +18,7 @@ mod support;
 use agentos_core::approve::{Policy, PolicyAction, PolicyRule, PolicyVerb};
 use agentos_core::memory::InMemorySession;
 use agentos_core::orchestrator::MaxOrchestrator;
-use agentos_core::r#loop::{route, ApprovalTicket};
+use agentos_core::r#loop::{route, ApprovalBinding, ApprovalTicket};
 use agentos_core::runner::{
     approval_prompt_envelope, resume_run, run_envelope, PausedRun, ResumeDecision, RunOutcome,
     SESSION_SCOPE_EPHEMERAL, SESSION_SCOPE_KEY,
@@ -231,13 +231,17 @@ async fn golden_approval_pause_and_resume() {
     });
 
     // An unrelated message must not decide it, however affirmative it sounds.
+    // Bound to the sender `user_envelope` stamps, so these route against a
+    // prompt that really was put to them and the answers below fail for the
+    // reason under test rather than for being someone else's.
+    let binding = ApprovalBinding::new(ticket.clone(), support::SENDER);
     let undecided: Vec<Value> = ["y", "yes, go ahead", "approve", "/approve"]
         .into_iter()
         .map(|text| {
             let answer = user_envelope(text);
             json!({
                 "input": text,
-                "routed": format!("{:?}", route(Some(&ticket), &answer)),
+                "routed": format!("{:?}", route(Some(&binding), &answer)),
             })
         })
         .collect();
