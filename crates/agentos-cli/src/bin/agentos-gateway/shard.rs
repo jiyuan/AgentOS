@@ -223,6 +223,7 @@ impl ShardTurns<'_> {
                     model_controller: Some(&self.context.runtime.model_controller),
                     session_usage: Some(&self.context.session_usage),
                     agent_id: &self.context.runtime.active_agent,
+                    channel_id: &input.channel_id,
                     conversation_id: &input.conversation_id,
                 };
                 let reply = slash::render(cmd, &ctx).await;

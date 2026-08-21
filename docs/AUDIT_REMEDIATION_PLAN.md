@@ -466,7 +466,10 @@ Size: L — ~254 `conversation_id` and ~111 `channel_id` sites; `Session` keys o
 deliberate semver break; and the migration needs a `schema_version` table that
 does not exist — the schema is four bare `CREATE TABLE IF NOT EXISTS`
 (`memory/sqlite.rs:52-124`)
-Status: **not started**
+Status: **in progress** — `AUTH-002` and `ID-001` done; `ID-002` and
+`AUTH-001` outstanding. Memory, episodes, and attachments are keyed by
+`Principal`; sessions, approval tickets, `/clear`, and jobs are not, and data
+written under the old namespaces is unreachable until `ID-002` migrates it.
 Dependencies: M0, plus a persistence schema-version mechanism built as part of
 this milestone
 
@@ -911,10 +914,10 @@ a slice moves off `not started` only when the named artifact exists in the tree.
 | `REL-001` | M2 | Self-contained release workspace and documentation, with a clean-room archive checker | TEST-001 | **done** — workspace allowlist + transitive doc closure; `scripts/check-release-archive.sh` |
 | `REL-002` | M2 | Installer/wrapper contract, one install layout, pathless resume, clean-room smoke | REL-001 | **done** — XDG layout, `agentos config`, pathless `resume`, unknown commands rejected |
 | `CI-001` | M2 | Portable spill/golden tests and a real macOS Seatbelt probe | TEST-001 | **done** — `File::set_modified`, fixed-length temp trees, enforcing Seatbelt probe, macOS CI matrix |
-| `ID-001` | M3 | Typed principal and injective namespace | ADR-001 | not started |
+| `ID-001` | M3 | Typed principal and injective namespace | ADR-001 | **done** — `agentos_proto::Principal`, injective encoding, memory/episodes/attachments keyed by it |
 | `ID-002` | M3 | Versioned persistence migration and collision report | ID-001 | not started |
 | `AUTH-001` | M3 | Remote sender authentication and approval binding | ID-001 | not started |
-| `AUTH-002` | M3 | Exact policy lattice and explicit delegation grants | ADR-001, TEST-001 | not started |
+| `AUTH-002` | M3 | Exact policy lattice and explicit delegation grants | ADR-001, TEST-001 | **done** — witness-based `narrow`, `[[subagents.delegation_grants]]` |
 | `SBX-001` | M4 | Fail-closed registry and executor capability protocol | ADR-001 | not started |
 | `FS-001` | M4 | Validated path segments and no-follow containment | TEST-001 | not started |
 | `PROC-001` | M4 | Minimal tool environment and process-group termination | SBX-001 | not started |

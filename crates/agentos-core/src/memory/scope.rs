@@ -1,5 +1,5 @@
 use agentos_interfaces::orchestrator::MemoryFragment;
-use agentos_proto::{AgentId, ConversationId, Namespace, RunId, TaskId};
+use agentos_proto::{AgentId, ChannelId, ConversationId, Namespace, Principal, RunId, TaskId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -33,7 +33,14 @@ pub enum MemoryOwner {
     User(Arc<str>),
     Agent(AgentId),
     Task(TaskId),
-    Conversation(ConversationId),
+    /// One conversation, keyed by its [`Principal`] rather than by a bare
+    /// `ConversationId`.
+    ///
+    /// A conversation id is channel-local: `telegram:42` and `feishu:42` are
+    /// both `"42"`, and so was a second agent's `telegram:42`. Keying on the
+    /// id alone made all three the same memory namespace (`ID-001`,
+    /// [ADR-0003](../../../../docs/adr/0003-TYPED_PRINCIPAL.md)).
+    Conversation(Principal),
     Shared,
 }
 
@@ -48,13 +55,18 @@ impl MemoryOwner {
         }
     }
 
-    pub(crate) fn id(&self) -> &str {
+    /// The owner's identity, already namespace-encoded.
+    ///
+    /// A principal brings its own injective encoding, so it is used as-is;
+    /// every other kind is a single opaque string and goes through
+    /// [`scope_component`].
+    pub(crate) fn namespace_id(&self) -> String {
         match self {
-            Self::User(id) => id,
-            Self::Agent(id) => id.as_str(),
-            Self::Task(id) => id.as_str(),
-            Self::Conversation(id) => id.as_str(),
-            Self::Shared => "global",
+            Self::User(id) => scope_component(id),
+            Self::Agent(id) => scope_component(id.as_str()),
+            Self::Task(id) => scope_component(id.as_str()),
+            Self::Conversation(principal) => principal.storage_name(),
+            Self::Shared => "global".to_owned(),
         }
     }
 }
@@ -106,7 +118,7 @@ impl MemoryScope {
             "{}/{}/{}/{}/{}",
             self.visibility.as_str(),
             self.owner.kind(),
-            scope_component(self.owner.id(), "global"),
+            self.owner.namespace_id(),
             self.store.as_str(),
             self.domain_name()
         ))
@@ -115,7 +127,7 @@ impl MemoryScope {
     pub(crate) fn domain_name(&self) -> String {
         self.domain
             .as_deref()
-            .map(|domain| scope_component(domain, "general"))
+            .map(scope_component)
             .unwrap_or_else(|| "general".to_owned())
     }
 }
@@ -124,6 +136,10 @@ impl MemoryScope {
 pub struct MemoryCaller {
     pub agent_id: AgentId,
     pub task_id: TaskId,
+    /// Which channel the conversation belongs to. Without it a conversation
+    /// id is channel-local and two channels' conversations collide.
+    #[serde(default = "unknown_channel")]
+    pub channel_id: ChannelId,
     pub conversation_id: ConversationId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_id: Option<Arc<str>>,
@@ -146,6 +162,36 @@ pub struct HydrationRequest {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+/// The channel a caller deserialized from a record written before
+/// `MemoryCaller` carried one. A distinct, reserved name rather than an empty
+/// string, so pre-principal state is visibly pre-principal instead of
+/// masquerading as a real channel.
+fn unknown_channel() -> ChannelId {
+    ChannelId::new("unknown-channel")
+}
+
+impl EpisodeRecord {
+    /// The principal this episode belongs to.
+    pub fn conversation_principal(&self) -> Principal {
+        Principal::conversation(
+            self.active_agent.clone(),
+            self.channel_id.clone(),
+            self.conversation_id.clone(),
+        )
+    }
+}
+
+impl MemoryCaller {
+    /// The principal for this caller's own conversation.
+    pub fn conversation_principal(&self) -> Principal {
+        Principal::conversation(
+            self.agent_id.clone(),
+            self.channel_id.clone(),
+            self.conversation_id.clone(),
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -184,6 +230,10 @@ pub struct EpisodeRecord {
     pub run_id: RunId,
     pub task_id: TaskId,
     pub active_agent: AgentId,
+    /// Which channel the conversation belongs to, so the episode is filed
+    /// under the same principal the conversation's other memory is.
+    #[serde(default = "unknown_channel")]
+    pub channel_id: ChannelId,
     pub conversation_id: ConversationId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_id: Option<Arc<str>>,
@@ -225,10 +275,21 @@ pub enum RetrievalStrategy {
     Hybrid,
 }
 
-pub(crate) fn scope_component(value: &str, fallback: &str) -> String {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return fallback.to_owned();
-    }
-    trimmed.replace('/', "_")
+/// One namespace component, encoded so that distinct inputs stay distinct.
+///
+/// This was `trimmed.replace('/', "_")`, which is not injective: `a/b` and
+/// `a_b` produced the same namespace, so two owners shared one another's
+/// memory. `channels/attachments.rs` even carried a test asserting the
+/// collision (`ID-001`, [ADR-0003](../../../../docs/adr/0003-TYPED_PRINCIPAL.md)).
+///
+/// Values that are already unambiguous pass through unchanged, because a
+/// namespace an operator can read out of the database is worth keeping.
+/// Anything else — a separator, a space, an empty string, any non-ASCII — is
+/// emitted as `~` followed by unpadded base64url. The marker is what makes the
+/// two forms distinguishable: a plain value can never begin with `~`, since
+/// `~` is not in the safe set.
+pub(crate) fn scope_component(value: &str) -> String {
+    // The same encoding `Principal::storage_name` uses for its own components,
+    // so one namespace does not mix two escaping rules.
+    agentos_proto::encode_component(value)
 }

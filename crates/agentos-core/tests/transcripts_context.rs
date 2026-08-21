@@ -41,6 +41,7 @@ async fn manager_with_fact(fact: &str) -> Arc<MemoryManager> {
     let caller = agentos_core::memory::MemoryCaller {
         agent_id: AgentId::new("golden-agent"),
         task_id: agentos_proto::TaskId::new("golden-task"),
+        channel_id: agentos_proto::ChannelId::new("golden-channel"),
         conversation_id: ConversationId::new(CONVERSATION),
         user_id: None,
         allowed_shared_domains: Vec::new(),
@@ -48,7 +49,11 @@ async fn manager_with_fact(fact: &str) -> Arc<MemoryManager> {
     };
     let scope = MemoryScope::new(
         MemoryStore::Semantic,
-        MemoryOwner::Conversation(ConversationId::new(CONVERSATION)),
+        MemoryOwner::Conversation(agentos_proto::Principal::conversation(
+            AgentId::new("golden-agent"),
+            agentos_proto::ChannelId::new("golden-channel"),
+            ConversationId::new(CONVERSATION),
+        )),
         MemoryVisibility::Private,
         None,
     );

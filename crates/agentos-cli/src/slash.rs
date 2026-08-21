@@ -18,7 +18,7 @@ use agentos_core::runtime::OrchestratorStrategy;
 use agentos_core::skills::WorkspaceSkillCatalog;
 use agentos_core::tools::ToolRegistry;
 use agentos_llm::{configured_selection_for_tier, LlmModelController, LlmModelTier};
-use agentos_proto::{AgentId, ConversationId, TaskId, Usage};
+use agentos_proto::{AgentId, ChannelId, ConversationId, TaskId, Usage};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -93,6 +93,9 @@ pub struct SlashContext<'a> {
     pub model_controller: Option<&'a LlmModelController>,
     pub session_usage: Option<&'a SessionUsage>,
     pub agent_id: &'a AgentId,
+    /// The channel the conversation belongs to. Part of the memory principal,
+    /// so `/memory` in the TUI reads the same namespace the run wrote to.
+    pub channel_id: &'a ChannelId,
     pub conversation_id: &'a ConversationId,
 }
 
@@ -215,7 +218,13 @@ pub async fn render(cmd: SlashCommand, ctx: &SlashContext<'_>) -> String {
         SlashCommand::ListCrons => format_crons(ctx.cron_store),
         SlashCommand::ListTools => format_tools(ctx.tool_registry),
         SlashCommand::ListMemory => {
-            format_memory(ctx.memory_manager, ctx.agent_id, ctx.conversation_id).await
+            format_memory(
+                ctx.memory_manager,
+                ctx.agent_id,
+                ctx.channel_id,
+                ctx.conversation_id,
+            )
+            .await
         }
         SlashCommand::ShowOrchestrator => format_orchestrator_status(ctx.orchestrator_handle),
         SlashCommand::SetOrchestrator(strategy) => {
@@ -469,11 +478,13 @@ pub fn format_tools(registry: Option<&ToolRegistry>) -> String {
 pub async fn format_memory(
     manager: &MemoryManager,
     agent_id: &AgentId,
+    channel_id: &ChannelId,
     conversation_id: &ConversationId,
 ) -> String {
     let caller = MemoryCaller {
         agent_id: agent_id.clone(),
         task_id: TaskId::new("main"),
+        channel_id: channel_id.clone(),
         conversation_id: conversation_id.clone(),
         user_id: None,
         allowed_shared_domains: Vec::new(),

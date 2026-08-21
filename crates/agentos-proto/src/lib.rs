@@ -3,6 +3,7 @@
 pub mod envelope;
 pub mod ids;
 pub mod message;
+pub mod principal;
 pub mod request;
 pub mod tool;
 pub mod trace;
@@ -14,6 +15,9 @@ pub use ids::{
     SpanId, TaskId, ToolCallId,
 };
 pub use message::{Attachment, AttachmentKind, Message, MessageRole};
+pub use principal::{
+    base64url, base64url_decode, decode_component, encode_component, Principal, PRINCIPAL_VERSION,
+};
 pub use request::{RequestHeader, RequestSection, RequestSource};
 pub use tool::{ToolCall, ToolResult, ToolStatus};
 pub use trace::{SpanKind, TraceEvent, TraceSpan};

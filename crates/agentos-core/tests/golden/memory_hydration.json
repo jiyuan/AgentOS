@@ -15,7 +15,7 @@
           "id": "memory",
           "messages": 1,
           "sources": [
-            "private/conversation/golden-conversation/semantic/general/record-1"
+            "private/conversation/v1.golden-agent.golden-channel.golden-conversation.n/semantic/general/record-1"
           ],
           "tokens": 64
         },

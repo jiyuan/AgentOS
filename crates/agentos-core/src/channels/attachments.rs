@@ -65,23 +65,20 @@ pub(crate) fn file_size(path: &Path) -> Option<u64> {
     fs::metadata(path).ok().map(|meta| meta.len())
 }
 
-/// Strip path separators, NULs, and parent-traversal sequences from a path
-/// segment so user-controlled values can't escape the attachments root.
+/// Encode a path segment so user-controlled values can neither escape the
+/// attachments root nor collide with one another.
+///
+/// This replaced characters — `/`, `\`, NUL, controls — with `_`, which kept
+/// the segment inside the root but was not injective: `oc_abc/def` and
+/// `oc_abc_def` landed in the same directory, and a test asserted that
+/// equality rather than reporting it. Two conversations could therefore write
+/// each other's attachments (`ID-001`).
+///
+/// `encode_component` is the same encoding principals use, so a safe segment
+/// stays readable and anything else becomes `~<base64url>` — which contains no
+/// separator, no NUL, no control character, and no `..`.
 fn sanitize_segment(input: &str) -> Arc<str> {
-    let cleaned: String = input
-        .chars()
-        .map(|c| match c {
-            '/' | '\\' | '\0' => '_',
-            c if c.is_control() => '_',
-            c => c,
-        })
-        .collect();
-    let trimmed = cleaned.trim_matches(|c: char| c == '.' || c.is_whitespace());
-    if trimmed.is_empty() {
-        Arc::from("_")
-    } else {
-        Arc::from(trimmed)
-    }
+    Arc::from(agentos_proto::encode_component(input))
 }
 
 fn sanitize_filename(input: &str) -> Arc<str> {
@@ -115,12 +112,29 @@ mod tests {
         // even if the surrounding underscores look ugly.
         let cleaned = sanitize_segment("../../etc/passwd");
         assert!(!cleaned.contains('/') && !cleaned.contains('\\'));
-        assert_eq!(sanitize_segment("oc_abc/def").as_ref(), "oc_abc_def");
+        assert!(!cleaned.contains(".."));
+        // Inverted. This asserted `"oc_abc_def"` for both — the collision, not
+        // a property. Distinct inputs must land in distinct directories.
+        assert_ne!(
+            sanitize_segment("oc_abc/def"),
+            sanitize_segment("oc_abc_def")
+        );
+        assert_eq!(sanitize_segment("oc_abc_def").as_ref(), "oc_abc_def");
         let evil = sanitize_filename("..\\evil.exe");
         assert!(!evil.contains('/') && !evil.contains('\\'));
         assert!(evil.contains("evil.exe"));
         assert_eq!(sanitize_filename("").as_ref(), "attachment.bin");
-        assert_eq!(sanitize_segment("...").as_ref(), "_");
+        // Every traversal-ish segment still encodes to something inert, and
+        // to something *different* from every other such segment.
+        for segment in ["...", "..", ".", "", "/", "\\"] {
+            let encoded = sanitize_segment(segment);
+            assert!(!encoded.contains('/') && !encoded.contains('\\') && !encoded.contains(".."));
+        }
+        let distinct: std::collections::BTreeSet<Arc<str>> = ["...", "..", ".", "", "/", "\\"]
+            .iter()
+            .map(|segment| sanitize_segment(segment))
+            .collect();
+        assert_eq!(distinct.len(), 6, "traversal segments must stay distinct");
     }
 
     #[test]

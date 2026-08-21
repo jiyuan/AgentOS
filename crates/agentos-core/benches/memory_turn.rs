@@ -36,6 +36,7 @@ fn bench_caller(ctx: &RunContext<'_>) -> MemoryCaller {
     MemoryCaller {
         agent_id: ctx.system.active_agent.clone(),
         task_id: ctx.system.task_id.clone(),
+        channel_id: agentos_proto::ChannelId::new("bench-channel"),
         conversation_id: ConversationId::new("bench-conv"),
         user_id: None,
         allowed_shared_domains: Vec::new(),
@@ -85,6 +86,7 @@ fn populated_manager(runtime: &tokio::runtime::Runtime) -> Arc<MemoryManager> {
     let writer = MemoryCaller {
         agent_id: agent.clone(),
         task_id: agentos_proto::TaskId::new("bench-run"),
+        channel_id: agentos_proto::ChannelId::new("bench-channel"),
         conversation_id: ConversationId::new("bench-conv"),
         user_id: None,
         allowed_shared_domains: Vec::new(),

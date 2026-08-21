@@ -11,7 +11,7 @@ use agentos_core::memory::{
     MemoryStore, MemoryVisibility, ReflectionParams, SqliteStore,
 };
 use agentos_interfaces::memory::Query;
-use agentos_proto::{AgentId, ConversationId, RunId, TaskId};
+use agentos_proto::{AgentId, ChannelId, ConversationId, Principal, RunId, TaskId};
 use std::sync::Arc;
 
 fn episode(conversation: &str, run: &str, summary: &str) -> EpisodeRecord {
@@ -19,6 +19,7 @@ fn episode(conversation: &str, run: &str, summary: &str) -> EpisodeRecord {
         run_id: RunId::new(run),
         task_id: TaskId::new("t"),
         active_agent: AgentId::new("agent"),
+        channel_id: ChannelId::new("telegram"),
         conversation_id: ConversationId::new(conversation),
         user_id: None,
         // A succeeded multi-step tool run is recordable (not trivial) and a
@@ -36,6 +37,7 @@ fn caller(conversation: &str) -> MemoryCaller {
     MemoryCaller {
         agent_id: AgentId::new("agent"),
         task_id: TaskId::new("t"),
+        channel_id: ChannelId::new("telegram"),
         conversation_id: ConversationId::new(conversation),
         user_id: None,
         allowed_shared_domains: Vec::new(),
@@ -82,7 +84,11 @@ async fn reflect_all_promotes_repeated_episodes_across_conversations() {
     // The promoted fact is retrievable from the conversation's semantic scope.
     let scope = MemoryScope::new(
         MemoryStore::Semantic,
-        MemoryOwner::Conversation(ConversationId::new("telegram:1")),
+        MemoryOwner::Conversation(Principal::conversation(
+            AgentId::new("agent"),
+            ChannelId::new("telegram"),
+            ConversationId::new("telegram:1"),
+        )),
         MemoryVisibility::Private,
         None,
     );

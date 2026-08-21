@@ -490,6 +490,7 @@ async fn run_tui_loop(
                     model_controller: channel.model_controller.as_ref(),
                     session_usage: Some(&session_usage),
                     agent_id: active_agent,
+                    channel_id: &channel.id,
                     conversation_id: &channel.conversation_id,
                 };
                 println!("{}", slash::render(cmd, &ctx).await);

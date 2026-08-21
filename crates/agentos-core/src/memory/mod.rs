@@ -1,6 +1,6 @@
 use agentos_interfaces::memory::{Memory, MemoryError, Query, Record, Selector};
 use agentos_interfaces::orchestrator::{MemoryFragment, RunContext};
-use agentos_proto::{AgentId, ConversationId, Namespace, RecordId};
+use agentos_proto::{AgentId, ChannelId, ConversationId, Namespace, RecordId};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -329,6 +329,7 @@ impl MemoryManager {
         let caller = MemoryCaller {
             agent_id: episode.active_agent.clone(),
             task_id: episode.task_id.clone(),
+            channel_id: episode.channel_id.clone(),
             conversation_id: episode.conversation_id.clone(),
             user_id: episode.user_id.clone(),
             allowed_shared_domains: Vec::new(),
@@ -336,7 +337,7 @@ impl MemoryManager {
         };
         let scope = MemoryScope::new(
             MemoryStore::Episodic,
-            MemoryOwner::Conversation(episode.conversation_id.clone()),
+            MemoryOwner::Conversation(episode.conversation_principal()),
             MemoryVisibility::Private,
             None,
         );
@@ -691,6 +692,7 @@ pub fn memory_caller_from_context(
     MemoryCaller {
         agent_id: ctx.system.active_agent.clone(),
         task_id: ctx.system.task_id.clone(),
+        channel_id: channel_id_from_context(ctx),
         conversation_id,
         user_id,
         allowed_shared_domains,
@@ -713,6 +715,19 @@ pub fn conversation_id_from_context(ctx: &RunContext<'_>) -> Option<Conversation
         .get("conversation_id")
         .and_then(Value::as_str)
         .map(ConversationId::new)
+}
+
+/// The channel the conversation arrived on, which is half of what makes a
+/// conversation id unique: `telegram:42` and `feishu:42` are both `"42"`.
+///
+/// Falls back to the reserved `unknown-channel` rather than to an empty
+/// string, so a context that never carried one is visibly distinct from a
+/// channel actually named "".
+pub fn channel_id_from_context(ctx: &RunContext<'_>) -> ChannelId {
+    caller_metadata_from_context(ctx)
+        .get("channel_id")
+        .and_then(Value::as_str)
+        .map_or_else(|| ChannelId::new("unknown-channel"), ChannelId::new)
 }
 
 fn caller_metadata_from_context<'a>(ctx: &'a RunContext<'_>) -> &'a BTreeMap<Arc<str>, Value> {
@@ -763,7 +778,7 @@ mod tests {
     use super::*;
     use agentos_interfaces::session::Item;
     use agentos_interfaces::RunState;
-    use agentos_proto::{AgentId, Message, MessageRole, RunId, TaskId};
+    use agentos_proto::{AgentId, ChannelId, Message, MessageRole, Principal, RunId, TaskId};
     use serde_json::json;
 
     #[test]
@@ -799,13 +814,18 @@ mod tests {
         let manager = MemoryManager::new(Arc::new(InMemoryMemory::default()));
         let scope = MemoryScope::new(
             MemoryStore::Audit,
-            MemoryOwner::Conversation(ConversationId::new("chat-1")),
+            MemoryOwner::Conversation(Principal::conversation(
+                AgentId::new("default"),
+                ChannelId::new("test-channel"),
+                ConversationId::new("chat-1"),
+            )),
             MemoryVisibility::Private,
             None,
         );
         let query = Query::lexical("", 5);
         let caller = MemoryCaller {
             agent_id: AgentId::new("default"),
+            channel_id: ChannelId::new("test-channel"),
             task_id: TaskId::new("task-1"),
             conversation_id: ConversationId::new("chat-1"),
             user_id: None,

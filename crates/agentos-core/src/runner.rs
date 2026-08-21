@@ -443,7 +443,14 @@ pub async fn resume_run(
         }
         ResumeDecision::Reject { reason } => {
             paused.state.reject(approval_id, Arc::clone(&reason));
-            record_denied_episode(&paused.state, &paused.conversation_id, &reason, deps).await;
+            record_denied_episode(
+                &paused.state,
+                &paused.channel_id,
+                &paused.conversation_id,
+                &reason,
+                deps,
+            )
+            .await;
             return Err(RunError::ApprovalDenied { reason }.into());
         }
         // Expired, or nobody to ask. Fails the run closed like a denial, but
@@ -457,7 +464,8 @@ pub async fn resume_run(
             return Err(RunError::ApprovalUnanswered { reason }.into());
         }
     }
-    let episode_seed = EpisodeSeed::from_state(&paused.state, &paused.conversation_id);
+    let episode_seed =
+        EpisodeSeed::from_state(&paused.state, &paused.channel_id, &paused.conversation_id);
 
     let loop_deps = LoopDeps {
         orchestrator: deps.orchestrator,
@@ -702,7 +710,9 @@ async fn finish(
         "finished",
     )?;
     let mut output_metadata = BTreeMap::new();
-    if let Some(metadata) = record_finished_episode(&state, &conversation_id, deps).await {
+    if let Some(metadata) =
+        record_finished_episode(&state, &channel_id, &conversation_id, deps).await
+    {
         output_metadata.extend(metadata);
     }
 

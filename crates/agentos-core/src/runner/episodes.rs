@@ -2,7 +2,9 @@ use super::{task_id_for_state, RunnerDeps};
 use crate::memory::{EpisodeOutcome, EpisodeRecord};
 use crate::r#loop::RunError;
 use agentos_interfaces::RunState;
-use agentos_proto::{AgentId, ConversationId, Envelope, MessageRole, RunId, SpanKind, TaskId};
+use agentos_proto::{
+    AgentId, ChannelId, ConversationId, Envelope, MessageRole, RunId, SpanKind, TaskId,
+};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -13,6 +15,7 @@ pub(super) struct EpisodeSeed {
     run_id: RunId,
     task_id: TaskId,
     active_agent: AgentId,
+    channel_id: ChannelId,
     conversation_id: ConversationId,
     user_id: Option<Arc<str>>,
     user_content: Arc<str>,
@@ -29,13 +32,18 @@ impl EpisodeSeed {
             run_id: run_id.clone(),
             task_id,
             active_agent: active_agent.clone(),
+            channel_id: input.channel_id.clone(),
             conversation_id: input.conversation_id.clone(),
             user_id: Some(Arc::clone(&input.sender)),
             user_content: Arc::clone(&input.message.content),
         }
     }
 
-    pub(super) fn from_state(state: &RunState, conversation_id: &ConversationId) -> Self {
+    pub(super) fn from_state(
+        state: &RunState,
+        channel_id: &ChannelId,
+        conversation_id: &ConversationId,
+    ) -> Self {
         Self {
             run_id: state.run_id.clone(),
             task_id: state
@@ -43,6 +51,7 @@ impl EpisodeSeed {
                 .clone()
                 .unwrap_or_else(|| task_id_for_state(state)),
             active_agent: state.active_agent.clone(),
+            channel_id: channel_id.clone(),
             conversation_id: conversation_id.clone(),
             user_id: user_id_from_state(state),
             user_content: state
@@ -58,11 +67,17 @@ impl EpisodeSeed {
 
 pub(super) async fn record_finished_episode(
     state: &RunState,
+    channel_id: &ChannelId,
     conversation_id: &ConversationId,
     deps: &RunnerDeps<'_>,
 ) -> Option<BTreeMap<Arc<str>, Value>> {
     let manager = deps.memory_manager?;
-    let episode = episode_from_state(state, conversation_id, EpisodeOutcome::Succeeded);
+    let episode = episode_from_state(
+        state,
+        channel_id,
+        conversation_id,
+        EpisodeOutcome::Succeeded,
+    );
     match manager.record_episode(episode).await {
         Ok(Some(record_id)) => {
             let mut metadata = BTreeMap::new();
@@ -99,6 +114,7 @@ pub(super) async fn record_finished_episode(
 
 pub(super) async fn record_denied_episode(
     state: &RunState,
+    channel_id: &ChannelId,
     conversation_id: &ConversationId,
     reason: &Arc<str>,
     deps: &RunnerDeps<'_>,
@@ -106,7 +122,8 @@ pub(super) async fn record_denied_episode(
     let Some(manager) = deps.memory_manager else {
         return;
     };
-    let mut episode = episode_from_state(state, conversation_id, EpisodeOutcome::Denied);
+    let mut episode =
+        episode_from_state(state, channel_id, conversation_id, EpisodeOutcome::Denied);
     episode.summary = Arc::from(truncate_summary(
         &format!("Denied approval: {reason}\n{}", episode.summary),
         480,
@@ -161,6 +178,7 @@ pub(super) async fn record_error_episode(
         run_id: seed.run_id.clone(),
         task_id: seed.task_id.clone(),
         active_agent: seed.active_agent.clone(),
+        channel_id: seed.channel_id.clone(),
         conversation_id: seed.conversation_id.clone(),
         user_id: seed.user_id.clone(),
         outcome,
@@ -188,6 +206,7 @@ pub(super) async fn record_error_episode(
 
 fn episode_from_state(
     state: &RunState,
+    channel_id: &ChannelId,
     conversation_id: &ConversationId,
     outcome: EpisodeOutcome,
 ) -> EpisodeRecord {
@@ -217,6 +236,7 @@ fn episode_from_state(
             .clone()
             .unwrap_or_else(|| task_id_for_state(state)),
         active_agent: state.active_agent.clone(),
+        channel_id: channel_id.clone(),
         conversation_id: conversation_id.clone(),
         user_id: user_id_from_state(state),
         outcome,

@@ -1,8 +1,19 @@
 # ADR-0003 — A typed principal is the key for every isolated resource
 
-- Status: accepted
+- Status: accepted; partially implemented
 - Date: 2026-08-21
-- Milestone: M3 (`ID-001`)
+- Milestone: M3 (`ID-001` landed; `ID-002` and `AUTH-001` outstanding)
+
+## What is implemented
+
+`Principal` exists in `agentos-proto` with both encodings, and memory scopes,
+episode records, attachment path segments, and the memory tool's owner
+resolution are keyed by it. What is *not* yet done: sessions, approval tickets,
+`/clear`, jobs, and task sessions still key on a bare `ConversationId`
+(`AUTH-001` and the milestone's deliverable 2), and no migration exists for
+data written under the old namespaces (`ID-002`). Until that lands, memory
+written before this change is unreachable rather than merged — which is the
+failure mode this ADR asks for, but it is a real one.
 
 ## Context
 

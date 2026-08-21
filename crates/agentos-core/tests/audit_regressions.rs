@@ -11,9 +11,9 @@
 //! milestone in its ignore reason. When that milestone lands, its PR deletes
 //! the `#[ignore]` and the test becomes the proof.
 //!
-//! The `AUTH-002` group has been through that transition: those three run
-//! normally now, and are what a future change to `Policy::narrow` is measured
-//! against.
+//! The `AUTH-002` and `ID-001` groups have been through that transition: those
+//! five run normally now, and are what a future change to `Policy::narrow` or
+//! to namespace encoding is measured against.
 //!
 //! Run them with:
 //!
@@ -130,14 +130,15 @@ fn an_equally_constrained_child_still_narrows() {
 }
 
 // ---------------------------------------------------------------------------
-// M3 / ID-001 — namespace encoding is not injective
-// ADR-0003. `scope_component` does `trimmed.replace('/', "_")`.
+// M3 / ID-001 — CLOSED. Namespace encoding is injective.
+//
+// `scope_component` was `trimmed.replace('/', "_")`. These two were red
+// against it and now guard the replacement.
 // ---------------------------------------------------------------------------
 
 /// Two different owners sharing one namespace means one reads and overwrites
 /// the other's memory. `a/b` is a realistic channel-derived id.
 #[test]
-#[ignore = "red until M3 / ID-001 uses injective encoding; see docs/adr/0003-TYPED_PRINCIPAL.md"]
 fn two_owners_that_differ_only_by_a_slash_get_different_namespaces() {
     let slashed = MemoryScope::new(
         MemoryStore::Semantic,
@@ -162,7 +163,6 @@ fn two_owners_that_differ_only_by_a_slash_get_different_namespaces() {
 /// The same defect on the domain component, which a deployment controls
 /// through `[memory] default_domain` and `[memory.shared_domains]`.
 #[test]
-#[ignore = "red until M3 / ID-001 uses injective encoding; see docs/adr/0003-TYPED_PRINCIPAL.md"]
 fn two_domains_that_differ_only_by_a_slash_get_different_namespaces() {
     let owner = MemoryOwner::User(Arc::from("someone"));
     let slashed = MemoryScope::new(
@@ -358,3 +358,67 @@ async fn a_spill_locator_is_not_a_host_path() {
 // - **M7 / MEM-001 and CFG-001, inert config keys.** These assert that a key
 //   *changes behavior*, which requires the wiring the milestone adds. Verified
 //   today only as "parses and is never read", which is a grep, not a test.
+
+// ---------------------------------------------------------------------------
+// M3 / ID-001 — CLOSED. A conversation id is not an identity on its own.
+// ---------------------------------------------------------------------------
+
+/// The acceptance criterion in the plan, stated directly: "`telegram:42`,
+/// `feishu:42`, and another agent's `telegram:42` never share session or
+/// memory state."
+///
+/// A conversation id is channel-local — Telegram's chat 42 and Feishu's chat
+/// 42 are both the string `"42"` — so keying memory on it alone put three
+/// different conversations in one namespace.
+#[test]
+fn the_same_conversation_number_on_two_channels_is_two_namespaces() {
+    use agentos_core::memory::{MemoryOwner, MemoryScope, MemoryStore, MemoryVisibility};
+    use agentos_proto::{ChannelId, ConversationId, Principal};
+
+    let namespace_for = |agent: &str, channel: &str| {
+        MemoryScope::new(
+            MemoryStore::Semantic,
+            MemoryOwner::Conversation(Principal::conversation(
+                agentos_proto::AgentId::new(agent),
+                ChannelId::new(channel),
+                ConversationId::new("42"),
+            )),
+            MemoryVisibility::Private,
+            None,
+        )
+        .namespace()
+    };
+
+    let telegram = namespace_for("main", "telegram");
+    let feishu = namespace_for("main", "feishu");
+    let other_agent = namespace_for("second", "telegram");
+
+    assert_ne!(telegram, feishu, "two channels, two namespaces");
+    assert_ne!(telegram, other_agent, "two agents, two namespaces");
+    assert_ne!(feishu, other_agent);
+}
+
+/// And the namespace still reads as itself, because an operator has to be able
+/// to tell whose rows these are.
+#[test]
+fn a_conversation_namespace_names_its_principal_readably() {
+    use agentos_core::memory::{MemoryOwner, MemoryScope, MemoryStore, MemoryVisibility};
+    use agentos_proto::{AgentId, ChannelId, ConversationId, Principal};
+
+    let namespace = MemoryScope::new(
+        MemoryStore::Semantic,
+        MemoryOwner::Conversation(Principal::conversation(
+            AgentId::new("main"),
+            ChannelId::new("telegram"),
+            ConversationId::new("42"),
+        )),
+        MemoryVisibility::Private,
+        None,
+    )
+    .namespace();
+
+    assert_eq!(
+        namespace.as_str(),
+        "private/conversation/v1.main.telegram.42.n/semantic/general"
+    );
+}

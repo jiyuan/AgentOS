@@ -29,8 +29,11 @@ pub(super) fn authorize_scope(
                 Err(unauthorized("user memory belongs to a different caller"))
             }
         }
-        MemoryOwner::Conversation(conversation_id) => {
-            if conversation_id == &caller.conversation_id {
+        MemoryOwner::Conversation(principal) => {
+            // The whole principal, not just the conversation id: the same id
+            // on another channel, or under another agent, is another
+            // conversation's memory.
+            if principal == &caller.conversation_principal() {
                 Ok(())
             } else {
                 Err(unauthorized(
@@ -88,7 +91,7 @@ pub(super) fn hydration_scopes(
         }
         scopes.push(MemoryScope::new(
             store,
-            MemoryOwner::Conversation(caller.conversation_id.clone()),
+            MemoryOwner::Conversation(caller.conversation_principal()),
             MemoryVisibility::Private,
             domain.clone(),
         ));

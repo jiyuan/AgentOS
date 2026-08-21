@@ -6,7 +6,8 @@ use agentos_interfaces::memory::{Query, Selector};
 use agentos_interfaces::orchestrator::RunContext;
 use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
 use agentos_proto::{
-    AgentId, ConversationId, Namespace, RecordId, TaskId, ToolCall, ToolResult, ToolStatus,
+    AgentId, ChannelId, ConversationId, Namespace, RecordId, TaskId, ToolCall, ToolResult,
+    ToolStatus,
 };
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -309,7 +310,7 @@ fn scope_from_args(
 ) -> Result<MemoryScope, ToolError> {
     if let Some(namespace) = parsed.namespace.as_deref() {
         if namespace != legacy_namespace.as_str() {
-            return parse_scoped_namespace(namespace);
+            return parse_scoped_namespace(caller, namespace);
         }
     }
 
@@ -347,7 +348,10 @@ fn scope_from_args(
     ))
 }
 
-fn parse_scoped_namespace(namespace: &str) -> Result<MemoryScope, ToolError> {
+fn parse_scoped_namespace(
+    caller: &MemoryCaller,
+    namespace: &str,
+) -> Result<MemoryScope, ToolError> {
     let parts = namespace.split('/').collect::<Vec<_>>();
     if parts.len() != 5 {
         return Err(ToolError::Failed(Arc::from(format!(
@@ -356,18 +360,32 @@ fn parse_scoped_namespace(namespace: &str) -> Result<MemoryScope, ToolError> {
     }
     Ok(MemoryScope::new(
         parse_store(parts[3])?,
-        parse_namespace_owner(parts[1], parts[2])?,
+        parse_namespace_owner(caller, parts[1], parts[2])?,
         parse_visibility(parts[0])?,
         Some(Arc::from(parts[4])),
     ))
 }
 
-fn parse_namespace_owner(kind: &str, id: &str) -> Result<MemoryOwner, ToolError> {
+fn parse_namespace_owner(
+    caller: &MemoryCaller,
+    kind: &str,
+    id: &str,
+) -> Result<MemoryOwner, ToolError> {
     match kind {
         "user" => Ok(MemoryOwner::User(Arc::from(id))),
         "agent" => Ok(MemoryOwner::Agent(AgentId::new(id))),
         "task" => Ok(MemoryOwner::Task(TaskId::new(id))),
-        "conversation" => Ok(MemoryOwner::Conversation(ConversationId::new(id))),
+        // A conversation namespace names a principal, and the only one this
+        // caller may reach is its own — `authorize` refuses every other, so
+        // accepting them here only postponed the refusal past the point where
+        // a useful message could be given. Compared by encoded name rather
+        // than decoded, so nothing has to parse attacker-influenced base64.
+        "conversation" if id == caller.conversation_principal().storage_name() => {
+            Ok(MemoryOwner::Conversation(caller.conversation_principal()))
+        }
+        "conversation" => Err(ToolError::Failed(Arc::from(
+            "conversation memory namespace must name this conversation's own principal",
+        ))),
         "shared" if id == "global" => Ok(MemoryOwner::Shared),
         "shared" => Err(ToolError::Failed(Arc::from(
             "shared memory namespace must use owner id global",
@@ -403,11 +421,16 @@ fn parse_owner(caller: &MemoryCaller, input: &str) -> Result<MemoryOwner, ToolEr
         } else {
             TaskId::new(explicit_id)
         })),
-        "conversation" => Ok(MemoryOwner::Conversation(if explicit_id.is_empty() {
-            caller.conversation_id.clone()
-        } else {
-            ConversationId::new(explicit_id)
-        })),
+        // `conversation:<id>` may only name this caller's own conversation;
+        // any other id is another principal's memory.
+        "conversation"
+            if explicit_id.is_empty() || explicit_id == caller.conversation_id.as_str() =>
+        {
+            Ok(MemoryOwner::Conversation(caller.conversation_principal()))
+        }
+        "conversation" => Err(ToolError::Failed(Arc::from(
+            "conversation memory belongs to a different conversation",
+        ))),
         "shared" => Ok(MemoryOwner::Shared),
         _ => Err(ToolError::Failed(Arc::from(format!(
             "unsupported memory owner: {input}"
@@ -420,7 +443,7 @@ fn caller_default_owner(caller: &MemoryCaller) -> MemoryOwner {
         .user_id
         .clone()
         .map(MemoryOwner::User)
-        .unwrap_or_else(|| MemoryOwner::Conversation(caller.conversation_id.clone()))
+        .unwrap_or_else(|| MemoryOwner::Conversation(caller.conversation_principal()))
 }
 
 fn context_default_owner(ctx: &RunContext<'_>, caller: &MemoryCaller) -> Option<MemoryOwner> {
@@ -433,7 +456,7 @@ fn context_default_owner(ctx: &RunContext<'_>, caller: &MemoryCaller) -> Option<
     match metadata.get("memory_default_owner").and_then(Value::as_str) {
         Some("agent") => Some(MemoryOwner::Agent(caller.agent_id.clone())),
         Some("task") => Some(MemoryOwner::Task(caller.task_id.clone())),
-        Some("conversation") => Some(MemoryOwner::Conversation(caller.conversation_id.clone())),
+        Some("conversation") => Some(MemoryOwner::Conversation(caller.conversation_principal())),
         Some("user") => caller.user_id.clone().map(MemoryOwner::User),
         Some("shared") => Some(MemoryOwner::Shared),
         _ => None,
@@ -497,6 +520,7 @@ fn fallback_caller() -> MemoryCaller {
     MemoryCaller {
         agent_id: AgentId::new("memory-tool"),
         task_id: TaskId::new("memory-tool"),
+        channel_id: ChannelId::new("memory-tool"),
         conversation_id: ConversationId::new("memory-tool"),
         user_id: None,
         allowed_shared_domains: Vec::new(),

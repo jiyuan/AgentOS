@@ -90,7 +90,7 @@ something that no longer exists — the two-way ratchet
 
 | Capability | Status | Platforms | Required config | Limitations | Test level |
 |---|---|---|---|---|---|
-| Three-layer scoped memory (session, working, long-term) | Stable | all | `[memory]` | Namespace encoding is non-injective: `a/b` and `a_b` collide, and a test currently asserts the collision ([ADR-0003](adr/0003-TYPED_PRINCIPAL.md), M3) | unit, integration |
+| Three-layer scoped memory (session, working, long-term) | Stable | all | `[memory]` | Namespaces are keyed by `Principal` and encoded injectively ([ADR-0003](adr/0003-TYPED_PRINCIPAL.md)). Memory written before this is under the old keys and needs the `ID-002` migration | unit, integration |
 | SQLite reference backend | Stable | all | `[memory] backend = "sqlite"` | One `Mutex<Connection>` shared across all shard threads — a global lock, not a pool. No WAL, no busy timeout (M8) | unit, integration |
 | In-memory backend | Stable | all | `[memory] backend = "in_memory"` | Not durable; for tests and ephemeral runs | unit |
 | Passive retrieval into planning context | Stable | all | `[memory]` | — | integration |
@@ -124,7 +124,7 @@ parsing, streaming assembly, and retry behavior.
 | One-shot CLI | Stable | all | — | — | integration |
 | Telegram | **Preview** | all | `[[channels]]`, bot token | **Fails open**: accepts every chat when `AGENTOS_TELEGRAM_CHAT_ID` is unset, and has no sender allowlist at all. The update offset lives only in process memory and advances *before* the run, so a crash both replays and loses (M3, M8) | unit |
 | Feishu | **Preview** | all | `[[channels]]`, app credentials | **Fails open**: an empty allowlist returns `true`. Reads `event_id` and never dedupes on it (M3, M8) | unit |
-| Attachments | **Preview** | all | — | Downloads are unbounded, and the path components are built with non-injective sanitization (M3, M4) | unit |
+| Attachments | **Preview** | all | — | Downloads are unbounded (M4). Path components are now injectively encoded, so two conversations can no longer share a directory | unit |
 
 ## Orchestration and workspace
 

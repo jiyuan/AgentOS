@@ -699,11 +699,12 @@ fn fts_match_query(input: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentos_proto::{AgentId, TaskId};
+    use agentos_proto::{AgentId, ChannelId, TaskId};
 
     fn caller() -> MemoryCaller {
         MemoryCaller {
             agent_id: AgentId::new("alice"),
+            channel_id: ChannelId::new("test-channel"),
             task_id: TaskId::new("t1"),
             conversation_id: ConversationId::new("c1"),
             user_id: None,

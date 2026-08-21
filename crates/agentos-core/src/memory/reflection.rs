@@ -45,7 +45,7 @@ pub struct ReflectionRequest {
 
 impl ReflectionRequest {
     pub fn for_conversation(caller: &MemoryCaller) -> Self {
-        let owner = MemoryOwner::Conversation(caller.conversation_id.clone());
+        let owner = MemoryOwner::Conversation(caller.conversation_principal());
         Self {
             episode_scope: MemoryScope::new(
                 MemoryStore::Episodic,
@@ -262,11 +262,25 @@ impl MemoryManager {
         let owners = maintenance.episodic_conversation_owners()?;
         let mut combined = ReflectionReport::default();
         for owner in owners {
-            let conversation = agentos_proto::ConversationId::new(owner.as_ref());
+            // The owner id in an episodic namespace is a principal storage
+            // name. Anything that does not decode was written before
+            // principals existed and belongs to the `ID-002` migration, not to
+            // a maintenance pass that would file its results under a
+            // fabricated identity.
+            let Some(principal) = agentos_proto::Principal::from_storage_name(owner.as_ref())
+            else {
+                tracing::warn!(
+                    owner = owner.as_ref(),
+                    "skipping reflection for an episodic owner that is not a principal; \
+                     run the identity migration"
+                );
+                continue;
+            };
             let caller = MemoryCaller {
-                agent_id: agent_id.clone(),
+                agent_id: principal.agent.clone(),
                 task_id: agentos_proto::TaskId::new("memory-maintenance"),
-                conversation_id: conversation,
+                channel_id: principal.channel.clone(),
+                conversation_id: principal.conversation.clone(),
                 user_id: None,
                 allowed_shared_domains: Vec::new(),
                 audit_read_access: false,
