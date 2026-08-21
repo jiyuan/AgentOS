@@ -128,6 +128,64 @@ impl Default for PolicyConfig {
 pub const DEFAULT_SHELL_ALLOWLIST: [&str; 8] =
     ["printf", "echo", "pwd", "ls", "find", "cat", "head", "tail"];
 
+/// A program in the shell allowlist whose *arguments* the guardrail also
+/// checks.
+///
+/// The allowlist alone matches on the program name, which is enough for a
+/// command that can only inspect. It is not enough for a command that can be
+/// argued into running something else: `python3 -c "<payload>"` and
+/// `find . -exec sh -c "<payload>" \;` both clear a program-name check while
+/// being arbitrary code execution. A profile names the shape of call that is
+/// actually intended, and refuses the rest.
+///
+/// The two constraints are deliberately different mechanisms, because the two
+/// escapes are:
+///
+/// - `require_first_arg_suffix` is an allowlist, and it is the right tool for
+///   an interpreter. Once `python3`'s first argument is a script path, every
+///   later argument belongs to the script rather than to the interpreter, so
+///   pinning that one position closes `-c`, `-m`, `-i`, a bare `-`, and the
+///   short-flag clusters (`-Bc`) that an exact-match denylist would miss.
+/// - `deny_args` is a denylist, for a command whose flags do not cluster and
+///   where only a handful of them are dangerous. `find` is the shipped case:
+///   its actions are whole tokens, so naming them is exact.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ShellProfileConfig {
+    /// Program this profile governs, as a bare name matching the call's
+    /// `command` field. A profile also admits its program, so a program named
+    /// here need not repeat itself in `shell_allowlist`; when it appears in
+    /// both, the profile still applies.
+    pub program: Arc<str>,
+    /// When non-empty, the first entry of the structured args array must end
+    /// with one of these suffixes. Pins an interpreter to a script file.
+    #[serde(default)]
+    pub require_first_arg_suffix: Vec<Arc<str>>,
+    /// Arguments refused outright, compared literally against each entry of
+    /// the structured args array.
+    #[serde(default)]
+    pub deny_args: Vec<Arc<str>>,
+}
+
+/// Argument profiles applied when `agent.toml` declares no `[guardrails]`
+/// section. `find` is in the default allowlist and its action predicates
+/// (`-exec`, `-delete`, …) run other programs and remove files, so the
+/// default allowlist would otherwise ship a code-execution primitive.
+pub fn default_shell_profiles() -> Vec<ShellProfileConfig> {
+    vec![ShellProfileConfig {
+        program: Arc::from("find"),
+        require_first_arg_suffix: Vec::new(),
+        deny_args: [
+            "-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf",
+            "-fls",
+        ]
+        .iter()
+        .copied()
+        .map(Arc::from)
+        .collect(),
+    }]
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct GuardrailsConfig {
@@ -135,6 +193,10 @@ pub struct GuardrailsConfig {
     /// Each entry is a bare program name — arguments belong in the structured
     /// args array, not here. Defaults to `DEFAULT_SHELL_ALLOWLIST`.
     pub shell_allowlist: Vec<Arc<str>>,
+    /// Programs whose structured args array is checked too, not only the
+    /// program name. Required for anything that can be argued into running
+    /// other code. Defaults to `default_shell_profiles`.
+    pub shell_profiles: Vec<ShellProfileConfig>,
 }
 
 impl Default for GuardrailsConfig {
@@ -145,6 +207,7 @@ impl Default for GuardrailsConfig {
                 .copied()
                 .map(Arc::from)
                 .collect(),
+            shell_profiles: default_shell_profiles(),
         }
     }
 }
@@ -375,6 +438,32 @@ impl WorkspaceConfig {
             if command.split_whitespace().count() != 1 {
                 return Err(format!(
                     "guardrails.shell_allowlist entry '{command}' must be a single bare program name with no arguments"
+                ));
+            }
+        }
+        for profile in &self.guardrails.shell_profiles {
+            let program = &profile.program;
+            if program.split_whitespace().count() != 1 {
+                return Err(format!(
+                    "guardrails.shell_profiles entry '{program}' must be a single bare program name with no arguments"
+                ));
+            }
+            // A profile with neither constraint reads as "this program is
+            // governed" while admitting every call, which is the opposite of
+            // what naming it means.
+            if profile.require_first_arg_suffix.is_empty() && profile.deny_args.is_empty() {
+                return Err(format!(
+                    "guardrails.shell_profiles entry '{program}' constrains nothing; set require_first_arg_suffix or deny_args, or drop the profile"
+                ));
+            }
+            if profile
+                .require_first_arg_suffix
+                .iter()
+                .chain(&profile.deny_args)
+                .any(|entry| entry.is_empty())
+            {
+                return Err(format!(
+                    "guardrails.shell_profiles entry '{program}' has an empty constraint string"
                 ));
             }
         }
@@ -783,6 +872,56 @@ stages = [
     }
 
     #[test]
+    fn shell_profile_validation_rejects_authoring_mistakes() {
+        let mut config = WorkspaceConfig::default();
+        assert!(config.validate_guardrails().is_ok());
+
+        // A profile that constrains nothing reads as "governed" while
+        // admitting every call — the exact shape of the finding this
+        // mechanism exists to close.
+        config.guardrails.shell_profiles = vec![ShellProfileConfig {
+            program: Arc::from("python3"),
+            require_first_arg_suffix: Vec::new(),
+            deny_args: Vec::new(),
+        }];
+        assert!(config.validate_guardrails().is_err());
+
+        config.guardrails.shell_profiles = vec![ShellProfileConfig {
+            program: Arc::from("python3 -c"),
+            require_first_arg_suffix: vec![Arc::from(".py")],
+            deny_args: Vec::new(),
+        }];
+        assert!(config.validate_guardrails().is_err());
+
+        config.guardrails.shell_profiles = vec![ShellProfileConfig {
+            program: Arc::from("python3"),
+            require_first_arg_suffix: vec![Arc::from("")],
+            deny_args: Vec::new(),
+        }];
+        assert!(config.validate_guardrails().is_err());
+    }
+
+    #[test]
+    fn the_default_guardrails_profile_find() {
+        // `find` is in the default allowlist, so the default profile set has
+        // to cover it even for a deployment that writes no `[guardrails]`
+        // section at all.
+        let config = WorkspaceConfig::default();
+        assert!(config
+            .guardrails
+            .shell_allowlist
+            .contains(&Arc::from("find")));
+        let find = config
+            .guardrails
+            .shell_profiles
+            .iter()
+            .find(|profile| profile.program.as_ref() == "find")
+            .expect("the default profiles must cover find");
+        assert!(find.deny_args.contains(&Arc::from("-exec")));
+        assert!(find.deny_args.contains(&Arc::from("-delete")));
+    }
+
+    #[test]
     fn repository_workspace_config_declares_effective_resources() {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let config = WorkspaceConfig::load(&repo_root.join("workspace/agent.toml"))
@@ -799,17 +938,36 @@ stages = [
                 Arc::from("skill-creator"),
                 Arc::from("web-research"),
                 Arc::from("audit-skill"),
-                Arc::from("email-digest"),
-                Arc::from("rss-digest"),
-                Arc::from("fetch-arxiv-paper-list"),
             ]
         );
+        // The shipped policy allowlist turns each name into a blanket
+        // `Allow`, so the tools with operations worth gating must stay out of
+        // it and keep their built-in per-operation rules.
+        for tool in ["shell", "file", "memory"] {
+            assert!(
+                !config.policy.allowlist.contains(&Arc::from(tool)),
+                "repo agent.toml must not blanket-allow '{tool}'"
+            );
+        }
+        // `python3` is admitted by profile, not by bare program name: the
+        // allowlist does not check arguments and the profile does.
         assert!(
-            config
+            !config
                 .guardrails
                 .shell_allowlist
                 .contains(&Arc::from("python3")),
-            "repo agent.toml should grant python3 to the shell guardrail"
+            "repo agent.toml must not grant python3 an unchecked-argument allowlist entry"
+        );
+        let python = config
+            .guardrails
+            .shell_profiles
+            .iter()
+            .find(|profile| profile.program.as_ref() == "python3")
+            .expect("repo agent.toml should profile python3");
+        assert_eq!(
+            python.require_first_arg_suffix,
+            vec![Arc::from(".py")],
+            "python3 must be pinned to a script path so -c cannot reach it"
         );
         assert_eq!(
             config.resources.tools.enabled,

@@ -1,3 +1,4 @@
+use crate::config::ShellProfileConfig;
 use crate::tools::{safe_workspace_path, skills_dir, workspace_root};
 use agentos_interfaces::guardrail::{
     GuardrailError, GuardrailOutcome, Input, InputGuardrail, OutputGuardrail, ToolGuardrail,
@@ -6,7 +7,7 @@ use agentos_interfaces::orchestrator::RunContext;
 use agentos_proto::{Message, ToolCall, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -63,19 +64,97 @@ impl OutputGuardrail for MaxOutputLength {
 
 pub struct ShellCommandAllowlist {
     allowed: BTreeSet<Arc<str>>,
+    profiles: BTreeMap<Arc<str>, ShellProfileConfig>,
 }
 
 impl ShellCommandAllowlist {
     pub fn new(commands: impl IntoIterator<Item = impl Into<Arc<str>>>) -> Self {
         Self {
             allowed: commands.into_iter().map(Into::into).collect(),
+            profiles: BTreeMap::new(),
         }
+    }
+
+    /// Attach the argument profiles from `[guardrails] shell_profiles`.
+    ///
+    /// A profile both admits its program and constrains it, so the two config
+    /// lists compose without an operator having to name a program twice.
+    pub fn with_profiles(mut self, profiles: impl IntoIterator<Item = ShellProfileConfig>) -> Self {
+        self.profiles = profiles
+            .into_iter()
+            .map(|profile| (Arc::clone(&profile.program), profile))
+            .collect();
+        self
+    }
+
+    /// Why this call is refused, or `None` when it is admitted.
+    ///
+    /// Split out from `check_call` so the decision is testable without a
+    /// `RunContext`, and so the two admission paths — bare allowlist entry and
+    /// profile — are visibly one decision rather than two.
+    fn refusal(&self, command: &str, args: &[String]) -> Option<String> {
+        let profile = self.profiles.get(command);
+        if profile.is_none() && !self.allowed.contains(command) {
+            let mut admitted: Vec<&str> = self
+                .allowed
+                .iter()
+                .map(Arc::as_ref)
+                .chain(self.profiles.keys().map(Arc::as_ref))
+                .collect();
+            admitted.sort_unstable();
+            admitted.dedup();
+            return Some(format!(
+                "shell command '{command}' is not allowlisted; allowed commands: {}",
+                admitted.join(", ")
+            ));
+        }
+        let profile = profile?;
+
+        if let Some(denied) = args
+            .iter()
+            .find(|arg| profile.deny_args.iter().any(|entry| entry.as_ref() == *arg))
+        {
+            return Some(format!(
+                "shell command '{command}' may not be called with '{denied}'"
+            ));
+        }
+
+        if !profile.require_first_arg_suffix.is_empty() {
+            let suffixes = profile
+                .require_first_arg_suffix
+                .iter()
+                .map(Arc::as_ref)
+                .collect::<Vec<_>>()
+                .join(", ");
+            // The first argument is the whole control: for an interpreter it
+            // is either a script path or an instruction to the interpreter
+            // itself, and only the first kind is intended. Everything after it
+            // is the script's own argument list.
+            let Some(first) = args.first() else {
+                return Some(format!(
+                    "shell command '{command}' requires a first argument ending in one of: {suffixes}"
+                ));
+            };
+            if !profile
+                .require_first_arg_suffix
+                .iter()
+                .any(|suffix| first.ends_with(suffix.as_ref()))
+            {
+                return Some(format!(
+                    "shell command '{command}' first argument '{first}' must end in one of: {suffixes}"
+                ));
+            }
+        }
+
+        None
     }
 }
 
 #[derive(Debug, Deserialize)]
 struct ShellCallArgs {
     command: String,
+    #[serde(default)]
+    args: Vec<String>,
 }
 
 #[async_trait]
@@ -97,18 +176,9 @@ impl ToolGuardrail for ShellCommandAllowlist {
                 parsed.command
             ))));
         }
-        if self.allowed.contains(parsed.command.as_str()) {
-            Ok(GuardrailOutcome::Passed)
-        } else {
-            Ok(GuardrailOutcome::Tripped(Arc::from(format!(
-                "shell command '{}' is not allowlisted; allowed commands: {}",
-                parsed.command,
-                self.allowed
-                    .iter()
-                    .map(|command| command.as_ref())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ))))
+        match self.refusal(&parsed.command, &parsed.args) {
+            Some(reason) => Ok(GuardrailOutcome::Tripped(Arc::from(reason))),
+            None => Ok(GuardrailOutcome::Passed),
         }
     }
 

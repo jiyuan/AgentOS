@@ -9,14 +9,41 @@ max_turns = 256
 
 [policy]
 default = "deny"
-allowlist = ["shell", "file", "cron_create", "cron_remove", "memory", "job_status", "job_output", "job_kill"]
+# Naming a tool here turns it into a blanket `Allow`, discarding the
+# operation-level rules the built-in path would have produced. So only tools
+# whose every operation is safe belong here: `shell`, `file`, and `memory` are
+# deliberately absent, which leaves them on their built-in rules — `file` read
+# allowed and `file` write asked, `memory` read allowed and write/forget asked
+# (`[memory.policy]`), and every `shell` call asked.
+allowlist = ["cron_create", "cron_remove", "job_status", "job_output", "job_kill"]
 
 # Programs the shell tool guardrail accepts in a call's `command` field.
-# The first eight are read-only inspection commands (the built-in default);
-# `python3` is added so skill bundles (email-digest, rss-digest) can run
-# their bundled fetch scripts.
+# These eight are read-only inspection commands (the built-in default).
+# A program that can be argued into running other code does not belong here;
+# give it a profile below instead.
 [guardrails]
-shell_allowlist = ["printf", "echo", "pwd", "ls", "find", "cat", "head", "tail", "python3"]
+shell_allowlist = ["printf", "echo", "pwd", "ls", "find", "cat", "head", "tail"]
+
+# Programs whose structured `args` array is checked too. Naming a program here
+# also admits it, so a profiled program need not repeat itself above.
+
+# `find` is in the allowlist, and its action predicates run other programs and
+# delete files. Without this the read-only inspection set ships an arbitrary
+# code execution primitive as `find . -exec sh -c '<payload>' \;`.
+[[guardrails.shell_profiles]]
+program = "find"
+deny_args = ["-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"]
+
+# `python3` is admitted only as `python3 <script>.py [script args...]`, which
+# is the shape the bundled skill scripts use (audit-skill, skill-creator, and
+# the email-digest / rss-digest fetchers). Pinning the first argument to a
+# script path is what makes it safe: python only reads `-c`, `-m`, `-i` and a
+# bare `-` in that position, so once it holds a path every later argument goes
+# to the script rather than to the interpreter. Writing a new script to run
+# this way needs a `file` write, which the policy above sends to approval.
+[[guardrails.shell_profiles]]
+program = "python3"
+require_first_arg_suffix = [".py"]
 
 [memory]
 backend = "sqlite"

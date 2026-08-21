@@ -343,7 +343,8 @@ impl AgentRuntime {
                 .with_compaction(Some(high_llm.clone()), workspace_config.compaction)
         });
         let shell_allowlist =
-            ShellCommandAllowlist::new(workspace_config.guardrails.shell_allowlist.iter().cloned());
+            ShellCommandAllowlist::new(workspace_config.guardrails.shell_allowlist.iter().cloned())
+                .with_profiles(workspace_config.guardrails.shell_profiles.iter().cloned());
 
         Ok(Self {
             workspace_config,
@@ -703,7 +704,8 @@ pub fn build_subagents(
                 )
                 .with_tool_guardrail(
                     "ShellCommandAllowlist",
-                    ShellCommandAllowlist::new(config.guardrails.shell_allowlist.iter().cloned()),
+                    ShellCommandAllowlist::new(config.guardrails.shell_allowlist.iter().cloned())
+                        .with_profiles(config.guardrails.shell_profiles.iter().cloned()),
                 );
         }
         // The skill-bundle write boundary is a hard permission gate, not an

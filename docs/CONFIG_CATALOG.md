@@ -17,6 +17,10 @@ Every key `agent.toml` accepts, derived from the config structs. Edit the doc co
 | `policy.allowlist` | `Vec<Arc<str>>` | (empty) | *(undocumented — see `config/undocumented.txt`)* |
 | `guardrails` | `GuardrailsConfig` | (table) | Content checks applied to input, tool calls, and output. |
 | `guardrails.shell_allowlist` | `Vec<Arc<str>>` | `["printf","echo","pwd","ls","find","cat","head","tail"]` | Programs the shell tool guardrail permits in a call's `command` field. Each entry is a bare program name — arguments belong in the structured args array, not here. Defaults to `DEFAULT_SHELL_ALLOWLIST`. |
+| `guardrails.shell_profiles` | `Vec<ShellProfileConfig>` | (none) | Programs whose structured args array is checked too, not only the program name. Required for anything that can be argued into running other code. Defaults to `default_shell_profiles`. |
+| `guardrails.shell_profiles.program` | `Arc<str>` | — | Program this profile governs, as a bare name matching the call's `command` field. A profile also admits its program, so a program named here need not repeat itself in `shell_allowlist`; when it appears in both, the profile still applies. |
+| `guardrails.shell_profiles.require_first_arg_suffix` | `Vec<Arc<str>>` | — | When non-empty, the first entry of the structured args array must end with one of these suffixes. Pins an interpreter to a script file. |
+| `guardrails.shell_profiles.deny_args` | `Vec<Arc<str>>` | — | Arguments refused outright, compared literally against each entry of the structured args array. |
 | `memory` | `MemoryConfig` | (table) | Long-term memory: storage, what gets recalled into a request, and what a run is allowed to write back. |
 | `memory.backend` | `Arc<str>` | `sqlite` | *(undocumented — see `config/undocumented.txt`)* |
 | `memory.path` | `Option<PathBuf>` | (unset) | *(undocumented — see `config/undocumented.txt`)* |
@@ -157,5 +161,5 @@ Every key `agent.toml` accepts, derived from the config structs. Edit the doc co
 | `spill.root` | `PathBuf` | `spill` | Where artifacts are written. Relative paths resolve against the workspace root; an absolute path is taken as given, for a deployment that wants spill on a different volume from the session database. |
 | `spill.retention_days` | `u64` | `0` | Days an artifact is kept, or `0` to keep everything.  `0` is a choice rather than a disabled feature — see the module docs. |
 
-102 of 149 keys have no description yet. They are listed in `crates/agentos-core/src/config/undocumented.txt`; writing the doc comment on the field is what removes a line from it.
+102 of 153 keys have no description yet. They are listed in `crates/agentos-core/src/config/undocumented.txt`; writing the doc comment on the field is what removes a line from it.
 <!-- END GENERATED: config -->
