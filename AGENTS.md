@@ -69,6 +69,7 @@ cargo bench -p agentos-core                               # Loop overhead benchm
 bash scripts/check-import-boundaries.sh                    # Core must not depend on workspace/extensions.
 bash scripts/check-module-size.sh                         # 800-LOC ceiling (cfg(test) excluded).
 bash scripts/check-catalogs.sh                            # docs/*-catalog.md still match the code.
+bash scripts/check-release-archive.sh                     # Clean-room: package, install, run one offline turn.
 cargo semver-checks check-release -p agentos-interfaces --baseline-rev HEAD
 ```
 

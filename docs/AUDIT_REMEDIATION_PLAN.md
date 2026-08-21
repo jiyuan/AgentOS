@@ -379,7 +379,13 @@ Primary files: `workspace/agent.toml`, `crates/agentos-core/src/guardrails/mod.r
 
 Priority: P0
 Size: M — shell scripts plus one CI job
-Status: **not started**
+Status: **done** — verified by `scripts/check-release-archive.sh`, which
+packages an archive, installs it and the source checkout into isolated
+prefixes under a redirected `HOME`, and completes an offline `builtin.echo`
+turn with no repository reachable. 29 checks, run on both platforms by the
+`release-smoke` CI job. Three mutations were used to confirm the checker
+bites: an empty packaged workspace, a deleted linked document, and leaked
+runtime state.
 Dependencies: M0
 
 The failure is end to end and currently untested by anything:
@@ -902,9 +908,9 @@ a slice moves off `not started` only when the named artifact exists in the tree.
 | `DOC-001` | M0 | Correct the three overstated claims in README / AGENTS.md / DESIGN.md | — | **done** — also `docs/ARCHITECTURE.md` and the `subagents` doc comment |
 | `TEST-001` | M0 | Un-weaken `enforced_or_skip!` and the orphan test; add red tests for each P0/P1 finding | ADR-001 | **done** — `enforced_or_fail!`, `a_killed_child_leaves_no_grandchild`, and `tests/audit_regressions.rs` (7 red, 1 green control) |
 | `CFG-000` | M1 | Conservative shipped policy, command profiles, and shell argument validation | — | **done** — `crates/agentos-core/tests/shipped_config_policy.rs` |
-| `REL-001` | M2 | Self-contained release workspace and documentation, with a clean-room archive checker | TEST-001 | not started |
-| `REL-002` | M2 | Installer/wrapper contract, one install layout, pathless resume, clean-room smoke | REL-001 | not started |
-| `CI-001` | M2 | Portable spill/golden tests and a real macOS Seatbelt probe | TEST-001 | not started |
+| `REL-001` | M2 | Self-contained release workspace and documentation, with a clean-room archive checker | TEST-001 | **done** — workspace allowlist + transitive doc closure; `scripts/check-release-archive.sh` |
+| `REL-002` | M2 | Installer/wrapper contract, one install layout, pathless resume, clean-room smoke | REL-001 | **done** — XDG layout, `agentos config`, pathless `resume`, unknown commands rejected |
+| `CI-001` | M2 | Portable spill/golden tests and a real macOS Seatbelt probe | TEST-001 | **done** — `File::set_modified`, fixed-length temp trees, enforcing Seatbelt probe, macOS CI matrix |
 | `ID-001` | M3 | Typed principal and injective namespace | ADR-001 | not started |
 | `ID-002` | M3 | Versioned persistence migration and collision report | ID-001 | not started |
 | `AUTH-001` | M3 | Remote sender authentication and approval binding | ID-001 | not started |

@@ -650,21 +650,31 @@ pub fn build_subagents(
         // so we can hand them to the orchestrator (which surfaces them as the
         // LLM's `tools` schema for function calling).
         let tool_specs = tools.specs();
+        // A sub-agent naming a skill the workspace never loaded is a
+        // configuration error, not a warning. `filtered` drops unknown names
+        // silently, so before this the sub-agent came up looking configured
+        // while three of `general-subagent`'s six skills did not exist —
+        // visible only as a `warn!` nobody reads at the default filter, and
+        // indistinguishable at runtime from a skill the model chose not to
+        // use (M2 deliverable 5). `load_enabled` already fails this way for
+        // the workspace catalog; this makes the sub-agent path agree.
+        let unknown: Vec<&str> = subagent
+            .skills
+            .iter()
+            .filter(|declared| !skill_catalog.contains(declared))
+            .map(AsRef::as_ref)
+            .collect();
+        if !unknown.is_empty() {
+            return Err(format!(
+                "sub-agent '{}' declares skills the workspace has not enabled: {}. \
+                 Add them to [resources.skills] enabled, or remove them from the sub-agent.",
+                subagent.id,
+                unknown.join(", ")
+            ));
+        }
         // Narrow the parent's skill catalog to just what this sub-agent
         // declared in its `skills` field. An empty list means no access.
         let subagent_skill_catalog = skill_catalog.filtered(&subagent.skills);
-        // Warn (but don't fail) when a sub-agent declares a skill the
-        // parent didn't load. Helps operators catch typos and staging
-        // mistakes.
-        for declared in &subagent.skills {
-            if !skill_catalog.contains(declared) {
-                tracing::warn!(
-                    subagent = %subagent.id,
-                    skill = %declared,
-                    "sub-agent declared skill that is not in the parent's loaded catalog"
-                );
-            }
-        }
         // Build the per-sub-agent resource_index so the LLM sees its own
         // tools AND skills as available resources. Reuses the parent's
         // helper that knows how to weave tools + mcp + skills into the

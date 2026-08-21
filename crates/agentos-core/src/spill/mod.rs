@@ -492,17 +492,16 @@ mod tests {
     }
 
     /// Set a file's mtime without pulling in a crate for it.
+    ///
+    /// `File::set_modified` rather than `touch -d @<epoch>`: the `-d @seconds`
+    /// form is a GNU extension, so the previous version of this helper failed
+    /// on macOS and every BSD — on a platform AgentOS supports (M2 / `CI-001`).
     fn filetime_set(path: &Path, when: SystemTime) {
-        let seconds = when
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("test timestamps are after the epoch")
-            .as_secs();
-        let output = std::process::Command::new("touch")
-            .arg("-d")
-            .arg(format!("@{seconds}"))
-            .arg(path)
-            .output()
-            .expect("touch runs");
-        assert!(output.status.success(), "touch failed: {output:?}");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("the spill artifact is open-able for writing")
+            .set_modified(when)
+            .expect("the filesystem supports setting mtime");
     }
 }

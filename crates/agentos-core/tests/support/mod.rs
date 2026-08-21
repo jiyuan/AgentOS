@@ -248,18 +248,48 @@ impl Drop for TempTree {
     }
 }
 
+/// Total length of every path [`temp_tree`] returns, in bytes.
+///
+/// Chosen to clear the longest temp prefix in practice with wide margin: macOS
+/// hands out `/var/folders/<2>/<~30>/T/`, around 49 bytes, and a deeply nested
+/// CI `TMPDIR` can add plenty more. Well under `PATH_MAX` on every supported
+/// platform. Raising it is cheap — re-record the goldens it moves.
+const TEMP_TREE_PATH_LEN: usize = 200;
+
 /// An empty directory unique to this process and thread, so scenarios running
 /// in parallel cannot collide on one path.
 ///
-/// The discriminator is a fixed-width hash rather than the ids themselves: a
-/// golden that redacts this path still pins the *character count* of the
-/// content that carried it, and a `ThreadId` that renders as one digit on one
-/// run and two on the next would make that count depend on test scheduling.
+/// **Every path this returns is exactly [`TEMP_TREE_PATH_LEN`] bytes long.**
+/// A golden that redacts the path still pins the *character count* of the
+/// content that carried it, and that content reaches token estimation before
+/// any redaction happens. Two things would otherwise make the count depend on
+/// where the test ran rather than on what the code did:
+///
+///   - a `ThreadId` that renders as one digit on one run and two on the next,
+///     which the fixed-width hash already handled;
+///   - `std::env::temp_dir()` itself, which is `/tmp` on Linux and roughly
+///     fifty bytes on macOS — so `tool_result_spilled` pinned a token count
+///     only reproducible under a four-byte temp prefix (M2 / `CI-001`).
+///
+/// Padding the whole path to a constant closes both. The padding is trailing
+/// `x`s in the directory name, which is inert: nothing reads it.
 pub fn temp_tree(label: &str) -> TempTree {
     let mut hasher = DefaultHasher::new();
     (std::process::id(), std::thread::current().id()).hash(&mut hasher);
-    let root =
+    let stem =
         std::env::temp_dir().join(format!("agentos-golden-{label}-{:016x}", hasher.finish()));
+    let stem_len = stem.as_os_str().len();
+    assert!(
+        stem_len <= TEMP_TREE_PATH_LEN,
+        "temp tree path is {stem_len} bytes before padding, over the {TEMP_TREE_PATH_LEN}-byte \
+         budget goldens pin token counts against. Raise TEMP_TREE_PATH_LEN and re-record the \
+         affected goldens, or shorten TMPDIR."
+    );
+    let root = PathBuf::from(format!(
+        "{}{}",
+        stem.to_str().expect("temp paths in tests are UTF-8"),
+        "x".repeat(TEMP_TREE_PATH_LEN - stem_len)
+    ));
     std::fs::create_dir_all(&root).expect("a temp tree is creatable");
     TempTree(root)
 }

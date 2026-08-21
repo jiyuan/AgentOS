@@ -580,9 +580,16 @@ where
         eprintln!("paused run has no pending approval");
         return Ok(());
     };
-    let decision = match args.get(2).map(String::as_str) {
+    // The decision follows the optional path, so it sits at index 1 when the
+    // path was omitted and at index 2 when it was given.
+    let verb_at = if args.get(1).is_some_and(|arg| is_resume_decision(arg)) {
+        1
+    } else {
+        2
+    };
+    let decision = match args.get(verb_at).map(String::as_str) {
         Some("reject") => ResumeDecision::Reject {
-            reason: args.get(3).map_or_else(
+            reason: args.get(verb_at + 1).map_or_else(
                 || Arc::from("rejected by user"),
                 |reason| Arc::from(reason.as_str()),
             ),
@@ -666,9 +673,20 @@ fn env_flag_enabled(name: &str) -> bool {
     })
 }
 
+/// The words that follow `resume` as a decision rather than a path.
+///
+/// `resume` takes an *optional* path — `resume`, `resume approve`, and
+/// `resume <path> approve` are all valid — so position alone cannot say
+/// whether the first argument is a path. Without this, `agentos resume
+/// approve` looked for a paused run in a file named `approve` and reported
+/// that it did not exist (M2 deliverable 4).
+fn is_resume_decision(arg: &str) -> bool {
+    matches!(arg, "approve" | "reject")
+}
+
 fn state_path(args: &[String], home: &Path) -> PathBuf {
     if args.first().is_some_and(|arg| arg == "resume") {
-        if let Some(path) = args.get(1) {
+        if let Some(path) = args.get(1).filter(|arg| !is_resume_decision(arg)) {
             return PathBuf::from(path);
         }
     }
@@ -860,5 +878,53 @@ impl Egress for TuiEgress {
         io::stdout()
             .flush()
             .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| (*word).to_owned()).collect()
+    }
+
+    /// M2 deliverable 4. The path is optional, so the decision keyword has to
+    /// be told apart from a path by name rather than by position — otherwise
+    /// `resume approve` looks for a paused run in a file called `approve`.
+    #[test]
+    fn a_pathless_resume_uses_the_default_state_path() {
+        let home = Path::new("/home/agentos");
+        let default = home.join("workspace/runs/cli-run-1.json");
+
+        assert_eq!(state_path(&argv(&["resume"]), home), default);
+        assert_eq!(state_path(&argv(&["resume", "approve"]), home), default);
+        assert_eq!(
+            state_path(&argv(&["resume", "reject", "no thanks"]), home),
+            default
+        );
+    }
+
+    #[test]
+    fn an_explicit_resume_path_still_wins() {
+        let home = Path::new("/home/agentos");
+        assert_eq!(
+            state_path(&argv(&["resume", "/tmp/run.json"]), home),
+            PathBuf::from("/tmp/run.json")
+        );
+        assert_eq!(
+            state_path(&argv(&["resume", "/tmp/run.json", "reject"]), home),
+            PathBuf::from("/tmp/run.json")
+        );
+    }
+
+    /// Only `resume` takes a state path; every other command uses the default.
+    #[test]
+    fn other_commands_are_unaffected() {
+        let home = Path::new("/home/agentos");
+        let default = home.join("workspace/runs/cli-run-1.json");
+        assert_eq!(state_path(&argv(&[]), home), default);
+        assert_eq!(state_path(&argv(&["telegram-once"]), home), default);
+        assert_eq!(state_path(&argv(&["approve"]), home), default);
     }
 }

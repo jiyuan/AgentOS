@@ -79,7 +79,7 @@ something that no longer exists — the two-way ratchet
 | Capability | Status | Platforms | Required config | Limitations | Test level |
 |---|---|---|---|---|---|
 | Landlock sandbox | Stable | Linux 5.13+ with the LSM enabled | tool declares a `SandboxMode` | Bounds filesystem **writes** only; reads and network are unrestricted | unit, integration |
-| Seatbelt sandbox | **Preview** | macOS | tool declares a `SandboxMode` | `availability()` reports `Enforced` from a bare `Path::exists` rather than probing the mechanism, and no CI runner exercises it ([ADR-0002](adr/0002-FAIL_CLOSED_ISOLATION.md), M2/M4) | unit |
+| Seatbelt sandbox | Stable | macOS | tool declares a `SandboxMode` | Bounds filesystem **writes** only; reads and network are unrestricted, as on Linux | unit, integration, CI |
 | Registry enforcement of `SandboxMode` | **Preview** | all | — | `if let Some(runner)` with no `else`: with no compatible executor, control falls through to the in-process body and the declared mode is discarded (M4) | none |
 | Isolation worker subprocess | **Preview** | Linux, macOS | `[isolation]` | 43 lines; rejects every tool but `shell`, with no handshake that would let the registry discover that first (M4) | integration |
 | Minimal subprocess environment | **Deferred** | — | — | Not implemented: `tools/exec.rs` never calls `env_clear`, so provider and channel credentials are inherited by every child (M4) | none |
@@ -153,7 +153,7 @@ parsing, streaming assembly, and retry behavior.
 
 | Capability | Status | Platforms | Required config | Limitations | Test level |
 |---|---|---|---|---|---|
-| Release archive | **Preview** | Linux, macOS | — | Not self-contained: ships one workspace file, and the installer's layout disagrees with the install documentation (M2) | none |
+| Release archive | Stable | Linux, macOS | — | — | script (`check-release-archive.sh`), CI |
 | Generated catalogs | Stable | all | — | — | integration |
 | Import-boundary check | Stable | all | — | Self-testing (`--self-test`) | script, integration |
 | Module-size check | Stable | all | — | Two allowlisted files exceed the 800-LOC budget | script |

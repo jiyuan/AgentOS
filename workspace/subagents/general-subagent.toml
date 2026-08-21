@@ -10,7 +10,13 @@ policy_id = "general"
 orchestrator = "builtin.max"
 model_tier = "medium"
 tools = ["http", "file", "memory", "shell", "skill_validate", "cron_create", "cron_list", "cron_remove"]
-skills = ["web-research", "skill-creator", "audit-skill", "email-digest", "rss-digest", "fetch-arxiv-paper-list"]
+# Must be a subset of [resources.skills] enabled in agent.toml — a name the
+# workspace has not enabled is now a startup error rather than a silent drop.
+# `email-digest`, `rss-digest`, and `fetch-arxiv-paper-list` were listed here
+# and never enabled, so they had no effect; removing them keeps the shipped
+# capability surface where it already was. Enable them in agent.toml first if
+# they are wanted back.
+skills = ["web-research", "skill-creator", "audit-skill"]
 memory_view = "shared_readonly"
 memory_domains = ["agentos"]
 memory_tools = ["read", "write"]

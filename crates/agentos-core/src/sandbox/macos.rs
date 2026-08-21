@@ -11,29 +11,88 @@
 //! is allowed would have to enumerate every path a shell command legitimately
 //! touches, and would deny by accident rather than by decision.
 //!
-//! **Verified by construction, not by running.** This module is compiled and
-//! unit-tested on every platform, not just macOS — it is string building and
-//! one `Path::exists`, so there is no reason for the profile builder or the
-//! quote escaping to go unchecked on the machine that happens to run CI. What
-//! cannot be checked anywhere but macOS is whether Seatbelt then honours the
-//! profile, and the enforcement suite skips with a reason where
-//! [`super::availability`] does not report it. `sandbox-exec` is also deprecated by Apple, still present
-//! and still the only unprivileged option — if it is removed, `availability`
-//! starts reporting unavailable and tools declaring a sandbox stop running
-//! rather than quietly running unsandboxed.
+//! **Verified by construction, and — for availability — by running.** The
+//! profile builder and the quote escaping are compiled and unit-tested on every
+//! platform, not just macOS: they are string building, so there is no reason to
+//! leave them unchecked on the machine that happens to run CI.
+//!
+//! [`availability`] used to be one `Path::exists`, which reported
+//! `Enforced("seatbelt")` for any machine that merely *had* the binary — a
+//! strictly weaker claim than Linux's, which issues a real
+//! `landlock_create_ruleset` version syscall. It now applies a profile that
+//! denies writes and confirms a write is actually refused, so `Enforced` means
+//! Seatbelt was observed enforcing rather than assumed to (M2 / `CI-001`,
+//! §4.3 of the audit remediation plan). The result is cached: the probe spawns
+//! a process, and nothing needs it more than once.
+//!
+//! `sandbox-exec` is deprecated by Apple, still present and still the only
+//! unprivileged option — if it is removed, `availability` reports unavailable
+//! and tools declaring a sandbox stop running rather than quietly running
+//! unsandboxed.
 
 use super::{Availability, Sandbox};
 use std::path::Path;
+use std::sync::OnceLock;
 
 /// Apple's profile interpreter. Deprecated, present on every supported release.
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
-pub(super) fn availability() -> Availability {
-    if Path::new(SANDBOX_EXEC).exists() {
-        Availability::Enforced("seatbelt")
-    } else {
-        Availability::Unavailable("this machine has no /usr/bin/sandbox-exec")
+/// What the probe observed, from its two signals.
+///
+/// Pure, so the reasoning is unit-tested on every platform even though only
+/// macOS can produce the inputs. The interesting case is the third: the
+/// interpreter ran and reported success, and the write it was supposed to stop
+/// landed anyway. Reporting `Enforced` there is exactly the overstatement this
+/// probe exists to remove.
+fn verdict(spawned: bool, refused_the_write: bool) -> Availability {
+    match (spawned, refused_the_write) {
+        (false, _) => {
+            Availability::Unavailable("/usr/bin/sandbox-exec is missing or could not be run")
+        }
+        (true, true) => Availability::Enforced("seatbelt"),
+        (true, false) => Availability::Unavailable(
+            "sandbox-exec ran but a denied write still succeeded; Seatbelt is not enforcing here",
+        ),
     }
+}
+
+pub(super) fn availability() -> Availability {
+    static PROBED: OnceLock<Availability> = OnceLock::new();
+    *PROBED.get_or_init(probe)
+}
+
+/// Apply a deny-writes profile and check that a write is actually refused.
+///
+/// The target is under the system temp directory and is removed either way, so
+/// a machine where the probe *fails* to be enforced does not accumulate files.
+fn probe() -> Availability {
+    if !Path::new(SANDBOX_EXEC).exists() {
+        return verdict(false, false);
+    }
+    let target =
+        std::env::temp_dir().join(format!("agentos-seatbelt-probe-{}", std::process::id()));
+    let _ = std::fs::remove_file(&target);
+
+    // `(allow default)` then `(deny file-write*)`, the same subtract-from-open
+    // shape `profile` builds, with no writable subpath granted back.
+    let output = std::process::Command::new(SANDBOX_EXEC)
+        .arg("-p")
+        .arg("(version 1)\n(allow default)\n(deny file-write*)\n")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg(format!("echo probe > {}", target.display()))
+        .output();
+
+    if output.is_err() {
+        return verdict(false, false);
+    }
+    // Whether the file exists is the signal, and the exit status deliberately
+    // is not: a shell redirection Seatbelt blocks fails the command, but a
+    // shell reporting success while the write went nowhere is equally fine.
+    // What must not happen is the file being there afterwards.
+    let wrote = target.exists();
+    let _ = std::fs::remove_file(&target);
+    verdict(true, !wrote)
 }
 
 /// Put the command inside `sandbox-exec -p <profile>`.
@@ -108,6 +167,32 @@ mod tests {
             2,
             "the injected rule must not become a rule"
         );
+    }
+
+    /// The probe's reasoning, checked on every platform even though only macOS
+    /// can produce its inputs.
+    #[test]
+    fn a_machine_without_the_interpreter_is_unavailable() {
+        assert!(matches!(
+            verdict(false, false),
+            Availability::Unavailable(_)
+        ));
+        assert!(matches!(verdict(false, true), Availability::Unavailable(_)));
+    }
+
+    #[test]
+    fn a_refused_write_is_the_only_thing_that_counts_as_enforced() {
+        assert_eq!(verdict(true, true), Availability::Enforced("seatbelt"));
+    }
+
+    /// The case `Path::exists` reported as `Enforced` and this one does not:
+    /// the interpreter is there, and it did not stop the write.
+    #[test]
+    fn an_interpreter_that_does_not_enforce_is_unavailable() {
+        let Availability::Unavailable(reason) = verdict(true, false) else {
+            panic!("a write that was not refused cannot be reported as enforced");
+        };
+        assert!(reason.contains("not enforcing"), "{reason}");
     }
 
     #[test]

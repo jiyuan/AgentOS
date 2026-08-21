@@ -2,9 +2,14 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-prefix="${PREFIX:-$HOME/.agentos}"
+# XDG paths, which is what docs/INSTALL.md, README.md, and docs/USER_GUIDE.md
+# have always told users to run. The installer previously defaulted to
+# ~/.agentos, so following the documentation gave "command not found"
+# (M2 deliverable 2). One layout, and the documents are the definition of it.
+xdg_data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+prefix="${PREFIX:-$HOME/.local}"
 bindir="${BINDIR:-$prefix/bin}"
-agentos_home="${AGENTOS_HOME:-$prefix/share/agentos}"
+agentos_home="${AGENTOS_HOME:-$xdg_data_home/agentos}"
 from_source=0
 skip_build=0
 rust_toolchain="${AGENTOS_RUST_TOOLCHAIN:-stable}"
@@ -18,14 +23,16 @@ Install AgentOS from a source checkout or a packaged release bundle.
 Options:
   --from-source       Build binaries from the current source checkout.
   --skip-build        Do not build source binaries; require existing artifacts.
-  --prefix PATH       Installation prefix. Default: ~/.agentos
+  --prefix PATH       Installation prefix. Default: ~/.local
   --bindir PATH       Binary install directory. Default: <prefix>/bin
-  --home PATH         AgentOS runtime home. Default: <prefix>/share/agentos
+  --home PATH         AgentOS runtime home. Default: $XDG_DATA_HOME/agentos
+                      (~/.local/share/agentos)
   -h, --help          Show this help.
 
 Environment:
   PREFIX              Installation prefix override.
   BINDIR              Binary install directory override.
+  XDG_DATA_HOME       Base for the runtime home. Default: ~/.local/share
   AGENTOS_HOME        AgentOS runtime home override.
   AGENTOS_RUST_TOOLCHAIN  Rust toolchain for source builds. Default: stable
 USAGE
@@ -42,6 +49,8 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --prefix)
+      # An explicit prefix relocates the whole install, which is what a
+      # clean-room smoke test into a temporary directory needs.
       prefix="$2"
       bindir="$prefix/bin"
       agentos_home="$prefix/share/agentos"
@@ -129,18 +138,41 @@ done
 
 install -m 755 "$root/scripts/start-agentos.sh" "$agentos_home/scripts/start-agentos.sh"
 install -m 644 "$root/.env.example" "$agentos_home/.env.example"
-install -m 644 "$root/workspace/agent.toml" "$agentos_home/workspace/agent.toml"
 install -m 644 "$root/README.md" "$agentos_home/README.md"
-install -m 644 "$root/docs/INSTALL.md" "$agentos_home/docs/INSTALL.md"
-install -m 644 "$root/docs/USER_GUIDE.md" "$agentos_home/docs/USER_GUIDE.md"
-install -m 644 "$root/docs/RELEASE_NOTES.md" "$agentos_home/docs/RELEASE_NOTES.md"
 install -m 644 "$root/LICENSE" "$agentos_home/LICENSE"
+
+# Whatever documentation the source is carrying. From a release bundle this is
+# the closure package-release.sh computed; from a source checkout it is docs/.
+# Either way the links inside the installed README have somewhere to point.
+for doc in "$root"/docs/*.md; do
+  [[ -e "$doc" ]] || continue
+  install -m 644 "$doc" "$agentos_home/docs/$(basename "$doc")"
+done
 
 if [[ ! -f "$agentos_home/.env" ]]; then
   cp "$agentos_home/.env.example" "$agentos_home/.env"
 fi
 
-cp -r "$root/workspace" "$agentos_home/"
+# The workspace, by the same allowlist package-release.sh uses. This was
+# `cp -r "$root/workspace"`, which from a source checkout copied the
+# developer's runtime state — a multi-hundred-megabyte agentos.sqlite, traces/,
+# runs/, task directories and their session logs — into the install, and from a
+# bundle copied a workspace holding nothing but agent.toml, leaving
+# WorkspaceSkillCatalog::load_enabled to fail at startup on a missing skill
+# (M2 deliverable 1).
+for entry in agent.toml skills subagents suborchs; do
+  source_path="$root/workspace/$entry"
+  if [[ ! -e "$source_path" ]]; then
+    echo "workspace entry is missing from the source tree: workspace/$entry" >&2
+    exit 1
+  fi
+  rm -rf "${agentos_home:?}/workspace/$entry"
+  if [[ -d "$source_path" ]]; then
+    cp -RL "$source_path" "$agentos_home/workspace/$entry"
+  else
+    install -m 644 "$source_path" "$agentos_home/workspace/$entry"
+  fi
+done
 
 cat >"$bindir/agentos" <<EOF
 #!/usr/bin/env bash

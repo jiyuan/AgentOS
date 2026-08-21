@@ -6,7 +6,11 @@ agentos_home="${AGENTOS_HOME:-$(cd "$script_dir/.." && pwd)}"
 env_file="${AGENTOS_ENV_FILE:-$agentos_home/.env}"
 allow_env_overrides=1
 mode="tui"
+# Whether an explicit command word was given. Distinguishes `agentos` (default
+# TUI) from `agentos confg` (a typo that must not silently start the TUI).
+saw_command=0
 resume_path=""
+resume_path_given=0
 resume_decision="approve"
 resume_reason=""
 llm_provider="${AGENTOS_LLM_PROVIDER:-}"
@@ -152,7 +156,9 @@ Commands:
   gateway-restart       Restart the persistent gateway.
   gateway-stop          Stop the persistent gateway.
   gateway-status        Show gateway status.
-  resume PATH           Resume a paused run.
+  config                Show the effective configuration.
+  resume [PATH]         Resume a paused run. Without PATH, the default
+                        workspace/runs/cli-run-1.json is used.
 
 Options:
   --env-file PATH       Load environment from PATH.
@@ -168,28 +174,55 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     tui|telegram-once|telegram-cron-smoke|feishu-once|feishu-cron-smoke)
       mode="$1"
+      saw_command=1
       shift
       ;;
     gateway-start)
       mode="gateway-start"
+      saw_command=1
       shift
       ;;
     gateway-restart)
       mode="gateway-restart"
+      saw_command=1
       shift
       ;;
     gateway-stop)
       mode="gateway-stop"
+      saw_command=1
       shift
       ;;
     gateway-status)
       mode="gateway-status"
+      saw_command=1
+      shift
+      ;;
+    config)
+      mode="config"
+      saw_command=1
       shift
       ;;
     resume)
+      # `resume [PATH] [approve|reject [REASON]]` — every part optional. The
+      # path used to be read as a bare `$2`, which died with "unbound variable"
+      # under `set -u` for a plain `agentos resume`, even though the CLI already
+      # defaults to workspace/runs/cli-run-1.json (M2 deliverable 4).
       mode="resume"
-      resume_path="$2"
-      shift 2
+      saw_command=1
+      shift
+      if [[ $# -ge 1 && "$1" != --* && "$1" != "approve" && "$1" != "reject" ]]; then
+        resume_path="$1"
+        resume_path_given=1
+        shift
+      fi
+      if [[ $# -ge 1 && ( "$1" == "approve" || "$1" == "reject" ) ]]; then
+        resume_decision="$1"
+        shift
+        if [[ "$resume_decision" == "reject" && $# -ge 1 && "$1" != --* ]]; then
+          resume_reason="$1"
+          shift
+        fi
+      fi
       ;;
     --env-file)
       env_file="$2"
@@ -225,7 +258,20 @@ while [[ $# -gt 0 ]]; do
       cli_args+=("$@")
       break
       ;;
+    -*)
+      cli_args+=("$1")
+      shift
+      ;;
     *)
+      # A bare word in first position is a command, and an unrecognised one is
+      # an error. Previously every such word was appended to cli_args with mode
+      # left at its default, so `agentos confg` silently started the TUI and the
+      # "unknown command" branch below could never be reached.
+      if [[ ${#cli_args[@]} -eq 0 && "$saw_command" == "0" ]]; then
+        echo "unknown command: $1" >&2
+        usage >&2
+        exit 2
+      fi
       cli_args+=("$1")
       shift
       ;;
@@ -256,6 +302,11 @@ case "$mode" in
   gateway-status)
     exec "$gateway_bin" status --pid-path "$gateway_pid_path" --log-path "$gateway_log_path" --config "$AGENTOS_AGENT_CONFIG_PATH" --session-db-path "$AGENTOS_SESSION_DB_PATH"
     ;;
+  config)
+    # Through the wrapper, so diagnostics do not require the private
+    # agentos-gateway binary to be on PATH (M2 deliverable 3).
+    exec "$gateway_bin" config --pid-path "$gateway_pid_path" --log-path "$gateway_log_path" --config "$AGENTOS_AGENT_CONFIG_PATH" --session-db-path "$AGENTOS_SESSION_DB_PATH"
+    ;;
   tui)
     exec "$cli_bin" ${cli_args[@]+"${cli_args[@]}"}
     ;;
@@ -263,10 +314,17 @@ case "$mode" in
     exec "$cli_bin" "$mode" ${cli_args[@]+"${cli_args[@]}"}
     ;;
   resume)
-    if [[ "$resume_decision" == "reject" && -n "$resume_reason" ]]; then
-      exec "$cli_bin" resume "$resume_path" reject "$resume_reason" ${cli_args[@]+"${cli_args[@]}"}
+    # Built up rather than interpolated: passing an empty "$resume_path" would
+    # hand the CLI "" as the state path instead of letting it use its default.
+    resume_argv=(resume)
+    if [[ "$resume_path_given" == "1" ]]; then
+      resume_argv+=("$resume_path")
     fi
-    exec "$cli_bin" resume "$resume_path" "$resume_decision" ${cli_args[@]+"${cli_args[@]}"}
+    resume_argv+=("$resume_decision")
+    if [[ "$resume_decision" == "reject" && -n "$resume_reason" ]]; then
+      resume_argv+=("$resume_reason")
+    fi
+    exec "$cli_bin" "${resume_argv[@]}" ${cli_args[@]+"${cli_args[@]}"}
     ;;
   *)
     echo "unknown command: $mode" >&2

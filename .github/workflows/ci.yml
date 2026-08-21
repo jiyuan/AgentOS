@@ -37,19 +37,37 @@ jobs:
       - name: Generated catalogs are current
         run: bash scripts/check-catalogs.sh
 
+  # Both supported platforms, not just the cheap one. macOS is the point of the
+  # matrix rather than a bonus: it is the only place Seatbelt exists, and
+  # tests/sandbox.rs now *fails* rather than skips when a supported target
+  # cannot enforce a sandbox, so this job is what makes that assertion real
+  # (M2 / `CI-001`).
   test:
-    name: workspace tests
-    runs-on: ubuntu-latest
+    name: workspace tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
+      # A skip here means the runner could not enforce a sandbox, which the
+      # suite now treats as a failure. Named separately so the log says which
+      # mechanism was in force rather than leaving it to be inferred.
+      - name: Report the sandbox mechanism
+        run: cargo test -p agentos-core --locked --test sandbox -- --nocapture
 
   bench-smoke:
-    name: bench compile + smoke
-    runs-on: ubuntu-latest
+    name: bench compile + smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -58,7 +76,27 @@ jobs:
       # proves every bench (criterion and custom harnesses) still compiles
       # and runs, nothing more.
       - name: Smoke-run benches
-        run: cargo bench -p agentos-core -- --test
+        run: cargo bench -p agentos-core --locked -- --test
+
+  release-smoke:
+    name: clean-room release archive (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Packages an archive, extracts it, installs from both the archive and
+      # the source checkout into isolated prefixes under a redirected HOME,
+      # validates every packaged documentation link, and completes one offline
+      # `builtin.echo` turn with no repository reachable. That last step is §5
+      # of docs/AUDIT_REMEDIATION_PLAN.md's definition of done, and nothing
+      # exercised it before this job existed.
+      - name: Clean-room archive and install check
+        run: bash scripts/check-release-archive.sh
 
   semver-checks:
     name: semver-checks (advisory)
