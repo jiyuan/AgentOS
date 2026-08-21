@@ -5,6 +5,13 @@ pub mod providers;
 
 pub use providers::ProviderError;
 
+/// Every LLM provider this crate can talk to.
+///
+/// The single source of truth: `parse_model` validates against it, and
+/// `agentos-core`'s capability-matrix test checks the documented surface
+/// against it, so adding an adapter without documenting it fails the build.
+pub const SUPPORTED_PROVIDERS: &[&str] = &["openai", "anthropic", "deepseek", "ollama"];
+
 use agentos_interfaces::orchestrator::RunContext;
 use agentos_interfaces::tool::ToolSpec;
 use agentos_proto::{Message, MessageRole};
@@ -490,10 +497,7 @@ pub fn parse_model_identifier(
     if provider == "builtin.echo" {
         return Err("builtin.echo is not a selectable LLM model".to_owned());
     }
-    if !matches!(
-        provider.as_str(),
-        "openai" | "anthropic" | "deepseek" | "ollama"
-    ) {
+    if !SUPPORTED_PROVIDERS.contains(&provider.as_str()) {
         return Err(format!("unknown LLM provider: {provider}"));
     }
     Ok(LlmSelection {

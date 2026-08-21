@@ -26,6 +26,14 @@ gateways.
 The core design goal is simple: every run follows one auditable loop, and every
 external capability crosses a narrow trait or policy boundary.
 
+Not every capability listed above is equally finished.
+[`CAPABILITY_MATRIX.md`](CAPABILITY_MATRIX.md) gives each one a Stable /
+Preview / Deferred status with its security limitations and test level; read it
+before relying on anything here in production.
+[`adr/`](adr/README.md) records the decisions behind the invariants below, and
+each invariant that the code does not yet enforce says so with the milestone
+that closes it.
+
 ## 2. Core Invariants
 
 - The run loop owns control flow.

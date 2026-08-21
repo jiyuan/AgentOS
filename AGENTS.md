@@ -144,5 +144,6 @@ These rules are load-bearing. Violating any of them breaks the extension model o
 | `crates/agentos-core/src/invariants.rs` | Debug-build assertions over three load-bearing relationships. Compiled out of release builds. |
 | `docs/ARCHITECTURE.md` | Full architecture reference: extension boundary, config authority, memory model, verification matrix. |
 | `docs/adr/` | Architecture decision records. One testable definition per disputed invariant, each naming the milestone that closes the gap. Read before changing narrowing, isolation, identity, provider requests, safety events, `/clear`, or streaming. |
+| `docs/CAPABILITY_MATRIX.md` | Every capability with a Stable / Preview / Deferred status, its platforms, required config, security limitations, and test level. Ratcheted by `tests/capability_matrix.rs`: a new tool or provider without a row fails the build. |
 | `docs/TRANSFER_ROADMAP.md` | Most recent work, with per-item rationale and status. |
 | `docs/CONFIG_CATALOG.md`, `docs/TOOL_CATALOG.md` | Generated from the code by `agentos-gateway catalog`. Edit the doc comment on the field, not the table. |

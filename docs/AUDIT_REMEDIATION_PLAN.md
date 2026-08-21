@@ -242,8 +242,12 @@ constraint that drives it, so it can be challenged with evidence.
 
 Priority: P0
 Size: S — documentation and red tests only
-Status: **in progress** — `ADR-001` and `DOC-001` done; `TEST-001` partial
-(deliverables 1, 4, and 5 landed; 2, 3, and 6 outstanding)
+Status: **done** — all six deliverables landed. `ADR-001` →
+[`docs/adr/`](adr/README.md); baseline → [`AUDIT_BASELINE_2026-08-18.md`](AUDIT_BASELINE_2026-08-18.md);
+capability matrix → [`CAPABILITY_MATRIX.md`](CAPABILITY_MATRIX.md), ratcheted by
+`tests/capability_matrix.rs`; `DOC-001` → three corrected claims; `TEST-001` →
+`enforced_or_fail!`, the grandchild orphan test, and
+`tests/audit_regressions.rs`
 Dependencies: none
 
 Deliverables:
@@ -258,13 +262,21 @@ Deliverables:
    - stable buffered output versus provisional streaming.
    `ADR-001` is a deliverable of this milestone, not a prerequisite that already
    exists.
-2. Record a baseline snapshot (`docs/AUDIT_BASELINE_2026-08-18.md`) of current
-   benchmark, storage, startup, and gateway smoke figures.
+2. Record a baseline snapshot ([`docs/AUDIT_BASELINE_2026-08-18.md`](AUDIT_BASELINE_2026-08-18.md))
+   of current benchmark, storage, startup, and gateway smoke figures. **Done.**
+   Loop overhead, allocations, and concurrency are measured; storage is taken
+   from the reference deployment's live database. Startup and gateway smoke are
+   recorded as coverage gaps rather than figures — there is no smoke harness in
+   CI to measure, which is `CI-001`/`CI-002`.
 3. Add a capability matrix with `stable`, `preview`, and `deferred` status,
    supported platforms, required config, security limitations, and test level.
    Reuse the ratchet pattern already proven by
    `crates/agentos-core/src/config/undocumented.txt` — a list that fails the
    build both when an entry is missing and when a stale entry remains.
+   **Done:** [`docs/CAPABILITY_MATRIX.md`](CAPABILITY_MATRIX.md), ratcheted by
+   `crates/agentos-core/tests/capability_matrix.rs` against
+   `BUILTIN_TOOL_NAMES`, `RUNTIME_TOOL_NAMES`, and
+   `agentos_llm::SUPPORTED_PROVIDERS`.
 4. **Correct three overstated claims in the shipped documentation.** Each is
    currently contradicted by the code:
    - `README.md` — "sub-agents and routing whose permissions can only narrow the
@@ -283,7 +295,11 @@ Deliverables:
      uses `exec sleep 30` specifically to avoid the grandchild case its own
      comment identifies as "a real orphan". Add the failing grandchild variant.
 6. Turn each remaining P0/P1 audit finding into a failing regression test before
-   changing implementation behavior.
+   changing implementation behavior. **Done:**
+   `crates/agentos-core/tests/audit_regressions.rs`. Findings that need a seam
+   the owning milestone builds — channel allowlists, approval binding, egress,
+   `/clear`, compaction manifests, inert config keys — are listed at the bottom
+   of that file with the reason, rather than silently absent.
 
 Acceptance criteria:
 
@@ -884,7 +900,7 @@ a slice moves off `not started` only when the named artifact exists in the tree.
 |---|---|---|---|---|
 | `ADR-001` | M0 | Resolve narrowing, sandbox, identity, request, audit, clear, and streaming contracts as ADRs under `docs/adr/` | — | **done** — [`docs/adr/`](adr/README.md), seven records |
 | `DOC-001` | M0 | Correct the three overstated claims in README / AGENTS.md / DESIGN.md | — | **done** — also `docs/ARCHITECTURE.md` and the `subagents` doc comment |
-| `TEST-001` | M0 | Un-weaken `enforced_or_skip!` and the orphan test; add red tests for each P0/P1 finding | ADR-001 | **partial** — `enforced_or_fail!` and `a_killed_child_leaves_no_grandchild` landed; per-finding red tests outstanding |
+| `TEST-001` | M0 | Un-weaken `enforced_or_skip!` and the orphan test; add red tests for each P0/P1 finding | ADR-001 | **done** — `enforced_or_fail!`, `a_killed_child_leaves_no_grandchild`, and `tests/audit_regressions.rs` (7 red, 1 green control) |
 | `CFG-000` | M1 | Conservative shipped policy, command profiles, and shell argument validation | — | **done** — `crates/agentos-core/tests/shipped_config_policy.rs` |
 | `REL-001` | M2 | Self-contained release workspace and documentation, with a clean-room archive checker | TEST-001 | not started |
 | `REL-002` | M2 | Installer/wrapper contract, one install layout, pathless resume, clean-room smoke | REL-001 | not started |

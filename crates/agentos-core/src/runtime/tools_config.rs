@@ -19,8 +19,9 @@ pub(super) fn build_parent_tools(
     let mut tools = ToolRegistry::new();
     for tool in &config.resources.tools.enabled {
         match tool.as_ref() {
-            // Both of these need a runtime-owned handle rather than just a
-            // name, so they cannot go through `register_builtin_tool`.
+            // These need a runtime-owned handle rather than just a name, so
+            // they cannot go through `register_builtin_tool`. Kept in step with
+            // `RUNTIME_TOOL_NAMES`.
             "memory" => tools.register(MemoryTool::with_manager(memory_manager.clone())),
             "job_status" => tools.register(JobStatusTool::new(jobs.clone())),
             "job_output" => tools.register(JobOutputTool::new(jobs.clone())),
@@ -171,6 +172,16 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "cron_list",
     "cron_remove",
 ];
+
+/// Built-in tools that [`register_builtin_tool`] cannot construct, because they
+/// need a runtime-owned handle — the memory manager or the job registry — and
+/// not just a name. `build_parent_tools` registers them directly.
+///
+/// Named rather than left implicit in that `match` so anything enumerating the
+/// tool surface sees all of it: `docs/TOOL_CATALOG.md` describes these four in
+/// prose for the same reason, and `tests/capability_matrix.rs` checks the
+/// matrix against both lists.
+pub const RUNTIME_TOOL_NAMES: &[&str] = &["memory", "job_status", "job_output", "job_kill"];
 
 /// Register a built-in tool by name, bounded by the deployment's `[limits]`.
 ///

@@ -36,7 +36,9 @@ pub use mcp_config::register_configured_mcp;
 mod tools_config;
 
 use tools_config::{build_parent_tools, subagent_memory_tool_enabled, subagent_policy};
-pub use tools_config::{phase5_policy, register_builtin_tool, BUILTIN_TOOL_NAMES};
+pub use tools_config::{
+    phase5_policy, register_builtin_tool, BUILTIN_TOOL_NAMES, RUNTIME_TOOL_NAMES,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimePaths {
