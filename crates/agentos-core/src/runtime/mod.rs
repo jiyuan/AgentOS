@@ -35,7 +35,9 @@ mod mcp_config;
 pub use mcp_config::register_configured_mcp;
 mod tools_config;
 
-use tools_config::{build_parent_tools, subagent_memory_tool_enabled, subagent_policy};
+use tools_config::{
+    build_parent_tools, subagent_delegation_grants, subagent_memory_tool_enabled, subagent_policy,
+};
 pub use tools_config::{
     phase5_policy, register_builtin_tool, BUILTIN_TOOL_NAMES, RUNTIME_TOOL_NAMES,
 };
@@ -296,11 +298,15 @@ impl AgentRuntime {
             &workspace_config.resources.skills.enabled,
         )
         .map_err(|err| format!("failed to load workspace skills: {err}"))?;
+        // Before the sub-agents, because each sub-agent's policy is now derived
+        // from this one rather than synthesised independently.
+        let policy = phase5_policy(&workspace_config, &mcp_specs);
         let subagents = build_subagents(
             &workspace_config,
             model_controller.clone(),
             memory_manager.clone(),
             skill_catalog.clone(),
+            &policy,
         )?;
         let resource_index =
             workspace_config.resource_index(&tools.specs(), &mcp_specs, &skill_catalog.metadata());
@@ -326,7 +332,6 @@ impl AgentRuntime {
             OrchestratorStrategy::from_config(&workspace_config.agent.orchestrator)?;
         let orchestrator =
             StrategyOrchestrator::new(orchestrator_strategy, max_orchestrator, min_orchestrator);
-        let policy = phase5_policy(&workspace_config, &mcp_specs);
         let trace_sink: Arc<dyn TraceSink> = Arc::new(JsonlTraceSink::new(paths.trace_dir));
         let task_workspace = Arc::new(TaskWorkspace::new(
             workspace_config.task_workspace.root.clone(),
@@ -619,6 +624,7 @@ pub fn build_subagents(
     models: LlmModelController,
     memory_manager: Arc<MemoryManager>,
     skill_catalog: WorkspaceSkillCatalog,
+    parent_policy: &Policy,
 ) -> Result<Option<SubAgentRegistry>, String> {
     if config.subagents.is_empty() {
         return Ok(None);
@@ -699,11 +705,12 @@ pub fn build_subagents(
                 subagent_resource_index,
                 memory_hydrator,
             )?,
-            subagent_policy(subagent)?,
+            subagent_policy(subagent, parent_policy)?,
         )
         .with_tools(Arc::new(tools))
         .with_max_turns(subagent.max_turns)
-        .with_seed_from_parent(subagent.seed_from_parent);
+        .with_seed_from_parent(subagent.seed_from_parent)
+        .with_delegation_grants(subagent_delegation_grants(subagent)?);
         if subagent.memory_view.as_ref() != "none" || subagent_memory_tool_enabled(subagent) {
             definition = definition.with_memory_manager(memory_manager.clone());
         }

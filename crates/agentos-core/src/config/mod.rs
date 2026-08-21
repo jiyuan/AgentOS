@@ -32,7 +32,7 @@ pub use memory::{
 };
 pub use orchestrator::{RoutingConfig, RoutingRuleConfig, StageConfig, TemplateConfig};
 pub use spill::{SpillConfig, DEFAULT_SPILL_RELPATH};
-pub use subagents::SubAgentConfig;
+pub use subagents::{DelegationGrantConfig, SubAgentConfig};
 
 pub(crate) use orchestrator::stage_execution_order;
 
@@ -56,10 +56,11 @@ pub struct WorkspaceConfig {
     pub channels: ChannelsConfig,
     /// Where the subprocess worker that runs sandboxed tools is found.
     pub isolation: IsolationConfig,
-    /// Sub-agents this agent may delegate to. Each carries its own tools and a
-    /// policy that cannot reach an action the parent does not hold. Narrowing
-    /// is checked by tool name, so naming a tool the parent gates behind
-    /// `ask_user` grants it to the sub-agent outright.
+    /// Sub-agents this agent may delegate to. Each carries its own tools and
+    /// inherits the parent's rules for them, so a sub-agent can never decide a
+    /// call more permissively than its parent — arguments included. Listing a
+    /// tool selects it; it does not elevate it. See
+    /// `subagents.delegation_grants` for the declared exception.
     pub subagents: Vec<SubAgentConfig>,
     /// MCP servers to connect to.
     pub mcp_servers: Vec<McpServerConfig>,

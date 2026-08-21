@@ -52,6 +52,45 @@ pub struct SubAgentConfig {
     /// enough to fit a thorough multi-paragraph answer, short enough to catch
     /// runaway generation.
     pub max_output_chars: usize,
+    /// Authority this sub-agent holds that its parent does not.
+    ///
+    /// Naming a tool in `tools` does **not** grant it: the sub-agent's policy
+    /// is narrowed against the parent's over exact actions and arguments, so a
+    /// tool the parent gates behind `ask_user` stays gated for the sub-agent
+    /// too. That is the point — an unattended sub-agent silently inheriting a
+    /// blanket `allow` for every tool it listed was the `AUTH-002` finding.
+    ///
+    /// A grant is how the legitimate case is expressed instead: state the
+    /// tool, the decision, and why, and the elevation becomes visible and
+    /// reviewable. Grants apply only against the immediate parent — each level
+    /// of delegation needs its own.
+    pub delegation_grants: Vec<DelegationGrantConfig>,
+}
+
+/// One standing elevation for one sub-agent and one tool.
+///
+/// Deliberately limited to tools. A grant over `handoff`, `delegate`, or
+/// `escalate` — let alone every action at once — has no current use case, and
+/// the narrow surface is the safe direction to be wrong in.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DelegationGrantConfig {
+    /// The tool this grant covers.
+    pub tool: Arc<str>,
+    /// What the sub-agent may do with it: `allow` or `ask_user`. `deny` is
+    /// rejected — a grant exists to widen, and narrowing needs no grant.
+    pub decision: Arc<str>,
+    /// Exact argument values the grant is limited to, matching `[policy]`
+    /// rule syntax. Empty covers every call to the tool.
+    #[serde(default)]
+    pub arg_equals: BTreeMap<Arc<str>, Value>,
+    /// Why this sub-agent needs authority its parent withheld. Required: a
+    /// grant nobody can explain is a grant nobody can review.
+    pub reason: Arc<str>,
+    /// Unix seconds after which the grant stops applying. Omit for a standing
+    /// grant.
+    #[serde(default)]
+    pub expires_at: Option<u64>,
 }
 
 impl Default for SubAgentConfig {
@@ -74,6 +113,7 @@ impl Default for SubAgentConfig {
             skill_bundle_writer: false,
             seed_from_parent: false,
             max_output_chars: 64_000,
+            delegation_grants: Vec::new(),
         }
     }
 }

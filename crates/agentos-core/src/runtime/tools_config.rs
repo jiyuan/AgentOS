@@ -1,4 +1,4 @@
-use crate::approve::{Policy, PolicyAction, PolicyRule, PolicyVerb};
+use crate::approve::{DelegationGrant, Policy, PolicyAction, PolicyRule, PolicyVerb};
 use crate::config::{LimitsConfig, SubAgentConfig, WorkspaceConfig};
 use crate::jobs::JobRegistry;
 use crate::memory::MemoryManager;
@@ -102,39 +102,139 @@ fn policy_default_decision(input: &str) -> PolicyVerb {
     }
 }
 
-pub(super) fn subagent_policy(subagent: &SubAgentConfig) -> Result<Policy, String> {
+/// The policy a sub-agent runs under: the parent's rules, restricted to the
+/// tools the sub-agent lists.
+///
+/// Previously every listed tool became a blanket `Allow`, on the reasoning
+/// that "naming a tool in the sub-agent allowlist is an explicit grant". That
+/// is what made `file` reachable for `write` by a sub-agent whose parent only
+/// held `read`, and `shell` unattended for a sub-agent whose parent asks about
+/// every call — the `AUTH-002` widening, produced here and then waved through
+/// by `parent_exposes_tool`.
+///
+/// Inheriting the parent's rules verbatim is both narrower and simpler: the
+/// sub-agent's list decides *which* tools it can reach, and the parent's rules
+/// keep deciding *under what conditions*. A tool the parent has no rule for
+/// yields no rule here either, so it falls to the child's `Deny` default.
+///
+/// A sub-agent that genuinely needs more than its parent says so in
+/// `[[subagents.delegation_grants]]`, where the elevation is visible.
+pub(super) fn subagent_policy(
+    subagent: &SubAgentConfig,
+    parent: &Policy,
+) -> Result<Policy, String> {
+    let grants = subagent_delegation_grants(subagent)?;
     let mut policy = Policy::default();
+    // Grants first, because `decide` is first-match-wins: a grant governs the
+    // calls it covers, and the inherited rules below govern everything else.
+    // An unconstrained grant therefore replaces the inherited rule outright,
+    // while one pinned to `{operation: "read"}` leaves `write` inherited.
+    for grant in &grants {
+        policy.rules.push(PolicyRule {
+            action: grant.action.clone(),
+            decision: grant.decision.clone(),
+            reason: Some(Arc::clone(&grant.reason)),
+            arg_equals: grant.arg_equals.clone(),
+        });
+    }
     for tool in subagent
         .tools
         .iter()
         .filter(|tool| tool.as_ref() != "memory")
     {
-        add_subagent_tool_allow_policy(&mut policy, tool);
+        policy
+            .rules
+            .extend(parent_rules_for_tool(parent, tool).cloned());
     }
     if subagent_memory_tool_enabled(subagent) {
         for operation in subagent_memory_operations(subagent)? {
-            match operation.as_ref() {
-                "read" => allow_tool_operation(&mut policy, "memory", "read"),
-                "write" => allow_tool_operation(&mut policy, "memory", "write"),
-                "forget" => allow_tool_operation(&mut policy, "memory", "forget"),
-                other => {
-                    return Err(format!(
-                        "unknown subagent memory operation '{other}'; expected read, write, or forget"
-                    ));
-                }
+            if !matches!(operation.as_ref(), "read" | "write" | "forget") {
+                return Err(format!(
+                    "unknown subagent memory operation '{operation}'; expected read, write, or forget"
+                ));
             }
+            // The parent's rule for exactly this operation, or nothing. A
+            // sub-agent listing `write` when the parent gates writes behind
+            // `ask_user` inherits the gate rather than escaping it.
+            policy.rules.extend(
+                parent_rules_for_tool(parent, "memory")
+                    .filter(|rule| {
+                        rule.arg_equals.get("operation")
+                            == Some(&Value::String(operation.to_string()))
+                    })
+                    .cloned(),
+            );
         }
     }
     Ok(policy)
 }
 
-fn add_subagent_tool_allow_policy(policy: &mut Policy, tool: &str) {
-    // Naming a tool in the sub-agent allowlist is an explicit grant: allow
-    // every operation of that tool unconditionally so the sub-agent never
-    // re-prompts for approval mid-task (e.g. `file` write, not just read).
-    // `memory` is excluded here and handled per-operation by the caller so
-    // shared-domain writes/forgets keep their own gating.
-    allow_tool_once(policy, Arc::from(tool));
+fn parent_rules_for_tool<'a>(
+    parent: &'a Policy,
+    tool: &'a str,
+) -> impl Iterator<Item = &'a PolicyRule> {
+    parent.rules.iter().filter(
+        move |rule| matches!(&rule.action, PolicyAction::Tool(name) if name.as_ref() == tool),
+    )
+}
+
+/// The grants declared for one sub-agent, validated.
+///
+/// Kept next to `subagent_policy` because the two are read together: the
+/// policy states what the sub-agent asks for, and these state which parts of
+/// that the operator has authorised it to hold beyond the parent.
+pub(super) fn subagent_delegation_grants(
+    subagent: &SubAgentConfig,
+) -> Result<Vec<DelegationGrant>, String> {
+    subagent
+        .delegation_grants
+        .iter()
+        .map(|grant| {
+            let decision = match grant.decision.as_ref() {
+                "allow" => PolicyVerb::Allow,
+                "ask_user" => PolicyVerb::AskUser,
+                "deny" => {
+                    return Err(format!(
+                        "sub-agent '{}' grants tool '{}' the decision 'deny'; a grant widens \
+                         authority, and narrowing needs no grant",
+                        subagent.id, grant.tool
+                    ));
+                }
+                other => {
+                    return Err(format!(
+                        "sub-agent '{}' grants tool '{}' the unknown decision '{other}'; \
+                         expected allow or ask_user",
+                        subagent.id, grant.tool
+                    ));
+                }
+            };
+            if grant.reason.trim().is_empty() {
+                return Err(format!(
+                    "sub-agent '{}' grants tool '{}' with an empty reason; state why this \
+                     sub-agent needs authority its parent withheld",
+                    subagent.id, grant.tool
+                ));
+            }
+            if !subagent
+                .tools
+                .iter()
+                .any(|tool| tool.as_ref() == grant.tool.as_ref())
+            {
+                return Err(format!(
+                    "sub-agent '{}' grants tool '{}', which it does not list in `tools`; the \
+                     grant would have no effect",
+                    subagent.id, grant.tool
+                ));
+            }
+            Ok(DelegationGrant {
+                action: PolicyAction::Tool(Arc::clone(&grant.tool)),
+                decision,
+                arg_equals: grant.arg_equals.clone(),
+                reason: Arc::clone(&grant.reason),
+                expires_at: grant.expires_at,
+            })
+        })
+        .collect()
 }
 
 pub(super) fn subagent_memory_tool_enabled(subagent: &SubAgentConfig) -> bool {
@@ -325,6 +425,7 @@ fn ask_tool_once(
 mod tests {
     use super::*;
     use crate::approve::PolicyDecision;
+    use crate::config::DelegationGrantConfig;
     use crate::memory::InMemoryMemory;
     use agentos_interfaces::orchestrator::Plan;
     use agentos_proto::{ToolCall, ToolCallId};
@@ -384,78 +485,249 @@ mod tests {
     }
 
     #[test]
-    fn subagent_file_policy_narrows_parent_file_policy() {
+    fn a_subagent_inherits_the_parents_rules_for_the_tools_it_lists() {
         let config = config_with_parent_tools(&["file"]);
         let parent = phase5_policy(&config, &[]);
         let child_config = SubAgentConfig {
             tools: vec![Arc::from("file")],
             ..SubAgentConfig::default()
         };
-        let child = subagent_policy(&child_config).expect("child policy builds");
+        let child = subagent_policy(&child_config, &parent).expect("child policy builds");
 
-        Policy::narrow(&parent, &child).expect("file child policy should narrow parent policy");
+        Policy::narrow(&parent, &child).expect("inherited rules narrow by construction");
+        // The parent's split survives into the sub-agent: read without asking,
+        // write with. This used to be a blanket Allow covering both.
         assert_eq!(
+            child.decide(&tool_plan(
+                "file",
+                json!({ "operation": "read", "path": "README.md" })
+            )),
+            PolicyDecision::Allow
+        );
+        assert!(matches!(
             child.decide(&tool_plan(
                 "file",
                 json!({ "operation": "write", "path": "README.md", "content": "changed" })
             )),
-            PolicyDecision::Allow
-        );
+            PolicyDecision::AskUser { .. }
+        ));
     }
 
+    /// The behaviour `AUTH-002` removed, stated as what now happens instead.
+    ///
+    /// Listing a tool decides *which* tools a sub-agent can reach. It does not
+    /// decide under what conditions — the parent's rules still do. An
+    /// operation the parent never granted is denied rather than inherited as
+    /// an unconstrained allow.
     #[test]
-    fn narrowed_subagent_listed_tool_never_asks_for_approval() {
-        // Parent gates `file` write behind AskUser for itself. A sub-agent
-        // that explicitly lists `file` must get the *narrowed* (effective)
-        // policy that allows every file operation without approval — the
-        // parent's AskUser must not leak into the delegatee.
+    fn listing_a_tool_does_not_elevate_what_the_parent_gated() {
         let config = config_with_parent_tools(&["file", "shell"]);
         let parent = phase5_policy(&config, &[]);
         let child_config = SubAgentConfig {
             tools: vec![Arc::from("file"), Arc::from("shell")],
             ..SubAgentConfig::default()
         };
-        let child = subagent_policy(&child_config).expect("child policy builds");
-        let effective =
-            Policy::narrow(&parent, &child).expect("listed tools should narrow cleanly");
+        let child = subagent_policy(&child_config, &parent).expect("child policy builds");
+        let effective = Policy::narrow(&parent, &child).expect("listed tools narrow cleanly");
 
-        assert_eq!(
+        assert!(matches!(
             effective.decide(&tool_plan(
                 "file",
                 json!({ "operation": "write", "path": "x", "content": "y" })
             )),
-            PolicyDecision::Allow
-        );
-        assert_eq!(
+            PolicyDecision::AskUser { .. }
+        ));
+        // An operation the parent has no rule for reaches neither of them.
+        assert!(matches!(
             effective.decide(&tool_plan(
                 "file",
                 json!({ "operation": "delete", "path": "x" })
             )),
-            PolicyDecision::Allow
-        );
+            PolicyDecision::Deny { .. }
+        ));
+        assert!(matches!(
+            effective.decide(&tool_plan("shell", json!({ "command": "ls" }))),
+            PolicyDecision::AskUser { .. }
+        ));
+    }
+
+    /// The replacement for the escape hatch: an operator who wants a sub-agent
+    /// to run a gated tool unattended says so, once, with a reason.
+    #[test]
+    fn a_delegation_grant_elevates_exactly_what_it_names() {
+        let config = config_with_parent_tools(&["file", "shell"]);
+        let parent = phase5_policy(&config, &[]);
+        let child_config = SubAgentConfig {
+            tools: vec![Arc::from("file"), Arc::from("shell")],
+            delegation_grants: vec![DelegationGrantConfig {
+                tool: Arc::from("shell"),
+                decision: Arc::from("allow"),
+                arg_equals: BTreeMap::new(),
+                reason: Arc::from("unattended nightly maintenance"),
+                expires_at: None,
+            }],
+            ..SubAgentConfig::default()
+        };
+        let grants = subagent_delegation_grants(&child_config).expect("the grant is valid");
+
+        // `subagent_policy` emits the granted rule ahead of the inherited one.
+        let child = subagent_policy(&child_config, &parent).expect("child policy builds");
+
+        let effective =
+            Policy::narrow_with_grants(&parent, &child, &grants).expect("the granted tool narrows");
         assert_eq!(
             effective.decide(&tool_plan("shell", json!({ "command": "ls" }))),
             PolicyDecision::Allow
         );
+
+        // Only what it names: `file` write is untouched by a `shell` grant.
+        assert!(matches!(
+            effective.decide(&tool_plan(
+                "file",
+                json!({ "operation": "write", "path": "x", "content": "y" })
+            )),
+            PolicyDecision::AskUser { .. }
+        ));
+
+        // And the same policy without the grant backing it is a widening.
+        assert!(Policy::narrow(&parent, &child).is_err());
     }
 
     #[test]
-    fn subagent_cannot_allowlist_tool_parent_never_grants() {
-        // Safety invariant preserved: listing a tool the parent does not
-        // expose at all is still a widening error, not a silent grant.
+    fn a_grant_for_a_tool_the_subagent_does_not_list_is_rejected() {
+        let child_config = SubAgentConfig {
+            tools: vec![Arc::from("file")],
+            delegation_grants: vec![DelegationGrantConfig {
+                tool: Arc::from("shell"),
+                decision: Arc::from("allow"),
+                arg_equals: BTreeMap::new(),
+                reason: Arc::from("would have no effect"),
+                expires_at: None,
+            }],
+            ..SubAgentConfig::default()
+        };
+        let error = subagent_delegation_grants(&child_config).expect_err("the grant is inert");
+        assert!(error.contains("does not list in `tools`"), "{error}");
+    }
+
+    #[test]
+    fn a_grant_needs_a_reason_and_a_widening_decision() {
+        let with_empty_reason = SubAgentConfig {
+            tools: vec![Arc::from("shell")],
+            delegation_grants: vec![DelegationGrantConfig {
+                tool: Arc::from("shell"),
+                decision: Arc::from("allow"),
+                arg_equals: BTreeMap::new(),
+                reason: Arc::from("   "),
+                expires_at: None,
+            }],
+            ..SubAgentConfig::default()
+        };
+        assert!(subagent_delegation_grants(&with_empty_reason)
+            .expect_err("an unexplained grant is rejected")
+            .contains("empty reason"));
+
+        let denying = SubAgentConfig {
+            tools: vec![Arc::from("shell")],
+            delegation_grants: vec![DelegationGrantConfig {
+                tool: Arc::from("shell"),
+                decision: Arc::from("deny"),
+                arg_equals: BTreeMap::new(),
+                reason: Arc::from("narrowing needs no grant"),
+                expires_at: None,
+            }],
+            ..SubAgentConfig::default()
+        };
+        assert!(subagent_delegation_grants(&denying)
+            .expect_err("a denying grant is rejected")
+            .contains("a grant widens authority"));
+    }
+
+    #[test]
+    fn an_expired_grant_does_not_elevate() {
+        let config = config_with_parent_tools(&["shell"]);
+        let parent = phase5_policy(&config, &[]);
+        let child_config = SubAgentConfig {
+            tools: vec![Arc::from("shell")],
+            delegation_grants: vec![DelegationGrantConfig {
+                tool: Arc::from("shell"),
+                decision: Arc::from("allow"),
+                arg_equals: BTreeMap::new(),
+                reason: Arc::from("expired last century"),
+                expires_at: Some(1),
+            }],
+            ..SubAgentConfig::default()
+        };
+        let grants = subagent_delegation_grants(&child_config).expect("the grant parses");
+        let child = subagent_policy(&child_config, &parent).expect("child policy builds");
+
+        assert!(Policy::narrow_with_grants(&parent, &child, &grants).is_err());
+    }
+
+    /// The same safety property, reached differently. It used to be a widening
+    /// *error*, because the child synthesised a blanket `Allow` for any tool it
+    /// listed. Now there is nothing to widen: the parent has no rule for the
+    /// tool, so the child inherits none and the call falls to its `Deny`
+    /// default. The sub-agent still cannot reach it, and the refusal names the
+    /// tool at the point of use.
+    #[test]
+    fn a_subagent_cannot_reach_a_tool_the_parent_never_grants() {
         let config = config_with_parent_tools(&["http"]);
         let parent = phase5_policy(&config, &[]);
         let child_config = SubAgentConfig {
             tools: vec![Arc::from("shell")],
             ..SubAgentConfig::default()
         };
-        let child = subagent_policy(&child_config).expect("child policy builds");
+        let child = subagent_policy(&child_config, &parent).expect("child policy builds");
 
-        assert!(Policy::narrow(&parent, &child).is_err());
+        Policy::narrow(&parent, &child).expect("an empty child policy widens nothing");
+        assert!(matches!(
+            child.decide(&tool_plan("shell", json!({ "command": "ls" }))),
+            PolicyDecision::Deny { .. }
+        ));
     }
 
+    /// And a grant cannot conjure authority the parent never had: the grant is
+    /// only consulted for a rule the child actually holds, and the child holds
+    /// the granted rule only against a parent that is not denying it outright.
     #[test]
-    fn subagent_explicit_tool_allowlist_avoids_tool_approval() {
+    fn a_grant_cannot_reach_past_an_explicit_parent_deny() {
+        let config = config_with_parent_tools(&["shell"]);
+        let mut parent = phase5_policy(&config, &[]);
+        parent.rules.insert(
+            0,
+            PolicyRule {
+                action: PolicyAction::Tool(Arc::from("shell")),
+                decision: PolicyVerb::Deny,
+                reason: Some(Arc::from("shell is forbidden here")),
+                arg_equals: BTreeMap::new(),
+            },
+        );
+        let child_config = SubAgentConfig {
+            tools: vec![Arc::from("shell")],
+            delegation_grants: vec![DelegationGrantConfig {
+                tool: Arc::from("shell"),
+                decision: Arc::from("allow"),
+                arg_equals: BTreeMap::new(),
+                reason: Arc::from("should not defeat an explicit deny"),
+                expires_at: None,
+            }],
+            ..SubAgentConfig::default()
+        };
+        let grants = subagent_delegation_grants(&child_config).expect("the grant parses");
+        let child = subagent_policy(&child_config, &parent).expect("child policy builds");
+
+        assert!(Policy::narrow_with_grants(&parent, &child, &grants).is_err());
+    }
+
+    /// A tool the *parent* allows outright stays allowed for the sub-agent;
+    /// one the parent gates stays gated. The sub-agent's list selects, it does
+    /// not elevate.
+    #[test]
+    fn a_subagent_tool_list_selects_rather_than_elevates() {
+        let mut config = config_with_parent_tools(&["shell", "cron_create", "cron_remove"]);
+        config.policy.allowlist = vec![Arc::from("cron_create"), Arc::from("cron_remove")];
+        let parent = phase5_policy(&config, &[]);
         let child_config = SubAgentConfig {
             tools: vec![
                 Arc::from("shell"),
@@ -464,12 +736,13 @@ mod tests {
             ],
             ..SubAgentConfig::default()
         };
-        let child = subagent_policy(&child_config).expect("child policy builds");
+        let child = subagent_policy(&child_config, &parent).expect("child policy builds");
 
-        assert_eq!(
+        // Gated for the parent, so gated here. Previously a blanket Allow.
+        assert!(matches!(
             child.decide(&tool_plan("shell", json!({ "command": "ls" }))),
-            PolicyDecision::Allow
-        );
+            PolicyDecision::AskUser { .. }
+        ));
         assert_eq!(
             child.decide(&tool_plan(
                 "cron_create",
@@ -483,22 +756,32 @@ mod tests {
         );
     }
 
+    /// `memory_tools` selects which operations the sub-agent can reach at all;
+    /// the parent's rule for each still decides whether it asks. An operation
+    /// left off the list is denied, which is what it always was.
     #[test]
-    fn subagent_memory_tool_operations_avoid_approval_when_declared() {
+    fn subagent_memory_operations_are_selected_then_inherited() {
+        let config = config_with_parent_tools(&["memory"]);
+        let parent = phase5_policy(&config, &[]);
         let child_config = SubAgentConfig {
             tools: vec![Arc::from("memory")],
             memory_tools: vec![Arc::from("read"), Arc::from("write")],
             ..SubAgentConfig::default()
         };
-        let child = subagent_policy(&child_config).expect("child policy builds");
+        let child = subagent_policy(&child_config, &parent).expect("child policy builds");
 
         assert_eq!(
+            child.decide(&tool_plan("memory", json!({ "operation": "read" }))),
+            PolicyDecision::Allow
+        );
+        // The parent asks about memory writes, so the sub-agent does too.
+        assert!(matches!(
             child.decide(&tool_plan(
                 "memory",
                 json!({ "operation": "write", "body": { "fact": "x" } })
             )),
-            PolicyDecision::Allow
-        );
+            PolicyDecision::AskUser { .. }
+        ));
         assert!(matches!(
             child.decide(&tool_plan("memory", json!({ "operation": "forget" }))),
             PolicyDecision::Deny { .. }
@@ -579,7 +862,7 @@ mod tests {
         let parent = phase5_policy(&config, &[]);
 
         for subagent in &config.subagents {
-            let child = subagent_policy(subagent).expect("subagent policy builds");
+            let child = subagent_policy(subagent, &parent).expect("subagent policy builds");
             Policy::narrow(&parent, &child).unwrap_or_else(|err| {
                 panic!(
                     "subagent '{}' policy '{}' should narrow parent policy: {err}",

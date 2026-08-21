@@ -9,10 +9,13 @@
 //! 2. A parent's own tool call still requires user approval even when a
 //!    configured child declares that tool `allow` — the parent does not
 //!    inherit child permissions.
-//! 3. A child whose `allow` narrows a parent `ask_user` runs the tool
-//!    without pausing — narrowing in the permitted direction still works.
+//! 3. A child `allow` over a parent `ask_user` is refused — that is a
+//!    widening, whatever the child's allowlist says.
+//! 4. The same delegation with an explicit `DelegationGrant` runs the tool
+//!    without pausing, so the unattended case stays available and becomes
+//!    declared rather than implied (`AUTH-002`).
 
-use agentos_core::approve::{Policy, PolicyAction, PolicyRule, PolicyVerb};
+use agentos_core::approve::{DelegationGrant, Policy, PolicyAction, PolicyRule, PolicyVerb};
 use agentos_core::memory::InMemorySession;
 use agentos_core::runner::{run_envelope, RunOutcome, RunnerDeps};
 use agentos_core::subagents::{SubAgentDefinition, SubAgentRegistry};
@@ -143,6 +146,14 @@ impl Tool for EchoTool {
 }
 
 fn child_registry(session: Arc<InMemorySession>, child_policy: Policy) -> SubAgentRegistry {
+    child_registry_with_grants(session, child_policy, Vec::new())
+}
+
+fn child_registry_with_grants(
+    session: Arc<InMemorySession>,
+    child_policy: Policy,
+    grants: Vec<DelegationGrant>,
+) -> SubAgentRegistry {
     let mut tools = ToolRegistry::new();
     tools.register(EchoTool);
     let mut registry = SubAgentRegistry::new().with_session(session);
@@ -154,7 +165,8 @@ fn child_registry(session: Arc<InMemorySession>, child_policy: Policy) -> SubAge
             child_policy,
         )
         .with_tools(Arc::new(tools))
-        .with_max_turns(4),
+        .with_max_turns(4)
+        .with_delegation_grants(grants),
     );
     registry
 }
@@ -270,13 +282,49 @@ async fn parent_tool_call_still_requires_approval_when_child_declares_allow() {
     );
 }
 
+/// A parent that gates the tool behind `ask_user` and a child that allows it
+/// is a widening, and the delegated run must not start.
+///
+/// This is the `AUTH-002` case end to end. It previously ran to completion, on
+/// the strength of the tool appearing in the child's allowlist.
 #[tokio::test]
-async fn child_allow_narrowing_parent_ask_user_runs_without_pause() {
-    // Parent gates the tool behind ask_user; the child allowlists it. This is
-    // the permitted narrowing direction: the delegated child executes the
-    // tool without pausing, and the parent gets its result.
+async fn an_ungranted_child_allow_over_a_parent_ask_user_is_refused() {
     let session = Arc::new(InMemorySession::default());
     let registry = child_registry(session.clone(), Policy::allow_tools([TOOL_NAME]));
+    let parent = DelegatingParent;
+    let policy = parent_policy(Some(PolicyVerb::AskUser));
+    let deps = runner_deps(&parent, session.as_ref(), &policy, None, Some(&registry));
+
+    let error = run_envelope(
+        user_envelope("delegate please"),
+        RunId::new("narrow-run"),
+        &deps,
+    )
+    .await
+    .expect_err("a widening delegation must not run");
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("narrowing") || rendered.contains("widens"),
+        "the failure must name the widening, got: {rendered}"
+    );
+}
+
+/// The same delegation with the elevation declared: it runs, unattended, and
+/// the parent gets the child's result.
+#[tokio::test]
+async fn a_granted_child_allow_over_a_parent_ask_user_runs_without_pause() {
+    let session = Arc::new(InMemorySession::default());
+    let registry = child_registry_with_grants(
+        session.clone(),
+        Policy::allow_tools([TOOL_NAME]),
+        vec![DelegationGrant {
+            action: PolicyAction::Tool(Arc::from(TOOL_NAME)),
+            decision: PolicyVerb::Allow,
+            arg_equals: BTreeMap::new(),
+            reason: Arc::from("the delegated task cannot pause for approval"),
+            expires_at: None,
+        }],
+    );
     let parent = DelegatingParent;
     let policy = parent_policy(Some(PolicyVerb::AskUser));
     let deps = runner_deps(&parent, session.as_ref(), &policy, None, Some(&registry));
@@ -289,7 +337,7 @@ async fn child_allow_narrowing_parent_ask_user_runs_without_pause() {
     .await
     .expect("delegated run completes");
     let RunOutcome::Finished { output, .. } = outcome else {
-        panic!("narrowed child must run without pausing");
+        panic!("a granted child must run without pausing");
     };
     assert!(
         output.message.content.contains("child result: ok"),

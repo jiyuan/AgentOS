@@ -756,7 +756,7 @@ fn record_run_finish(state: &mut RunState, hooks: Option<&Hooks>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::approve::{Policy, PolicyAction, PolicyRule, PolicyVerb};
+    use crate::approve::{DelegationGrant, Policy, PolicyAction, PolicyRule, PolicyVerb};
     use crate::memory::InMemorySession;
     use crate::r#loop::ToolGuardrailEntry;
     use crate::subagents::{SubAgentDefinition, SubAgentRegistry};
@@ -873,8 +873,16 @@ mod tests {
         );
     }
 
+    /// End to end: a sub-agent runs a parent-gated tool without pausing *when
+    /// an explicit delegation grant says it may*.
+    ///
+    /// This used to pass on the strength of the tool appearing in the child's
+    /// allowlist, which is the `AUTH-002` widening. The behaviour is still
+    /// available — an unattended sub-agent that stops to ask is not unattended
+    /// — but it now costs one declared grant with a stated reason, and it
+    /// covers exactly the tool named.
     #[tokio::test]
-    async fn subagent_allowlisted_tool_runs_without_parent_approval() {
+    async fn a_granted_subagent_tool_runs_without_parent_approval() {
         let session = Arc::new(InMemorySession::default());
         let child_orchestrator = Arc::new(ChildApprovalOrchestrator);
         let parent_orchestrator = ParentDelegateOrchestrator;
@@ -890,7 +898,14 @@ mod tests {
                 Policy::allow_tools(["mock"]),
             )
             .with_tools(tools)
-            .with_max_turns(4),
+            .with_max_turns(4)
+            .with_delegation_grants(vec![DelegationGrant {
+                action: PolicyAction::Tool(Arc::from("mock")),
+                decision: PolicyVerb::Allow,
+                arg_equals: BTreeMap::new(),
+                reason: Arc::from("the delegated task cannot pause for approval"),
+                expires_at: None,
+            }]),
         );
         let parent_policy = Policy {
             rules: vec![

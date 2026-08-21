@@ -85,3 +85,37 @@ fn the_shipped_subagents_build() {
         "startup would reject the shipped workspace: {names:?}"
     );
 }
+
+/// `AUTH-002` against the shipped workspace: no sub-agent silently holds more
+/// than the parent, and any that does says so in `delegation_grants`.
+#[test]
+fn no_shipped_subagent_silently_out_permits_the_parent() {
+    let config = shipped_config();
+    let granted: Vec<String> = config
+        .subagents
+        .iter()
+        .filter(|subagent| !subagent.delegation_grants.is_empty())
+        .map(|subagent| {
+            format!(
+                "{}: {}",
+                subagent.id,
+                subagent
+                    .delegation_grants
+                    .iter()
+                    .map(|grant| format!("{}={}", grant.tool, grant.decision))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+        .collect();
+
+    // Not a prohibition on grants — a deployment may need one. This pins the
+    // shipped posture: today every sub-agent runs on exactly its parent's
+    // rules, so adding a grant here is a visible, reviewable change.
+    assert!(
+        granted.is_empty(),
+        "the shipped workspace declares delegation grants: {granted:?}. \
+         That may be intended, but it elevates a sub-agent above the parent \
+         policy and should be a deliberate review decision."
+    );
+}

@@ -46,9 +46,9 @@ that closes it.
   deletes items outright ([ADR-0006](adr/0006-CLEAR_EPOCH.md), M6).
 - Passive memory retrieval hydrates planning context; explicit memory mutation
   goes through tools and approval.
-- Sub-agent permissions can only narrow parent permissions — today by tool
-  name, so a sub-agent naming an `AskUser` tool receives it as `Allow`
-  ([ADR-0001](adr/0001-POLICY_NARROWING.md), `AUTH-002`).
+- Sub-agent permissions can only narrow parent permissions, over actions and
+  arguments; an exception is an explicit delegation grant
+  ([ADR-0001](adr/0001-POLICY_NARROWING.md)).
 - External implementation contracts live in `agentos-interfaces`.
 - Workspace-owned content is data, not a dependency of core crates.
 - Runtime paths are injected by CLI/gateway construction, not inferred from

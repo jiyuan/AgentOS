@@ -128,11 +128,15 @@ pub(crate) fn request_derives_from_state(
 ///
 /// The property: for every action the child could take — because a rule allows
 /// or asks about it, or because its default does — the parent must have some
-/// non-`Deny` path to that same action. Argument constraints are ignored here.
-/// A child is permitted to be more specific about arguments than its parent
-/// (that is what an explicit sub-agent tool allowlist does), so an
-/// argument-level comparison would fire on configurations that are correct by
-/// design.
+/// non-`Deny` path to that same action.
+///
+/// Coarser than `Policy::narrow` on purpose, and it stays coarse. Narrowing is
+/// now exact over arguments *and* may be relaxed for one delegatee by a
+/// `DelegationGrant`; this assertion knows about neither, so it states only
+/// what holds regardless of both: a sub-agent cannot act where the parent has
+/// no path at all. Restating the exact rule here would either duplicate
+/// `narrow` — making it a check of the implementation against itself — or fire
+/// on every legitimately granted delegation.
 pub(crate) fn delegation_narrows(parent: &Policy, child: &Policy) {
     assert!(
         permissiveness(&child.default_decision) <= permissiveness(&parent.default_decision),

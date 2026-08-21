@@ -1,4 +1,4 @@
-use crate::approve::{Policy, PolicyError};
+use crate::approve::{DelegationGrant, Policy, PolicyError};
 use crate::config::CompactionConfig;
 use crate::memory::{InMemorySession, MemoryManager};
 use crate::prompt::Compaction;
@@ -62,6 +62,14 @@ pub struct SubAgentDefinition {
     /// see. Turn it on for the sub-agent that needs the discussion so far —
     /// a reviewer, an editor — not for the one that fetches a URL.
     pub seed_from_parent: bool,
+    /// Authority this sub-agent holds beyond its parent, from
+    /// `[[subagents.delegation_grants]]`.
+    ///
+    /// On the definition rather than on the registry so non-transitivity is
+    /// structural: `prepare` narrows against the immediate parent with only
+    /// this delegatee's grants, and a sub-agent of a sub-agent is narrowed
+    /// with its own, never with these.
+    pub delegation_grants: Vec<DelegationGrant>,
 }
 
 impl SubAgentDefinition {
@@ -83,7 +91,16 @@ impl SubAgentDefinition {
             output_guardrails: Vec::new(),
             tool_guardrails: Vec::new(),
             seed_from_parent: false,
+            delegation_grants: Vec::new(),
         }
+    }
+
+    /// Authority this sub-agent holds beyond its parent. Empty by default:
+    /// a sub-agent gets nothing its parent does not have unless an operator
+    /// wrote down why.
+    pub fn with_delegation_grants(mut self, grants: Vec<DelegationGrant>) -> Self {
+        self.delegation_grants = grants;
+        self
     }
 
     pub fn with_tools(mut self, tools: Arc<ToolRegistry>) -> Self {
@@ -317,7 +334,11 @@ impl SubAgentRegistry {
                 agent_id: spec.agent_id.clone(),
                 policy_id: Arc::clone(&spec.policy_id),
             })?;
-        let child_policy = Policy::narrow(parent_policy, &definition.policy)?;
+        let child_policy = Policy::narrow_with_grants(
+            parent_policy,
+            &definition.policy,
+            &definition.delegation_grants,
+        )?;
         // X5: state the security property over the policy the child run is
         // actually handed, rather than trusting that the call above produced
         // it. Independent of how `narrow` decides individual rules.

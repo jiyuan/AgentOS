@@ -1,8 +1,9 @@
-use agentos_interfaces::orchestrator::Plan;
-use agentos_proto::ToolCall;
+use agentos_interfaces::orchestrator::{OrchestratorTemplate, Plan, SubAgentSpec, SubOrchSpec};
+use agentos_proto::{AgentId, TaskId, ToolCall, ToolCallId};
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -145,65 +146,304 @@ impl Policy {
         })
     }
 
+    /// Narrow `child` against `parent`, with no delegation grants.
+    ///
+    /// See [`Self::narrow_with_grants`] for the rule this enforces.
     pub fn narrow(parent: &Self, child: &Self) -> Result<Self, PolicyError> {
+        Self::narrow_with_grants(parent, child, &[])
+    }
+
+    /// Narrow `child` against `parent`, treating `grants` as authority the
+    /// parent additionally holds *for this delegatee only*.
+    ///
+    /// The property, from [ADR-0001](../../../../docs/adr/0001-POLICY_NARROWING.md):
+    /// for every possible call, the child's effective decision is no more
+    /// permissive than the parent's, arguments included.
+    ///
+    /// This replaces a tool-name-granular check. The previous version accepted
+    /// a child `Allow` whenever the parent held *any* `Allow`/`AskUser` rule
+    /// for the same tool name, which meant a parent rule constrained to
+    /// `{operation: "read"}` legitimised an unconstrained child `Allow` that
+    /// reached `write`, and a parent `AskUser` silently became a child
+    /// `Allow`. Both are widenings, and both were reachable from the shipped
+    /// configuration.
+    ///
+    /// The legitimate need that escape hatch served — an unattended sub-agent
+    /// must not stop to ask — is now served by an explicit
+    /// [`DelegationGrant`], so the authority is declared and auditable rather
+    /// than implied by a tool appearing in an allowlist.
+    pub fn narrow_with_grants(
+        parent: &Self,
+        child: &Self,
+        grants: &[DelegationGrant],
+    ) -> Result<Self, PolicyError> {
         if !default_decision_covers(&parent.default_decision, &child.default_decision) {
             return Err(PolicyError::Widened(Arc::from("default")));
         }
 
-        for child_rule in &child.rules {
-            match child_rule.decision {
-                PolicyVerb::Allow => {
-                    // A child `Allow` is valid if the parent already exposes
-                    // that exact action (the normal `covers` check) OR — for
-                    // tools — if the parent governs the same tool at all with
-                    // an Allow/AskUser rule. The latter lets an explicit
-                    // sub-agent tool allowlist suppress approval prompts for a
-                    // tool the parent itself can use, without letting the
-                    // sub-agent reach tools the parent denies or never grants.
-                    let covered = parent.rules.iter().any(|parent_rule| {
-                        matches!(
-                            parent_rule.decision,
-                            PolicyVerb::Allow | PolicyVerb::AskUser
-                        ) && parent_rule.covers(child_rule)
-                    });
-                    if !covered && !parent_exposes_tool(parent, child_rule) {
-                        return Err(PolicyError::Widened(child_rule.label()));
-                    }
-                }
-                PolicyVerb::AskUser => {
-                    if !parent.rules.iter().any(|parent_rule| {
-                        matches!(
-                            parent_rule.decision,
-                            PolicyVerb::Allow | PolicyVerb::AskUser
-                        ) && parent_rule.covers(child_rule)
-                    }) {
-                        return Err(PolicyError::Widened(child_rule.label()));
-                    }
-                }
-                PolicyVerb::Deny => {}
+        // Compare the two policies by *deciding*, not by comparing rules.
+        //
+        // A structural comparison has to re-derive what `decide` already
+        // knows — that rules are first-match-wins, so an earlier rule can make
+        // a later one unreachable — and getting that subtly wrong produces a
+        // check that rejects correct configurations. An earlier draft of this
+        // function did exactly that and was not even reflexive: some policies
+        // failed to narrow to themselves.
+        //
+        // Instead: enumerate a finite set of calls that is complete for these
+        // two policies, and ask both of them. Two calls that agree on every
+        // (key, value) pair any rule mentions are indistinguishable to every
+        // rule, so a representative of each equivalence class is enough.
+        for witness in witnesses(parent, child)? {
+            let child_decision = child.decide(&witness);
+            let parent_decision = parent.decide(&witness);
+            if decision_permissiveness(&child_decision) <= decision_permissiveness(&parent_decision)
+            {
+                continue;
             }
+            if grants
+                .iter()
+                .any(|grant| grant.permits(&witness, &child_decision, parent))
+            {
+                continue;
+            }
+            return Err(PolicyError::Widened(witness_label(&witness)));
         }
 
         Ok(child.clone())
     }
 }
 
-/// True when `child_rule` targets a tool the parent already exposes to this
-/// delegatee (any same-tool rule whose decision is `Allow` or `AskUser`).
+/// Standing authority for one delegatee to hold a decision its parent does not.
 ///
-/// This is the mechanism behind "an explicitly allowlisted sub-agent tool
-/// needs no approval": the parent may gate the tool behind `AskUser` (or
-/// per-operation arg constraints) for itself, but a sub-agent that names the
-/// tool in its allowlist gets blanket `Allow`. Tools the parent denies or
-/// never grants are not exposed, so the sub-agent still cannot reach them.
-fn parent_exposes_tool(parent: &Policy, child_rule: &PolicyRule) -> bool {
-    let PolicyAction::Tool(child_tool) = &child_rule.action else {
-        return false;
-    };
-    parent.rules.iter().any(|rule| {
-        matches!(rule.decision, PolicyVerb::Allow | PolicyVerb::AskUser)
-            && matches!(&rule.action, PolicyAction::Tool(tool) if tool == child_tool)
-    })
+/// The explicit form of what `parent_exposes_tool` used to do implicitly for
+/// every sub-agent at once. A grant names exactly one action, may pin exact
+/// argument values, and elevates only against the immediate parent — each
+/// level of delegation needs its own grant, declared by the operator, so a
+/// sub-agent cannot pass its authority further down.
+///
+/// Bounded expiry and durable issuance/use records are the half of
+/// [ADR-0001](../../../../docs/adr/0001-POLICY_NARROWING.md) that needs the
+/// safety-event store: `expires_at` is honoured here and optional, and M6 adds
+/// issuance at runtime plus a record of every use. Until then a grant is a
+/// standing authorization in `agent.toml`, which is at least visible, scoped,
+/// and reviewable — none of which was true of the escape hatch.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DelegationGrant {
+    /// The action this grant covers. `Any` is deliberately representable but
+    /// should be rare: it grants across every tool.
+    pub action: PolicyAction,
+    /// The decision the delegatee may hold for `action`.
+    pub decision: PolicyVerb,
+    /// Exact argument values the grant is limited to. Empty means the grant
+    /// covers every call to `action`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub arg_equals: BTreeMap<Arc<str>, Value>,
+    /// Why this authority exists. Required, because a grant nobody can explain
+    /// is a grant nobody can review.
+    pub reason: Arc<str>,
+    /// Unix seconds after which the grant no longer applies. `None` is a
+    /// standing grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
+}
+
+impl DelegationGrant {
+    /// Whether this grant authorises `decision` for `call`.
+    ///
+    /// Four conditions, all necessary: the grant is unexpired; it matches this
+    /// exact call, arguments included; it is at least as permissive as the
+    /// decision it is being asked to justify; and the parent does not deny the
+    /// call outright.
+    ///
+    /// The parent is not consulted for *authority* — the point of a grant is
+    /// that the parent does not hold it — but an explicit parent `Deny`
+    /// outranks a grant, so a grant cannot re-permit what an operator wrote a
+    /// rule to stop.
+    fn permits(&self, call: &Plan, decision: &PolicyDecision, parent: &Policy) -> bool {
+        if self.is_expired(now_unix_seconds()) {
+            return false;
+        }
+        if decision_permissiveness(decision) > permissiveness(&self.decision) {
+            return false;
+        }
+        let tool_args = match call {
+            Plan::CallTool(tool_call) => serde_json::from_str::<Value>(tool_call.args.get()).ok(),
+            _ => None,
+        };
+        if !self.as_rule().matches(call, tool_args.as_ref()) {
+            return false;
+        }
+        !matches!(parent.decide(call), PolicyDecision::Deny { .. })
+    }
+
+    fn is_expired(&self, now: u64) -> bool {
+        self.expires_at.is_some_and(|expiry| now >= expiry)
+    }
+
+    fn as_rule(&self) -> PolicyRule {
+        PolicyRule {
+            action: self.action.clone(),
+            decision: self.decision.clone(),
+            reason: None,
+            arg_equals: self.arg_equals.clone(),
+        }
+    }
+}
+
+fn now_unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
+/// A call name that appears in no rule, standing for "every other tool".
+///
+/// Without it, a child `Any` rule that is wider than the parent's would go
+/// unnoticed whenever every *named* tool happened to be covered.
+const UNNAMED_TOOL_WITNESS: &str = "\u{0}agentos.unnamed-tool-witness";
+
+/// The cap on generated witnesses. Reached only by a policy naming many
+/// distinct argument keys; refusing is the safe direction, and the error says
+/// what to simplify.
+const MAX_WITNESSES: usize = 4096;
+
+/// A finite set of calls that distinguishes these two policies.
+///
+/// Rules match arguments by exact equality, so two calls that agree on every
+/// (key, value) pair mentioned anywhere in either policy are treated
+/// identically by both. Enumerating one representative per equivalence class
+/// therefore decides the universal property exactly, not approximately.
+fn witnesses(parent: &Policy, child: &Policy) -> Result<Vec<Plan>, PolicyError> {
+    let rules = || parent.rules.iter().chain(child.rules.iter());
+
+    let mut tools: BTreeSet<Arc<str>> = rules()
+        .filter_map(|rule| match &rule.action {
+            PolicyAction::Tool(name) => Some(Arc::clone(name)),
+            _ => None,
+        })
+        .collect();
+    tools.insert(Arc::from(UNNAMED_TOOL_WITNESS));
+
+    // Every argument key any rule constrains, with the values it constrains it
+    // to plus one value no rule names.
+    let mut arg_space: BTreeMap<Arc<str>, BTreeSet<String>> = BTreeMap::new();
+    for rule in rules() {
+        for (key, value) in &rule.arg_equals {
+            arg_space
+                .entry(Arc::clone(key))
+                .or_default()
+                .insert(value.to_string());
+        }
+    }
+
+    let mut combinations = tools.len();
+    for values in arg_space.values() {
+        combinations = combinations.saturating_mul(values.len() + 1);
+        if combinations > MAX_WITNESSES {
+            return Err(PolicyError::InvalidYaml {
+                line: 0,
+                message: Arc::from(
+                    "policy constrains too many distinct argument keys to verify narrowing; \
+                     reduce the number of `arg_equals` keys",
+                ),
+            });
+        }
+    }
+
+    // The cross product of one value per constrained key, where `None` means
+    // "a value no rule mentions".
+    let keys: Vec<Arc<str>> = arg_space.keys().cloned().collect();
+    let mut assignments: Vec<Vec<Option<Value>>> = vec![Vec::new()];
+    for key in &keys {
+        let mut values: Vec<Option<Value>> = vec![None];
+        for encoded in &arg_space[key] {
+            values.push(serde_json::from_str(encoded).ok());
+        }
+        assignments = assignments
+            .into_iter()
+            .flat_map(|prefix| {
+                values.iter().map(move |value| {
+                    let mut next = prefix.clone();
+                    next.push(value.clone());
+                    next
+                })
+            })
+            .collect();
+    }
+
+    let mut plans = Vec::with_capacity(combinations + 3);
+    for tool in &tools {
+        for assignment in &assignments {
+            let mut args = serde_json::Map::new();
+            // A key absent and a key holding an unmentioned value are the
+            // same to exact-equality matching, so `None` stands for both.
+            for (key, value) in keys.iter().zip(assignment) {
+                if let Some(value) = value {
+                    args.insert(key.to_string(), value.clone());
+                }
+            }
+            let encoded = Value::Object(args).to_string();
+            let Ok(args) = RawValue::from_string(encoded) else {
+                continue;
+            };
+            plans.push(Plan::CallTool(ToolCall {
+                id: ToolCallId::new("policy-narrowing-witness"),
+                name: Arc::clone(tool),
+                args,
+            }));
+        }
+    }
+    plans.push(Plan::Handoff(
+        AgentId::new("policy-narrowing-witness"),
+        None,
+    ));
+    plans.push(Plan::Delegate(SubAgentSpec {
+        agent_id: AgentId::new("policy-narrowing-witness"),
+        policy_id: Arc::from("policy-narrowing-witness"),
+        metadata: BTreeMap::new(),
+    }));
+    plans.push(Plan::Escalate(SubOrchSpec {
+        template: OrchestratorTemplate {
+            name: Arc::from("policy-narrowing-witness"),
+            stages: Vec::new(),
+        },
+        task_id: TaskId::new("policy-narrowing-witness"),
+        policy_id: Arc::from("policy-narrowing-witness"),
+        metadata: BTreeMap::new(),
+    }));
+    Ok(plans)
+}
+
+/// How a refused witness is named in [`PolicyError::Widened`].
+fn witness_label(plan: &Plan) -> Arc<str> {
+    match plan {
+        Plan::CallTool(call) if call.name.as_ref() == UNNAMED_TOOL_WITNESS => {
+            Arc::from("any other tool")
+        }
+        Plan::CallTool(call) => Arc::clone(&call.name),
+        Plan::Handoff(_, _) => Arc::from("handoff"),
+        Plan::Delegate(_) => Arc::from("delegate"),
+        Plan::Escalate(_) => Arc::from("escalate"),
+        Plan::CallTools(_) | Plan::Reply(_) | Plan::ResumeSubAgent { .. } => Arc::from("action"),
+    }
+}
+
+fn decision_permissiveness(decision: &PolicyDecision) -> u8 {
+    match decision {
+        PolicyDecision::Deny { .. } => 0,
+        PolicyDecision::AskUser { .. } => 1,
+        PolicyDecision::Allow => 2,
+    }
+}
+
+/// `Allow` (2) is more permissive than `AskUser` (1) than `Deny` (0).
+fn permissiveness(verb: &PolicyVerb) -> u8 {
+    match verb {
+        PolicyVerb::Deny => 0,
+        PolicyVerb::AskUser => 1,
+        PolicyVerb::Allow => 2,
+    }
 }
 
 fn default_decision_covers(parent: &PolicyVerb, child: &PolicyVerb) -> bool {
@@ -260,21 +500,6 @@ impl PolicyRule {
                     .unwrap_or_else(|| Arc::from("policy requires user approval")),
             },
         }
-    }
-
-    fn covers(&self, child: &Self) -> bool {
-        match (&self.action, &child.action) {
-            (PolicyAction::Any, _) => {}
-            (PolicyAction::Tool(parent), PolicyAction::Tool(child)) if parent == child => {}
-            (PolicyAction::Handoff, PolicyAction::Handoff)
-            | (PolicyAction::Delegate, PolicyAction::Delegate)
-            | (PolicyAction::Escalate, PolicyAction::Escalate) => {}
-            _ => return false,
-        }
-
-        self.arg_equals
-            .iter()
-            .all(|(key, value)| child.arg_equals.get(key) == Some(value))
     }
 
     /// How this rule names its action in an error or an assertion. Already the
@@ -437,13 +662,191 @@ mod tests {
         assert!(matches!(policy.decide(&deny), PolicyDecision::Deny { .. }));
     }
 
+    /// The `AUTH-002` widening, now refused. A parent that asks about `shell`
+    /// is stating that a human decides each call; a child `Allow` removes the
+    /// human, and narrowing is what has to notice.
     #[test]
-    fn narrow_allows_child_allow_when_parent_would_ask_user() {
+    fn narrow_refuses_a_child_allow_the_parent_only_asks_about() {
         let parent = Policy::ask_user_tools(["shell"]);
         let child = Policy::allow_tools(["shell"]);
 
-        Policy::narrow(&parent, &child)
-            .expect("delegated child allowlist may allow a parent-ask tool");
+        assert!(matches!(
+            Policy::narrow(&parent, &child),
+            Err(PolicyError::Widened(_))
+        ));
+    }
+
+    /// The same pair, with the elevation declared. This is the whole trade the
+    /// slice makes: the capability stays available, and it becomes visible.
+    #[test]
+    fn a_grant_admits_exactly_the_pair_narrowing_refused() {
+        let parent = Policy::ask_user_tools(["shell"]);
+        let child = Policy::allow_tools(["shell"]);
+        let grants = vec![DelegationGrant {
+            action: PolicyAction::Tool(Arc::from("shell")),
+            decision: PolicyVerb::Allow,
+            arg_equals: BTreeMap::new(),
+            reason: Arc::from("unattended maintenance window"),
+            expires_at: None,
+        }];
+
+        Policy::narrow_with_grants(&parent, &child, &grants)
+            .expect("a declared grant admits the elevation");
+    }
+
+    /// A grant is not a skeleton key: it covers the action it names.
+    #[test]
+    fn a_grant_does_not_cover_a_different_tool() {
+        let parent = Policy::ask_user_tools(["shell", "file"]);
+        let child = Policy::allow_tools(["file"]);
+        let grants = vec![DelegationGrant {
+            action: PolicyAction::Tool(Arc::from("shell")),
+            decision: PolicyVerb::Allow,
+            arg_equals: BTreeMap::new(),
+            reason: Arc::from("shell only"),
+            expires_at: None,
+        }];
+
+        assert!(Policy::narrow_with_grants(&parent, &child, &grants).is_err());
+    }
+
+    /// Nor does a grant pinned to specific arguments justify an unconstrained
+    /// rule — the same subset check narrowing itself applies.
+    #[test]
+    fn an_argument_pinned_grant_does_not_justify_an_unconstrained_rule() {
+        let parent = Policy::ask_user_tools(["file"]);
+        let child = Policy::allow_tools(["file"]);
+        let grants = vec![DelegationGrant {
+            action: PolicyAction::Tool(Arc::from("file")),
+            decision: PolicyVerb::Allow,
+            arg_equals: BTreeMap::from([(Arc::from("operation"), serde_json::json!("read"))]),
+            reason: Arc::from("reads only"),
+            expires_at: None,
+        }];
+
+        assert!(Policy::narrow_with_grants(&parent, &child, &grants).is_err());
+    }
+
+    /// A child that keeps the grant's constraint is admitted, so the pinned
+    /// grant is usable rather than merely strict.
+    #[test]
+    fn an_argument_pinned_grant_admits_a_matching_rule() {
+        let parent = Policy::ask_user_tools(["file"]);
+        let child = Policy {
+            rules: vec![PolicyRule {
+                action: PolicyAction::Tool(Arc::from("file")),
+                decision: PolicyVerb::Allow,
+                reason: None,
+                arg_equals: BTreeMap::from([(Arc::from("operation"), serde_json::json!("read"))]),
+            }],
+            default_decision: PolicyVerb::Deny,
+        };
+        let grants = vec![DelegationGrant {
+            action: PolicyAction::Tool(Arc::from("file")),
+            decision: PolicyVerb::Allow,
+            arg_equals: BTreeMap::from([(Arc::from("operation"), serde_json::json!("read"))]),
+            reason: Arc::from("reads only"),
+            expires_at: None,
+        }];
+
+        Policy::narrow_with_grants(&parent, &child, &grants).expect("the pinned grant applies");
+    }
+
+    /// A child rule may be *more* constrained than the grant: the grant's call
+    /// set contains the rule's, which is the direction that stays safe.
+    #[test]
+    fn a_child_may_be_stricter_than_its_grant() {
+        let parent = Policy::ask_user_tools(["file"]);
+        let child = Policy {
+            rules: vec![PolicyRule {
+                action: PolicyAction::Tool(Arc::from("file")),
+                decision: PolicyVerb::Allow,
+                reason: None,
+                arg_equals: BTreeMap::from([
+                    (Arc::from("operation"), serde_json::json!("read")),
+                    (Arc::from("path"), serde_json::json!("README.md")),
+                ]),
+            }],
+            default_decision: PolicyVerb::Deny,
+        };
+        let grants = vec![DelegationGrant {
+            action: PolicyAction::Tool(Arc::from("file")),
+            decision: PolicyVerb::Allow,
+            arg_equals: BTreeMap::from([(Arc::from("operation"), serde_json::json!("read"))]),
+            reason: Arc::from("reads only"),
+            expires_at: None,
+        }];
+
+        Policy::narrow_with_grants(&parent, &child, &grants).expect("a stricter child is fine");
+    }
+
+    /// A parent rule constrained to one operation does not license a child
+    /// rule that reaches every operation.
+    #[test]
+    fn narrow_refuses_a_child_that_drops_parent_argument_constraints() {
+        let parent = Policy {
+            rules: vec![PolicyRule {
+                action: PolicyAction::Tool(Arc::from("file")),
+                decision: PolicyVerb::Allow,
+                reason: None,
+                arg_equals: BTreeMap::from([(Arc::from("operation"), serde_json::json!("read"))]),
+            }],
+            default_decision: PolicyVerb::Deny,
+        };
+        let child = Policy::allow_tools(["file"]);
+
+        assert!(Policy::narrow(&parent, &child).is_err());
+    }
+
+    /// A parent that allows everything by default covers a child rule for
+    /// which it holds no explicit rule. Guards the fix against being
+    /// "narrowing rejects whatever it cannot find".
+    #[test]
+    fn a_permissive_parent_default_covers_an_unmatched_child_rule() {
+        let parent = Policy {
+            rules: Vec::new(),
+            default_decision: PolicyVerb::Allow,
+        };
+        let child = Policy::allow_tools(["shell"]);
+
+        Policy::narrow(&parent, &child).expect("the parent allows everything by default");
+    }
+
+    /// A parent `Deny` aimed at one operation must not drag down the floor for
+    /// a child rule that cannot reach that operation.
+    #[test]
+    fn a_disjoint_parent_deny_does_not_block_an_unrelated_child_rule() {
+        let parent = Policy {
+            rules: vec![
+                PolicyRule {
+                    action: PolicyAction::Tool(Arc::from("file")),
+                    decision: PolicyVerb::Deny,
+                    reason: None,
+                    arg_equals: BTreeMap::from([(
+                        Arc::from("operation"),
+                        serde_json::json!("delete"),
+                    )]),
+                },
+                PolicyRule {
+                    action: PolicyAction::Tool(Arc::from("file")),
+                    decision: PolicyVerb::Allow,
+                    reason: None,
+                    arg_equals: BTreeMap::new(),
+                },
+            ],
+            default_decision: PolicyVerb::Deny,
+        };
+        let child = Policy {
+            rules: vec![PolicyRule {
+                action: PolicyAction::Tool(Arc::from("file")),
+                decision: PolicyVerb::Allow,
+                reason: None,
+                arg_equals: BTreeMap::from([(Arc::from("operation"), serde_json::json!("read"))]),
+            }],
+            default_decision: PolicyVerb::Deny,
+        };
+
+        Policy::narrow(&parent, &child).expect("the deny cannot match a read");
     }
 
     #[test]

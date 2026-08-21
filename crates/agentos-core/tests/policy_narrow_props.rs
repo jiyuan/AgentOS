@@ -1,22 +1,28 @@
 //! A5 invariant: `Policy::narrow` property tests over random parent/child
 //! pairs — narrowing must never widen what the parent permits.
 //!
-//! The implementation's narrowing contract is *tool-granular*, not
-//! argument-granular: a child `Allow` on tool T is accepted whenever the
-//! parent has any `Allow`/`AskUser` rule for T, even if that parent rule is
-//! constrained to specific arguments (see `parent_exposes_tool` in
-//! `approve/mod.rs` — this is the documented "explicitly allowlisted
-//! sub-agent tool needs no approval" escape hatch). The properties below
-//! therefore assert the contract the code actually guarantees:
+//! The contract is *exact*: for every call, the child's decision is no more
+//! permissive than the parent's, arguments included
+//! ([ADR-0001](../../../docs/adr/0001-POLICY_NARROWING.md)).
+//!
+//! This file used to say the opposite — that narrowing was "tool-granular,
+//! not argument-granular", and scope its properties to match
+//! `parent_exposes_tool`. A property suite written to the contract the code
+//! happened to have cannot report that the contract is wrong, which is why
+//! 1000 cases per run went green across the whole `AUTH-002` window.
 //!
 //! 1. Narrowing is reflexive: every policy narrows to itself.
 //! 2. The narrowed default verb never exceeds the parent default verb.
-//! 3. For actions the parent never exposes through any `Allow`/`AskUser`
+//! 3. **The lattice property.** For every generated parent/child pair that
+//!    narrows, and every call in the plan universe — tools, operations, and
+//!    arguments — `child(call) <= parent(call)`.
+//! 4. For actions the parent never exposes through any `Allow`/`AskUser`
 //!    rule, the narrowed policy can never decide more permissively than the
 //!    parent's default verb.
-//! 4. A child `Allow` rule on a tool the parent does not expose is rejected
+//! 5. A child `Allow` rule on a tool the parent does not expose is rejected
 //!    with `PolicyError::Widened`.
-//! 5. A child default verb more permissive than the parent's is rejected.
+//! 6. A child default verb more permissive than the parent's is rejected.
+//! 7. A grant admits exactly what it names, and no more.
 
 use agentos_core::approve::{Policy, PolicyAction, PolicyDecision, PolicyRule, PolicyVerb};
 use agentos_interfaces::orchestrator::{OrchestratorTemplate, Plan, SubAgentSpec, SubOrchSpec};
@@ -171,6 +177,35 @@ proptest! {
         );
     }
 
+    /// The property `AUTH-002` exists to establish, and the one this suite
+    /// could not previously express: whatever the rules say, no call comes out
+    /// of the child more permissively than it would from the parent.
+    ///
+    /// Quantified over the *call* universe rather than over rules, so a child
+    /// rule that is subtly wider in its arguments is caught by the call that
+    /// exploits the difference rather than by a structural comparison that
+    /// might share the implementation's blind spot.
+    #[test]
+    fn a_narrowed_child_never_out_permits_its_parent_on_any_call(
+        parent in policy_strategy(),
+        child in policy_strategy(),
+    ) {
+        let Ok(effective) = Policy::narrow(&parent, &child) else {
+            // Refusals are property 5's business; this one is about what a
+            // policy that *was* admitted may then decide.
+            return Ok(());
+        };
+        for plan in plan_universe() {
+            let child_decision = effective.decide(&plan);
+            let parent_decision = parent.decide(&plan);
+            prop_assert!(
+                decision_rank(&child_decision) <= decision_rank(&parent_decision),
+                "child decided {child_decision:?} where the parent decides \
+                 {parent_decision:?}\n  plan:   {plan:?}\n  parent: {parent:?}\n  child:  {child:?}"
+            );
+        }
+    }
+
     #[test]
     fn narrowed_default_never_exceeds_parent_default(
         parent in policy_strategy(),
@@ -211,10 +246,16 @@ proptest! {
 
     #[test]
     fn allow_rule_on_unexposed_tool_is_rejected(
-        parent in policy_strategy(),
+        mut parent in policy_strategy(),
         tool_index in 0..TOOLS.len(),
         child_verb in prop_oneof![Just(PolicyVerb::Allow), Just(PolicyVerb::AskUser)],
     ) {
+        // A parent with no *rule* for the tool can still permit it through a
+        // permissive default, in which case the child widens nothing. Before
+        // the lattice rewrite, `narrow` ignored the parent default when
+        // judging a child rule and rejected those too. Pinned rather than
+        // assumed away, because assuming it rejects most generated cases.
+        parent.default_decision = PolicyVerb::Deny;
         let tool = TOOLS[tool_index];
         let exposed = parent_exposes(&parent, &call_tool_plan(tool, "{}"));
         prop_assume!(!exposed);

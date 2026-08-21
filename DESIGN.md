@@ -49,7 +49,7 @@ Guardrail and approval placement:
 
 - Input guardrails run in `Start`; tool guardrails run in `Act`; output guardrails run before a terminal reply finishes.
 - Every non-terminal action crosses `Approve`. `allow` proceeds to `Act`, `deny` terminates with a policy error, and `ask_user` serializes a paused `RunState` for later resume.
-- Sub-agent permissions can only narrow the parent's; every sub-agent tool call re-enters the loop at `Approve`. The narrowing check is currently by tool name, so naming an `AskUser` tool in a sub-agent's allowlist promotes it to `Allow` for that sub-agent (`AUTH-002`).
+- Sub-agent permissions can only narrow the parent's, over actions and arguments alike; every sub-agent tool call re-enters the loop at `Approve`. A sub-agent that needs more than its parent holds carries an explicit delegation grant naming the tool and the reason.
 - An approval prompt issues a ticket, and only an answer naming that ticket decides it. Anything else stays ordinary input.
 - `Plan` is also where input that arrived mid-run is claimed: the previous turn has been observed and the next request has not been assembled yet.
 

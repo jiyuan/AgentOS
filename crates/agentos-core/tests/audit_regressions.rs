@@ -5,15 +5,15 @@
 //! milestone that closes it has an unambiguous definition of done and cannot
 //! close by accident.
 //!
-//! **Every test here is `#[ignore]`d and red on purpose**, with one named
-//! exception. That is not a weakened test — the opposite. Each asserts the
-//! behavior the owning ADR specifies, against code that does not yet provide
-//! it, and names the milestone in its ignore reason. When that milestone
-//! lands, its PR deletes the `#[ignore]` and this file becomes the proof.
+//! **A test here is `#[ignore]`d while it is red on purpose.** That is not a
+//! weakened test — the opposite. Each asserts the behavior the owning ADR
+//! specifies, against code that does not yet provide it, and names the
+//! milestone in its ignore reason. When that milestone lands, its PR deletes
+//! the `#[ignore]` and the test becomes the proof.
 //!
-//! The exception is `an_equally_constrained_child_still_narrows`, which runs
-//! normally: it is the control that stops `AUTH-002` from being "closed" by a
-//! `narrow` that rejects every child policy.
+//! The `AUTH-002` group has been through that transition: those three run
+//! normally now, and are what a future change to `Policy::narrow` is measured
+//! against.
 //!
 //! Run them with:
 //!
@@ -50,15 +50,18 @@ fn tool_rule(tool: &str, decision: PolicyVerb, args: &[(&str, serde_json::Value)
 }
 
 // ---------------------------------------------------------------------------
-// M3 / AUTH-002 — narrowing is by tool name, so it is not narrowing
-// ADR-0001. `parent_exposes_tool` matches on the tool name alone.
+// M3 / AUTH-002 — CLOSED. Narrowing is exact over actions and arguments.
+//
+// These three were red against `parent_exposes_tool`, which matched on the
+// tool name alone. They run normally now and are the regression guard: the
+// first two must stay red-if-reverted, and the third stops the fix from being
+// a `narrow` that rejects everything.
 // ---------------------------------------------------------------------------
 
 /// A parent that gates `shell` behind an approval prompt is stating that a
 /// human decides each call. A sub-agent naming `shell` in its allowlist gets
 /// `Allow`, which removes the human without any record that it happened.
 #[test]
-#[ignore = "red until M3 / AUTH-002 makes narrowing exact; see docs/adr/0001-POLICY_NARROWING.md"]
 fn a_child_cannot_promote_a_parent_ask_user_to_allow() {
     let parent = Policy {
         rules: vec![tool_rule("shell", PolicyVerb::AskUser, &[])],
@@ -78,7 +81,6 @@ fn a_child_cannot_promote_a_parent_ask_user_to_allow() {
 /// The parent may use `file` for reads and nothing else. An unconstrained
 /// child `Allow` reaches `write`, which the parent never held.
 #[test]
-#[ignore = "red until M3 / AUTH-002 makes narrowing exact; see docs/adr/0001-POLICY_NARROWING.md"]
 fn a_child_cannot_drop_the_parents_argument_constraints() {
     let parent = Policy {
         rules: vec![tool_rule(
@@ -99,11 +101,9 @@ fn a_child_cannot_drop_the_parents_argument_constraints() {
     );
 }
 
-/// The control, and the only test in this file that is **green today and must
-/// stay green**: a child that is genuinely no wider than its parent still
-/// narrows. Not ignored, because the failure it guards against — "fix"
-/// narrowing by rejecting everything — would otherwise go unnoticed until
-/// someone tried to configure a sub-agent.
+/// The control: a child that is genuinely no wider than its parent still
+/// narrows. Guards against "fixing" narrowing by rejecting everything, which
+/// would otherwise go unnoticed until someone tried to configure a sub-agent.
 #[test]
 fn an_equally_constrained_child_still_narrows() {
     let parent = Policy {
