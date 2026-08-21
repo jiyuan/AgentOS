@@ -27,6 +27,13 @@
 //! an explicit `kill().await` somewhere in [`run`]. `a_killed_child_leaves_no_survivor`
 //! checks the pid is actually gone rather than trusting the mechanism.
 //!
+//! It reaps the *direct child only*. A child that forks before it is killed
+//! leaves a grandchild reparented to init and still running — see the ignored
+//! `a_killed_child_leaves_no_grandchild`, which is red on purpose until M4 in
+//! `docs/AUDIT_REMEDIATION_PLAN.md` terminates the process group. Read the
+//! deadline as a bound on the process this module started, not on everything
+//! that process went on to start.
+//!
 //! # Capping is not the same as not reading
 //!
 //! [`capped`] keeps the first `max_output_bytes` and then **keeps draining and
@@ -369,6 +376,72 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert!(!alive, "pid {pid} was left running after its deadline");
+    }
+
+    /// The case the test above sidesteps with `exec`.
+    ///
+    /// `kill_on_drop` signals the direct child and nothing else, so a shell
+    /// that forks before it is killed leaves a grandchild reparented to init
+    /// and still running past the deadline the caller asked for. That is the
+    /// orphan `a_killed_child_leaves_no_survivor`'s own comment names and then
+    /// avoids, which made "no orphan process" a claim no test checked.
+    ///
+    /// Ignored because it is red on purpose: M4 in
+    /// `docs/AUDIT_REMEDIATION_PLAN.md` terminates the process group rather
+    /// than the direct child, and this is the test that will show it worked.
+    /// Run with `cargo test -p agentos-core -- --ignored a_killed_child_leaves_no_grandchild`.
+    #[tokio::test]
+    #[ignore = "red until M4 terminates the process group; see AUDIT_REMEDIATION_PLAN.md"]
+    async fn a_killed_child_leaves_no_grandchild() {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(
+            &(std::process::id(), std::thread::current().id()),
+            &mut hasher,
+        );
+        let pid_file = std::env::temp_dir().join(format!(
+            "agentos-grandchild-probe-{:016x}",
+            std::hash::Hasher::finish(&hasher)
+        ));
+        let _ = std::fs::remove_file(&pid_file);
+
+        // `sleep 10` rather than 30: long enough to outlast the 300ms deadline
+        // and the poll window below by a wide margin, short enough that a
+        // surviving orphan cleans itself up soon after the test reports.
+        let args = vec![
+            "-c".to_owned(),
+            format!("sleep 10 & echo $! > {}; sleep 10", pid_file.display()),
+        ];
+        let mut spec = exec("sh", &args);
+        spec.timeout = Duration::from_millis(300);
+        let error = run(spec).await.expect_err("the shell must not complete");
+        assert!(matches!(error, ExecError::TimedOut { .. }));
+
+        let pid = std::fs::read_to_string(&pid_file)
+            .expect("the shell recorded its grandchild's pid")
+            .trim()
+            .to_owned();
+        let _ = std::fs::remove_file(&pid_file);
+
+        let mut alive = true;
+        for _ in 0..20 {
+            let probe = std::process::Command::new("kill")
+                .args(["-0", &pid])
+                .output()
+                .expect("kill -0 runs");
+            if !probe.status.success() {
+                alive = false;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // Best effort: do not leave the orphan behind for the next test.
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid])
+            .output();
+        assert!(
+            !alive,
+            "grandchild pid {pid} outlived the deadline its parent was killed for"
+        );
     }
 
     #[tokio::test]

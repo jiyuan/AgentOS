@@ -1,11 +1,18 @@
 //! Roadmap X2: the sandbox is enforced by the kernel, or it is not claimed.
 //!
-//! Every test that asserts *enforcement* skips loudly when this machine has no
-//! backend, printing the reason. That is deliberate and the item asks for it: a
-//! sandbox test that quietly passes on a kernel without Landlock is worse than
-//! no test, because it reports a guarantee nobody is making.
+//! Every test below asserts *enforcement*, so on a platform AgentOS claims to
+//! sandbox — Linux and macOS — a missing backend is a failure, not a skip. The
+//! earlier version of this file skipped instead, which made the whole suite
+//! green on a kernel without Landlock: a test that reports a guarantee nobody
+//! is making is worse than no test (`TEST-001` in
+//! `docs/AUDIT_REMEDIATION_PLAN.md`).
 //!
-//! Run with `-- --nocapture` to see which of these actually ran.
+//! The one named exception is `AGENTOS_ALLOW_UNSANDBOXED_TESTS=1`, for a
+//! machine that genuinely cannot enforce one — an old kernel, a container
+//! without the Landlock LSM. It downgrades the failure to a loud skip. CI must
+//! not set it; that is what makes the exception visible rather than hidden.
+//!
+//! Run with `-- --nocapture` to see which mechanism enforced each test.
 
 use agentos_core::sandbox::{availability, Sandbox};
 use agentos_core::tools::call_isolated_subprocess;
@@ -15,14 +22,36 @@ use agentos_proto::{ToolCall, ToolCallId};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Skip with a reason, or return the mechanism doing the enforcing.
-macro_rules! enforced_or_skip {
+/// The mechanism doing the enforcing, or a failure.
+///
+/// On Linux and macOS an unavailable sandbox fails: those are the platforms the
+/// `SandboxMode` contract is written against, so "no backend here" is a real
+/// regression and not a property of the test. Everywhere else there is nothing
+/// to enforce and the test skips.
+macro_rules! enforced_or_fail {
     ($test:literal) => {
         match availability() {
             agentos_core::sandbox::Availability::Enforced(mechanism) => mechanism,
             agentos_core::sandbox::Availability::Unavailable(reason) => {
-                eprintln!("skipping {}: {reason}", $test);
-                return;
+                if !cfg!(any(target_os = "linux", target_os = "macos")) {
+                    eprintln!("skipping {}: {reason}", $test);
+                    return;
+                }
+                if std::env::var_os("AGENTOS_ALLOW_UNSANDBOXED_TESTS").is_some() {
+                    eprintln!(
+                        "skipping {}: {reason} \
+                         (AGENTOS_ALLOW_UNSANDBOXED_TESTS is set)",
+                        $test
+                    );
+                    return;
+                }
+                panic!(
+                    "{} needs an enforced sandbox on this platform, and there is \
+                     none: {reason}. Set AGENTOS_ALLOW_UNSANDBOXED_TESTS=1 to \
+                     downgrade this to a skip on a machine that cannot provide \
+                     one.",
+                    $test
+                );
             }
         }
     };
@@ -83,7 +112,7 @@ async fn write_attempt(sandbox: &Sandbox, target: &Path) -> bool {
 /// workspace.
 #[tokio::test]
 async fn a_read_only_child_cannot_write_to_the_workspace() {
-    let mechanism = enforced_or_skip!("a_read_only_child_cannot_write_to_the_workspace");
+    let mechanism = enforced_or_fail!("a_read_only_child_cannot_write_to_the_workspace");
     let workspace = temp_dir("read-only");
     let target = workspace.join("forbidden.txt");
 
@@ -109,7 +138,7 @@ async fn a_read_only_child_cannot_write_to_the_workspace() {
 /// sandbox from a `cwd`.
 #[tokio::test]
 async fn a_read_only_child_cannot_write_outside_it_either() {
-    enforced_or_skip!("a_read_only_child_cannot_write_outside_it_either");
+    enforced_or_fail!("a_read_only_child_cannot_write_outside_it_either");
     let workspace = temp_dir("read-only-outside");
     let Some(elsewhere) = outside_dir("read-only") else {
         eprintln!("skipping a_read_only_child_cannot_write_outside_it_either: nowhere writable outside the workspace");
@@ -131,7 +160,7 @@ async fn a_read_only_child_cannot_write_outside_it_either() {
 /// sandbox's scope unclear.
 #[tokio::test]
 async fn a_read_only_child_can_still_read() {
-    enforced_or_skip!("a_read_only_child_can_still_read");
+    enforced_or_fail!("a_read_only_child_can_still_read");
     let workspace = temp_dir("read-only-reads");
     let readable = workspace.join("readable.txt");
     std::fs::write(&readable, "contents").expect("fixture is writable from the test");
@@ -158,7 +187,7 @@ async fn a_read_only_child_can_still_read() {
 /// workspace and nothing outside it.
 #[tokio::test]
 async fn a_workspace_write_child_writes_inside_and_not_outside() {
-    enforced_or_skip!("a_workspace_write_child_writes_inside_and_not_outside");
+    enforced_or_fail!("a_workspace_write_child_writes_inside_and_not_outside");
     let workspace = temp_dir("workspace-write");
     // Not another temp dir: `workspace_write` grants the temp dir on purpose,
     // so "outside" has to mean somewhere the mode really does refuse.
@@ -188,7 +217,7 @@ async fn a_workspace_write_child_writes_inside_and_not_outside() {
 /// grandchild is bound by the same rules.
 #[tokio::test]
 async fn a_grandchild_inherits_the_sandbox() {
-    enforced_or_skip!("a_grandchild_inherits_the_sandbox");
+    enforced_or_fail!("a_grandchild_inherits_the_sandbox");
     let workspace = temp_dir("grandchild");
     let sandbox = Sandbox::new(SandboxMode::ReadOnly, workspace.clone());
     let target = workspace.join("via-grandchild.txt");
@@ -223,7 +252,7 @@ async fn a_grandchild_inherits_the_sandbox() {
 /// the sandbox working.
 #[tokio::test]
 async fn dev_null_stays_writable() {
-    enforced_or_skip!("dev_null_stays_writable");
+    enforced_or_fail!("dev_null_stays_writable");
     let workspace = temp_dir("dev-null");
     let sandbox = Sandbox::new(SandboxMode::ReadOnly, workspace.clone());
 
@@ -263,7 +292,7 @@ async fn full_access_is_unrestricted_on_every_platform() {
 /// it starts.
 #[tokio::test]
 async fn the_isolation_worker_runs_under_its_sandbox() {
-    enforced_or_skip!("the_isolation_worker_runs_under_its_sandbox");
+    enforced_or_fail!("the_isolation_worker_runs_under_its_sandbox");
     let workspace = temp_dir("worker");
     let Some(elsewhere) = outside_dir("worker") else {
         eprintln!("skipping the_isolation_worker_runs_under_its_sandbox: nowhere writable outside the workspace");
@@ -332,7 +361,7 @@ async fn the_isolation_worker_runs_under_its_sandbox() {
 /// the tool anyway — is the one outcome nobody asked for.
 #[tokio::test]
 async fn an_unbuildable_sandbox_fails_the_call() {
-    enforced_or_skip!("an_unbuildable_sandbox_fails_the_call");
+    enforced_or_fail!("an_unbuildable_sandbox_fails_the_call");
     // Under a root this process cannot write to, so it cannot be created
     // either — a directory that is merely absent is created on demand.
     let missing = PathBuf::from("/agentos-sandbox-uncreatable/workspace");
