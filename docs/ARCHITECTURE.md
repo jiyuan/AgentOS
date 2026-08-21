@@ -33,11 +33,14 @@ external capability crosses a narrow trait or policy boundary.
 - Guardrails inspect content; approval checks permission.
 - One module assembles every provider request, and every request records what
   it was made of.
-- The session log is append-only. What the model sees is a projection over that
-  log, never a rewrite of it.
+- The session log is append-only, and what the model sees is a projection over
+  that log rather than a rewrite of it — except for `/clear`, which still
+  deletes items outright (M6).
 - Passive memory retrieval hydrates planning context; explicit memory mutation
   goes through tools and approval.
-- Sub-agent permissions can only narrow parent permissions.
+- Sub-agent permissions can only narrow parent permissions — today by tool
+  name, so a sub-agent naming an `AskUser` tool receives it as `Allow`
+  (`AUTH-002`).
 - External implementation contracts live in `agentos-interfaces`.
 - Workspace-owned content is data, not a dependency of core crates.
 - Runtime paths are injected by CLI/gateway construction, not inferred from
@@ -321,8 +324,9 @@ telemetry, and silently never sent.
 - **Manifest.** Each call returns a `PromptManifest`, recorded as a
   `RequestHeader` in the trace, so "what did the model see" is answered from the
   trace rather than by re-reading the code.
-- **Projection.** The session log is append-only. `prompt::projection` computes
-  the model-visible view over it. A *checkpoint* is an ordinary transcript item
+- **Projection.** The session log is append-only — `/clear` excepted, see M6 in
+  [`AUDIT_REMEDIATION_PLAN.md`](AUDIT_REMEDIATION_PLAN.md).
+  `prompt::projection` computes the model-visible view over it. A *checkpoint* is an ordinary transcript item
   that summarizes an inclusive range of earlier positions; the projection folds
   that range out. This is what lets compaction, fork, and elision each be a read
   rather than a bespoke mutation path.

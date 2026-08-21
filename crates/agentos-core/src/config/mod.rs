@@ -57,7 +57,9 @@ pub struct WorkspaceConfig {
     /// Where the subprocess worker that runs sandboxed tools is found.
     pub isolation: IsolationConfig,
     /// Sub-agents this agent may delegate to. Each carries its own tools and a
-    /// policy that can only narrow the parent's.
+    /// policy that cannot reach an action the parent does not hold. Narrowing
+    /// is checked by tool name, so naming a tool the parent gates behind
+    /// `ask_user` grants it to the sub-agent outright.
     pub subagents: Vec<SubAgentConfig>,
     /// MCP servers to connect to.
     pub mcp_servers: Vec<McpServerConfig>,

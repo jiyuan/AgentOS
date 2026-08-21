@@ -49,7 +49,7 @@ Guardrail and approval placement:
 
 - Input guardrails run in `Start`; tool guardrails run in `Act`; output guardrails run before a terminal reply finishes.
 - Every non-terminal action crosses `Approve`. `allow` proceeds to `Act`, `deny` terminates with a policy error, and `ask_user` serializes a paused `RunState` for later resume.
-- Sub-agent permissions can only narrow the parent's; every sub-agent tool call re-enters the loop at `Approve`.
+- Sub-agent permissions can only narrow the parent's; every sub-agent tool call re-enters the loop at `Approve`. The narrowing check is currently by tool name, so naming an `AskUser` tool in a sub-agent's allowlist promotes it to `Allow` for that sub-agent (`AUTH-002`).
 - An approval prompt issues a ticket, and only an answer naming that ticket decides it. Anything else stays ordinary input.
 - `Plan` is also where input that arrived mid-run is claimed: the previous turn has been observed and the next request has not been assembled yet.
 
@@ -57,7 +57,7 @@ Guardrail and approval placement:
 
 One module, `crates/agentos-core/src/prompt/`, is the only path from a run's context to the messages a provider sees. Every contribution is a named section, and every call returns a manifest recorded in the trace, so "what did the model see" is answered from the trace rather than by re-reading the code.
 
-The session log beneath it is append-only. What the model sees is a *projection* over that log: a checkpoint item summarizes an inclusive range of earlier positions and the projection folds that range out. Compaction, tool-output elision, and conversation fork are therefore all reads, never rewrites — which is what keeps the record of what actually happened intact while what the model reads shrinks.
+The session log beneath it is append-only on every path but one. What the model sees is a *projection* over that log: a checkpoint item summarizes an inclusive range of earlier positions and the projection folds that range out. Compaction, tool-output elision, and conversation fork are therefore all reads, never rewrites — which is what keeps the record of what actually happened intact while what the model reads shrinks. The exception is `/clear`, which today deletes a conversation's items outright instead of projecting them away; M6 replaces it with an epoch marker.
 
 Pressure is estimated per request, relieved first by eliding already-spilled tool output and then, if that is not enough, by summarizing the oldest span. A provider that rejects a request for length is the one trigger that is never an estimate: the loop forces one compaction and retries once.
 

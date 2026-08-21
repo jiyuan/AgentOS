@@ -12,11 +12,14 @@ Highlights:
   prompts that only the ticket they issued can answer
 - one module that assembles every provider request, and a manifest on each
   request recording what went into it
-- an append-only session log with projected views: tool-output spill, elision
-  under context pressure, span compaction, and conversation fork
+- a session log that is append-only under tool-output spill, elision under
+  context pressure, span compaction, and conversation fork — each a projected
+  view rather than a rewrite (`/clear` is the one path that still deletes)
 - pluggable extension traits (`Channel`, `Tool`, `Skill`, `McpClient`,
   `Memory`, `Session`, `SemanticIndex`, `Orchestrator`)
-- sub-agents and routing whose permissions can only narrow the parent's
+- sub-agents and routing that cannot reach a tool the parent does not hold
+  (a tool the parent *does* hold is currently granted to the sub-agent
+  unconditionally — see `AUTH-002` in `docs/AUDIT_REMEDIATION_PLAN.md`)
 - scoped three-layer memory (session, working, long-term) on a SQLite reference
   backend, with optional vector retrieval
 - static and stdio MCP-backed tools, kernel-sandboxed (Landlock/Seatbelt) for

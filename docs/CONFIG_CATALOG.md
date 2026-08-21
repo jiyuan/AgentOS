@@ -72,7 +72,7 @@ Every key `agent.toml` accepts, derived from the config structs. Edit the doc co
 | `isolation` | `IsolationConfig` | (table) | Where the subprocess worker that runs sandboxed tools is found. |
 | `isolation.worker_path` | `Option<PathBuf>` | (unset) | *(undocumented — see `config/undocumented.txt`)* |
 | `isolation.worker_path_env` | `Option<String>` | (unset) | *(undocumented — see `config/undocumented.txt`)* |
-| `subagents` | `Vec<SubAgentConfig>` | (none) | Sub-agents this agent may delegate to. Each carries its own tools and a policy that can only narrow the parent's. |
+| `subagents` | `Vec<SubAgentConfig>` | (none) | Sub-agents this agent may delegate to. Each carries its own tools and a policy that cannot reach an action the parent does not hold. Narrowing is checked by tool name, so naming a tool the parent gates behind `ask_user` grants it to the sub-agent outright. |
 | `subagents.name` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
 | `subagents.id` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
 | `subagents.description` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
