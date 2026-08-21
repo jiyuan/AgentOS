@@ -38,7 +38,7 @@ table.
 cd /workspace/agentos
 git log --oneline -3                                            # HEAD 224f070, tree clean
 grep -rn "PrincipalKeyV1\|SenderIdentity\|SessionKey" crates/    # zero hits
-ls docs/adr                                                      # absent
+ls docs/adr                                                      # written by ADR-001
 sed -n '38,52p'   scripts/package-release.sh                     # one workspace file shipped
 sed -n '5,7p'     scripts/install-agentos.sh                     # ~/.agentos, not ~/.local
 sed -n '148,207p' crates/agentos-core/src/approve/mod.rs         # parent_exposes_tool
@@ -242,7 +242,8 @@ constraint that drives it, so it can be challenged with evidence.
 
 Priority: P0
 Size: S — documentation and red tests only
-Status: **not started**
+Status: **in progress** — `ADR-001` and `DOC-001` done; `TEST-001` partial
+(deliverables 1, 4, and 5 landed; 2, 3, and 6 outstanding)
 Dependencies: none
 
 Deliverables:
@@ -301,7 +302,9 @@ Primary files: `DESIGN.md`, `README.md`, `AGENTS.md`, `docs/ARCHITECTURE.md`,
 
 Priority: P0
 Size: S — configuration only; the mechanism it needs already exists
-Status: **not started**
+Status: **done** — closed by `CFG-000`, verified by
+`crates/agentos-core/tests/shipped_config_policy.rs` (9 tests against the real
+`workspace/agent.toml`; reverting the config alone fails 6 of them)
 Dependencies: none
 
 This was item 8 of the old identity milestone (`AUTH-003`), gated behind
@@ -874,37 +877,36 @@ previous revision of this plan buried them inside milestones sized in weeks.
 ## 10. Pull-request slices
 
 Keep changes independently reviewable. Do not combine persistence migrations,
-policy semantics, and new features in one PR. **Every slice below is `not
-started`**; the previous revision marked ten of them complete without a
-corresponding commit.
+policy semantics, and new features in one PR. The `Status` column is evidence:
+a slice moves off `not started` only when the named artifact exists in the tree.
 
-| Slice | Milestone | Scope | Depends on |
-|---|---|---|---|
-| `ADR-001` | M0 | Resolve narrowing, sandbox, identity, request, audit, clear, and streaming contracts as ADRs under `docs/adr/` | — |
-| `DOC-001` | M0 | Correct the three overstated claims in README / AGENTS.md / DESIGN.md | — |
-| `TEST-001` | M0 | Un-weaken `enforced_or_skip!` and the orphan test; add red tests for each P0/P1 finding | ADR-001 |
-| `CFG-000` | M1 | Conservative shipped policy, command profiles, and shell argument validation | — |
-| `REL-001` | M2 | Self-contained release workspace and documentation, with a clean-room archive checker | TEST-001 |
-| `REL-002` | M2 | Installer/wrapper contract, one install layout, pathless resume, clean-room smoke | REL-001 |
-| `CI-001` | M2 | Portable spill/golden tests and a real macOS Seatbelt probe | TEST-001 |
-| `ID-001` | M3 | Typed principal and injective namespace | ADR-001 |
-| `ID-002` | M3 | Versioned persistence migration and collision report | ID-001 |
-| `AUTH-001` | M3 | Remote sender authentication and approval binding | ID-001 |
-| `AUTH-002` | M3 | Exact policy lattice and explicit delegation grants | ADR-001, TEST-001 |
-| `SBX-001` | M4 | Fail-closed registry and executor capability protocol | ADR-001 |
-| `FS-001` | M4 | Validated path segments and no-follow containment | TEST-001 |
-| `PROC-001` | M4 | Minimal tool environment and process-group termination | SBX-001 |
-| `NET-001` | M4 | Egress policy and bounded HTTP | TEST-001 |
-| `ING-001` | M4 | Attachment and frame limits | ID-001 |
-| `REQ-001` | M5 | Unified provider-call gateway, request kinds, compaction usage accounting | ADR-001 |
-| `AUD-001` | M6 | Durable, redacted safety events | REQ-001, ID-001 |
-| `STATE-001` | M6 | Clear epochs, denial semantics, terminal output gate, `act()` policy re-assertion | AUD-001 |
-| `CFG-001` | M7 | Unknown-key rejection and effective-config inventory | ADR-001 |
-| `MEM-001` | M7 | Effective memory policy, domains, shared writes, retention | ID-001, CFG-001, CFG-000 |
-| `SPILL-001` | M7 | Opaque spill locator and scoped retrieval | FS-001 |
-| `GW-001` | M8 | Durable ingress, WAL, maintenance leadership, atomic state files, shutdown | ID-002 |
-| `MCP-001` | M8 | Standard lifecycle, request-id correlation, bounds, interoperability, server isolation | SBX-001 |
-| `CI-002` | M9 | Required platform, artifact, gateway, migration, and semver gates | prior slices |
+| Slice | Milestone | Scope | Depends on | Status |
+|---|---|---|---|---|
+| `ADR-001` | M0 | Resolve narrowing, sandbox, identity, request, audit, clear, and streaming contracts as ADRs under `docs/adr/` | — | **done** — [`docs/adr/`](adr/README.md), seven records |
+| `DOC-001` | M0 | Correct the three overstated claims in README / AGENTS.md / DESIGN.md | — | **done** — also `docs/ARCHITECTURE.md` and the `subagents` doc comment |
+| `TEST-001` | M0 | Un-weaken `enforced_or_skip!` and the orphan test; add red tests for each P0/P1 finding | ADR-001 | **partial** — `enforced_or_fail!` and `a_killed_child_leaves_no_grandchild` landed; per-finding red tests outstanding |
+| `CFG-000` | M1 | Conservative shipped policy, command profiles, and shell argument validation | — | **done** — `crates/agentos-core/tests/shipped_config_policy.rs` |
+| `REL-001` | M2 | Self-contained release workspace and documentation, with a clean-room archive checker | TEST-001 | not started |
+| `REL-002` | M2 | Installer/wrapper contract, one install layout, pathless resume, clean-room smoke | REL-001 | not started |
+| `CI-001` | M2 | Portable spill/golden tests and a real macOS Seatbelt probe | TEST-001 | not started |
+| `ID-001` | M3 | Typed principal and injective namespace | ADR-001 | not started |
+| `ID-002` | M3 | Versioned persistence migration and collision report | ID-001 | not started |
+| `AUTH-001` | M3 | Remote sender authentication and approval binding | ID-001 | not started |
+| `AUTH-002` | M3 | Exact policy lattice and explicit delegation grants | ADR-001, TEST-001 | not started |
+| `SBX-001` | M4 | Fail-closed registry and executor capability protocol | ADR-001 | not started |
+| `FS-001` | M4 | Validated path segments and no-follow containment | TEST-001 | not started |
+| `PROC-001` | M4 | Minimal tool environment and process-group termination | SBX-001 | not started |
+| `NET-001` | M4 | Egress policy and bounded HTTP | TEST-001 | not started |
+| `ING-001` | M4 | Attachment and frame limits | ID-001 | not started |
+| `REQ-001` | M5 | Unified provider-call gateway, request kinds, compaction usage accounting | ADR-001 | not started |
+| `AUD-001` | M6 | Durable, redacted safety events | REQ-001, ID-001 | not started |
+| `STATE-001` | M6 | Clear epochs, denial semantics, terminal output gate, `act()` policy re-assertion | AUD-001 | not started |
+| `CFG-001` | M7 | Unknown-key rejection and effective-config inventory | ADR-001 | not started |
+| `MEM-001` | M7 | Effective memory policy, domains, shared writes, retention | ID-001, CFG-001, CFG-000 | not started |
+| `SPILL-001` | M7 | Opaque spill locator and scoped retrieval | FS-001 | not started |
+| `GW-001` | M8 | Durable ingress, WAL, maintenance leadership, atomic state files, shutdown | ID-002 | not started |
+| `MCP-001` | M8 | Standard lifecycle, request-id correlation, bounds, interoperability, server isolation | SBX-001 | not started |
+| `CI-002` | M9 | Required platform, artifact, gateway, migration, and semver gates | prior slices | not started |
 
 Each implementation PR should include the failing test, implementation, focused
 verification, documentation, and capability-matrix update in the same change.

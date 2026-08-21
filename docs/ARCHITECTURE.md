@@ -35,12 +35,12 @@ external capability crosses a narrow trait or policy boundary.
   it was made of.
 - The session log is append-only, and what the model sees is a projection over
   that log rather than a rewrite of it — except for `/clear`, which still
-  deletes items outright (M6).
+  deletes items outright ([ADR-0006](adr/0006-CLEAR_EPOCH.md), M6).
 - Passive memory retrieval hydrates planning context; explicit memory mutation
   goes through tools and approval.
 - Sub-agent permissions can only narrow parent permissions — today by tool
   name, so a sub-agent naming an `AskUser` tool receives it as `Allow`
-  (`AUTH-002`).
+  ([ADR-0001](adr/0001-POLICY_NARROWING.md), `AUTH-002`).
 - External implementation contracts live in `agentos-interfaces`.
 - Workspace-owned content is data, not a dependency of core crates.
 - Runtime paths are injected by CLI/gateway construction, not inferred from
