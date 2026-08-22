@@ -53,7 +53,7 @@ something that no longer exists — the two-way ratchet
 | Span compaction | Stable | all | `[limits]` | The summarizer records a `compaction` header and its tokens reach run totals; totals across a compaction are larger than before M5 because the old ones omitted them | integration, golden |
 | Tool-output elision under context pressure | Stable | all | `[limits]` | — | integration, golden |
 | Conversation fork | Stable | all | — | — | integration |
-| Tool-output spill | Stable | all | `[limits]` | The locator is an absolute host path embedded in a model-visible retrieval hint, and lands in the durable transcript (M7) | integration |
+| Tool-output spill | Stable | all | `[limits]`, `[spill]` | The locator is opaque (`spill:<run>/<artifact>`) and carries no host path into the transcript; retrieval is `spill_read`, authorized by the transcript that cites it | integration |
 | Token estimation and calibration | Stable | all | — | Heuristic, not a tokenizer; two rates, calibrated per provider | integration |
 
 ## Tools
@@ -71,6 +71,7 @@ something that no longer exists — the two-way ratchet
 | `tool:job_status` | Stable | all | `[resources.tools]`, `[jobs]` | — | integration |
 | `tool:job_output` | Stable | all | `[resources.tools]`, `[jobs]` | — | integration |
 | `tool:job_kill` | Stable | all | `[resources.tools]`, `[jobs]` | — | integration |
+| `tool:spill_read` | Stable | all | `[resources.tools]`, `[spill]` | Reads back a tool result that outgrew the inline cap. A `spill:` locator is not a path; it resolves only inside the configured store, through an `openat(O_NOFOLLOW)` walk, and only when the calling run's own transcript cites it. Registered only when a spill store is configured | unit, integration |
 | Background jobs outliving their turn | Stable | all | `[jobs]` | Fenced to the conversation that started them | integration |
 | Static (in-process) MCP tools | Stable | all | `[[mcp_servers]]` | — | unit |
 | stdio MCP transport | **Preview** | all | `[[mcp_servers]]` | Not MCP: no `initialize`, no `protocolVersion`, no capability negotiation, no request-id correlation — one stray line desynchronizes every later call. Unbounded channel and `read_line`. **No test module and no integration test anywhere** (M8) | none |

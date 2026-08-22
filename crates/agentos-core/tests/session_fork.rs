@@ -14,7 +14,7 @@
 
 use agentos_core::memory::{InMemorySession, SqliteStore};
 use agentos_core::prompt;
-use agentos_core::spill::{SpillSource, SpillStore, SPILL_LOCATOR_KEY};
+use agentos_core::spill::{SpillLocator, SpillSource, SpillStore, SPILL_LOCATOR_KEY};
 use agentos_interfaces::session::{Item, Session, Transcript};
 use agentos_proto::{ConversationId, Message, MessageRole, RunId, ToolCallId};
 use serde_json::Value;
@@ -317,21 +317,24 @@ async fn spill_locators_in_a_seeded_prefix_resolve_from_the_child() {
     assert_eq!(locator, saved.locator.as_str());
 
     // The artifact is readable from the child's side with nothing copied: one
-    // file on disk, referenced by two conversations.
-    let content = std::fs::read_to_string(locator).expect("the artifact resolves");
+    // file on disk, referenced by two conversations. Resolved through the
+    // store, because a locator is not a path (M7 / `SPILL-001`).
+    let parsed = SpillLocator::parse(locator).expect("the locator parses");
+    let mut content = String::new();
+    std::io::Read::read_to_string(
+        &mut store.open(&parsed).expect("the artifact resolves"),
+        &mut content,
+    )
+    .expect("the artifact reads");
     assert_eq!(content, "the full output the parent's tool produced");
     // Read the run directory off the locator rather than rebuilding its name:
     // the store sanitizes path segments, and this test is about the fork, not
     // about that rule.
-    let run_dir = PathBuf::from(locator)
-        .parent()
-        .expect("a locator names a file inside the store")
-        .to_path_buf();
+    let run_dir = store.root().join(parsed.run());
     let files: Vec<_> = std::fs::read_dir(&run_dir)
         .expect("the run directory exists")
         .collect();
     assert_eq!(files.len(), 1, "forking must not duplicate spilled output");
-    assert!(run_dir.starts_with(store.root()));
 }
 
 // ---------------------------------------------------------------------------

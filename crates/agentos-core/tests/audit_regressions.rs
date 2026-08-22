@@ -5,23 +5,17 @@
 //! milestone that closes it has an unambiguous definition of done and cannot
 //! close by accident.
 //!
-//! **A test here is `#[ignore]`d while it is red on purpose.** That is not a
-//! weakened test — the opposite. Each asserts the behavior the owning ADR
-//! specifies, against code that does not yet provide it, and names the
-//! milestone in its ignore reason. When that milestone lands, its PR deletes
-//! the `#[ignore]` and the test becomes the proof.
+//! **A test here was `#[ignore]`d while it was red on purpose.** That was not
+//! a weakened test — the opposite. Each asserts the behavior the owning ADR
+//! specifies, against code that did not yet provide it, and named the
+//! milestone in its ignore reason. When that milestone landed, its commit
+//! deleted the `#[ignore]` and the test became the proof.
 //!
-//! The `AUTH-002`, `ID-001`, `SBX-001`, `FS-001`, and `PROC-001` groups have
-//! been through that transition: those nine run normally now, and are what a
-//! future change to `Policy::narrow`, to namespace encoding, to registry
-//! dispatch, to filesystem containment, or to the child environment is
-//! measured against.
-//!
-//! Run them with:
-//!
-//! ```sh
-//! cargo test -p agentos-core --test audit_regressions -- --ignored
-//! ```
+//! **Every test in this file now runs.** `AUTH-002`, `ID-001`, `SBX-001`,
+//! `FS-001`, `PROC-001`, and `SPILL-001` have all been through that
+//! transition, and the file is now what a future change to `Policy::narrow`,
+//! to namespace encoding, to registry dispatch, to filesystem containment, to
+//! the child environment, or to the spill locator is measured against.
 //!
 //! Findings that could not be expressed as a test at this layer are listed at
 //! the bottom of the file, with the reason. They are not silently absent.
@@ -366,16 +360,18 @@ async fn a_child_process_does_not_inherit_the_parents_secrets() {
 }
 
 // ---------------------------------------------------------------------------
-// M7 / SPILL-001 — the spill locator is an absolute host path
-// `spill/mod.rs` renders the locator with `path.to_string_lossy()` and embeds
-// it in a model-visible retrieval hint that lands in the durable transcript.
+// M7 / SPILL-001 — the spill locator was an absolute host path
+// `spill/mod.rs` rendered the locator with `path.to_string_lossy()` and
+// embedded it in a model-visible retrieval hint that landed in the durable
+// transcript. Closed; the assertions below are now a regression gate.
 // ---------------------------------------------------------------------------
 
-/// The model is handed a real filesystem path and told to open it with `file`.
-/// That leaks the host layout into the transcript and makes the locator a
-/// capability anyone who can echo a string can forge.
+/// The model used to be handed a real filesystem path and told to open it with
+/// `file`. That leaked the host layout into the transcript and made the
+/// locator a capability anyone who could echo a string could forge.
+///
+/// Green since M7 / `SPILL-001`.
 #[tokio::test]
-#[ignore = "red until M7 / SPILL-001 replaces the locator with an opaque, owner-scoped handle"]
 async fn a_spill_locator_is_not_a_host_path() {
     use agentos_core::spill::{SpillSource, SpillStore};
     use agentos_proto::RunId;

@@ -539,7 +539,8 @@ impl WorkspaceConfig {
         for tool in &self.resources.tools.enabled {
             match tool.as_ref() {
                 "shell" | "http" | "file" | "memory" | "skill_validate" | "cron_create"
-                | "cron_list" | "cron_remove" | "job_status" | "job_output" | "job_kill" => {}
+                | "cron_list" | "cron_remove" | "job_status" | "job_output" | "job_kill"
+                | "spill_read" => {}
                 other => return Err(format!("unknown resources.tools.enabled entry '{other}'")),
             }
         }
@@ -1023,6 +1024,7 @@ stages = [
                 Arc::from("job_status"),
                 Arc::from("job_output"),
                 Arc::from("job_kill"),
+                Arc::from("spill_read"),
             ]
         );
         assert_eq!(config.resources.mcp.enabled, vec![Arc::from("remote_echo")]);

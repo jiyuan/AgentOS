@@ -763,10 +763,11 @@ Current state, verified field by field:
   authority.
 - `config/undocumented.txt` is 118 lines with a 16-line header — exactly 102
   undocumented keys, already behind a two-way ratchet.
-- `spill/mod.rs:170-178` renders the locator as an **absolute host path** and
-  embeds it in a `retrieval_hint` instructing the model to open it with the `file`
-  tool. It lands in the durable transcript (`loop/items.rs:67-80`) and is
-  re-emitted into later provider requests on elision (`prompt/prune.rs:144-152`).
+- `spill/mod.rs:170-178` rendered the locator as an **absolute host path** and
+  embedded it in a `retrieval_hint` instructing the model to open it with the
+  `file` tool. It landed in the durable transcript (`loop/items.rs:67-80`) and
+  was re-emitted into later provider requests on elision
+  (`prompt/prune.rs:144-152`). **Closed by `SPILL-001`.**
 
 Deliverables:
 
@@ -790,8 +791,12 @@ Deliverables:
    hand-written `println!`s that will go stale. Derive it from the same
    `config/catalog.rs` machinery that generates the catalogs.
 8. Reduce undocumented stable config keys from 102 to zero.
-9. Replace absolute spill paths exposed to the model with an opaque,
-   owner-scoped locator and a dedicated retrieval operation.
+9. **Done.** `SpillLocator` is `spill:<run>/<artifact>` — two sanitized
+   segments, no host path in the transcript. Retrieval is the `spill_read`
+   tool, resolved through `paths::RootDir` against the configured store and
+   authorized by the calling run's own transcript citing the locator. The
+   `file` tool is no longer the retrieval path, which also fixes a spill root
+   outside the workspace being unreadable.
 10. Add retention and quotas for sessions, traces, attachments, spill, gateway
     logs, jobs, and access records.
 
@@ -806,7 +811,12 @@ Acceptance criteria:
 - Count, age, and byte retention prune deterministic seeded data.
 - A large tool result is recovered through the normal loop and registry with an
   opaque locator, including when spill storage is outside the workspace.
-- A locator cannot read another run's spill or an arbitrary file.
+  **Met** — `tests/spill_retrieval.rs` drives a real run whose store is under
+  the system temp directory.
+- A locator cannot read another run's spill or an arbitrary file. **Met** —
+  a locator naming an artifact that genuinely exists but that this
+  conversation was never given reads nothing, and the check was shown to fail
+  when removed. A path-shaped locator is refused before the store is touched.
 
 Primary files: `crates/agentos-core/src/config/`, `crates/agentos-core/src/runtime/`,
 `crates/agentos-core/src/memory/`, `crates/agentos-core/src/spill/mod.rs`,
@@ -971,7 +981,7 @@ a slice moves off `not started` only when the named artifact exists in the tree.
 | `STATE-001` | M6 | Clear epochs, denial semantics, terminal output gate, `act()` policy re-assertion | AUD-001 | **done** — `session_epochs` + `agentos-gateway purge`, `RunError::StructuralDenial`, `loop/output.rs` gating every synthesized terminal reply, private `Authorization` on `ActCtx` + `tests/loop_transitions.rs`, `[channels] provisional_streaming = false` |
 | `CFG-001` | M7 | Unknown-key rejection and effective-config inventory | ADR-001 | not started |
 | `MEM-001` | M7 | Effective memory policy, domains, shared writes, retention | ID-001, CFG-001, CFG-000 | not started |
-| `SPILL-001` | M7 | Opaque spill locator and scoped retrieval | FS-001 | not started |
+| `SPILL-001` | M7 | Opaque spill locator and scoped retrieval | FS-001 | **done** — `spill:<run>/<artifact>`, `spill_read` tool authorized by the transcript, contained by `RootDir` |
 | `GW-001` | M8 | Durable ingress, WAL, maintenance leadership, atomic state files, shutdown | ID-002 | not started |
 | `MCP-001` | M8 | Standard lifecycle, request-id correlation, bounds, interoperability, server isolation | SBX-001 | not started |
 | `CI-002` | M9 | Required platform, artifact, gateway, migration, and semver gates | prior slices | not started |

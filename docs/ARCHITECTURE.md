@@ -408,6 +408,18 @@ telemetry, and silently never sent.
   still see what a tool produced. Artifact directories are `0700`, files are
   created `O_EXCL` at `0600`, and every path segment is sanitized by replacement
   so a model-supplied id cannot escape the root.
+
+  The locator is `spill:<run>/<artifact>` and is deliberately *not* a path. It
+  used to be the absolute host path, handed to the model with an instruction to
+  open it with the `file` tool — which put the host's layout into a durable
+  transcript, made the locator authorize nothing (anything that could read one
+  path could read any path), and left a spill root outside the workspace
+  unreadable, since `file` is contained to the workspace. Retrieval is now the
+  `spill_read` tool: it resolves against the configured store through
+  `paths::RootDir`, and refuses a locator the calling run's own transcript does
+  not cite. That last check is the authorization — the model may re-read what
+  it was told about and nothing else — and it spans turns for free, because a
+  conversation's transcript does.
 - **Elision.** Under pressure, the middle of an already-recorded tool result is
   replaced by a marker citing its locator. Free, deterministic, and a view
   rather than a rewrite.

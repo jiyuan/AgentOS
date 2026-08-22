@@ -224,12 +224,11 @@ mod tests {
 
     #[test]
     fn a_spilled_result_points_at_its_artifact() {
+        let locator = SpillLocator::for_tests("run-1", "shell-tool_1.txt");
         let spill = SpillRef {
-            locator: SpillLocator::for_tests("/spill/run-1/shell-tool_1.txt"),
             bytes: (CAP + 100) as u64,
-            retrieval_hint: Arc::from(
-                "The full output was saved to /spill/run-1/shell-tool_1.txt.",
-            ),
+            retrieval_hint: Arc::from(format!("The full output was saved as {locator}.")),
+            locator,
         };
 
         let item = tool_result_item(oversized(), CAP, Some(spill));
@@ -238,12 +237,15 @@ mod tests {
         assert!(item
             .message
             .content
-            .contains("/spill/run-1/shell-tool_1.txt"));
+            .contains("spill:run-1/shell-tool_1.txt"));
         assert!(!item.message.content.contains("request a smaller range"));
         assert_eq!(
             item.message.metadata.get("content_spill_locator"),
-            Some(&Value::String("/spill/run-1/shell-tool_1.txt".to_owned()))
+            Some(&Value::String("spill:run-1/shell-tool_1.txt".to_owned()))
         );
+        // M7 / `SPILL-001`: what lands in the durable transcript is the
+        // locator, not the host path it used to be.
+        assert!(!item.message.content.contains("/spill/"));
     }
 
     #[test]

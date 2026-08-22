@@ -147,8 +147,8 @@ fn elide(message: &mut Message) -> Option<usize> {
     {
         Some(locator) => format!(
             "\n\n[... {removed} bytes elided from the middle of this tool result to fit the \
-             context window. The full output is at {locator}; read the range you need rather \
-             than re-running the call ...]\n\n"
+             context window. The full output is {locator}; read the range you need with the \
+             `spill_read` tool rather than re-running the call ...]\n\n"
         ),
         None => format!(
             "\n\n[... {removed} bytes elided from the middle of this tool result to fit the \

@@ -11,6 +11,24 @@
 //! the model can read or grep the rest on demand and an operator can still see
 //! what a tool actually produced.
 //!
+//! # What the locator is, and is not
+//!
+//! `spill:<run>/<artifact>`. It names a place inside *this store* and nothing
+//! else. It used to be the absolute host path, rendered with
+//! `to_string_lossy()` and handed to the model with an instruction to open it
+//! with the `file` tool (M7 / `SPILL-001`). Three things were wrong with that:
+//! the host's directory layout landed in a durable transcript that a provider
+//! sees on every later turn; the locator was a *path*, so anything that could
+//! read a path could read any path; and a spill root outside the workspace was
+//! unreadable, because the `file` tool is contained to the workspace.
+//!
+//! Retrieval is now the `spill_read` tool, which resolves a locator against
+//! this store through `paths::RootDir` — so the two segments cannot escape it
+//! even if something upstream let a hostile one through — and refuses a
+//! locator the calling run's own transcript does not mention. That last check
+//! is the authorization: a model may re-read what it was told about, and
+//! nothing else. It spans turns for free, because the transcript does.
+//!
 //! # Storage safety
 //!
 //! Spilled output is whatever a tool read or fetched, so it is treated as
@@ -32,10 +50,12 @@
 //!
 //! The plan grouped artifacts by conversation, but `RunState` carries no
 //! conversation id and adding one is a breaking `agentos-interfaces` change for
-//! no gain here: a spill is produced by one tool call in one run, the locator
-//! is absolute so retrieval is unaffected either way, and a run directory is
-//! self-contained for retention sweeps.
+//! no gain here: a spill is produced by one tool call in one run, a run
+//! directory is self-contained for retention sweeps, and the run segment in a
+//! locator is a *name*, not the thing that authorizes retrieval — so grouping
+//! does not decide who can read what.
 
+use crate::paths::{ContainmentError, RootDir};
 use agentos_proto::{RunId, ToolCallId};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -52,31 +72,88 @@ pub enum SpillError {
     },
 }
 
-/// An opaque handle to one spilled artifact.
+/// The scheme every locator carries, so a string that is not one is obvious
+/// at a glance to a reader and to the parser.
+pub const SPILL_SCHEME: &str = "spill:";
+
+/// An opaque handle to one spilled artifact: `spill:<run>/<artifact>`.
 ///
-/// The local store renders it as a filesystem path; a future remote store
-/// could render a URI or key. Consumers pass it through with the store's
-/// [`SpillRef::retrieval_hint`] rather than assuming a path.
+/// Two sanitized segments and nothing else. Not a path — a locator says where
+/// something is *in this store*, and a store is free to be a directory today
+/// and an object bucket later without the transcripts written in between
+/// meaning something different.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SpillLocator(Arc<str>);
+pub struct SpillLocator {
+    run: Arc<str>,
+    artifact: Arc<str>,
+    rendered: Arc<str>,
+}
 
 impl SpillLocator {
+    fn new(run: String, artifact: String) -> Self {
+        let rendered = Arc::from(format!("{SPILL_SCHEME}{run}/{artifact}"));
+        Self {
+            run: Arc::from(run),
+            artifact: Arc::from(artifact),
+            rendered,
+        }
+    }
+
+    /// Read a locator back out of a transcript or a tool argument.
+    ///
+    /// Rejects anything that is not exactly two segments under the scheme.
+    /// This is a parse, not a validation pass over a path: there is no input
+    /// it accepts that names something outside a store, so the containment in
+    /// `paths::RootDir` beneath it is a second answer to the same question
+    /// rather than the only one.
+    pub fn parse(raw: &str) -> Option<Self> {
+        let body = raw.strip_prefix(SPILL_SCHEME)?;
+        let (run, artifact) = body.split_once('/')?;
+        if run.is_empty() || artifact.is_empty() || artifact.contains('/') {
+            return None;
+        }
+        // The segments a store writes are already `[A-Za-z0-9_.-]`; anything
+        // else came from somewhere that had no business minting a locator.
+        let acceptable = |segment: &str| {
+            segment.len() <= MAX_SEGMENT_CHARS
+                && segment
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+                && segment != "."
+                && segment != ".."
+        };
+        if !acceptable(run) || !acceptable(artifact) {
+            return None;
+        }
+        Some(Self::new(run.to_owned(), artifact.to_owned()))
+    }
+
+    /// The run directory this artifact lives in.
+    pub fn run(&self) -> &str {
+        &self.run
+    }
+
+    /// The artifact's file name within that directory.
+    pub fn artifact(&self) -> &str {
+        &self.artifact
+    }
+
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.rendered
     }
 
     /// Build a locator without touching the disk. Test-only: production
     /// locators are minted by [`SpillStore::save_text`], which is what makes
     /// them meaningful.
     #[cfg(test)]
-    pub fn for_tests(path: &str) -> Self {
-        Self(Arc::from(path))
+    pub fn for_tests(run: &str, artifact: &str) -> Self {
+        Self::new(run.to_owned(), artifact.to_owned())
     }
 }
 
 impl fmt::Display for SpillLocator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.rendered)
     }
 }
 
@@ -161,21 +238,36 @@ impl SpillStore {
         source: &SpillSource<'_>,
         content: &str,
     ) -> Result<SpillRef, SpillError> {
-        let dir = self.root.join(safe_segment(source.run_id.as_str()));
+        let run = safe_segment(source.run_id.as_str());
+        let artifact = spill_file_name(source);
+        let dir = self.root.join(&run);
         create_private_dir(&dir).await?;
+        write_private_file(&dir.join(&artifact), content).await?;
 
-        let path = dir.join(spill_file_name(source));
-        write_private_file(&path, content).await?;
-
-        let locator = SpillLocator(Arc::from(path.to_string_lossy().into_owned()));
+        let locator = SpillLocator::new(run, artifact);
         Ok(SpillRef {
             bytes: content.len() as u64,
             retrieval_hint: Arc::from(format!(
-                "The full output was saved to {locator}. Read it with the `file` tool \
+                "The full output was saved as {locator}. Read it with the `spill_read` tool \
                  (use `offset`/`tail` for a slice) instead of re-running the command."
             )),
             locator,
         })
+    }
+
+    /// Open the artifact a locator names, contained to this store.
+    ///
+    /// The walk is `paths::RootDir`'s, one component at a time with
+    /// `openat(O_NOFOLLOW)` — so a symlink planted inside the store between
+    /// the write and the read is refused rather than followed, and the two
+    /// segments cannot name anything above the root even if something
+    /// upstream minted a locator this store did not write.
+    ///
+    /// Authorization is *not* here. This answers "where is it"; whether the
+    /// caller may have it is the `spill_read` tool's question, and it asks the
+    /// transcript.
+    pub fn open(&self, locator: &SpillLocator) -> Result<std::fs::File, ContainmentError> {
+        RootDir::open(&self.root)?.open_file(Path::new(locator.run()).join(locator.artifact()))
     }
 
     /// Delete run directories whose newest artifact is older than `max_age`.
@@ -232,6 +324,11 @@ async fn newest_write(dir: &Path) -> Option<SystemTime> {
     newest
 }
 
+/// The cap `safe_segment` applies and [`SpillLocator::parse`] enforces. Well
+/// under any filesystem name limit, and short enough that a locator stays
+/// readable in a transcript.
+const MAX_SEGMENT_CHARS: usize = 64;
+
 /// One path segment built from untrusted text: every character outside
 /// `[A-Za-z0-9_]` becomes `_`, and the result is capped well under any
 /// filesystem name limit. `..`, `/`, and `\\` therefore cannot survive, so a
@@ -239,7 +336,7 @@ async fn newest_write(dir: &Path) -> Option<SystemTime> {
 fn safe_segment(raw: &str) -> String {
     let mut segment: String = raw
         .chars()
-        .take(64)
+        .take(MAX_SEGMENT_CHARS)
         .map(|character| {
             if character.is_ascii_alphanumeric() || character == '_' {
                 character
@@ -355,9 +452,20 @@ mod tests {
             .expect("saving succeeds");
 
         assert_eq!(saved.bytes, content.len() as u64);
-        let read = std::fs::read_to_string(saved.locator.as_str()).expect("the artifact reads");
+        // Read back through the store, because a locator is not a path any
+        // caller can open — which is the point of M7 / `SPILL-001`.
+        let mut read = String::new();
+        std::io::Read::read_to_string(
+            &mut store.open(&saved.locator).expect("the artifact opens"),
+            &mut read,
+        )
+        .expect("the artifact reads");
         assert_eq!(read, content, "the artifact must be byte-identical");
         assert!(saved.retrieval_hint.contains(saved.locator.as_str()));
+        assert!(
+            !saved.retrieval_hint.contains(&*root.to_string_lossy()),
+            "the hint must not put the host spill directory in the transcript"
+        );
     }
 
     #[tokio::test]
@@ -408,7 +516,11 @@ mod tests {
             .await
             .expect("saving succeeds");
 
-        let file = std::fs::metadata(saved.locator.as_str()).expect("artifact metadata");
+        let file = store
+            .open(&saved.locator)
+            .expect("the artifact opens")
+            .metadata()
+            .expect("artifact metadata");
         assert_eq!(file.permissions().mode() & 0o777, 0o600);
         let dir =
             std::fs::metadata(root.join(safe_segment(run.as_str()))).expect("directory metadata");
@@ -428,14 +540,16 @@ mod tests {
             .await
             .expect("saving succeeds");
 
-        let path = PathBuf::from(saved.locator.as_str());
-        assert!(
-            path.starts_with(&root),
-            "{} escaped {}",
-            path.display(),
-            root.display()
-        );
-        assert!(!saved.locator.as_str().contains(".."));
+        // The segments were sanitized, so the locator names a child of the
+        // root and nothing above it — and the store can still open it.
+        assert!(!saved.locator.run().contains(".."));
+        assert!(!saved.locator.artifact().contains(".."));
+        assert!(!saved.locator.run().contains('/'));
+        assert!(store.open(&saved.locator).is_ok());
+        assert!(root
+            .join(saved.locator.run())
+            .join(saved.locator.artifact())
+            .exists());
     }
     /// Retention removes a whole run's artifacts, not some of them: a
     /// conversation with half its locators resolving is worse than one with

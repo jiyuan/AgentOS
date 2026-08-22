@@ -278,8 +278,20 @@ impl AgentRuntime {
             workspace_config.jobs.max_concurrent,
             workspace_config.jobs.output_limit_bytes,
         ));
-        let mut tools =
-            build_parent_tools(&workspace_config, memory_manager.clone(), jobs.clone())?;
+        // Resolved here rather than beside the other paths below because the
+        // spill store needs it, and `spill_read` needs the store before the
+        // tool registry is built.
+        let resolved_workspace_root = absolutise(&paths.workspace_root);
+        // Spill artifacts live beside the other workspace-owned runtime state.
+        let spill = Some(Arc::new(SpillStore::new(
+            workspace_config.spill.root_in(&resolved_workspace_root),
+        )));
+        let mut tools = build_parent_tools(
+            &workspace_config,
+            memory_manager.clone(),
+            jobs.clone(),
+            spill.clone(),
+        )?;
         if let Some(path) = isolation_worker_path(&workspace_config) {
             tools = tools
                 .with_subprocess_isolation(path)
@@ -297,7 +309,6 @@ impl AgentRuntime {
         // MaxOrchestrators can hold a clone of it and dispatch skills (e.g.
         // web-research, skill-creator). Resolve to an absolute path so the
         // skills root is independent of the gateway process's CWD.
-        let resolved_workspace_root = absolutise(&paths.workspace_root);
         std::env::set_var("AGENTOS_HOME", &resolved_workspace_root);
         let resolved_skills_root = absolutise(&paths.skills_dir);
         let resolved_cron_dir = absolutise(&paths.cron_dir);
@@ -352,10 +363,6 @@ impl AgentRuntime {
         let task_workspace = Arc::new(TaskWorkspace::new(
             workspace_config.task_workspace.root.clone(),
         ));
-        // Spill artifacts live beside the other workspace-owned runtime state.
-        let spill = Some(Arc::new(SpillStore::new(
-            workspace_config.spill.root_in(&resolved_workspace_root),
-        )));
         let tool_result_inline_bytes = workspace_config.limits.tool_result_inline_bytes;
         let subagents = subagents.map(|registry| {
             registry

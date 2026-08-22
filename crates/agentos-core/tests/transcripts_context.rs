@@ -16,7 +16,7 @@ use agentos_core::memory::{
 };
 use agentos_core::orchestrator::{MaxOrchestrator, MemoryHydrationSettings};
 use agentos_core::runner::run_envelope;
-use agentos_core::spill::{ContentLimits, SpillStore, SPILL_LOCATOR_KEY};
+use agentos_core::spill::{ContentLimits, SpillLocator, SpillStore, SPILL_LOCATOR_KEY};
 use agentos_core::tools::ToolRegistry;
 use agentos_interfaces::session::Session;
 use agentos_interfaces::tool::Tool;
@@ -199,17 +199,28 @@ async fn golden_tool_result_spilled() {
         .find_map(|item| item.message.metadata.get(SPILL_LOCATOR_KEY))
         .and_then(Value::as_str)
         .expect("a spilled result records its locator");
-    let recovered = std::fs::read_to_string(locator).expect("the locator names a readable file");
+    let parsed = SpillLocator::parse(locator).expect("the locator parses");
+    let mut recovered = String::new();
+    std::io::Read::read_to_string(
+        &mut store
+            .open(&parsed)
+            .expect("the locator names a readable artifact"),
+        &mut recovered,
+    )
+    .expect("the artifact reads");
     assert_eq!(recovered, bulk_output(128));
 
-    // The locator is an absolute temp path, so it is redacted before pinning;
-    // the file *name* stays, because that is the part C2 derives.
-    let document = serde_json::to_string(&scenario(&llm, &transcript, &outcome))
-        .expect("scenario documents serialize")
-        .replace(&spill_root.path().to_string_lossy().to_string(), "<spill>");
+    // M7 / `SPILL-001`: nothing about the host reaches the transcript, so
+    // there is no temp path left to redact before pinning. The golden holds
+    // the locator verbatim, which is the point — it is stable across machines
+    // because it is not a path.
+    assert!(
+        !locator.contains(&*spill_root.path().to_string_lossy()),
+        "the locator leaked the host spill directory: {locator}"
+    );
     support::assert_golden(
         "tool_result_spilled",
-        &serde_json::from_str(&document).expect("redaction preserves valid JSON"),
+        &scenario(&llm, &transcript, &outcome),
     );
 }
 

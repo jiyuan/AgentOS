@@ -2,9 +2,10 @@ use crate::approve::{DelegationGrant, Policy, PolicyAction, PolicyRule, PolicyVe
 use crate::config::{LimitsConfig, SubAgentConfig, WorkspaceConfig};
 use crate::jobs::JobRegistry;
 use crate::memory::MemoryManager;
+use crate::spill::SpillStore;
 use crate::tools::{
     CronCreatorTool, CronListTool, CronRemoveTool, FileTool, HttpTool, JobKillTool, JobOutputTool,
-    JobStatusTool, MemoryTool, ShellTool, SkillValidateTool, ToolRegistry,
+    JobStatusTool, MemoryTool, ShellTool, SkillValidateTool, SpillReadTool, ToolRegistry,
 };
 use agentos_interfaces::tool::ToolSpec;
 use serde_json::Value;
@@ -15,6 +16,7 @@ pub(super) fn build_parent_tools(
     config: &WorkspaceConfig,
     memory_manager: Arc<MemoryManager>,
     jobs: Arc<JobRegistry>,
+    spill: Option<Arc<SpillStore>>,
 ) -> Result<ToolRegistry, String> {
     let mut tools = ToolRegistry::new();
     for tool in &config.resources.tools.enabled {
@@ -26,6 +28,17 @@ pub(super) fn build_parent_tools(
             "job_status" => tools.register(JobStatusTool::new(jobs.clone())),
             "job_output" => tools.register(JobOutputTool::new(jobs.clone())),
             "job_kill" => tools.register(JobKillTool::new(jobs.clone())),
+            // No store means nothing can spill, so nothing can cite a locator,
+            // so the tool would refuse every call. Leaving it out of the schema
+            // is more honest than offering the model one that cannot succeed.
+            "spill_read" => {
+                if let Some(store) = &spill {
+                    tools.register(SpillReadTool::new(store.clone()).with_limits(
+                        config.limits.file_read_bytes,
+                        config.limits.file_read_max_bytes,
+                    ));
+                }
+            }
             _ => register_builtin_tool(
                 &mut tools,
                 tool,
@@ -286,7 +299,13 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
 /// tool surface sees all of it: `docs/TOOL_CATALOG.md` describes these four in
 /// prose for the same reason, and `tests/capability_matrix.rs` checks the
 /// matrix against both lists.
-pub const RUNTIME_TOOL_NAMES: &[&str] = &["memory", "job_status", "job_output", "job_kill"];
+pub const RUNTIME_TOOL_NAMES: &[&str] = &[
+    "memory",
+    "job_status",
+    "job_output",
+    "job_kill",
+    "spill_read",
+];
 
 /// Register a built-in tool by name, bounded by the deployment's `[limits]`.
 ///
@@ -330,7 +349,11 @@ fn add_builtin_tool_policy(policy: &mut Policy, tool: &str) {
         // Reading and stopping *this conversation's own* jobs. The registry
         // fences every lookup by conversation, so there is nothing here to
         // gate that the fence does not already deny.
-        "http" | "skill_validate" | "job_status" | "job_output" | "job_kill" => {
+        // `spill_read` joins these because it reads back output the run
+        // itself produced, and only what its own transcript already cites
+        // (M7 / `SPILL-001`). Gating it would ask the user to approve seeing
+        // the rest of an answer they were already shown the start of.
+        "http" | "skill_validate" | "job_status" | "job_output" | "job_kill" | "spill_read" => {
             allow_tool_once(policy, Arc::from(tool))
         }
         "file" => {
@@ -809,6 +832,7 @@ mod tests {
             &config_with_parent_tools(&["http"]),
             memory,
             Arc::new(JobRegistry::default()),
+            None,
         )
         .expect("configured tools build");
 
@@ -896,7 +920,7 @@ mod tests {
             config.limits.directory_list_entries = limit;
             let memory = Arc::new(MemoryManager::new(Arc::new(InMemoryMemory::default())));
             let jobs = Arc::new(JobRegistry::default());
-            let tools = build_parent_tools(&config, memory, jobs).expect("tools build");
+            let tools = build_parent_tools(&config, memory, jobs, None).expect("tools build");
 
             // `read` on a directory is how the tool lists. `src` is relative
             // to the workspace root, which in a unit test is the crate

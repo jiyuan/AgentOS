@@ -25,18 +25,18 @@
     {
       "context_budget_tokens": 4096,
       "kind": "turn",
-      "pressure_percent": 7,
-      "prompt_estimated_tokens": 288,
+      "pressure_percent": 5,
+      "prompt_estimated_tokens": 241,
       "sections": [
         {
-          "chars": 950,
+          "chars": 761,
           "id": "transcript",
           "messages": 3,
-          "tokens": 257
+          "tokens": 210
         }
       ],
       "tool_tokens": 31,
-      "total_chars": 950,
+      "total_chars": 761,
       "total_messages": 3
     }
   ],
@@ -70,7 +70,7 @@
           ]
         },
         {
-          "content": "line 0000: the quick brown fox jumps over the lazy dog\nline 0001: the quick brown fox jumps over the lazy dog\nline 0002: the quick brown fox jumps over the lazy dog\nline 0003: the quick brown fox jumps over the lazy dog\nline 0004: the quick brown fox jumps over the lazy dog\nline 0005: the quick brown fox jumps over the lazy dog\nline 0006: the quick brown fox jumps over the lazy dog\nline 0007: the quick brown fox jumps over the lazy dog\nline 0008: the quick brown fox jumps over the lazy dog\nline 0009: the qu\n\n[tool result truncated inline: showing 512 of 7040 bytes. The full output was saved to <spill>/golden_spill/bulk-call_1.txt. Read it with the `file` tool (use `offset`/`tail` for a slice) instead of re-running the command.]",
+          "content": "line 0000: the quick brown fox jumps over the lazy dog\nline 0001: the quick brown fox jumps over the lazy dog\nline 0002: the quick brown fox jumps over the lazy dog\nline 0003: the quick brown fox jumps over the lazy dog\nline 0004: the quick brown fox jumps over the lazy dog\nline 0005: the quick brown fox jumps over the lazy dog\nline 0006: the quick brown fox jumps over the lazy dog\nline 0007: the quick brown fox jumps over the lazy dog\nline 0008: the quick brown fox jumps over the lazy dog\nline 0009: the qu\n\n[tool result truncated inline: showing 512 of 7040 bytes. The full output was saved as spill:golden_spill/bulk-call_1.txt. Read it with the `spill_read` tool (use `offset`/`tail` for a slice) instead of re-running the command.]",
           "role": "tool",
           "tool_call_id": "call-1"
         }
@@ -97,7 +97,7 @@
       ]
     },
     {
-      "content": "line 0000: the quick brown fox jumps over the lazy dog\nline 0001: the quick brown fox jumps over the lazy dog\nline 0002: the quick brown fox jumps over the lazy dog\nline 0003: the quick brown fox jumps over the lazy dog\nline 0004: the quick brown fox jumps over the lazy dog\nline 0005: the quick brown fox jumps over the lazy dog\nline 0006: the quick brown fox jumps over the lazy dog\nline 0007: the quick brown fox jumps over the lazy dog\nline 0008: the quick brown fox jumps over the lazy dog\nline 0009: the qu\n\n[tool result truncated inline: showing 512 of 7040 bytes. The full output was saved to <spill>/golden_spill/bulk-call_1.txt. Read it with the `file` tool (use `offset`/`tail` for a slice) instead of re-running the command.]",
+      "content": "line 0000: the quick brown fox jumps over the lazy dog\nline 0001: the quick brown fox jumps over the lazy dog\nline 0002: the quick brown fox jumps over the lazy dog\nline 0003: the quick brown fox jumps over the lazy dog\nline 0004: the quick brown fox jumps over the lazy dog\nline 0005: the quick brown fox jumps over the lazy dog\nline 0006: the quick brown fox jumps over the lazy dog\nline 0007: the quick brown fox jumps over the lazy dog\nline 0008: the quick brown fox jumps over the lazy dog\nline 0009: the qu\n\n[tool result truncated inline: showing 512 of 7040 bytes. The full output was saved as spill:golden_spill/bulk-call_1.txt. Read it with the `spill_read` tool (use `offset`/`tail` for a slice) instead of re-running the command.]",
       "role": "tool",
       "tool_call_id": "call-1"
     },

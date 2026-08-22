@@ -10,6 +10,7 @@ mod http;
 mod jobs;
 mod shell;
 mod skill_validate;
+mod spill;
 
 pub(crate) use common::{safe_workspace_path, skills_dir, workspace_root};
 pub use cron::{CronCreatorTool, CronListTool, CronRemoveTool};
@@ -20,3 +21,4 @@ pub use http::HttpTool;
 pub use jobs::{JobKillTool, JobOutputTool, JobStatusTool};
 pub use shell::ShellTool;
 pub use skill_validate::SkillValidateTool;
+pub use spill::{SpillReadTool, DEFAULT_SPILL_READ_BYTES, MAX_SPILL_READ_BYTES};
