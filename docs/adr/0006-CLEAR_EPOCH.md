@@ -1,6 +1,6 @@
 # ADR-0006 — `/clear` starts a new epoch; it does not delete
 
-- Status: accepted
+- Status: accepted; implemented by M6 / `STATE-001` except principal keying
 - Date: 2026-08-21
 - Milestone: M6
 
@@ -59,3 +59,25 @@ group conversation cannot clear another's state.
   visible history.
 - The explicit purge does delete, requires approval, and leaves a safety
   event.
+
+## Implementation notes
+
+`crates/agentos-core/src/memory/session_store.rs`, verified by
+`tests/session_epoch.rs`, which reads the log underneath the projection so
+"hidden" and "deleted" are actually distinguishable to the test.
+
+Two departures from the decision above:
+
+- **The epoch is keyed by conversation, not by principal.** `Session::load`
+  takes a bare `ConversationId`, so a per-principal epoch would be unreadable
+  by the one query that has to apply it. Principal keying arrives with M3
+  deliverable 2, which is where the `Session` semver break lives. Until then,
+  one participant's `/clear` in a group conversation clears the shared view —
+  stated in the capability matrix rather than left to be discovered.
+- **The purge does not cross `Approve`.** `Approve` gates what the *model* may
+  do; a purge is an operator's decision about their own records, with no run to
+  pause and no model asking, so routing it through the run policy would be a
+  category error. It is gated instead on shell access to the host and on naming
+  the conversation twice (`agentos-gateway purge --conversation ID --yes ID`),
+  which is what keeps it off the casual path — the point the decision was
+  actually making. The safety event is recorded as required.

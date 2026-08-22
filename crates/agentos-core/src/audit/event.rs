@@ -55,6 +55,13 @@ pub enum SafetyEventKind {
     DelegationGrantUsed,
     /// The run ended with an error rather than an answer.
     TerminalError,
+    /// An operator irreversibly deleted a conversation's session log.
+    ///
+    /// The one deletion the runtime performs on purpose, and therefore the one
+    /// that most needs a record that it happened
+    /// ([ADR-0006](../../../../docs/adr/0006-CLEAR_EPOCH.md)). `/clear` is not
+    /// this: it writes an epoch marker and removes nothing.
+    SessionPurged,
 }
 
 impl SafetyEventKind {
@@ -72,6 +79,7 @@ impl SafetyEventKind {
             Self::DelegationGrantIssued => "delegation_grant_issued",
             Self::DelegationGrantUsed => "delegation_grant_used",
             Self::TerminalError => "terminal_error",
+            Self::SessionPurged => "session_purged",
         }
     }
 }
@@ -107,6 +115,8 @@ pub enum SafetyOutcome {
     Used,
     /// The run ended badly.
     Failed,
+    /// Records were deleted, deliberately and by a human.
+    Purged,
 }
 
 impl SafetyOutcome {
@@ -124,6 +134,7 @@ impl SafetyOutcome {
             Self::Issued => "issued",
             Self::Used => "used",
             Self::Failed => "failed",
+            Self::Purged => "purged",
         }
     }
 }

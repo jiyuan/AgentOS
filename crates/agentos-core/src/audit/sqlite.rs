@@ -146,6 +146,7 @@ fn parse_kind(name: &str) -> SafetyEventKind {
         "delegation_grant_issued" => SafetyEventKind::DelegationGrantIssued,
         "delegation_grant_used" => SafetyEventKind::DelegationGrantUsed,
         "terminal_error" => SafetyEventKind::TerminalError,
+        "session_purged" => SafetyEventKind::SessionPurged,
         _ => SafetyEventKind::TerminalError,
     }
 }
@@ -163,6 +164,7 @@ fn parse_outcome(name: &str) -> SafetyOutcome {
         "issued" => SafetyOutcome::Issued,
         "used" => SafetyOutcome::Used,
         "failed" => SafetyOutcome::Failed,
+        "purged" => SafetyOutcome::Purged,
         _ => SafetyOutcome::Failed,
     }
 }

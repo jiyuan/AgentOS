@@ -18,7 +18,7 @@ the milestone that closes the gap.
 | [0003](0003-TYPED_PRINCIPAL.md) | One versioned principal keys every isolated resource; encoding is injective, and channels fail closed on identity | M3 (`ID-001`) |
 | [0004](0004-REQUEST_KINDS.md) | Every provider call has a kind and a recorded manifest — including kinds that contribute no transcript, which is what preserves routing's injection defence | M5 (`REQ-001`) |
 | [0005](0005-SAFETY_EVENTS.md) | Safety decisions are immutable append-only events; a deletion is never the record of an outcome | M6 (`AUD-001`) |
-| [0006](0006-CLEAR_EPOCH.md) | `/clear` writes an epoch marker; irreversible purge is a distinct authorized operation | M6 |
+| [0006](0006-CLEAR_EPOCH.md) | `/clear` writes an epoch marker; irreversible purge is a distinct authorized operation | M6 (`STATE-001`) |
 | [0007](0007-BUFFERED_OUTPUT.md) | Stable channels buffer behind output guardrails; streaming is opt-in and labelled provisional until guardrails are incremental | M6 |
 
 ## Writing a new one

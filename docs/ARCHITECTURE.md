@@ -42,8 +42,9 @@ that closes it.
 - One module assembles every provider request, and every request records what
   it was made of.
 - The session log is append-only, and what the model sees is a projection over
-  that log rather than a rewrite of it — except for `/clear`, which still
-  deletes items outright ([ADR-0006](adr/0006-CLEAR_EPOCH.md), M6).
+  that log rather than a rewrite of it — `/clear` included, which appends an
+  epoch marker ([ADR-0006](adr/0006-CLEAR_EPOCH.md)). The one deletion is the
+  `agentos-gateway purge` operator command.
 - Passive memory retrieval hydrates planning context; explicit memory mutation
   goes through tools and approval.
 - Sub-agent permissions can only narrow parent permissions, over actions and
@@ -374,12 +375,21 @@ telemetry, and silently never sent.
   trace rather than by re-reading the code. `RequestBuilder` is the single path
   from sections to messages *and* manifest, so a manifest cannot describe
   content that was not sent.
-- **Projection.** The session log is append-only — `/clear` excepted, see M6 in
-  [`AUDIT_REMEDIATION_PLAN.md`](AUDIT_REMEDIATION_PLAN.md).
-  `prompt::projection` computes the model-visible view over it. A *checkpoint* is an ordinary transcript item
+- **Projection.** The session log is append-only. `prompt::projection` computes
+  the model-visible view over it. A *checkpoint* is an ordinary transcript item
   that summarizes an inclusive range of earlier positions; the projection folds
   that range out. This is what lets compaction, fork, and elision each be a read
   rather than a bespoke mutation path.
+
+  `/clear` is the same idea one level down, in the store rather than in the
+  projection module: it appends to `session_epochs`, and `Session::load`
+  returns only items at or after the newest epoch. It lives there because the
+  epoch has to constrain every reader of `session_items` — `fork` included,
+  which would otherwise copy hidden history into a child — and a filter at the
+  call sites is a filter somebody forgets. The epoch is keyed by conversation
+  rather than by principal, which ADR-0006 asks for; that waits on `Session`
+  being principal-keyed (M3 deliverable 2), so in a group conversation one
+  participant's `/clear` still clears the shared view.
 - **Pressure.** `prompt::tokens` estimates how much of the context window a
   request occupies. It is a heuristic, not a tokenizer, and uses two rates
   because a 4:1 characters-per-token divisor badly under-counts CJK text.

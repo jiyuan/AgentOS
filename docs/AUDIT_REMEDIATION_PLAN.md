@@ -642,7 +642,7 @@ Primary files: `crates/agentos-core/src/prompt/mod.rs`,
 
 Priority: P1
 Size: M — ~400–600 LOC, and safety events have **no durable substrate today**
-Status: **deliverables 1–4 and 8 done**; 5–7 open (`STATE-001`)
+Status: **deliverables 1–5 and 8 done**; 6–7 open (`STATE-001`)
 Dependencies: M3, M4, M5
 
 Current state: `memory_access_log` (`memory/sqlite.rs:112`) is the only durable
@@ -680,11 +680,15 @@ Deliverables:
    tool call comes back as a `Denied` `ToolResult` and never becomes an error.
    State diagram updated in `DESIGN.md` and `docs/ARCHITECTURE.md` §7; both
    arms pinned in `tests/loop_transitions.rs`.
-5. Make `/clear` create a new session epoch or tombstone instead of
-   `DELETE FROM session_items` (`memory/sqlite.rs:145-152`).
-   `prompt/projection.rs` is the in-tree precedent — compaction already hides a
-   span without deleting it. If irreversible purge is required, expose it as a
-   distinct authorized operation.
+5. **Done.** `/clear` appends to `session_epochs` and removes nothing;
+   `Session::load` and `fork` both read from the newest epoch, and the filter
+   lives beside the queries in `memory/session_store.rs` rather than at call
+   sites. Irreversible purge is `SqliteStore::purge_session`, reachable only
+   from `agentos-gateway purge --conversation ID --yes ID`, which records a
+   `session_purged` safety event. **One gap against ADR-0006:** the epoch is
+   keyed by conversation, not by principal, because `Session::load` still takes
+   a bare `ConversationId` — that is M3 deliverable 2. In a group conversation
+   one participant's `/clear` therefore still clears the shared view.
 6. Route cancellation and every other terminal reply through the declared output
    policy.
 7. Default stable channels to buffered, guardrail-checked output.
@@ -711,7 +715,7 @@ Acceptance criteria:
   failed step too, under the `failed` phase.
 - Audit events do not expose raw secrets or unrestricted tool arguments. **Met**
   — canary test over every field of every stored event.
-- Normal `/clear` performs no session-item `DELETE`.
+- Normal `/clear` performs no session-item `DELETE`. **Met** — verified by reading the log underneath the projection, not just by loading.
 - A seeded output-policy violation emits zero user-visible bytes in stable mode.
 - A directly constructed `ActCtx` carrying a tool call cannot execute it without
   a policy decision. **Met** — it does not compile, verified by adding the

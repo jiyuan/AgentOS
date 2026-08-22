@@ -3,10 +3,10 @@ use super::{
 };
 use crate::audit::SafetyLogError;
 use agentos_interfaces::memory::{Memory, Query, Record, Selector};
-use agentos_interfaces::session::{Item, Session, SessionError, Transcript};
-use agentos_proto::{ConversationId, Namespace, RecordId};
+use agentos_interfaces::session::SessionError;
+use agentos_proto::{Namespace, RecordId};
 use async_trait::async_trait;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -82,6 +82,16 @@ impl SqliteStore {
 
             CREATE INDEX IF NOT EXISTS idx_session_items_conversation_ordinal
                 ON session_items(conversation_id, ordinal);
+
+            CREATE TABLE IF NOT EXISTS session_epochs (
+                row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT NOT NULL,
+                epoch_ordinal INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_session_epochs_conversation
+                ON session_epochs(conversation_id, epoch_ordinal);
             "#,
         )
         .map_err(memory_sqlite_error)?;
@@ -149,19 +159,12 @@ impl SqliteStore {
             .map_err(|_| SafetyLogError::Backend(Arc::from("sqlite store lock poisoned")))
     }
 
-    fn session_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, SessionError> {
+    pub(super) fn session_conn(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, Connection>, SessionError> {
         self.conn
             .lock()
             .map_err(|_| SessionError::Backend(Arc::from("sqlite store lock poisoned")))
-    }
-
-    pub fn clear_session(&self, conv_id: &ConversationId) -> Result<usize, SessionError> {
-        let conn = self.session_conn()?;
-        conn.execute(
-            "DELETE FROM session_items WHERE conversation_id = ?1",
-            params![conv_id.as_str()],
-        )
-        .map_err(session_sqlite_error)
     }
 }
 
@@ -505,119 +508,6 @@ impl SqliteStore {
     }
 }
 
-#[async_trait]
-impl Session for SqliteStore {
-    async fn load(&self, conv_id: &ConversationId) -> Result<Transcript, SessionError> {
-        let conn = self.session_conn()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT item_json \
-                 FROM session_items \
-                 WHERE conversation_id = ?1 \
-                 ORDER BY ordinal ASC",
-            )
-            .map_err(session_sqlite_error)?;
-        let rows = stmt
-            .query_map(params![conv_id.as_str()], |row| row.get::<_, String>(0))
-            .map_err(session_sqlite_error)?;
-
-        let mut transcript = Transcript::default();
-        for row in rows {
-            let item_json = row.map_err(session_sqlite_error)?;
-            transcript
-                .items
-                .push(serde_json::from_str(&item_json).map_err(session_json_error)?);
-        }
-        Ok(transcript)
-    }
-
-    async fn append(&self, conv_id: &ConversationId, items: Vec<Item>) -> Result<(), SessionError> {
-        if items.is_empty() {
-            return Ok(());
-        }
-
-        let mut conn = self.session_conn()?;
-        let tx = conn.transaction().map_err(session_sqlite_error)?;
-        let next_ordinal = tx
-            .query_row(
-                "SELECT COALESCE(MAX(ordinal) + 1, 0) FROM session_items WHERE conversation_id = ?1",
-                params![conv_id.as_str()],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(session_sqlite_error)?
-            .unwrap_or(0);
-
-        for (offset, item) in items.into_iter().enumerate() {
-            let offset = i64::try_from(offset).map_err(|_| {
-                SessionError::Backend(Arc::from("session append batch is too large"))
-            })?;
-            let item_json = serde_json::to_string(&item).map_err(session_json_error)?;
-            tx.execute(
-                "INSERT INTO session_items (conversation_id, ordinal, item_json) VALUES (?1, ?2, ?3)",
-                params![conv_id.as_str(), next_ordinal + offset, item_json],
-            )
-            .map_err(session_sqlite_error)?;
-        }
-
-        tx.commit().map_err(session_sqlite_error)
-    }
-
-    /// Copy a prefix with one statement (roadmap X6).
-    ///
-    /// The default implementation would deserialize every item, move it through
-    /// memory, and re-serialize it. Here the rows never leave the database, and
-    /// the ordinals carry over unchanged — which is what keeps a compaction
-    /// checkpoint's absolute positions meaningful in the child.
-    ///
-    /// The emptiness and self-fork checks happen inside the same transaction as
-    /// the copy, so a concurrent append to the target cannot slip between the
-    /// look and the write.
-    async fn fork(
-        &self,
-        source: &ConversationId,
-        boundary: usize,
-        child_id: &ConversationId,
-    ) -> Result<usize, SessionError> {
-        if source == child_id {
-            return Err(SessionError::Backend(Arc::from(format!(
-                "cannot fork conversation '{}' onto itself",
-                source.as_str()
-            ))));
-        }
-        let boundary = i64::try_from(boundary).unwrap_or(i64::MAX);
-
-        let mut conn = self.session_conn()?;
-        let tx = conn.transaction().map_err(session_sqlite_error)?;
-        let existing: i64 = tx
-            .query_row(
-                "SELECT COUNT(*) FROM session_items WHERE conversation_id = ?1",
-                params![child_id.as_str()],
-                |row| row.get(0),
-            )
-            .map_err(session_sqlite_error)?;
-        if existing > 0 {
-            return Err(SessionError::Backend(Arc::from(format!(
-                "fork target '{}' already holds {existing} items; seeding it would interleave \
-                 two histories",
-                child_id.as_str()
-            ))));
-        }
-
-        let seeded = tx
-            .execute(
-                "INSERT INTO session_items (conversation_id, ordinal, item_json) \
-                 SELECT ?1, ordinal, item_json FROM session_items \
-                 WHERE conversation_id = ?2 AND ordinal < ?3 \
-                 ORDER BY ordinal ASC",
-                params![child_id.as_str(), source.as_str(), boundary],
-            )
-            .map_err(session_sqlite_error)?;
-        tx.commit().map_err(session_sqlite_error)?;
-        Ok(seeded)
-    }
-}
-
 fn ensure_memory_record_columns(conn: &Connection) -> Result<(), MemoryError> {
     for (name, definition) in [
         ("updated_at", "TEXT"),
@@ -670,7 +560,7 @@ pub(crate) fn memory_sqlite_error(err: rusqlite::Error) -> MemoryError {
     MemoryError::Backend(Arc::from(err.to_string()))
 }
 
-fn session_sqlite_error(err: rusqlite::Error) -> SessionError {
+pub(super) fn session_sqlite_error(err: rusqlite::Error) -> SessionError {
     SessionError::Backend(Arc::from(err.to_string()))
 }
 
@@ -678,7 +568,7 @@ pub(crate) fn memory_json_error(err: serde_json::Error) -> MemoryError {
     MemoryError::Backend(Arc::from(err.to_string()))
 }
 
-fn session_json_error(err: serde_json::Error) -> SessionError {
+pub(super) fn session_json_error(err: serde_json::Error) -> SessionError {
     SessionError::Backend(Arc::from(err.to_string()))
 }
 
@@ -712,7 +602,7 @@ fn fts_match_query(input: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentos_proto::{AgentId, ChannelId, TaskId};
+    use agentos_proto::{AgentId, ChannelId, ConversationId, TaskId};
 
     fn caller() -> MemoryCaller {
         MemoryCaller {

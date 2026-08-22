@@ -14,6 +14,7 @@ mod qdrant;
 mod query;
 mod reflection;
 mod scope;
+mod session_store;
 mod sqlite;
 mod sqlite_vec;
 

@@ -1,4 +1,5 @@
 use agentos_cli::slash::{self, Parsed, SessionUsage, SlashCommand};
+use agentos_core::audit::{SafetyEvent, SafetyEventKind, SafetyJournal, SafetyOutcome};
 use agentos_core::channels::{feishu::FeishuChannel, telegram::TelegramChannel};
 use agentos_core::config::WorkspaceConfig;
 use agentos_core::crons::{CronSchedule, CronStore, MemoryMaintenanceCron};
@@ -202,6 +203,7 @@ fn run() -> Result<(), String> {
         }
         "serve" => serve(&config),
         "migrate" => migrate(&config),
+        "purge" => purge(&config),
         "-h" | "--help" | "help" => {
             usage();
             Ok(())
@@ -213,7 +215,7 @@ fn run() -> Result<(), String> {
 fn usage() {
     eprintln!(
         "\
-Usage: agentos-gateway <start|stop|restart|status|config|catalog|calibrate|migrate> [OPTIONS]
+Usage: agentos-gateway <start|stop|restart|status|config|catalog|calibrate|migrate|purge> [OPTIONS]
 
 Manage the AgentOS gateway as a persistent background service.
 
@@ -238,6 +240,11 @@ Subcommands:
              on, which the old rows do not record; `--agent NAME` likewise.
              `--assume-literal-underscores` accepts the literal reading of ids
              the old encoder made ambiguous — see the report before using it.
+  purge      Irreversibly delete one conversation's session log. This is not
+             `/clear`, which hides history behind an epoch marker and removes
+             nothing; this is the operation for somebody asking to be
+             forgotten. Requires `--conversation ID` and `--yes ID` naming the
+             same conversation twice, and records a safety event.
 
 All workspace paths derive from $AGENTOS_HOME (set in .env or the process env).
 If unset, $AGENTOS_HOME defaults to the parent dir of the loaded .env file,
@@ -1158,6 +1165,69 @@ fn runtime_paths(config: &ServiceConfig) -> RuntimePaths {
 /// place and the report is the part that needs reading: the old encoding lost
 /// information, so some namespaces cannot be migrated without a human deciding
 /// what they meant.
+/// Irreversibly delete a conversation's session log.
+///
+/// Deliberately here and not behind a slash command
+/// ([ADR-0006](../../../../../docs/adr/0006-CLEAR_EPOCH.md)). `Approve` gates
+/// what the *model* is allowed to do; a purge is an operator's decision about
+/// their own records, so gating it on the run policy would be a category
+/// error — there is no run to pause and no model asking. What it is gated on
+/// instead is shell access to the host and naming the conversation twice, so
+/// it cannot be reached by a message in the conversation it would destroy.
+fn purge(config: &ServiceConfig) -> Result<(), String> {
+    let flags: Vec<String> = env::args().skip(2).collect();
+    let value = |name: &str| {
+        let mut args = flags.iter();
+        while let Some(flag) = args.next() {
+            if let Some(inline) = flag.strip_prefix(&format!("{name}=")) {
+                return Some(inline.to_owned());
+            }
+            if flag == name {
+                return args.next().cloned();
+            }
+        }
+        None
+    };
+
+    let conversation =
+        value("--conversation").ok_or_else(|| "--conversation ID is required".to_owned())?;
+    let confirmed = value("--yes").ok_or_else(|| {
+        format!(
+            "--yes {conversation} is required: this deletes the log irreversibly, and `/clear` \
+             is what you want if you only need the model to start fresh"
+        )
+    })?;
+    if confirmed != conversation {
+        return Err(format!(
+            "--yes named '{confirmed}' but --conversation named '{conversation}'"
+        ));
+    }
+
+    let db_path = session_path(config);
+    if !db_path.exists() {
+        return Err(format!("no database at {}", db_path.display()));
+    }
+    let store = SqliteStore::open(&db_path)
+        .map_err(|err| format!("failed to open {}: {err}", db_path.display()))?;
+    let conversation_id = ConversationId::new(conversation.clone());
+    let removed = store
+        .purge_session(&conversation_id)
+        .map_err(|err| format!("failed to purge '{conversation}': {err}"))?;
+
+    // The one deletion the runtime performs on purpose, so it is the one that
+    // most needs a record that it happened (M6 / `AUD-001`).
+    SafetyJournal::new(Some(&store)).record(
+        SafetyEvent::new(
+            SafetyEventKind::SessionPurged,
+            SafetyOutcome::Purged,
+            conversation.clone(),
+        )
+        .with_detail(format!("{removed} session items deleted by an operator")),
+    );
+    println!("purged {removed} item(s) from conversation '{conversation}'");
+    Ok(())
+}
+
 fn migrate(config: &ServiceConfig) -> Result<(), String> {
     let flags: Vec<String> = env::args().skip(2).collect();
     let has = |name: &str| flags.iter().any(|flag| flag == name);

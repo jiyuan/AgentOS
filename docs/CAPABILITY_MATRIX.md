@@ -49,7 +49,7 @@ something that no longer exists — the two-way ratchet
 | Capability | Status | Platforms | Required config | Limitations | Test level |
 |---|---|---|---|---|---|
 | Single request authority (`prompt::assemble`) with `RequestHeader` | Stable | all | — | Every provider call declares a `RequestKind` and records a header through `prompt::gateway`; `scripts/check-provider-calls.sh` fails CI on a direct call added elsewhere ([ADR-0004](adr/0004-REQUEST_KINDS.md)) | unit, integration, golden |
-| Append-only session log with projection | Stable | all | — | `/clear` deletes rather than projecting ([ADR-0006](adr/0006-CLEAR_EPOCH.md), M6) | integration, golden |
+| Append-only session log with projection | Stable | all | — | `/clear` appends an epoch marker and deletes nothing; the epoch is per conversation rather than per principal until `Session` is principal-keyed (M3 deliverable 2). Deletion is `agentos-gateway purge` ([ADR-0006](adr/0006-CLEAR_EPOCH.md)) | integration, golden |
 | Span compaction | Stable | all | `[limits]` | The summarizer records a `compaction` header and its tokens reach run totals; totals across a compaction are larger than before M5 because the old ones omitted them | integration, golden |
 | Tool-output elision under context pressure | Stable | all | `[limits]` | — | integration, golden |
 | Conversation fork | Stable | all | — | — | integration |
