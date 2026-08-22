@@ -42,7 +42,7 @@ something that no longer exists — the two-way ratchet
 | `max_turns` budget | Stable | all | `[agent] max_turns` | — | integration |
 | Tool batches | Stable | all | — | — | integration |
 | Per-tool deadlines | Stable | all | `[limits]` | A deadline bounds the direct child only; a grandchild survives it (M4) | integration |
-| Durable safety events (`safety_events`) | Stable | all | a SQLite session/memory store | Nine event kinds, append-only, principal-stamped. Tool arguments enter only as a SHA-256 digest and reasons are capped at 512 bytes. A failed append is logged as `safety_log_write_failed` and does not fail the run; an entrypoint with no store records nothing ([ADR-0005](adr/0005-SAFETY_EVENTS.md)) | unit, integration |
+| Durable safety events (`safety_events`) | Stable | all | a SQLite session/memory store | Eleven event kinds, append-only, principal-stamped. Tool arguments enter only as a SHA-256 digest and reasons are capped at 512 bytes. A failed append is logged as `safety_log_write_failed` and does not fail the run; an entrypoint with no store records nothing ([ADR-0005](adr/0005-SAFETY_EVENTS.md)) | unit, integration |
 
 ## Prompt and session
 

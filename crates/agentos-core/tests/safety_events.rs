@@ -13,7 +13,8 @@ use agentos_core::audit::{SafetyEventKind, SafetyLog, SafetyOutcome, StoredSafet
 use agentos_core::memory::SqliteStore;
 use agentos_core::r#loop::ToolGuardrailEntry;
 use agentos_core::runner::{
-    resume_run, run_envelope, PausedRun, ResumeDecision, RunOutcome, RunnerDeps,
+    resume_run, run_envelope, JsonlTraceSink, PausedRun, ResumeDecision, RunOutcome, RunnerDeps,
+    TraceSink,
 };
 use agentos_core::tools::ToolRegistry;
 use agentos_interfaces::guardrail::{GuardrailError, GuardrailOutcome, ToolGuardrail};
@@ -176,6 +177,27 @@ fn deps<'a>(
     safety_log: &'a dyn SafetyLog,
     tool_guardrails: &'a [ToolGuardrailEntry<'a>],
 ) -> RunnerDeps<'a> {
+    deps_with_trace(
+        orchestrator,
+        session,
+        policy,
+        tools,
+        safety_log,
+        tool_guardrails,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deps_with_trace<'a>(
+    orchestrator: &'a dyn Orchestrator,
+    session: &'a SqliteStore,
+    policy: &'a Policy,
+    tools: &'a ToolRegistry,
+    safety_log: &'a dyn SafetyLog,
+    tool_guardrails: &'a [ToolGuardrailEntry<'a>],
+    trace_sink: Option<&'a dyn TraceSink>,
+) -> RunnerDeps<'a> {
     RunnerDeps {
         orchestrator,
         session,
@@ -184,7 +206,7 @@ fn deps<'a>(
         max_turns: 8,
         active_agent: AgentId::new(AGENT),
         tools: Some(tools),
-        trace_sink: None,
+        trace_sink,
         task_workspace: None,
         policy,
         subagents: None,
@@ -544,5 +566,46 @@ fn assert_no_canary(events: &[StoredSafetyEvent]) {
     assert!(
         !rendered.contains(CANARY),
         "a tool argument reached the safety log: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_run_still_persists_the_trace_it_had_built() {
+    // Deliverable 3 of M6. `RunLoopState::step` consumes the state, so before
+    // `StepFailure` the runner's error path had nothing to write and a run
+    // that ended badly left no trace file at all — the runs most worth
+    // reconstructing recording the least.
+    let tree = support::temp_tree("safety-trace");
+    let path = tree.path().join("store.sqlite");
+    let traces = tree.path().join("traces");
+    let store = store_at(&path);
+    let sink = JsonlTraceSink::new(&traces);
+    let orchestrator = HandOff;
+    let policy = policy(PolicyVerb::Allow);
+    let tools = registry();
+    let deps = deps_with_trace(
+        &orchestrator,
+        store.as_ref(),
+        &policy,
+        &tools,
+        store.as_ref(),
+        &[],
+        Some(&sink),
+    );
+
+    run_envelope(envelope(), RunId::new("run-traced"), &deps)
+        .await
+        .expect_err("a denied handoff ends the run");
+
+    let file = traces.join("run-traced.jsonl");
+    let written = std::fs::read_to_string(&file)
+        .unwrap_or_else(|err| panic!("a failed run writes {}: {err}", file.display()));
+    assert!(
+        written.contains("\"phase\":\"failed\""),
+        "the records are marked as coming from a failed run: {written}"
+    );
+    assert!(
+        written.contains("plan_started") && written.contains("plan_finished"),
+        "the turn the run got through is in the file: {written}"
     );
 }

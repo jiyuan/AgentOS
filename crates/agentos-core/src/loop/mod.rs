@@ -43,7 +43,7 @@ pub use approval_route::{
 use budget::{budget_exhausted_finish, record_llm_usage};
 use cancel::{cancelled_finish, unless_cancelled};
 use delegate::{execute_delegate, execute_resume_delegate, DelegateOutcome};
-pub use error::RunError;
+pub use error::{RunError, StepFailure};
 use escalate::{execute_escalate, EscalateOutcome};
 use items::{
     assistant_tool_call_item, metadata_value, subagent_result_item, suborchestrator_result_item,
@@ -120,31 +120,39 @@ pub enum RunLoopState {
 }
 
 impl RunLoopState {
-    pub async fn step(self, deps: &LoopDeps<'_>) -> Result<Self, RunError> {
+    /// Advance one state.
+    ///
+    /// A failure carries the state back out (see [`StepFailure`]): this method
+    /// consumes `self`, so anything it does not hand back is gone, and a run
+    /// that fails is exactly the one whose trace someone will want.
+    pub async fn step(self, deps: &LoopDeps<'_>) -> Result<Self, StepFailure> {
         match self {
             Self::Start(ctx) => start(ctx, deps).await,
             Self::Plan(ctx) => plan(ctx, deps).await,
             Self::Approve(ctx) => approve(ctx, deps).await,
             Self::Act(ctx) => act(ctx, deps).await,
-            Self::Observe(ctx) => observe(ctx).await,
-            Self::Paused(_) => Err(RunError::NotResumable),
-            Self::Finish(_) => Err(RunError::AlreadyDone),
+            Self::Observe(ctx) => Ok(observe(ctx)),
+            Self::Paused(state) => Err(StepFailure::new(state, RunError::NotResumable)),
+            Self::Finish(output) => Err(StepFailure::new(output.state, RunError::AlreadyDone)),
         }
     }
 }
 
-pub fn resume_approved(state: RunState) -> Result<RunLoopState, RunError> {
+pub fn resume_approved(state: RunState) -> Result<RunLoopState, StepFailure> {
     let mut state = state;
     if let Some(reason) = state.take_rejected_reason() {
-        return Err(RunError::ApprovalDenied { reason });
+        return Err(StepFailure::new(state, RunError::ApprovalDenied { reason }));
     }
     if let Some(reason) = state.take_unanswered_reason() {
-        return Err(RunError::ApprovalUnanswered { reason });
+        return Err(StepFailure::new(
+            state,
+            RunError::ApprovalUnanswered { reason },
+        ));
     }
 
     let turns = resume_turns(&state);
     let Some(action) = state.take_approved_action() else {
-        return Err(RunError::NotResumable);
+        return Err(StepFailure::new(state, RunError::NotResumable));
     };
     let plan = match action {
         InterruptionAction::ToolCall(call) => Plan::CallTool(call),
@@ -213,36 +221,51 @@ pub struct FinalOutput {
     pub message: Message,
 }
 
-async fn start(ctx: StartCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunError> {
+async fn start(ctx: StartCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, StepFailure> {
+    let state = ctx.state;
     info!(
-        run_id = ctx.state.run_id.as_str(),
-        active_agent = ctx.state.active_agent.as_str(),
+        run_id = state.run_id.as_str(),
+        active_agent = state.active_agent.as_str(),
         "run_loop_start"
     );
-    if let Some(item) = ctx.state.transcript.items.last() {
-        let mut run_ctx = RunContext::from_state(&ctx.state);
+    // The guardrail pass borrows `state` through its `RunContext`, so the
+    // failure is decided inside this block and acted on outside it — moving
+    // the state into a `StepFailure` while the borrow is live would not
+    // compile, and threading an `Option` through the loop reads worse.
+    let refusal = {
+        let mut run_ctx = RunContext::from_state(&state);
         run_ctx.cancel = deps.cancel.clone();
-        let input = Input {
-            message: item.message.clone(),
-        };
-        for entry in deps.input_guardrails {
-            let outcome = entry.guardrail.check(&input, &run_ctx).await?;
-            ensure_guardrail_passed(
-                deps,
-                SafetyEventKind::InputGuardrailTrip,
-                SafetyOutcome::Tripped,
-                &entry.name,
-                outcome,
-            )?;
+        let mut refusal = None;
+        if let Some(item) = state.transcript.items.last() {
+            let input = Input {
+                message: item.message.clone(),
+            };
+            for entry in deps.input_guardrails {
+                let checked = match entry.guardrail.check(&input, &run_ctx).await {
+                    Ok(outcome) => ensure_guardrail_passed(
+                        deps,
+                        SafetyEventKind::InputGuardrailTrip,
+                        SafetyOutcome::Tripped,
+                        &entry.name,
+                        outcome,
+                    ),
+                    Err(error) => Err(RunError::from(error)),
+                };
+                if let Err(error) = checked {
+                    refusal = Some(error);
+                    break;
+                }
+            }
         }
+        refusal
+    };
+    if let Some(error) = refusal {
+        return Err(StepFailure::new(state, error));
     }
-    Ok(RunLoopState::Plan(PlanCtx {
-        state: ctx.state,
-        turns: 0,
-    }))
+    Ok(RunLoopState::Plan(PlanCtx { state, turns: 0 }))
 }
 
-async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunError> {
+async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, StepFailure> {
     if ctx.turns >= deps.max_turns {
         // Mechanism-level safeguard. Exhausting the turn budget used to abort
         // the whole run with `MaxTurnsExceeded` — and because sub-agents run
@@ -339,7 +362,11 @@ async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunErro
         ),
     )
     .await;
-    let Some(plan) = planned.transpose()? else {
+    let planned = match planned.transpose() {
+        Ok(planned) => planned,
+        Err(error) => return Err(StepFailure::new(state, error)),
+    };
+    let Some(plan) = planned else {
         return Ok(RunLoopState::Finish(cancelled_finish(
             state, deps, "planning",
         )));
@@ -386,17 +413,31 @@ async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunErro
 
     match plan {
         Plan::Reply(message) => {
-            let mut run_ctx = RunContext::from_state(&state);
-            run_ctx.cancel = deps.cancel.clone();
-            for entry in deps.output_guardrails {
-                let outcome = entry.guardrail.check(&message, &run_ctx).await?;
-                ensure_guardrail_passed(
-                    deps,
-                    SafetyEventKind::OutputGuardrailTrip,
-                    SafetyOutcome::Tripped,
-                    &entry.name,
-                    outcome,
-                )?;
+            // Decided inside the borrow, acted on outside it — see `start`.
+            let refusal = {
+                let mut run_ctx = RunContext::from_state(&state);
+                run_ctx.cancel = deps.cancel.clone();
+                let mut refusal = None;
+                for entry in deps.output_guardrails {
+                    let checked = match entry.guardrail.check(&message, &run_ctx).await {
+                        Ok(outcome) => ensure_guardrail_passed(
+                            deps,
+                            SafetyEventKind::OutputGuardrailTrip,
+                            SafetyOutcome::Tripped,
+                            &entry.name,
+                            outcome,
+                        ),
+                        Err(error) => Err(RunError::from(error)),
+                    };
+                    if let Err(error) = checked {
+                        refusal = Some(error);
+                        break;
+                    }
+                }
+                refusal
+            };
+            if let Some(error) = refusal {
+                return Err(StepFailure::new(state, error));
             }
             Ok(RunLoopState::Finish(FinalOutput { state, message }))
         }
@@ -412,7 +453,8 @@ async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunErro
                 // An empty batch is not a plan. Say so rather than inventing
                 // an outcome: an orchestrator that returns one has a bug, and
                 // silently finishing the run would hide it.
-                None => Err(RunError::Orchestrator(
+                None => Err(StepFailure::new(
+                    state,
                     agentos_interfaces::orchestrator::OrchestratorError::Backend(Arc::from(
                         "orchestrator planned an empty tool batch",
                     )),
@@ -438,7 +480,7 @@ async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunErro
 /// call's `Usage` into `RunContext::usage_sink`; the loop drains the sink after
 /// `orchestrator.plan()` returns and calls this for every entry — including
 /// calls whose plan was `Plan::CallTool`, `Plan::Delegate`, etc.
-async fn approve(ctx: ApproveCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunError> {
+async fn approve(ctx: ApproveCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, StepFailure> {
     match approve_transition(ctx, deps) {
         ApproveTransition::Allow { state, plan, turns } => {
             // The elevation was recorded when narrowing admitted it; this is
@@ -485,17 +527,24 @@ async fn approve(ctx: ApproveCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, R
                 denied: Some(reason),
             }))
         }
-        ApproveTransition::Deny { subject, reason } => {
+        ApproveTransition::Deny {
+            state,
+            subject,
+            reason,
+        } => {
             deps.audit.record_reason(
                 SafetyEventKind::PolicyDenial,
                 SafetyOutcome::Denied,
                 subject,
                 reason.as_ref(),
             );
-            Err(RunError::ApprovalDenied { reason })
+            Err(StepFailure::new(state, RunError::ApprovalDenied { reason }))
         }
         ApproveTransition::Pause { state } => Ok(RunLoopState::Paused(state)),
-        ApproveTransition::Unsupported { reason } => Err(RunError::ApprovalUnsupported { reason }),
+        ApproveTransition::Unsupported { state, reason } => Err(StepFailure::new(
+            state,
+            RunError::ApprovalUnsupported { reason },
+        )),
     }
 }
 
@@ -513,7 +562,7 @@ fn plan_subject(plan: &Plan) -> Arc<str> {
     }
 }
 
-async fn act(ctx: ActCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunError> {
+async fn act(ctx: ActCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, StepFailure> {
     let ActCtx {
         mut state,
         plan,
@@ -544,7 +593,7 @@ async fn act(ctx: ActCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunError>
                             "tool_call",
                         )))
                     }
-                    Err(other) => return Err(other),
+                    Err(other) => return Err(StepFailure::new(state, other)),
                 },
             };
             let spilled = spill_oversized(&state, deps, &tool_name, &result).await;
@@ -559,25 +608,27 @@ async fn act(ctx: ActCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunError>
             #[cfg(debug_assertions)]
             crate::invariants::tool_result_follows_its_call(&state.transcript);
         }
-        Plan::Delegate(spec) => match execute_delegate(&mut state, deps, &spec).await? {
-            DelegateOutcome::Finished(result) => {
+        Plan::Delegate(spec) => match execute_delegate(&mut state, deps, &spec).await {
+            Err(error) => return Err(StepFailure::new(state, error)),
+            Ok(DelegateOutcome::Finished(result)) => {
                 state.transcript.items.push(subagent_result_item(result));
             }
-            DelegateOutcome::Paused(paused) => {
+            Ok(DelegateOutcome::Paused(paused)) => {
                 return pause_for_subagent_approval(state, spec, paused);
             }
         },
-        Plan::Escalate(spec) => match execute_escalate(&mut state, deps, &spec).await? {
-            EscalateOutcome::Finished(result) => {
+        Plan::Escalate(spec) => match execute_escalate(&mut state, deps, &spec).await {
+            Err(error) => return Err(StepFailure::new(state, error)),
+            Ok(EscalateOutcome::Finished(result)) => {
                 state
                     .transcript
                     .items
                     .push(suborchestrator_result_item(&spec, result));
             }
-            EscalateOutcome::Paused {
+            Ok(EscalateOutcome::Paused {
                 stage_agent,
                 paused,
-            } => {
+            }) => {
                 return pause_for_subagent_approval(state, stage_agent, *paused);
             }
         },
@@ -586,12 +637,14 @@ async fn act(ctx: ActCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunError>
         // executing a batch here, which would be a way past the per-call
         // approval the split exists to guarantee.
         Plan::CallTools(calls) => {
-            return Err(RunError::ApprovalUnsupported {
-                reason: Arc::from(format!(
-                    "a batch of {} tool calls reached Act without being split",
-                    calls.len()
-                )),
-            });
+            let reason = Arc::from(format!(
+                "a batch of {} tool calls reached Act without being split",
+                calls.len()
+            ));
+            return Err(StepFailure::new(
+                state,
+                RunError::ApprovalUnsupported { reason },
+            ));
         }
         Plan::Handoff(agent_id, payload) => {
             execute_handoff(&mut state, deps, agent_id, payload);
@@ -609,11 +662,12 @@ async fn act(ctx: ActCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunError>
                 conversation_id: child_conversation_id,
                 state: *child_state,
             };
-            match execute_resume_delegate(&mut state, deps, &spec, paused).await? {
-                DelegateOutcome::Finished(result) => {
+            match execute_resume_delegate(&mut state, deps, &spec, paused).await {
+                Err(error) => return Err(StepFailure::new(state, error)),
+                Ok(DelegateOutcome::Finished(result)) => {
                     state.transcript.items.push(subagent_result_item(result));
                 }
-                DelegateOutcome::Paused(paused) => {
+                Ok(DelegateOutcome::Paused(paused)) => {
                     return pause_for_subagent_approval(state, spec, paused);
                 }
             }
@@ -631,11 +685,10 @@ fn pause_for_subagent_approval(
     mut state: RunState,
     spec: agentos_interfaces::orchestrator::SubAgentSpec,
     paused: crate::subagents::SubAgentPausedRun,
-) -> Result<RunLoopState, RunError> {
-    let child_approval = paused
-        .state
-        .pending_approval()
-        .ok_or(RunError::SubAgent(SubAgentError::Paused))?;
+) -> Result<RunLoopState, StepFailure> {
+    let Some(child_approval) = paused.state.pending_approval() else {
+        return Err(StepFailure::new(state, SubAgentError::Paused));
+    };
     let approval_id = InterruptionId::new(format!(
         "approval-subagent-{}-{}",
         spec.agent_id.as_str(),
@@ -692,11 +745,13 @@ fn execute_handoff(
     trace::record_event(state, deps.hooks, span_id, "handoff_finished", fields);
 }
 
-async fn observe(ctx: ObserveCtx) -> Result<RunLoopState, RunError> {
-    Ok(RunLoopState::Plan(PlanCtx {
+/// The only state that cannot fail: it renames a context and hands control
+/// back to `Plan`.
+fn observe(ctx: ObserveCtx) -> RunLoopState {
+    RunLoopState::Plan(PlanCtx {
         state: ctx.state,
         turns: ctx.turns,
-    }))
+    })
 }
 
 /// Turn a guardrail verdict into control flow, recording the trip on the way

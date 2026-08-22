@@ -1,6 +1,6 @@
 # ADR-0005 — Safety decisions are immutable events, not absence of state
 
-- Status: accepted; implemented by M6 / `AUD-001` except error-path trace persistence
+- Status: accepted; implemented by M6 / `AUD-001`
 - Date: 2026-08-21
 - Milestone: M6
 

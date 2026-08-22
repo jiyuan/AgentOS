@@ -554,7 +554,13 @@ AgentOS uses nine independent safety rings:
    no field that would accept the arguments, which is what makes that
    structural rather than a habit. `SafetyLog` is defined in the core, not in
    `agentos-interfaces`, for the same reason `approve` is: an extension that
-   can replace the audit sink decides what the audit trail says. See
+   can replace the audit sink decides what the audit trail says.
+
+   The trace is a weaker record than the store — diagnostics rather than an
+   audit trail — but it used to disappear entirely on the path that needed it
+   most. `RunLoopState::step` consumes the state, so a failing step dropped it
+   and the runner had nothing to persist. `StepFailure` carries it back out,
+   and a failed run's records are written under the `failed` phase. See
    [`docs/adr/0005-SAFETY_EVENTS.md`](adr/0005-SAFETY_EVENTS.md).
 
 ### Checked invariants

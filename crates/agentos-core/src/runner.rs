@@ -10,7 +10,8 @@ use crate::memory::MemoryManager;
 use crate::prompt::Compaction;
 use crate::r#loop::{
     resume_approved, ApprovalOutcome, FinalOutput, InputGuardrailEntry, LoopDeps,
-    OutputGuardrailEntry, RunError, RunLoopState, StartCtx, Steering, ToolGuardrailEntry,
+    OutputGuardrailEntry, RunError, RunLoopState, StartCtx, Steering, StepFailure,
+    ToolGuardrailEntry,
 };
 use crate::spill::ContentLimits;
 use crate::subagents::SubAgentRegistry;
@@ -291,10 +292,9 @@ pub async fn run_envelope(
     loop {
         current = match current.step(&loop_deps).await {
             Ok(next) => next,
-            Err(err) => {
-                record_terminal_error(&audit, &err);
-                record_error_episode(&episode_seed, &err, deps).await;
-                return Err(err.into());
+            Err(failure) => {
+                let error = record_failed_run(failure, &audit, &episode_seed, deps, 0, 0).await;
+                return Err(error.into());
             }
         };
         match current {
@@ -440,20 +440,34 @@ pub async fn resume_run(
     };
     let mut current = match resume_approved(paused.state) {
         Ok(current) => current,
-        Err(err) => {
-            record_terminal_error(&audit, &err);
-            record_error_episode(&episode_seed, &err, deps).await;
-            return Err(err.into());
+        Err(failure) => {
+            let error = record_failed_run(
+                failure,
+                &audit,
+                &episode_seed,
+                deps,
+                trace_span_start,
+                trace_event_start,
+            )
+            .await;
+            return Err(error.into());
         }
     };
 
     loop {
         current = match current.step(&loop_deps).await {
             Ok(next) => next,
-            Err(err) => {
-                record_terminal_error(&audit, &err);
-                record_error_episode(&episode_seed, &err, deps).await;
-                return Err(err.into());
+            Err(failure) => {
+                let error = record_failed_run(
+                    failure,
+                    &audit,
+                    &episode_seed,
+                    deps,
+                    trace_span_start,
+                    trace_event_start,
+                )
+                .await;
+                return Err(error.into());
             }
         };
         match current {
@@ -484,6 +498,36 @@ pub async fn resume_run(
             next => current = next,
         }
     }
+}
+
+/// Everything a failed run owes a later reader, in one place.
+///
+/// The safety event, the episode, and — the part that needed
+/// [`StepFailure`] — the trace records the run had accumulated. A trace
+/// persistence failure is logged rather than returned: the run already has an
+/// error worth reporting, and replacing it with an I/O error about the
+/// bookkeeping would hide the thing that actually went wrong.
+async fn record_failed_run(
+    failure: StepFailure,
+    audit: &SafetyJournal<'_>,
+    seed: &EpisodeSeed,
+    deps: &RunnerDeps<'_>,
+    span_start: usize,
+    event_start: usize,
+) -> RunError {
+    let (state, error) = failure.into_parts();
+    record_terminal_error(audit, &error);
+    record_error_episode(seed, &error, deps).await;
+    if let Err(persist) =
+        persist_trace_records_with_sink(&state, deps.trace_sink, span_start, event_start, "failed")
+    {
+        tracing::warn!(
+            run_id = state.run_id.as_str(),
+            error = %persist,
+            "failed run's trace records could not be persisted"
+        );
+    }
+    error
 }
 
 pub fn save_paused_run(path: &Path, paused: &PausedRun) -> Result<(), RunnerError> {

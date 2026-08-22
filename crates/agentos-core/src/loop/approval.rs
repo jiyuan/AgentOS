@@ -27,6 +27,7 @@ pub(super) enum ApproveTransition {
     /// Fatal: there is no tool-call id to attach a result to, and a denied
     /// routing decision is not something the model can retry around.
     Deny {
+        state: RunState,
         subject: Arc<str>,
         reason: Arc<str>,
     },
@@ -34,6 +35,7 @@ pub(super) enum ApproveTransition {
         state: RunState,
     },
     Unsupported {
+        state: RunState,
         reason: Arc<str>,
     },
 }
@@ -54,6 +56,7 @@ pub(super) fn approve_transition(ctx: ApproveCtx, deps: &LoopDeps<'_>) -> Approv
             },
             plan => ApproveTransition::Deny {
                 subject: plan_subject(&plan),
+                state: ctx.state,
                 reason,
             },
         },
@@ -91,7 +94,10 @@ fn pause_for_approval(ctx: ApproveCtx, deps: &LoopDeps<'_>, reason: Arc<str>) ->
         // pausing on a batch as if it were one action: approving "these five
         // calls" is not a decision a user was shown enough to make.
         Plan::CallTools(_) | Plan::Reply(_) | Plan::ResumeSubAgent { .. } => {
-            return ApproveTransition::Unsupported { reason }
+            return ApproveTransition::Unsupported {
+                state: ctx.state,
+                reason,
+            }
         }
     };
 

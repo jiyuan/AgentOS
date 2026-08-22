@@ -5,6 +5,8 @@
 //! (cancellation, the turn budget) into terminal answers rather than letting
 //! them escape.
 
+use agentos_interfaces::run_state::RunState;
+
 use crate::subagents::SubAgentError;
 use crate::task_workspace::TaskWorkspaceError;
 use crate::tools::ToolRegistryError;
@@ -52,4 +54,68 @@ pub enum RunError {
     /// path is several frames deep and needs a typed way back up.
     #[error("run cancelled")]
     Cancelled,
+}
+
+/// A step that failed, carrying the state the run had reached when it did.
+///
+/// `RunLoopState::step` consumes `self`, so before this existed a failing step
+/// dropped the state on the way out and the runner had nothing left to
+/// persist: a run that ended badly left no trace at all, which made the runs
+/// most worth reconstructing the ones that recorded the least (M6 / `AUD-001`,
+/// [ADR-0005](../../../../docs/adr/0005-SAFETY_EVENTS.md)).
+///
+/// The state is not optional. Every path out of every state owns its
+/// `RunState` at the point it fails, so "we lost it" is not a case the type
+/// needs to represent — and making it representable is how it would come back.
+pub struct StepFailure {
+    /// Boxed so `Result<RunLoopState, StepFailure>` does not carry a whole
+    /// `RunState` in its error variant on every ordinary step. One allocation
+    /// on a path that is already ending the run.
+    state: Box<RunState>,
+    error: RunError,
+}
+
+impl StepFailure {
+    pub fn new(state: RunState, error: impl Into<RunError>) -> Self {
+        Self {
+            state: Box::new(state),
+            error: error.into(),
+        }
+    }
+
+    pub fn error(&self) -> &RunError {
+        &self.error
+    }
+
+    pub fn into_error(self) -> RunError {
+        self.error
+    }
+
+    /// The state to persist and the error to report.
+    pub fn into_parts(self) -> (RunState, RunError) {
+        (*self.state, self.error)
+    }
+}
+
+/// Renders the error and the run it belongs to, not the whole transcript: a
+/// `.expect()` on a failed step should print something a person can read.
+impl std::fmt::Debug for StepFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StepFailure")
+            .field("run_id", &self.state.run_id.as_str())
+            .field("error", &self.error)
+            .finish()
+    }
+}
+
+impl std::fmt::Display for StepFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl From<StepFailure> for RunError {
+    fn from(failure: StepFailure) -> Self {
+        failure.error
+    }
 }
