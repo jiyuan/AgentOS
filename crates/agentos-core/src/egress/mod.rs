@@ -36,6 +36,10 @@ pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const TOOL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// Opt back in to using the ambient HTTP proxy for tool requests, accepting
+/// that the proxy — not this policy — then decides where they go.
+pub const PROXY_OPT_IN_ENV: &str = "AGENTOS_TOOL_EGRESS_PROXY";
+
 /// The client for requests whose destination the *model* chose.
 ///
 /// Deliberately not [`crate::http::shared_client`]. That one is for endpoints
@@ -46,17 +50,41 @@ const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 /// split is the whole point. What this policy defends against is a
 /// *destination the model was talked into*, which is a different trust
 /// question with a different answer.
+///
+/// # Why the ambient proxy is off
+///
+/// A proxy resolves the destination itself. This client would connect to the
+/// proxy — one address, always the same, always allowed — and hand it a
+/// hostname, so [`GuardedResolver`] would never see the name that matters and
+/// the whole policy would quietly be doing nothing. On a machine behind a
+/// corporate proxy that is precisely the machine where reaching
+/// `http://internal.corp/` matters most.
+///
+/// So `no_proxy` by default, and [`PROXY_OPT_IN_ENV`] to take it back. The
+/// opt-in is loud rather than silent because what it buys is reachability and
+/// what it costs is the policy — and a deployment that needs it should know it
+/// is trading one for the other.
 pub fn tool_client() -> &'static Client {
     static CLIENT: OnceLock<Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        Client::builder()
+        let mut builder = Client::builder()
             .timeout(TOOL_REQUEST_TIMEOUT)
             .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             .user_agent(concat!("agentos-core/", env!("CARGO_PKG_VERSION")))
             // Every name this client resolves is judged before it is
             // connected to, on the first hop and on every redirect.
             .dns_resolver(Arc::new(GuardedResolver))
-            .redirect(guarded_redirects())
+            .redirect(guarded_redirects());
+        if std::env::var_os(PROXY_OPT_IN_ENV).is_some() {
+            tracing::warn!(
+                variable = PROXY_OPT_IN_ENV,
+                "tool HTTP requests will use the ambient proxy; the proxy, not the \
+                 egress policy, decides which destinations are reachable"
+            );
+        } else {
+            builder = builder.no_proxy();
+        }
+        builder
             .build()
             .expect("reqwest client builds with rustls + http2 features compiled in")
     })

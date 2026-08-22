@@ -202,7 +202,10 @@ mod tests {
     use super::*;
 
     fn client() -> Client {
-        Client::builder().build().expect("a default client builds")
+        Client::builder()
+            .no_proxy()
+            .build()
+            .expect("a default client builds")
     }
 
     #[tokio::test]

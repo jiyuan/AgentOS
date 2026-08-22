@@ -15,8 +15,10 @@ use agentos_core::egress::{fetch_bounded, fetch_capped, tool_client, Blocked, Fe
 use agentos_core::tools::HttpTool;
 use agentos_interfaces::tool::Tool;
 use agentos_proto::{ToolCall, ToolCallId, ToolStatus};
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use serde_json::value::RawValue;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -155,6 +157,7 @@ async fn a_redirect_the_policy_allows_is_still_followed() {
     // An unguarded client, so the *only* difference from the test above is
     // whether the policy is in the way.
     let plain = reqwest::Client::builder()
+        .no_proxy()
         .build()
         .expect("a default client builds");
     let fetched = fetch_capped(
@@ -205,6 +208,7 @@ async fn a_body_is_cut_off_at_the_cap_whatever_the_headers_say() {
     // The unguarded client, because this test is about the size bound and the
     // listener is on loopback. The destination policy has its own tests above.
     let plain = reqwest::Client::builder()
+        .no_proxy()
         .build()
         .expect("a default client builds");
     let fetched = fetch_capped(
@@ -226,6 +230,7 @@ async fn a_body_is_cut_off_at_the_cap_whatever_the_headers_say() {
 async fn an_allowed_destination_still_gets_through() {
     let address = serve_once("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello").await;
     let plain = reqwest::Client::builder()
+        .no_proxy()
         .build()
         .expect("a default client builds");
     let fetched = fetch_capped(
@@ -240,4 +245,64 @@ async fn an_allowed_destination_still_gets_through() {
     assert_eq!(fetched.status.as_u16(), 200);
     assert_eq!(fetched.body, "hello");
     assert!(!fetched.truncated);
+}
+
+/// Counts how many times it is asked, and always answers with one address.
+struct CountingResolver {
+    answer: SocketAddr,
+    calls: Arc<AtomicUsize>,
+}
+
+impl Resolve for CountingResolver {
+    fn resolve(&self, _name: Name) -> Resolving {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let answer = self.answer;
+        Box::pin(async move { Ok(Box::new(std::iter::once(answer)) as Addrs) })
+    }
+}
+
+/// DNS rebinding, as the property that actually defeats it.
+///
+/// A rebind needs *two* lookups: one the check sees, and a second, between the
+/// check and the connect, that the attacker's short-TTL record answers
+/// differently. Filtering inside the resolver removes the second — the address
+/// the policy judged is the address the connection uses.
+///
+/// A real rebinding fixture would need a DNS server that lies on the second
+/// query. This asserts the thing that makes such a server useless: one lookup
+/// per request, and the connection lands on exactly what it returned.
+#[tokio::test]
+async fn a_name_is_resolved_once_and_the_connection_uses_that_answer() {
+    let listener = serve_once("HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nlanded").await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let client = reqwest::Client::builder()
+        // As `tool_client` does, and for the same reason: a proxy would
+        // resolve the name itself and the resolver below would never be
+        // consulted.
+        .no_proxy()
+        .dns_resolver(Arc::new(CountingResolver {
+            answer: listener,
+            calls: Arc::clone(&calls),
+        }))
+        .build()
+        .expect("a client with a custom resolver builds");
+
+    // A name the resolver will be asked about, pointed at the listener. If
+    // anything re-resolved between the decision and the connection, the count
+    // would be higher — and that gap is the whole attack.
+    let fetched = fetch_capped(
+        &client,
+        &format!("http://agentos-rebind.invalid:{}/", listener.port()),
+        64 * 1024,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("the resolver's answer is reachable");
+
+    assert_eq!(fetched.body, "landed");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a second lookup between the check and the connect is what a rebind needs"
+    );
 }

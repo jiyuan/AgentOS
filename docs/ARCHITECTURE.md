@@ -480,7 +480,13 @@ AgentOS uses four independent safety rings:
    globally routable unicast is refused, plus the cloud metadata addresses,
    which are globally routable and are the highest-value SSRF target there is.
    A literal-address URL and every redirect hop are checked separately,
-   because neither reaches DNS. Bodies are streamed and stop at
+   because neither reaches DNS. The ambient HTTP proxy is deliberately off for
+   this client: a proxy resolves the destination itself, so every request
+   would connect to one always-allowed address and hand it a hostname the
+   policy never sees — on a machine behind a corporate proxy, which is exactly
+   where reaching `http://internal.corp/` matters most.
+   `AGENTOS_TOOL_EGRESS_PROXY=1` takes the proxy back and logs that the proxy,
+   not this policy, now decides. Bodies are streamed and stop at
    `[limits].http_response_bytes`. Endpoints the operator configured — a local
    Qdrant, an Ollama, a loopback proxy — go through `http::shared_client` and
    are deliberately not policed: an address written into `agent.toml` is the
