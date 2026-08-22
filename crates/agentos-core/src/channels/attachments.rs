@@ -93,7 +93,10 @@ impl AttachmentStore {
         path.push(&self.channel);
         path.push(safe_conv.as_ref());
         path.push(safe_msg.as_ref());
-        fs::create_dir_all(&path).map_err(|err| {
+        // Private (M8 / `GW-001`): the directory names are a conversation id
+        // and a message id, so a listable tree leaks who is talking to the
+        // agent even when the attachments themselves cannot be read.
+        crate::paths::create_private_dir(&path).map_err(|err| {
             ChannelError::Backend(Arc::from(format!(
                 "create attachment dir {} failed: {err}",
                 path.display()

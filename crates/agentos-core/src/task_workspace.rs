@@ -345,9 +345,11 @@ where
         path: path.to_path_buf(),
         source,
     })?;
-    fs::write(path, encoded).map_err(|source| TaskWorkspaceError::Io {
-        path: path.to_path_buf(),
-        source,
+    crate::paths::write_private_atomic(path, encoded.as_bytes()).map_err(|err| {
+        TaskWorkspaceError::Io {
+            path: err.path().to_path_buf(),
+            source: err.into_io(),
+        }
     })
 }
 

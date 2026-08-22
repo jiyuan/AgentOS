@@ -434,9 +434,12 @@ impl CronStore {
     }
 
     pub fn save_task(&self, task: &CronTask) -> Result<(), CronError> {
-        std::fs::create_dir_all(&self.root).map_err(storage_error)?;
         let encoded = toml::to_string_pretty(task).map_err(toml_ser_error)?;
-        std::fs::write(self.task_path(&task.id)?, encoded).map_err(storage_error)
+        // Atomic and private (M8 / `GW-001`): a cron task carries the prompt
+        // it fires and the conversation it fires into, and a half-written one
+        // makes the whole scheduler fail to load rather than just that task.
+        crate::paths::write_private_atomic(&self.task_path(&task.id)?, encoded.as_bytes())
+            .map_err(|err| storage_error(err.into_io()))
     }
 
     pub fn save_scheduler(&self, scheduler: &CronScheduler) -> Result<(), CronError> {

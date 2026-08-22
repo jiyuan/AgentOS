@@ -530,20 +530,22 @@ async fn record_failed_run(
     error
 }
 
+/// Persist the approval record for a paused run.
+///
+/// Atomic and private (M8 / `GW-001`): this file names the tool call that is
+/// about to fire, the conversation that asked for it, and the transcript so
+/// far. A crash halfway through a plain rewrite left a truncated document that
+/// deserializes as nothing, so the answer to an approval prompt resumed
+/// nothing; and the default mode made all of that readable by every user on
+/// the box.
 pub fn save_paused_run(path: &Path, paused: &PausedRun) -> Result<(), RunnerError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| RunnerError::StateIo {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
     let encoded = serde_json::to_vec_pretty(paused).map_err(|source| RunnerError::StateJson {
         path: path.to_path_buf(),
         source,
     })?;
-    std::fs::write(path, encoded).map_err(|source| RunnerError::StateIo {
-        path: path.to_path_buf(),
-        source,
+    crate::paths::write_private_atomic(path, &encoded).map_err(|err| RunnerError::StateIo {
+        path: err.path().to_path_buf(),
+        source: err.into_io(),
     })
 }
 
@@ -576,19 +578,26 @@ fn persist_trace_records(
     event_start: usize,
     phase: &'static str,
 ) -> Result<(), RunnerError> {
-    std::fs::create_dir_all(trace_dir).map_err(|source| RunnerError::TraceIo {
-        path: trace_dir.to_path_buf(),
-        source,
+    // Private (M8 / `GW-001`). A trace is the whole run: prompts, tool
+    // arguments, model output. Append-only, so there is nothing to replace
+    // atomically — but the mode still has to be set at creation, because
+    // chmod-after-create leaves a window where it is readable.
+    crate::paths::create_private_dir(trace_dir).map_err(|err| RunnerError::TraceIo {
+        path: err.path().to_path_buf(),
+        source: err.into_io(),
     })?;
     let path = trace_dir.join(format!("{}.jsonl", trace_file_stem(&state.run_id)));
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|source| RunnerError::TraceIo {
-            path: path.clone(),
-            source,
-        })?;
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path).map_err(|source| RunnerError::TraceIo {
+        path: path.clone(),
+        source,
+    })?;
 
     // Wall-clock at persist time, stamped onto every record in this batch.
     // Trace files are append-only per run_id, so long-lived gateway sessions

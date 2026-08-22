@@ -1318,12 +1318,17 @@ fn read_pid_record(path: &Path) -> Result<Option<PidRecord>, String> {
     }
 }
 
+/// Write the control record, atomically and privately (M8 / `GW-001`).
+///
+/// The owner token in it is what `stop` checks before signalling, so a reader
+/// who catches this file mid-rewrite reads a pid with no token and a writer
+/// who crashes mid-rewrite leaves one. Neither is possible through a rename.
 fn write_pid_record(path: &Path, pid: u32, owner_token: Option<&str>) -> Result<(), String> {
     let contents = match owner_token {
         Some(owner_token) => format!("{pid} {owner_token}\n"),
         None => format!("{pid}\n"),
     };
-    fs::write(path, contents)
+    agentos_core::paths::write_private_atomic(path, contents.as_bytes())
         .map_err(|err| format!("failed to write pid file {}: {err}", path.display()))
 }
 
