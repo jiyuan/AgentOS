@@ -61,6 +61,34 @@ pub trait Channel: Send + Sync {
     fn stream_egress(&self) -> Option<Arc<dyn StreamEgress>> {
         None
     }
+
+    /// Where this channel has read up to, if its transport has a resumable
+    /// position (M8 / `GW-001`, deliverable 3).
+    ///
+    /// The gateway persists this in its ingress ledger *after* the event it
+    /// belongs to is durably recorded, and hands it back through
+    /// [`Channel::resume_from`] on the next start. Telegram's `getUpdates`
+    /// offset is the motivating case: it lived in process memory and advanced
+    /// before the run, so a crash both replayed messages and lost them.
+    ///
+    /// Default `None`: a transport with no cursor — a webhook, a queue that
+    /// acknowledges per message — has nothing to resume from, and a channel
+    /// that returns `None` simply keeps whatever recovery its transport does
+    /// for it. Deduplication is a separate mechanism; see
+    /// [`INGRESS_ID_KEY`](agentos_proto::INGRESS_ID_KEY).
+    fn cursor(&self) -> Option<Arc<str>> {
+        None
+    }
+
+    /// Resume from a cursor this channel previously reported.
+    ///
+    /// Called once before the receive loop starts, with whatever
+    /// [`Channel::cursor`] last returned. The value is opaque to the gateway:
+    /// it is stored and handed back verbatim, so a channel may encode whatever
+    /// it needs. A channel that cannot make sense of it — a format from an
+    /// older release — should ignore it rather than fail, and let its
+    /// transport's own recovery take over.
+    fn resume_from(&mut self, _cursor: &str) {}
 }
 
 /// Optional edit-in-place streaming egress for a channel.

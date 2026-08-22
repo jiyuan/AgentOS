@@ -5,6 +5,7 @@ use crate::r#loop::{parse_action_data, DECISION_KEY, TICKET_KEY};
 use agentos_interfaces::{Channel, ChannelError, Egress, StreamEgress};
 use agentos_proto::{
     Attachment, AttachmentKind, ChannelId, ConversationId, Envelope, Message, MessageRole,
+    INGRESS_ID_KEY,
 };
 use async_trait::async_trait;
 use serde_json::Value;
@@ -332,6 +333,26 @@ impl Channel for TelegramChannel {
         self.id.clone()
     }
 
+    /// Telegram's `getUpdates` offset, as a decimal string.
+    ///
+    /// The gateway persists this after the update it belongs to is in the
+    /// ingress ledger, which is what makes a restart resume from the last
+    /// *recorded* update rather than from wherever the in-memory offset had
+    /// got to.
+    fn cursor(&self) -> Option<Arc<str>> {
+        self.offset.map(|offset| Arc::from(offset.to_string()))
+    }
+
+    fn resume_from(&mut self, cursor: &str) {
+        match cursor.parse::<i64>() {
+            Ok(offset) => self.offset = Some(offset),
+            // A cursor this build does not understand is not worth failing
+            // over: Telegram re-sends anything it has no acknowledgement for,
+            // and the ledger recognises the duplicates.
+            Err(err) => eprintln!("telegram ignoring unreadable ingress cursor '{cursor}': {err}"),
+        }
+    }
+
     async fn receive(&mut self) -> Option<Envelope> {
         let response = match self.fetch_updates() {
             Ok(Some(response)) => response,
@@ -569,6 +590,10 @@ fn parse_update(
     let mut metadata = BTreeMap::new();
     metadata.insert(Arc::from("kind"), Value::String("telegram".to_owned()));
     metadata.insert(Arc::from("update_id"), Value::from(update_id));
+    // What the gateway's ingress ledger dedupes on. `update_id` is Telegram's
+    // own identity for the delivery, which is exactly the thing that repeats
+    // when a poll is retried (M8 / `GW-001`).
+    metadata.insert(Arc::from(INGRESS_ID_KEY), Value::from(update_id));
     if let Some(message_id) = message_id {
         metadata.insert(Arc::from("message_id"), Value::from(message_id));
     }
@@ -618,6 +643,10 @@ fn parse_callback_query(
     let mut metadata = BTreeMap::new();
     metadata.insert(Arc::from("kind"), Value::String("telegram".to_owned()));
     metadata.insert(Arc::from("update_id"), Value::from(update_id));
+    // What the gateway's ingress ledger dedupes on. `update_id` is Telegram's
+    // own identity for the delivery, which is exactly the thing that repeats
+    // when a poll is retried (M8 / `GW-001`).
+    metadata.insert(Arc::from(INGRESS_ID_KEY), Value::from(update_id));
     metadata.insert(
         Arc::from(TICKET_KEY),
         Value::String(ticket.as_str().to_owned()),
@@ -781,6 +810,69 @@ mod tests {
             parsed.envelope.message.content.as_ref(),
             format!("/approve {ticket}")
         );
+    }
+
+    /// Every parsed update names Telegram's own delivery id, which is what
+    /// the gateway's ingress ledger dedupes on (M8 / `GW-001`). Without it a
+    /// redelivered update is a new message and the agent answers twice.
+    #[test]
+    fn both_kinds_of_update_carry_the_transport_delivery_id() {
+        let ticket = crate::r#loop::ApprovalTicket::mint();
+        for update in [
+            json!({
+                "update_id": 4242,
+                "message": { "chat": { "id": 99 }, "from": { "id": 7 }, "text": "hello" }
+            }),
+            json!({
+                "update_id": 4242,
+                "callback_query": {
+                    "id": "cbq-1",
+                    "from": { "id": 7 },
+                    "message": { "chat": { "id": 99 } },
+                    "data": format!("approve:{ticket}"),
+                }
+            }),
+        ] {
+            let parsed = parse_update(&update, &channel_id(), &open_admission()).expect("envelope");
+            assert_eq!(
+                parsed.envelope.ingress_id().as_deref(),
+                Some("4242"),
+                "got {:?}",
+                parsed.envelope.metadata
+            );
+        }
+    }
+
+    /// The offset is the gateway's to persist and hand back. It used to live
+    /// only in process memory, so a restart re-read everything Telegram still
+    /// held.
+    #[test]
+    fn the_offset_round_trips_through_the_channel_cursor() {
+        let token: Arc<str> = Arc::from("token");
+        let api_base: Arc<str> = Arc::from(DEFAULT_API_BASE);
+        let mut channel = TelegramChannel {
+            token: Arc::clone(&token),
+            id: channel_id(),
+            admission: open_admission(),
+            offset: None,
+            log_receive_errors: false,
+            attachments: AttachmentStore::from_env("telegram"),
+            api_base: Arc::clone(&api_base),
+            file_base: Arc::clone(&api_base),
+            egress: Arc::new(TelegramEgress {
+                api_base,
+                token,
+                stream_state: Arc::new(Mutex::new(HashMap::new())),
+            }),
+        };
+        assert_eq!(channel.cursor(), None, "a fresh channel has no position");
+        channel.resume_from("4243");
+        assert_eq!(channel.cursor().as_deref(), Some("4243"));
+
+        // A cursor from some other build is ignored rather than fatal: the
+        // transport re-sends what it has no acknowledgement for anyway.
+        channel.resume_from("not a number");
+        assert_eq!(channel.cursor().as_deref(), Some("4243"));
     }
 
     /// A press on some other feature's button is not an approval answer.

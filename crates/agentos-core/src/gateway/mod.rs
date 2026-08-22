@@ -3,12 +3,18 @@
 //! [`GatewayService`] is the per-run half — guardrails, approval prompts,
 //! delivery — and is what a one-shot entrypoint uses directly. [`shard`] and
 //! [`inbox`] are the concurrency half (roadmap item G1): conversations as
-//! actors, sharded across threads, serial within one.
+//! actors, sharded across threads, serial within one. [`ingress`] is the
+//! durability half (M8 / `GW-001`): what the gateway has accepted from a
+//! transport and how far each of those got, so a crash neither loses an
+//! accepted message nor answers a redelivered one twice.
 
 mod inbox;
+mod ingress;
 mod shard;
 
 pub use inbox::{Admitted, Inbox, DEFAULT_INBOX_CAPACITY};
+pub(crate) use ingress::init_schema as init_ingress_schema;
+pub use ingress::{AbandonedEvent, Admission, IngressError, IngressLedger, Settlement};
 pub use shard::{
     run_shard, shard_set, RouteError, Router, ShardConfig, ShardInbound, Turn, TurnHandler,
     DEFAULT_IDLE_INTERVAL,

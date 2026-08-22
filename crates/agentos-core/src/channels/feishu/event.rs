@@ -1,5 +1,7 @@
 use crate::channels::admission::AdmissionPolicy;
-use agentos_proto::{AttachmentKind, ChannelId, ConversationId, Envelope, Message, MessageRole};
+use agentos_proto::{
+    AttachmentKind, ChannelId, ConversationId, Envelope, Message, MessageRole, INGRESS_ID_KEY,
+};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::env;
@@ -114,6 +116,23 @@ pub(super) fn parse_event(
         .and_then(Value::as_str)
     {
         metadata.insert(Arc::from("event_id"), Value::String(event_id.to_owned()));
+        // What the gateway's ingress ledger dedupes on. Feishu already read
+        // this and used it for nothing (M8 / `GW-001`); it is the transport's
+        // own identity for the delivery, which is what repeats when the long
+        // connection reconnects mid-event.
+        metadata.insert(
+            Arc::from(INGRESS_ID_KEY),
+            Value::String(event_id.to_owned()),
+        );
+    } else {
+        // No `event_id` means nothing can recognise a redelivery of this
+        // event, so `message_id` stands in: Feishu re-sends the same message
+        // under the same message id, and two genuinely distinct messages never
+        // share one.
+        metadata.insert(
+            Arc::from(INGRESS_ID_KEY),
+            Value::String(format!("message:{message_id}")),
+        );
     }
     if let Some(tenant_key) = payload
         .get("header")
@@ -372,6 +391,35 @@ mod tests {
         assert_eq!(parsed.envelope.message.content.as_ref(), "hello");
         assert!(parsed.attachments.is_empty());
         assert_eq!(parsed.message_id, "om_1");
+    }
+
+    /// The gateway's ingress ledger dedupes on this. Feishu reads `event_id`
+    /// off every event and used it for nothing (M8 / `GW-001`).
+    #[test]
+    fn an_event_id_becomes_the_transport_delivery_id() {
+        let mut payload = text_event("hello");
+        payload["header"]["event_id"] = json!("evt-9f2");
+        let parsed =
+            parse_event(&payload, &channel_id(), &open_admission(), "chat_id").expect("parsed");
+        assert_eq!(parsed.envelope.ingress_id().as_deref(), Some("evt-9f2"));
+    }
+
+    /// Not every Feishu event carries a header `event_id`. The message id
+    /// stands in rather than leaving the event un-deduplicable, because Feishu
+    /// re-sends the same message under the same message id.
+    #[test]
+    fn a_missing_event_id_falls_back_to_the_message_id() {
+        let parsed = parse_event(
+            &text_event("hello"),
+            &channel_id(),
+            &open_admission(),
+            "chat_id",
+        )
+        .expect("parsed");
+        assert_eq!(
+            parsed.envelope.ingress_id().as_deref(),
+            Some("message:om_1")
+        );
     }
 
     #[test]

@@ -9,7 +9,7 @@ pub mod tool;
 pub mod trace;
 pub mod usage;
 
-pub use envelope::Envelope;
+pub use envelope::{Envelope, INGRESS_ID_KEY};
 pub use ids::{
     AgentId, ChannelId, ConversationId, InterruptionId, Namespace, RecordId, RunId, SchemaVersion,
     SpanId, TaskId, ToolCallId,

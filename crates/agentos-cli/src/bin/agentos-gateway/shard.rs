@@ -13,7 +13,8 @@ use super::{
 use agentos_cli::slash::{self, Parsed, SessionUsage, SlashCommand, SlashContext};
 use agentos_core::crons::{CronStore, MemoryMaintenanceCron};
 use agentos_core::gateway::{
-    run_shard, unix_now, GatewayRun, GatewayService, ShardConfig, ShardInbound, Turn, TurnHandler,
+    run_shard, unix_now, GatewayRun, GatewayService, IngressLedger, Settlement, ShardConfig,
+    ShardInbound, Turn, TurnHandler,
 };
 use agentos_core::r#loop::{
     route, ApprovalBinding, ApprovalOutcome, ApprovalTicket, InputGuardrailEntry,
@@ -45,6 +46,10 @@ pub(super) struct ShardContext {
     /// running the turn does not own the channel.
     pub(super) stream_egress: Option<Arc<dyn StreamEgress>>,
     pub(super) session_usage: Arc<SessionUsage>,
+    /// Where this channel's accepted events are recorded. The router admits
+    /// through it; the shard settles into it once the turn is over
+    /// (M8 / `GW-001`, deliverable 3).
+    pub(super) ledger: Arc<IngressLedger>,
 }
 
 /// Own one shard: a `current_thread` runtime, because the run loop's future is
@@ -168,10 +173,39 @@ struct ShardTurns<'a> {
 #[async_trait(?Send)]
 impl TurnHandler for ShardTurns<'_> {
     async fn run(&self, turn: Turn) {
+        // Read before the turn consumes it. Settling names the event, and the
+        // envelope is gone by the time there is anything to settle.
+        let event = turn
+            .input
+            .ingress_id()
+            .map(|event_id| (turn.input.channel_id.clone(), event_id));
+
         if let Err(err) = self.handle(turn).await {
             let _ = log_line(
                 &self.context.config,
                 &format!("{} turn failed: {err}", self.context.channel_name),
+            );
+        }
+
+        // Settled once the turn is over, whatever happened in it. Answered,
+        // refused, paused on an approval and errored are all *settled*: the
+        // sender heard back, so replaying the message on the next restart
+        // would answer them twice. The only unsettled state is the one this
+        // line never reaches — a process that died mid-turn (M8 / `GW-001`).
+        let Some((channel_id, event_id)) = event else {
+            return;
+        };
+        if let Err(err) = self
+            .context
+            .ledger
+            .settle(&channel_id, &event_id, Settlement::Handled)
+        {
+            let _ = log_line(
+                &self.context.config,
+                &format!(
+                    "{} could not settle ingress event {event_id}: {err}",
+                    self.context.channel_name
+                ),
             );
         }
     }

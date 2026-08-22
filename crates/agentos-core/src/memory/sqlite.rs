@@ -182,6 +182,7 @@ impl SqliteStore {
         .map_err(memory_sqlite_error)?;
         crate::audit::init_schema(&conn).map_err(memory_sqlite_error)?;
         super::lease::init_schema(&conn).map_err(memory_sqlite_error)?;
+        crate::gateway::init_ingress_schema(&conn).map_err(memory_sqlite_error)?;
         Self::backfill_fts_records(&conn)?;
         Ok(())
     }
@@ -204,6 +205,11 @@ impl SqliteStore {
     }
 
     pub(super) fn session_conn(&self) -> Result<PooledConnection<'_>, SessionError> {
+        Ok(self.pool.get())
+    }
+
+    /// A connection, for the gateway's ingress ledger.
+    pub(crate) fn ingress_conn(&self) -> Result<PooledConnection<'_>, MemoryError> {
         Ok(self.pool.get())
     }
 }

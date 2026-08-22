@@ -4,7 +4,8 @@ use agentos_core::channels::{feishu::FeishuChannel, telegram::TelegramChannel};
 use agentos_core::config::{effective, WorkspaceConfig};
 use agentos_core::crons::{CronSchedule, CronStore, MemoryMaintenanceCron};
 use agentos_core::gateway::{
-    shard_set, GatewayRun, GatewayService, Router, ShardConfig, DEFAULT_IDLE_INTERVAL,
+    shard_set, Admission, GatewayRun, GatewayService, IngressLedger, Router, ShardConfig,
+    DEFAULT_IDLE_INTERVAL,
 };
 use agentos_core::memory::migrate::{self, MigrationSettings};
 use agentos_core::memory::{
@@ -755,6 +756,23 @@ where
         idle_interval: DEFAULT_IDLE_INTERVAL,
     };
     let (router, inbounds) = shard_set(&shard_config);
+
+    // The durable record of what this gateway has accepted (M8 / `GW-001`,
+    // deliverable 3). Built before the shards, because the shards settle into
+    // it and the router admits through it.
+    let ledger = Arc::new(IngressLedger::new(Arc::clone(&runtime.session)));
+    report_abandoned_work(config, channel_name, &ledger, &channel.id())?;
+    if let Some(cursor) = ledger
+        .cursor(&channel.id())
+        .map_err(|err| format!("failed to read the {channel_name} ingress cursor: {err}"))?
+    {
+        log_line(
+            config,
+            &format!("{channel_name} resuming ingress from cursor {cursor}"),
+        )?;
+        channel.resume_from(&cursor);
+    }
+
     let egress = channel.egress();
     let stream_egress = gateway_streaming_enabled()
         .then(|| channel.stream_egress())
@@ -772,6 +790,7 @@ where
             egress: Arc::clone(&egress),
             stream_egress: stream_egress.clone(),
             session_usage: Arc::clone(&session_usage),
+            ledger: Arc::clone(&ledger),
         };
         let handle = thread::Builder::new()
             .name(format!("agentos-{channel_name}-shard-{shard}"))
@@ -787,7 +806,15 @@ where
         ),
     )?;
 
-    let outcome = route_inbound(config, &mut channel, channel_name, &router, egress.as_ref()).await;
+    let outcome = route_inbound(
+        config,
+        &mut channel,
+        channel_name,
+        &router,
+        egress.as_ref(),
+        &ledger,
+    )
+    .await;
 
     // Dropping the router closes every shard queue, which ends each shard once
     // it has drained. Join so a shard's in-flight turn finishes before the
@@ -808,6 +835,7 @@ async fn route_inbound<C>(
     channel_name: &str,
     router: &Router,
     egress: &dyn Egress,
+    ledger: &IngressLedger,
 ) -> Result<(), String>
 where
     C: Channel,
@@ -853,12 +881,101 @@ where
             continue;
         }
 
+        // Durable acceptance before delivery, and the cursor only after that
+        // (M8 / `GW-001`, deliverable 3). The window between the transport
+        // handing this over and the ledger row existing is the one where a
+        // crash means a replay — which the transport will do anyway, and which
+        // the ledger will then recognise. The reverse ordering is what could
+        // not be recovered from: a cursor advanced past an event nothing
+        // recorded is an accepted message that no longer exists anywhere.
+        match ledger.admit(&input) {
+            Ok(Admission::AlreadySettled) => {
+                log_line(
+                    config,
+                    &format!(
+                        "{channel_name} suppressed a replay of an event already handled                          ({})",
+                        input.conversation_id.as_str()
+                    ),
+                )?;
+                continue;
+            }
+            Ok(Admission::Retry { attempts }) => log_line(
+                config,
+                &format!(
+                    "{channel_name} re-running an event abandoned by an earlier attempt                      ({}, attempt {attempts})",
+                    input.conversation_id.as_str()
+                ),
+            )?,
+            Ok(Admission::Fresh | Admission::Unidentified) => {}
+            Err(err) => {
+                // The ledger is the durability guarantee; a gateway that
+                // cannot write it is a gateway that will replay and lose
+                // messages silently. Better to say so and keep running than to
+                // pretend the guarantee holds.
+                log_line(
+                    config,
+                    &format!("{channel_name} ingress ledger unavailable: {err}"),
+                )?;
+            }
+        }
+        if let Some(cursor) = channel.cursor() {
+            if let Err(err) = ledger.set_cursor(&channel.id(), &cursor) {
+                log_line(
+                    config,
+                    &format!("{channel_name} ingress cursor persist failed: {err}"),
+                )?;
+            }
+        }
+
         if let Err(err) = router.deliver(input).await {
             // Every shard is gone; there is nothing left to route to.
             log_line(config, &format!("{channel_name} routing failed: {err}"))?;
             return Ok(());
         }
     }
+}
+
+/// Say what the last run of this gateway accepted and never finished.
+///
+/// Not replayed from here: the transport re-sends anything it has no
+/// acknowledgement for, and replaying from the ledger as well would be exactly
+/// the duplicate the ledger exists to prevent. This is the reporting half —
+/// an operator reading the log after a crash can see which conversations were
+/// mid-turn.
+fn report_abandoned_work(
+    config: &ServiceConfig,
+    channel_name: &str,
+    ledger: &IngressLedger,
+    channel_id: &ChannelId,
+) -> Result<(), String> {
+    let abandoned = ledger
+        .unsettled(channel_id)
+        .map_err(|err| format!("failed to read the {channel_name} ingress ledger: {err}"))?;
+    if abandoned.is_empty() {
+        return Ok(());
+    }
+    log_line(
+        config,
+        &format!(
+            "{channel_name} has {} accepted event(s) that never finished",
+            abandoned.len()
+        ),
+    )?;
+    for event in abandoned.iter().take(20) {
+        log_line(
+            config,
+            &format!(
+                "{channel_name} abandoned event {} in conversation {} from {} \
+                 (attempt {}, accepted at {})",
+                event.event_id,
+                event.conversation_id.as_str(),
+                event.sender,
+                event.attempts,
+                event.accepted_at
+            ),
+        )?;
+    }
+    Ok(())
 }
 
 /// Replay every cron task that is due and bound to this channel as a synthetic
