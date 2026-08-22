@@ -735,22 +735,16 @@ fn run_persistent_gateways(
         handles.push((channel, handle));
     }
 
+    // Nothing here polls for the shutdown signal. Each channel's own router
+    // notices it and returns after draining, and the loop below already
+    // reports and removes a finished channel and exits when none are left —
+    // so waiting for them *is* the drain (M8 / `GW-001`, deliverable 5).
+    let mut announced = false;
     loop {
         thread::sleep(Duration::from_secs(1));
-        if gateway::shutdown_requested() && handles.iter().all(|(_, handle)| handle.is_finished()) {
-            // Every channel loop has noticed the signal and drained. Fall
-            // through to the join below so their outcomes are still reported.
-            log_line(config, "every channel gateway drained")?;
-            for (channel, handle) in handles {
-                match handle.join() {
-                    Ok(Ok(())) => log_line(config, &format!("{channel} gateway loop exited"))?,
-                    Ok(Err(err)) => {
-                        log_line(config, &format!("{channel} gateway loop failed: {err}"))?
-                    }
-                    Err(_) => log_line(config, &format!("{channel} gateway loop panicked"))?,
-                }
-            }
-            return Ok(());
+        if gateway::shutdown_requested() && !announced {
+            announced = true;
+            log_line(config, "shutdown requested; waiting for channels to drain")?;
         }
         let mut index = 0;
         while index < handles.len() {
