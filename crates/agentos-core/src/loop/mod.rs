@@ -12,7 +12,7 @@ use agentos_interfaces::guardrail::{
 };
 use agentos_interfaces::orchestrator::{Orchestrator, Plan, RunContext, StreamSink};
 use agentos_interfaces::run_state::{Interruption, InterruptionAction, RunState};
-use agentos_proto::{AgentId, InterruptionId, Message, SpanKind};
+use agentos_proto::{InterruptionId, Message, SpanKind};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -21,12 +21,14 @@ use tracing::info;
 
 mod approval;
 mod approval_route;
+mod authorization;
 mod batch;
 mod budget;
 mod cancel;
 mod delegate;
 mod error;
 mod escalate;
+mod handoff;
 mod items;
 mod planning;
 mod request;
@@ -40,14 +42,16 @@ pub use approval_route::{
     ApprovalOutcome, ApprovalTicket, Routed, ACTIONS_KEY, APPROVE, DECISION_KEY, DENY,
     EXPIRES_AT_KEY, INTERRUPTION_KEY, PROMPT_KIND, REASON_KEY, TICKET_KEY,
 };
+use authorization::plan_subject;
+pub use authorization::{Authorization, Unauthorized};
 use budget::{budget_exhausted_finish, record_llm_usage};
 use cancel::{cancelled_finish, unless_cancelled};
 use delegate::{execute_delegate, execute_resume_delegate, DelegateOutcome};
 pub use error::{RunError, StepFailure};
 use escalate::{execute_escalate, EscalateOutcome};
+use handoff::execute_handoff;
 use items::{
-    assistant_tool_call_item, metadata_value, subagent_result_item, suborchestrator_result_item,
-    tool_result_item,
+    assistant_tool_call_item, subagent_result_item, suborchestrator_result_item, tool_result_item,
 };
 use request::record_request_header;
 pub use steering::{Steered, Steering, DEFAULT_STEERING_CAPACITY};
@@ -172,6 +176,7 @@ pub fn resume_approved(state: RunState) -> Result<RunLoopState, StepFailure> {
         },
     };
     Ok(RunLoopState::Act(ActCtx {
+        authorized: Authorization::approved_by_human(&plan),
         state,
         plan,
         turns,
@@ -207,6 +212,14 @@ pub struct ActCtx {
     /// `Plan -> Approve -> Act -> Observe` progression intact so the model can
     /// read the denial and replan on the next turn.
     pub denied: Option<Arc<str>>,
+    /// Proof that `plan` crossed `Approve`.
+    ///
+    /// Private, and [`Authorization`] has no public constructor, so this
+    /// struct cannot be built by a literal outside the crate — which is what
+    /// closes the transition hole `AGENTS.md` used to say review enforced
+    /// (M6 / `STATE-001`). `Act` also checks the witness against the plan it
+    /// was handed, so a caller holding a real `ActCtx` cannot swap one in.
+    authorized: Authorization,
 }
 
 #[derive(Debug)]
@@ -499,6 +512,7 @@ async fn approve(ctx: ApproveCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, S
                 }
             }
             Ok(RunLoopState::Act(ActCtx {
+                authorized: Authorization::allowed(&plan),
                 state,
                 plan,
                 turns,
@@ -520,9 +534,11 @@ async fn approve(ctx: ApproveCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, S
                 .with_detail(reason.as_ref())
                 .with_digest(ArgumentDigest::of(call.args.get().as_bytes())),
             );
+            let plan = Plan::CallTool(call);
             Ok(RunLoopState::Act(ActCtx {
+                authorized: Authorization::allowed(&plan),
                 state,
-                plan: Plan::CallTool(call),
+                plan,
                 turns,
                 denied: Some(reason),
             }))
@@ -535,10 +551,13 @@ async fn approve(ctx: ApproveCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, S
             deps.audit.record_reason(
                 SafetyEventKind::PolicyDenial,
                 SafetyOutcome::Denied,
-                subject,
+                Arc::clone(&subject),
                 reason.as_ref(),
             );
-            Err(StepFailure::new(state, RunError::ApprovalDenied { reason }))
+            Err(StepFailure::new(
+                state,
+                RunError::StructuralDenial { subject, reason },
+            ))
         }
         ApproveTransition::Pause { state } => Ok(RunLoopState::Paused(state)),
         ApproveTransition::Unsupported { state, reason } => Err(StepFailure::new(
@@ -548,27 +567,37 @@ async fn approve(ctx: ApproveCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, S
     }
 }
 
-/// What a plan is *about*, for the `subject` of a safety event: the tool a
-/// call names, the agent a handoff targets, the sub-agent a delegation runs.
-fn plan_subject(plan: &Plan) -> Arc<str> {
-    match plan {
-        Plan::CallTool(call) => Arc::clone(&call.name),
-        Plan::CallTools(_) => Arc::from("tool_batch"),
-        Plan::Delegate(spec) => Arc::from(spec.agent_id.as_str()),
-        Plan::Escalate(spec) => Arc::clone(&spec.template.name),
-        Plan::Handoff(agent_id, _) => Arc::from(agent_id.as_str()),
-        Plan::ResumeSubAgent { spec, .. } => Arc::from(spec.agent_id.as_str()),
-        Plan::Reply(_) => Arc::from("reply"),
-    }
-}
-
 async fn act(ctx: ActCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, StepFailure> {
     let ActCtx {
         mut state,
         plan,
         turns,
         denied,
+        authorized,
     } = ctx;
+    // Re-assert, idempotently, on the way in. `Approve` decided this plan, but
+    // a decision made one state ago is not the same thing as a decision made
+    // now: the witness has to name *this* plan, and the policy has to still
+    // agree. A denied call skips the check because it is not going to run —
+    // recording the denial is the whole of what happens to it.
+    if denied.is_none() {
+        if let Err(refusal) = authorized.admits(&plan, deps.policy) {
+            let subject = plan_subject(&plan);
+            deps.audit.record_reason(
+                SafetyEventKind::PolicyDenial,
+                SafetyOutcome::Denied,
+                Arc::clone(&subject),
+                refusal.to_string(),
+            );
+            return Err(StepFailure::new(
+                state,
+                RunError::StructuralDenial {
+                    subject,
+                    reason: Arc::from(refusal.to_string()),
+                },
+            ));
+        }
+    }
     match plan {
         Plan::CallTool(call) => {
             // Record the assistant turn that requested the tool *before*
@@ -704,45 +733,6 @@ fn pause_for_subagent_approval(
         },
     ));
     Ok(RunLoopState::Paused(state))
-}
-
-fn execute_handoff(
-    state: &mut RunState,
-    deps: &LoopDeps<'_>,
-    agent_id: AgentId,
-    payload: Option<Value>,
-) {
-    let from_agent = state.active_agent.clone();
-    let parent_id = trace::run_span_id(state);
-    let mut fields = BTreeMap::new();
-    fields.insert(field_key("from_agent"), metadata_value(from_agent.as_str()));
-    fields.insert(field_key("to_agent"), metadata_value(agent_id.as_str()));
-    if let Some(payload) = payload {
-        fields.insert(field_key("payload"), payload);
-    }
-    let span_id = trace::record_span(
-        state,
-        parent_id,
-        SpanKind::Handoff,
-        format!("handoff.{}", agent_id.as_str()),
-        fields,
-    );
-    trace::record_event(
-        state,
-        deps.hooks,
-        span_id.clone(),
-        "handoff_started",
-        BTreeMap::new(),
-    );
-
-    state.active_agent = agent_id;
-
-    let mut fields = BTreeMap::new();
-    fields.insert(
-        field_key("active_agent"),
-        metadata_value(state.active_agent.as_str()),
-    );
-    trace::record_event(state, deps.hooks, span_id, "handoff_finished", fields);
 }
 
 /// The only state that cannot fail: it renames a context and hands control

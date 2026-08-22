@@ -642,7 +642,7 @@ Primary files: `crates/agentos-core/src/prompt/mod.rs`,
 
 Priority: P1
 Size: M — ~400–600 LOC, and safety events have **no durable substrate today**
-Status: **deliverables 1–3 done** (`AUD-001`); 4–8 open (`STATE-001`)
+Status: **deliverables 1–4 and 8 done**; 5–7 open (`STATE-001`)
 Dependencies: M3, M4, M5
 
 Current state: `memory_access_log` (`memory/sqlite.rs:112`) is the only durable
@@ -675,8 +675,11 @@ Deliverables:
    back out, so the runner persists a failed run's trace records under the
    `failed` phase before returning the error. Both `resume_run` refusal paths do
    the same.
-4. Define recoverable tool denial separately from fatal structural denial and
-   update the state diagram and tests.
+4. **Done.** `RunError::StructuralDenial` is separate from `ApprovalDenied` (a
+   human said no); the recoverable case has no variant at all, because a denied
+   tool call comes back as a `Denied` `ToolResult` and never becomes an error.
+   State diagram updated in `DESIGN.md` and `docs/ARCHITECTURE.md` §7; both
+   arms pinned in `tests/loop_transitions.rs`.
 5. Make `/clear` create a new session epoch or tombstone instead of
    `DELETE FROM session_items` (`memory/sqlite.rs:145-152`).
    `prompt/projection.rs` is the in-tree precedent — compaction already hides a
@@ -689,12 +692,15 @@ Deliverables:
    `plan()`, while output guardrails run afterwards at `loop/mod.rs:363-365`; the
    TUI sink does `print!` + `flush` per chunk and cannot retract. Keep provisional
    streaming opt-in until an incremental guardrail interface exists.
-8. Close the run-loop transition hole. `RunLoopState` is a public enum over
-   all-public-field context structs, so a hand-built `ActCtx` executes a tool with
-   no Approve pass and `act()` re-checks nothing. **Prefer re-asserting the policy
-   check idempotently inside `act()`** plus an exhaustive transition-table test;
-   full typestate costs ~400–600 LOC and still needs an unchecked constructor for
-   `Paused` resume.
+8. **Done.** `ActCtx` carries a private `Authorization` with no public
+   constructor, so a hand-built one does not compile; the witness fingerprints
+   the plan it was issued for, so a caller holding a legitimate `ActCtx` cannot
+   assign a different plan over the approved one; and `act()` re-decides against
+   the live policy, accepting `ask_user` only when a human answered. About 200
+   LOC rather than the 400–600 full typestate would have cost, and the
+   `Paused` resume case is handled by minting a human-approved witness rather
+   than by an unchecked constructor. `tests/loop_transitions.rs` pins the
+   table.
 
 Acceptance criteria:
 
@@ -708,7 +714,10 @@ Acceptance criteria:
 - Normal `/clear` performs no session-item `DELETE`.
 - A seeded output-policy violation emits zero user-visible bytes in stable mode.
 - A directly constructed `ActCtx` carrying a tool call cannot execute it without
-  a policy decision.
+  a policy decision. **Met** — it does not compile, verified by adding the
+  literal and reading the compiler's refusal. A plan swapped into a legitimate
+  `ActCtx` is refused at `Act`, verified by a test that fails when the check is
+  removed.
 
 Primary files: `crates/agentos-core/src/loop/`, `crates/agentos-core/src/runner.rs`,
 `crates/agentos-core/src/memory/sqlite.rs`, `crates/agentos-core/src/trace.rs`,

@@ -282,10 +282,22 @@ The core state enum is:
 - `Paused`
 - `Finish`
 
-Every transition consumes the previous state and returns the next state. Invalid
-transitions are not representable by the public API. No feature since the
-original loop has added a state or a transition; everything below attaches to an
-existing state or runs outside the loop entirely.
+Every transition consumes the previous state and returns the next state, or
+returns a `StepFailure` that carries the state back out so a failed run still
+persists its trace. Invalid transitions are not representable by the public
+API. No feature since the original loop has added a state or a transition;
+everything below attaches to an existing state or runs outside the loop
+entirely.
+
+The *ordering* used to be a review rule rather than a property. `ActCtx` had
+all-public fields, so a caller could build one carrying a tool call and hand it
+to `step`, and `Act` ran it with no policy decision behind it. It now carries a
+private `Authorization` with no public constructor — a hand-built `ActCtx` does
+not compile — and the witness names the plan it was issued for, so a caller
+holding a legitimate one cannot assign a different plan over the approved one.
+`Act` also re-decides against the live policy before running anything,
+accepting `ask_user` only when a human has actually answered. The transition
+table itself is pinned in `crates/agentos-core/tests/loop_transitions.rs`.
 
 Plan variants:
 
@@ -310,9 +322,16 @@ Guardrail placement:
 
 Approval placement:
 
-- Every non-terminal action crosses `Approve`.
+- Every non-terminal action crosses `Approve`, and `Act` re-asserts that it did.
 - `allow` proceeds to `Act`.
-- `deny` terminates with a policy error.
+- `deny` on a **tool call** is *recoverable*: `Act` records a `Denied`
+  `ToolResult` rather than running the tool, the model reads it on the next turn
+  and replans, and the run continues. It is never a `RunError`.
+- `deny` on a **handoff, delegation, or escalation** is *structural*: there is
+  no tool-call id to attach a result to and nothing to retry around, so the run
+  ends with `RunError::StructuralDenial`. That is a separate variant from
+  `RunError::ApprovalDenied`, which means a human was asked and said no — the
+  same distinction that already separates both from `ApprovalUnanswered`.
 - `ask_user` serializes a paused `RunState` and mints an approval ticket (§9).
 
 `Plan` is also the one point where new input is folded in. A message that

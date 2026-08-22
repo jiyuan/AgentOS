@@ -31,7 +31,7 @@ something that no longer exists — the two-way ratchet
 
 | Capability | Status | Platforms | Required config | Limitations | Test level |
 |---|---|---|---|---|---|
-| Typed run loop (`Start`→`Plan`→`Approve`→`Act`→`Observe`→`Finish`) | Stable | all | — | State *ordering* is not compiler-enforced; a hand-built `ActCtx` reaches `Act` with no `Approve` pass (M6) | integration, golden |
+| Typed run loop (`Start`→`Plan`→`Approve`→`Act`→`Observe`→`Finish`) | Stable | all | — | `ActCtx` carries a private authorization witness, so a hand-built one does not compile and a swapped plan is refused in `Act`; the transition table is pinned by `tests/loop_transitions.rs` | integration, golden |
 | Pause / resume over a serialized `RunState` | Stable | all | — | Paused-run state is written with plain `fs::write`: no temp+rename, no fsync, mode 0644 (M8) | integration, golden |
 | Ticketed approval | Stable | all | `[policy]` | A prompt is answerable only by the sender it was put to, or a `[policy] approval_administrators` entry. Tickets are still minted from a clock-seeded counter rather than a CSPRNG | unit, integration |
 | Policy engine (`allow` / `deny` / `ask_user`) | Stable | all | `[policy]` | — | unit, integration |

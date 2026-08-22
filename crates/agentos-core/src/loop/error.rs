@@ -37,8 +37,26 @@ pub enum RunError {
     SubAgent(#[from] SubAgentError),
     #[error("task workspace failed: {0}")]
     TaskWorkspace(#[from] TaskWorkspaceError),
+    /// A human was asked and said no.
+    ///
+    /// Distinct from [`Self::StructuralDenial`] because they are different
+    /// facts about who refused, and the reply a user should see differs: one
+    /// is their own decision coming back, the other is the deployment's
+    /// configuration. Both fail the run closed. The same argument already
+    /// separates [`Self::ApprovalUnanswered`] from this one.
     #[error("approval denied: {reason}")]
     ApprovalDenied { reason: Arc<str> },
+    /// The policy engine refused an action nobody can retry around: a handoff,
+    /// a delegation, an escalation, or a plan that reached `Act` without a
+    /// live authorization.
+    ///
+    /// The *recoverable* counterpart has no variant here on purpose. A denied
+    /// tool call comes back as a `Denied` `ToolResult` the model reads and
+    /// replans around, so it never becomes a `RunError` at all — which is the
+    /// type-level statement that the two are not the same kind of denial
+    /// (M6 / `STATE-001`, deliverable 4).
+    #[error("policy denied {subject}: {reason}")]
+    StructuralDenial { subject: Arc<str>, reason: Arc<str> },
     /// The approval ended without anyone deciding it — the prompt expired, or
     /// the run had no interactive user (roadmap item G2). Fails the run closed
     /// exactly like a denial, and is a separate variant so the audit trail and

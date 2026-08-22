@@ -23,15 +23,22 @@ stateDiagram-v2
     Plan --> Finish: reply
     Plan --> Approve: tool, handoff, delegate, escalate
     Approve --> Act: allow
+    Approve --> Act: deny a tool call (recoverable)
     Approve --> Paused: ask_user
-    Approve --> [*]: deny
+    Approve --> [*]: deny a handoff, delegate, or escalate (structural)
     Act --> Observe: action result
+    Act --> [*]: the plan is not the one Approve decided
     Observe --> Plan: continue
-    Paused --> Approve: resume
+    Paused --> Act: resume, approved
+    Paused --> [*]: resume, refused or unanswered
     Finish --> [*]
 ```
 
-`RunLoopState::step()` consumes the current state and returns the next state. The state enum is `Start`, `Plan`, `Approve`, `Act`, `Observe`, `Paused`, `Finish`. Invalid transitions are not represented by the public API.
+`RunLoopState::step()` consumes the current state and returns the next state. The state enum is `Start`, `Plan`, `Approve`, `Act`, `Observe`, `Paused`, `Finish`. A step that fails returns a `StepFailure` carrying the state back out, so a run that ends badly still persists its trace.
+
+Two denials, and they are different kinds of thing. A policy `deny` on a **tool call** is *recoverable*: `Act` records a `Denied` `ToolResult` instead of running the tool, the model reads the refusal on the next turn and replans, and the run continues. It never becomes a `RunError`. A policy `deny` on a **handoff, delegation, or escalation** is *structural*: there is no tool-call id to attach a result to and nothing for the model to retry around, so the run ends with `RunError::StructuralDenial`. That is again distinct from `RunError::ApprovalDenied`, which means a human was asked and said no.
+
+The ordering is enforced, not just documented. `ActCtx` carries a private `Authorization` with no public constructor, so a caller cannot build one and skip `Approve`; the witness names the plan it was issued for, so a caller holding a real `ActCtx` cannot assign a different plan over the approved one; and `Act` re-decides against the live policy before running anything, accepting `ask_user` only when a human actually answered. `crates/agentos-core/tests/loop_transitions.rs` pins the table, so a new edge has to be added there before it can be added to the loop.
 
 Plan variants:
 
@@ -48,7 +55,7 @@ Plan variants:
 Guardrail and approval placement:
 
 - Input guardrails run in `Start`; tool guardrails run in `Act`; output guardrails run before a terminal reply finishes.
-- Every non-terminal action crosses `Approve`. `allow` proceeds to `Act`, `deny` terminates with a policy error, and `ask_user` serializes a paused `RunState` for later resume.
+- Every non-terminal action crosses `Approve`, and `Act` re-asserts that it did. `allow` proceeds to `Act`, `deny` either records a refusal the model can replan around (a tool call) or terminates the run (anything structural), and `ask_user` serializes a paused `RunState` for later resume.
 - Sub-agent permissions can only narrow the parent's, over actions and arguments alike; every sub-agent tool call re-enters the loop at `Approve`. A sub-agent that needs more than its parent holds carries an explicit delegation grant naming the tool and the reason.
 - An approval prompt issues a ticket, and only an answer naming that ticket decides it. Anything else stays ordinary input.
 - `Plan` is also where input that arrived mid-run is claimed: the previous turn has been observed and the next request has not been assembled yet.

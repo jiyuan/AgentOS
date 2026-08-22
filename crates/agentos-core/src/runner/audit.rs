@@ -66,6 +66,7 @@ fn run_error_kind(error: &RunError) -> &'static str {
         RunError::SubAgent(_) => "subagent",
         RunError::TaskWorkspace(_) => "task_workspace",
         RunError::ApprovalDenied { .. } => "approval_denied",
+        RunError::StructuralDenial { .. } => "structural_denial",
         RunError::ApprovalUnanswered { .. } => "approval_unanswered",
         RunError::ApprovalUnsupported { .. } => "approval_unsupported",
         RunError::Cancelled => "cancelled",

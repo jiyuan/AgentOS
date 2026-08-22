@@ -551,7 +551,7 @@ async fn a_structural_denial_records_both_the_decision_and_the_run_ending() {
          why there is no answer needs the second one"
     );
     assert_eq!(events[0].event.subject.as_ref(), "somewhere-else");
-    assert_eq!(events[1].event.subject.as_ref(), "approval_denied");
+    assert_eq!(events[1].event.subject.as_ref(), "structural_denial");
 }
 
 /// The redaction contract, over every field of every stored event rather than
