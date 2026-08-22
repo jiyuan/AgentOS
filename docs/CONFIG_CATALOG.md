@@ -70,6 +70,7 @@ Every key `agent.toml` accepts, derived from the config structs. Edit the doc co
 | `channels.feishu` | `ChannelConfig` | (table) | *(undocumented — see `config/undocumented.txt`)* |
 | `channels.feishu.enabled` | `bool` | `false` | *(undocumented — see `config/undocumented.txt`)* |
 | `channels.feishu.mode` | `Arc<str>` | `long_connection` | *(undocumented — see `config/undocumented.txt`)* |
+| `channels.provisional_streaming` | `bool` | `false` | Forward assistant text as the model produces it, before the output guardrails have seen any of it. Off by default.  Provisional, and the name says why: output guardrails run at the end of a turn, so on a streaming channel the check happens after the user has already read the output. Turning this on trades that guarantee for latency, knowingly. It becomes eligible for a stable default when an incremental output-guardrail interface exists; the reasoning is in `docs/adr/0007-BUFFERED_OUTPUT.md`.  Named as a path rather than linked because this comment is rendered into `docs/CONFIG_CATALOG.md`, where a source-relative link resolves nowhere — `scripts/check-release-archive.sh` checks that every link in the packaged docs points at something in the bundle. |
 | `isolation` | `IsolationConfig` | (table) | Where the subprocess worker that runs sandboxed tools is found. |
 | `isolation.worker_path` | `Option<PathBuf>` | (unset) | *(undocumented — see `config/undocumented.txt`)* |
 | `isolation.worker_path_env` | `Option<String>` | (unset) | *(undocumented — see `config/undocumented.txt`)* |
@@ -172,5 +173,5 @@ Every key `agent.toml` accepts, derived from the config structs. Edit the doc co
 | `spill.root` | `PathBuf` | `spill` | Where artifacts are written. Relative paths resolve against the workspace root; an absolute path is taken as given, for a deployment that wants spill on a different volume from the session database. |
 | `spill.retention_days` | `u64` | `0` | Days an artifact is kept, or `0` to keep everything.  `0` is a choice rather than a disabled feature — see the module docs. |
 
-102 of 164 keys have no description yet. They are listed in `crates/agentos-core/src/config/undocumented.txt`; writing the doc comment on the field is what removes a line from it.
+102 of 165 keys have no description yet. They are listed in `crates/agentos-core/src/config/undocumented.txt`; writing the doc comment on the field is what removes a line from it.
 <!-- END GENERATED: config -->

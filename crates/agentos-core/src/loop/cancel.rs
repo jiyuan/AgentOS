@@ -52,12 +52,20 @@ use tracing::info;
 
 /// What the user sees when a run is stopped.
 ///
-/// A constant, and deliberately not passed through the output guardrails: it
-/// carries no model or user content for a content guardrail to inspect, and
-/// `budget_exhausted_finish` already establishes that a fixed stop notice goes
-/// out unchecked.
+/// It goes through the declared output policy like every other terminal reply
+/// (M6 / `STATE-001`, deliverable 6). It used not to, on the argument that a
+/// constant carries no model content for a content guardrail to inspect —
+/// which is true of *this* constant and is not the property the invariant
+/// needs. An output policy is a deployment's statement about everything that
+/// leaves the runtime; a path that decides for itself that it is exempt is a
+/// second way around the check, and the next constant to take that path may
+/// not be so harmless.
 const CANCELLED_NOTICE: &str = "Stopped. Anything I had already done in this turn is saved, \
      so you can pick up from here.";
+
+/// What goes out if the policy refuses even that. Shorter, and about the run
+/// rather than about the work.
+const WITHHELD_NOTICE: &str = "Stopped.";
 
 /// Run `work` unless the token fires first.
 ///
@@ -76,7 +84,7 @@ pub(super) async fn unless_cancelled<T>(
 }
 
 /// The terminal answer for a run that was stopped.
-pub(super) fn cancelled_finish(
+pub(super) async fn cancelled_finish(
     mut state: RunState,
     deps: &LoopDeps<'_>,
     at: &'static str,
@@ -109,10 +117,14 @@ pub(super) fn cancelled_finish(
         at,
     );
 
-    FinalOutput {
-        state,
-        message: Message::text(MessageRole::Assistant, CANCELLED_NOTICE),
-    }
+    let message = super::output::gated(
+        &state,
+        deps,
+        Message::text(MessageRole::Assistant, CANCELLED_NOTICE),
+        WITHHELD_NOTICE,
+    )
+    .await;
+    FinalOutput { state, message }
 }
 
 #[cfg(test)]

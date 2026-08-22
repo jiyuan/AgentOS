@@ -319,7 +319,13 @@ Guardrail placement:
 - Tool guardrails run in `Act`.
 - Output guardrails run before terminal replies finish — including the replies
   the loop synthesizes itself for budget exhaustion, cancellation, and context
-  overflow.
+  overflow. `loop/output.rs` is the single gate for the synthesized ones. A
+  model reply that trips fails the run; a notice the loop wrote is replaced by
+  a shorter fixed one, because the run has to terminate here and re-raising
+  would throw away the tool results a user who pressed stop most wants kept.
+  Streaming is the one way to put bytes past a sink before the check runs, and
+  is off unless `[channels] provisional_streaming` says otherwise
+  ([ADR-0007](adr/0007-BUFFERED_OUTPUT.md)).
 
 Approval placement:
 

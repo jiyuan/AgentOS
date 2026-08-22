@@ -642,7 +642,7 @@ Primary files: `crates/agentos-core/src/prompt/mod.rs`,
 
 Priority: P1
 Size: M — ~400–600 LOC, and safety events have **no durable substrate today**
-Status: **deliverables 1–5 and 8 done**; 6–7 open (`STATE-001`)
+Status: **done** — all eight deliverables. `AUD-001` and `STATE-001` both closed.
 Dependencies: M3, M4, M5
 
 Current state: `memory_access_log` (`memory/sqlite.rs:112`) is the only durable
@@ -689,13 +689,19 @@ Deliverables:
    keyed by conversation, not by principal, because `Session::load` still takes
    a bare `ConversationId` — that is M3 deliverable 2. In a group conversation
    one participant's `/clear` therefore still clears the shared view.
-6. Route cancellation and every other terminal reply through the declared output
-   policy.
-7. Default stable channels to buffered, guardrail-checked output.
-   `orchestrator/streaming.rs:60-64` currently forwards each chunk during
-   `plan()`, while output guardrails run afterwards at `loop/mod.rs:363-365`; the
-   TUI sink does `print!` + `flush` per chunk and cannot retract. Keep provisional
-   streaming opt-in until an incremental guardrail interface exists.
+6. **Done.** `loop/output.rs` is the one gate. Cancellation and budget
+   exhaustion both go through it and substitute a fixed notice when the policy
+   refuses, rather than failing a run that has to terminate here; a model reply
+   still fails the run, because there was an answer and it was not fit to send.
+   A guardrail *backend* error counts as a refusal: a check that could not run
+   has not passed.
+7. **Done.** `[channels] provisional_streaming` defaults to `false`, and both
+   entrypoints that install a `StreamSink` consult it. The matrix row said
+   "opt-in" while the code installed one unconditionally; `tests/
+   capability_matrix.rs` now asserts the default against
+   `WorkspaceConfig::default()`, so the row and the code cannot drift apart
+   again. `AGENTOS_TUI_STREAM=0` survives as a kill switch for a deployment
+   that opted in.
 8. **Done.** `ActCtx` carries a private `Authorization` with no public
    constructor, so a hand-built one does not compile; the witness fingerprints
    the plan it was issued for, so a caller holding a legitimate `ActCtx` cannot
@@ -717,6 +723,9 @@ Acceptance criteria:
   — canary test over every field of every stored event.
 - Normal `/clear` performs no session-item `DELETE`. **Met** — verified by reading the log underneath the projection, not just by loading.
 - A seeded output-policy violation emits zero user-visible bytes in stable mode.
+  **Met** — and the paired test shows the same violation *does* escape in
+  provisional mode, so the guarantee is a measured difference rather than an
+  artifact of a fixture that never streams.
 - A directly constructed `ActCtx` carrying a tool call cannot execute it without
   a policy decision. **Met** — it does not compile, verified by adding the
   literal and reading the compiler's refusal. A plan swapped into a legitimate
@@ -959,7 +968,7 @@ a slice moves off `not started` only when the named artifact exists in the tree.
 | `ING-001` | M4 | Attachment and frame limits | ID-001 | **done** — Feishu `FragmentBuffer` (count, pending-event and byte ceilings), streamed attachment downloads under `[limits].attachment_bytes` / `attachments_per_message`, capped provider bodies |
 | `REQ-001` | M5 | Unified provider-call gateway, request kinds, compaction usage accounting | ADR-001 | **done** — `RequestKind`, `RequestBuilder`, `prompt::gateway`, per-kind invariant branch, `scripts/check-provider-calls.sh` |
 | `AUD-001` | M6 | Durable, redacted safety events | REQ-001, ID-001 | **done** — `audit::` module, append-only `safety_events`, eleven event kinds, `ArgumentDigest`-only arguments, retained (`consumed`) interruptions, `StepFailure` so a failed step persists its trace |
-| `STATE-001` | M6 | Clear epochs, denial semantics, terminal output gate, `act()` policy re-assertion | AUD-001 | not started |
+| `STATE-001` | M6 | Clear epochs, denial semantics, terminal output gate, `act()` policy re-assertion | AUD-001 | **done** — `session_epochs` + `agentos-gateway purge`, `RunError::StructuralDenial`, `loop/output.rs` gating every synthesized terminal reply, private `Authorization` on `ActCtx` + `tests/loop_transitions.rs`, `[channels] provisional_streaming = false` |
 | `CFG-001` | M7 | Unknown-key rejection and effective-config inventory | ADR-001 | not started |
 | `MEM-001` | M7 | Effective memory policy, domains, shared writes, retention | ID-001, CFG-001, CFG-000 | not started |
 | `SPILL-001` | M7 | Opaque spill locator and scoped retrieval | FS-001 | not started |
@@ -1027,7 +1036,7 @@ them.
 | SSRF, inherited secrets, process descendants, unbounded ingress | P1 | M4 | Tool security | Open |
 | Routing/compaction record no manifest; compaction usage dropped | P1 | M5 | Prompt/orchestration | Open — see §4.1 for corrected framing |
 | Safety events not durably reconstructible | P1 | M6 | Run loop/observability | Closed by `AUD-001` |
-| Append-only, transition, denial, cancellation, streaming contract gaps | P1 | M6 | Run loop/session | Open |
+| Append-only, transition, denial, cancellation, streaming contract gaps | P1 | M6 | Run loop/session | Closed by `STATE-001` |
 | Inert/conflicting config and memory policy | P1 | M7 | Config/memory | Open |
 | Retention and default domain not wired | P1 | M7 | Memory | Open |
 | Spill locator is an absolute host path | P1 | M7 | Prompt/tools | Open |

@@ -40,6 +40,7 @@ fn matrix() -> String {
 struct Row {
     capability: String,
     status: String,
+    required: String,
     limitations: String,
 }
 
@@ -58,6 +59,7 @@ fn rows(body: &str) -> Vec<Row> {
             Some(Row {
                 capability: capability.to_owned(),
                 status: cells[1].trim().replace("**", ""),
+                required: cells[3].trim().to_owned(),
                 limitations: cells[4].trim().to_owned(),
             })
         })
@@ -162,5 +164,41 @@ fn the_matrix_parses_into_rows() {
         "parsed only {} capability rows from docs/CAPABILITY_MATRIX.md; \
          the table shape probably changed and the other tests are now vacuous",
         parsed.len()
+    );
+}
+
+/// A `Preview` capability must not be on by default (M6 / `STATE-001`,
+/// deliverable 7).
+///
+/// A row that says "opt-in" is a claim about the shipped defaults, and the
+/// matrix carried exactly that claim about streaming while both entrypoints
+/// installed a `StreamSink` unconditionally. The check is against
+/// `WorkspaceConfig::default()`, which is what a deployment gets before it
+/// writes any `agent.toml`, so the row and the code cannot drift apart again.
+#[test]
+fn no_preview_capability_is_enabled_by_default() {
+    let defaults = agentos_core::config::WorkspaceConfig::default();
+    assert!(
+        !defaults.channels.provisional_streaming,
+        "provisional streaming is a Preview capability and must be opt-in: \
+         output guardrails run after the chunks have been forwarded"
+    );
+
+    // The row has to keep saying so, because the assertion above is only
+    // meaningful to someone who read it here.
+    let streaming = rows(&matrix())
+        .into_iter()
+        .find(|row| row.capability == "Provisional streaming")
+        .expect("the matrix has a streaming row");
+    assert_eq!(streaming.status, "Preview");
+    assert!(
+        streaming.required.contains("provisional_streaming"),
+        "the row must name the key that turns it on, got: {}",
+        streaming.required
+    );
+    assert!(
+        streaming.limitations.contains("Off by default"),
+        "the row must say so where a reader is looking for the exposure, got: {}",
+        streaming.limitations
     );
 }

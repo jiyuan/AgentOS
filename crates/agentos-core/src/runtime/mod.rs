@@ -175,6 +175,16 @@ pub struct AgentRuntime {
 }
 
 impl AgentRuntime {
+    /// Whether this deployment has opted into forwarding assistant text before
+    /// the output guardrails have seen it (`[channels] provisional_streaming`).
+    ///
+    /// Every entrypoint that installs a `StreamSink` asks this first. Off by
+    /// default: see the field's own documentation and
+    /// [ADR-0007](../../../../docs/adr/0007-BUFFERED_OUTPUT.md).
+    pub fn provisional_streaming(&self) -> bool {
+        self.workspace_config.channels.provisional_streaming
+    }
+
     /// The inline cap and spill store every run in this runtime uses.
     pub fn content_limits(&self) -> ContentLimits<'_> {
         ContentLimits {

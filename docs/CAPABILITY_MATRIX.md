@@ -36,7 +36,7 @@ something that no longer exists — the two-way ratchet
 | Ticketed approval | Stable | all | `[policy]` | A prompt is answerable only by the sender it was put to, or a `[policy] approval_administrators` entry. Tickets are still minted from a clock-seeded counter rather than a CSPRNG | unit, integration |
 | Policy engine (`allow` / `deny` / `ask_user`) | Stable | all | `[policy]` | — | unit, integration |
 | Sub-agent policy narrowing | Stable | all | `[[subagents]]` | Exact over actions *and* arguments, decided by witness calls rather than by comparing rules. An elevation needs a declared `[[subagents.delegation_grants]]` entry, whose issuance and every use are safety events ([ADR-0001](adr/0001-POLICY_NARROWING.md), closed by M3 / `AUTH-002` and M6 / `AUD-001`) | unit, integration, property |
-| Input / tool / output guardrails | Stable | all | `[guardrails]` | Output guardrails run after streaming has already forwarded chunks; see *Provisional streaming* | unit, integration |
+| Input / tool / output guardrails | Stable | all | `[guardrails]` | Every terminal reply passes the output policy, including the notices the loop synthesizes for cancellation and budget exhaustion. Streaming is the one way to emit bytes ahead of the check, and is off by default; see *Provisional streaming* | unit, integration |
 | Shell command profiles (argument constraints) | Stable | all | `[[guardrails.shell_profiles]]` | Matches literal argument tokens; no shell-metacharacter parsing, because the tool takes structured argv rather than a command string | unit, integration |
 | Run cancellation and mid-run steering | Stable | all | — | Cancellation does not route through the declared output policy (M6) | integration |
 | `max_turns` budget | Stable | all | `[agent] max_turns` | — | integration |
@@ -115,7 +115,7 @@ parsing, streaming assembly, and retry behavior.
 | `provider:deepseek` | Stable | all | `DEEPSEEK_API_KEY` | — | unit |
 | `provider:ollama` | Stable | all | local Ollama service | No API key; whatever the local service exposes | unit |
 | Buffered replies | Stable | all | — | — | unit, golden |
-| Provisional streaming | **Preview** | all | opt-in | Chunks are forwarded during `plan()`, before output guardrails run, and the TUI sink cannot retract what it printed ([ADR-0007](adr/0007-BUFFERED_OUTPUT.md), M6) | integration |
+| Provisional streaming | **Preview** | all | `[channels] provisional_streaming = true` | Off by default. Chunks are forwarded during `plan()`, before output guardrails run, and the TUI sink cannot retract what it printed; a chat channel edits in place but the bytes reached a device first. Eligible for a stable default once an incremental output-guardrail interface exists ([ADR-0007](adr/0007-BUFFERED_OUTPUT.md)) | integration |
 
 ## Channels
 

@@ -108,10 +108,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Streaming TUI egress: a shared flag lets the token sink and the channel's
-    // final send coordinate so the reply is printed once. Disable with
-    // AGENTOS_TUI_STREAM=0 to fall back to a single buffered print.
+    // final send coordinate so the reply is printed once.
+    //
+    // Off unless `[channels] provisional_streaming` says otherwise — a `print!`
+    // followed by `flush` cannot be retracted, so on this sink an output
+    // guardrail is a check performed after the user has read the output (M6 /
+    // `STATE-001`, ADR-0007). AGENTOS_TUI_STREAM=0 remains a kill switch for a
+    // deployment that opted in and wants one session without it.
     let streamed = Arc::new(AtomicBool::new(false));
-    if tui_streaming_enabled() {
+    if runtime.provisional_streaming() && tui_streaming_enabled() {
         let flag = Arc::clone(&streamed);
         let sink: StreamSink = Arc::new(move |delta: &str| {
             print!("{delta}");

@@ -30,6 +30,7 @@ mod error;
 mod escalate;
 mod handoff;
 mod items;
+mod output;
 mod planning;
 mod request;
 mod steering;
@@ -300,11 +301,9 @@ async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, StepFai
     // an error. Checked before any work so a run cancelled between turns costs
     // nothing further.
     if deps.cancel.is_cancelled() {
-        return Ok(RunLoopState::Finish(cancelled_finish(
-            ctx.state,
-            deps,
-            "between_turns",
-        )));
+        return Ok(RunLoopState::Finish(
+            cancelled_finish(ctx.state, deps, "between_turns").await,
+        ));
     }
 
     let mut state = ctx.state;
@@ -380,9 +379,9 @@ async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, StepFai
         Err(error) => return Err(StepFailure::new(state, error)),
     };
     let Some(plan) = planned else {
-        return Ok(RunLoopState::Finish(cancelled_finish(
-            state, deps, "planning",
-        )));
+        return Ok(RunLoopState::Finish(
+            cancelled_finish(state, deps, "planning").await,
+        ));
     };
 
     trace::record_span(
@@ -616,11 +615,9 @@ async fn act(ctx: ActCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, StepFailu
                 None => match execute_tool(&mut state, deps, call).await {
                     Ok(result) => result,
                     Err(RunError::Cancelled) => {
-                        return Ok(RunLoopState::Finish(cancelled_finish(
-                            state,
-                            deps,
-                            "tool_call",
-                        )))
+                        return Ok(RunLoopState::Finish(
+                            cancelled_finish(state, deps, "tool_call").await,
+                        ))
                     }
                     Err(other) => return Err(StepFailure::new(state, other)),
                 },

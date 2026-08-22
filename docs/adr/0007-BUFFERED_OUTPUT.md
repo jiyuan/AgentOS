@@ -1,6 +1,6 @@
 # ADR-0007 — Stable channels buffer; streaming is opt-in until guardrails are incremental
 
-- Status: accepted
+- Status: accepted; implemented by M6 / `STATE-001`
 - Date: 2026-08-21
 - Milestone: M6
 
@@ -58,3 +58,18 @@ around the same check.
 - A cancelled run's terminal reply passes through the output policy.
 - The capability matrix labels streaming `preview`, and a test fails if a
   `preview` capability is enabled by default.
+
+## Implementation notes
+
+`[channels] provisional_streaming`, off by default;
+`crates/agentos-core/src/loop/output.rs` is the gate every synthesized
+terminal reply passes through. Verified by `tests/output_gate.rs` and the
+default assertion in `tests/capability_matrix.rs`.
+
+One thing the decision left implicit. A model reply that trips an output
+guardrail **fails the run**; a notice the *loop* wrote — cancellation, budget
+exhaustion — is replaced by a shorter fixed one instead. Those have to differ:
+the run must terminate at a cancellation, and re-raising would resurrect the
+hard-failure path the safeguard exists to remove, throwing away the tool
+results a user who pressed stop most wants kept. Either way the policy decides
+what leaves, which is the property the ADR is about.

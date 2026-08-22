@@ -8,8 +8,6 @@
 use super::telemetry::field_key;
 use super::{FinalOutput, LoopDeps};
 use crate::trace;
-use agentos_interfaces::guardrail::GuardrailOutcome;
-use agentos_interfaces::orchestrator::RunContext;
 use agentos_interfaces::run_state::RunState;
 use agentos_proto::{Message, MessageRole, SpanId, SpanKind, Usage};
 use serde_json::Value;
@@ -101,33 +99,12 @@ pub(super) async fn budget_exhausted_finish(
     );
 
     let message = budget_exhausted_message(&state, deps.max_turns);
-    let guardrail_tripped = {
-        let mut run_ctx = RunContext::from_state(&state);
-        run_ctx.cancel = deps.cancel.clone();
-        let mut tripped = false;
-        for entry in deps.output_guardrails {
-            match entry.guardrail.check(&message, &run_ctx).await {
-                Ok(GuardrailOutcome::Passed) => {}
-                Ok(GuardrailOutcome::Tripped(_)) | Err(_) => {
-                    tripped = true;
-                    break;
-                }
-            }
-        }
-        tripped
-    };
-    let message = if guardrail_tripped {
-        Message::text(
-            MessageRole::Assistant,
-            format!(
-                "I reached the {}-step budget for this run and can't return the partial \
-                 output here. Please retry with a narrower request.",
-                deps.max_turns
-            ),
-        )
-    } else {
-        message
-    };
+    let fallback = format!(
+        "I reached the {}-step budget for this run and can't return the partial \
+         output here. Please retry with a narrower request.",
+        deps.max_turns
+    );
+    let message = super::output::gated(&state, deps, message, &fallback).await;
     FinalOutput { state, message }
 }
 

@@ -54,7 +54,7 @@ Plan variants:
 
 Guardrail and approval placement:
 
-- Input guardrails run in `Start`; tool guardrails run in `Act`; output guardrails run before a terminal reply finishes.
+- Input guardrails run in `Start`; tool guardrails run in `Act`; output guardrails run before a terminal reply finishes — the loop's own cancellation and budget notices included, which pass through `loop/output.rs` and are replaced by a shorter fixed notice if the policy refuses them. Streaming forwards chunks before that check can run, so it is off unless `[channels] provisional_streaming` turns it on.
 - Every non-terminal action crosses `Approve`, and `Act` re-asserts that it did. `allow` proceeds to `Act`, `deny` either records a refusal the model can replan around (a tool call) or terminates the run (anything structural), and `ask_user` serializes a paused `RunState` for later resume.
 - Sub-agent permissions can only narrow the parent's, over actions and arguments alike; every sub-agent tool call re-enters the loop at `Approve`. A sub-agent that needs more than its parent holds carries an explicit delegation grant naming the tool and the reason.
 - An approval prompt issues a ticket, and only an answer naming that ticket decides it. Anything else stays ordinary input.

@@ -95,6 +95,13 @@ name = "agentos"
 read = true
 write = false
 
+# Streaming forwards each chunk of an answer as the model writes it, which is
+# before the output guardrails have run and after the terminal has already
+# printed it. Left off: a deployment that prefers latency to that guarantee
+# should be the one that says so. See docs/adr/0007-BUFFERED_OUTPUT.md.
+[channels]
+provisional_streaming = false
+
 [channels.tui]
 enabled = true
 mode = "interactive"

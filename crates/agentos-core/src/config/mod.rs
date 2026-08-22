@@ -229,11 +229,27 @@ pub struct ChannelsConfig {
     pub tui: ChannelConfig,
     pub telegram: ChannelConfig,
     pub feishu: ChannelConfig,
+    /// Forward assistant text as the model produces it, before the output
+    /// guardrails have seen any of it. Off by default.
+    ///
+    /// Provisional, and the name says why: output guardrails run at the end of
+    /// a turn, so on a streaming channel the check happens after the user has
+    /// already read the output. Turning this on trades that guarantee for
+    /// latency, knowingly. It becomes eligible for a stable default when an
+    /// incremental output-guardrail interface exists; the reasoning is in
+    /// `docs/adr/0007-BUFFERED_OUTPUT.md`.
+    ///
+    /// Named as a path rather than linked because this comment is rendered
+    /// into `docs/CONFIG_CATALOG.md`, where a source-relative link resolves
+    /// nowhere — `scripts/check-release-archive.sh` checks that every link in
+    /// the packaged docs points at something in the bundle.
+    pub provisional_streaming: bool,
 }
 
 impl Default for ChannelsConfig {
     fn default() -> Self {
         Self {
+            provisional_streaming: false,
             tui: ChannelConfig {
                 enabled: true,
                 mode: Arc::from("interactive"),

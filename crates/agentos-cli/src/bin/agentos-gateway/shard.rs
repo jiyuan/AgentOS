@@ -271,8 +271,14 @@ impl ShardTurns<'_> {
         );
         deps.cancel = turn.cancel;
         deps.steering = Some(turn.steering);
-        if let Some(stream) = self.context.stream_egress.clone() {
-            deps.stream_sink = Some(channel_stream_sink(stream, input.conversation_id.clone()));
+        // Only when the deployment opted in. A chat channel streams
+        // edit-in-place, so it *can* revise what it showed — but the bytes
+        // were still delivered to a device before any output guardrail ran
+        // (M6 / `STATE-001`, ADR-0007).
+        if self.context.runtime.provisional_streaming() {
+            if let Some(stream) = self.context.stream_egress.clone() {
+                deps.stream_sink = Some(channel_stream_sink(stream, input.conversation_id.clone()));
+            }
         }
         let service = self.service(&deps);
 
