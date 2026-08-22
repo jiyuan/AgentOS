@@ -11,21 +11,58 @@ use std::sync::Arc;
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct MemoryConfig {
+    /// Where records live: `sqlite` (durable, the default) or `in_memory`
+    /// (lost on restart). This is the authority; the deprecated `agent.memory`
+    /// is not.
     pub backend: Arc<str>,
+    /// The SQLite file, when the backend is `sqlite`. A relative path resolves
+    /// against the directory holding `agent.toml`. Unset uses the session
+    /// database, so memory and transcripts share one file.
     pub path: Option<PathBuf>,
+    /// The domain a read or write lands in when the caller names none.
+    ///
+    /// Part of every namespace, so two deployments with different defaults
+    /// keep separate bodies of memory even in one store. It reached nothing
+    /// before M7 / `MEM-001`: every unnamed scope read as the literal
+    /// `general`.
     pub default_domain: Arc<str>,
+    /// Whether the orchestrator recalls memory into a request at all. Off by
+    /// default; with it off none of the `hydrate_*` keys below do anything.
     pub hydration_enabled: bool,
+    /// How recalled fragments are chosen: `hybrid` (lexical and recency
+    /// fused), `lexical`, `recency`, or `semantic`.
     pub hydrate_strategy: Arc<str>,
+    /// The most fragments one request may recall, whatever the budget allows.
     pub hydrate_max_fragments: usize,
+    /// The token budget recalled memory may occupy in a request. The estimate
+    /// is `prompt::tokens`', which is a heuristic rather than a tokenizer.
     pub hydrate_max_estimated_tokens: usize,
+    /// Which stores are searched: any of `working`, `episodic`, `semantic`,
+    /// `procedural`, `audit`.
     pub hydrate_stores: Vec<Arc<str>>,
+    /// The vector index behind semantic retrieval: `none`, `sqlite_vec`
+    /// (built in), `qdrant`, or `vector` for the compiled-in extension.
     pub semantic_backend: Arc<str>,
+    /// Connection details for `semantic_backend = "qdrant"`.
     pub qdrant: MemoryQdrantConfig,
+    /// Table and dimensions for `semantic_backend = "sqlite_vec"`.
     pub sqlite_vec: MemorySqliteVecConfig,
+    /// Whether a finished run records an episode — what it was asked, which
+    /// tools it used, and how it ended. Episodes are what reflection promotes
+    /// into semantic facts, so this is off by default and enabling it is what
+    /// makes the agent learn across conversations.
     pub episode_recording_enabled: bool,
+    /// The scheduled maintenance sweep: promotion, supersession, and the
+    /// lexical index rebuild.
     pub reflection: MemoryReflectionConfig,
+    /// Ceilings on how much memory is kept. Applied by the reflection sweep,
+    /// so a deployment with reflection disabled prunes nothing.
     pub retention: MemoryRetentionConfig,
+    /// Who may read, write, and forget. The sole authority over the `memory`
+    /// tool's permissions (M7 / `MEM-001`).
     pub policy: MemoryPolicyConfig,
+    /// Domains whose records are visible across conversations, and whether
+    /// each may be written as well as read.
     pub shared_domains: Vec<MemorySharedDomainConfig>,
 }
 
@@ -59,12 +96,17 @@ impl Default for MemoryConfig {
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct MemoryReflectionConfig {
+    /// Whether the sweep runs at all. Off by default; with it off, retention
+    /// budgets are never applied either.
     pub enabled: bool,
     /// Cron expression (minute-resolution) for the sweep.
     pub schedule: Arc<str>,
     /// Minimum repeated episodes (by summary) before promotion to a semantic
     /// fact. Floored at 2 by the reflection engine.
     pub min_episode_repetitions: usize,
+    /// Whether the sweep rebuilds the full-text index from active records.
+    /// Cheap on a small store and the only thing that repairs an index left
+    /// stale by a crash mid-write.
     pub rebuild_lexical_index: bool,
 }
 
@@ -82,7 +124,12 @@ impl Default for MemoryReflectionConfig {
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct MemorySqliteVecConfig {
+    /// The virtual table the `sqlite-vec` index lives in, inside the memory
+    /// database.
     pub table: Arc<str>,
+    /// Embedding width. It has to match what the embedder produces; a
+    /// mismatch is a runtime error on the first write, not a load error,
+    /// because only the embedder knows.
     pub vector_dimensions: usize,
 }
 
@@ -108,11 +155,22 @@ impl From<&MemorySqliteVecConfig> for SqliteVecConfig {
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct MemoryQdrantConfig {
+    /// Base URL of the Qdrant instance. An operator-configured endpoint, so
+    /// it uses the shared HTTP client and is deliberately not subject to the
+    /// egress policy that judges model-chosen URLs.
     pub url: Arc<str>,
+    /// The collection records are stored in.
     pub collection: Arc<str>,
+    /// Named vector to use, for a collection configured with several. Unset
+    /// uses the unnamed default vector.
     pub vector_name: Option<Arc<str>>,
+    /// Embedding width, which must match both the collection's and the
+    /// embedder's.
     pub vector_dimensions: usize,
+    /// API key, for a Qdrant that requires one. A secret in the config file;
+    /// prefer an environment-substituted value where the deployment can.
     pub api_key: Option<Arc<str>>,
+    /// How long one Qdrant request may take before it is abandoned.
     pub timeout_ms: u64,
 }
 
@@ -214,8 +272,14 @@ impl MemoryPolicyConfig {
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct MemorySharedDomainConfig {
+    /// The domain's name, as it appears in a namespace and in a sub-agent's
+    /// `memory_domains`.
     pub name: Arc<str>,
+    /// Whether records in this domain are visible across conversations.
     pub read: bool,
+    /// Whether they may be written. One of the three gates a shared write
+    /// needs — the others are `[memory.policy].shared_writes` and a caller
+    /// holding the domain under a `shared_readwrite` memory view.
     pub write: bool,
 }
 

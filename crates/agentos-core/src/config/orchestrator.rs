@@ -11,7 +11,11 @@ use std::sync::Arc;
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct RoutingConfig {
+    /// Where each class of work goes. The classifier picks one by matching a
+    /// prompt against the rules' descriptions and examples.
     pub rules: Vec<RoutingRuleConfig>,
+    /// Where work goes when no rule matches, or when `llm_classifier` is off.
+    /// Unset dispatches directly to the main agent.
     pub fallback: Option<RoutingRuleConfig>,
     /// When false, routing never spends an LLM classifier round-trip:
     /// deterministic routes still apply, and everything else goes to the
@@ -32,12 +36,23 @@ impl Default for RoutingConfig {
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct RoutingRuleConfig {
+    /// The class of work this rule covers, as a stable name the trace records.
     pub domain: Arc<str>,
+    /// What the class is, in the classifier's own prompt. This is the whole of
+    /// what it has to go on besides `examples`, so it is worth writing well.
     pub description: Arc<str>,
+    /// Representative prompts for the class. Few-shot material for the
+    /// classifier, not patterns — they are never matched literally.
     pub examples: Vec<Arc<str>>,
+    /// What to do with a matching prompt: `direct` (the main agent handles
+    /// it), `subagent`, or `template`.
     pub dispatch: Arc<str>,
+    /// The `[[orchestrator_templates]]` name, for `dispatch = "template"`.
     pub template: Option<Arc<str>>,
+    /// The sub-agent to delegate to, for `dispatch = "subagent"`.
     pub agent_id: Option<Arc<str>>,
+    /// Which of that sub-agent's policies to run under. A sub-agent is
+    /// identified by the pair, so two policies are two delegatees.
     pub policy_id: Option<Arc<str>>,
 }
 
@@ -58,18 +73,30 @@ impl Default for RoutingRuleConfig {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct TemplateConfig {
+    /// The template's name, as a routing rule refers to it.
     pub name: Arc<str>,
+    /// What the template is for, as the classifier reads it.
     pub description: Arc<str>,
+    /// Instructions prepended to every stage's own context — the standing
+    /// brief for the whole multi-stage run.
     pub developer_instructions: Arc<str>,
+    /// The stages, in declaration order. Execution order comes from
+    /// `depends_on`, and a cycle is a load-time error.
     pub stages: Vec<StageConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct StageConfig {
+    /// The stage's name, which later stages name in `depends_on` and which
+    /// the trace records.
     pub name: Arc<str>,
+    /// The sub-agent that runs this stage.
     pub agent_id: Arc<str>,
+    /// Which of that sub-agent's policies the stage runs under.
     pub policy_id: Arc<str>,
+    /// Stages that must finish first. Empty means the stage can start
+    /// immediately; a cycle is refused at load time.
     pub depends_on: Vec<Arc<str>>,
 }
 

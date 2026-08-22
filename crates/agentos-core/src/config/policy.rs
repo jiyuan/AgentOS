@@ -12,7 +12,15 @@ use std::sync::Arc;
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct PolicyConfig {
+    /// What happens to an action no rule covers: `allow`, `ask_user`, or
+    /// `deny`. `deny` is the shipped value and the only one that fails closed.
     pub default: Arc<str>,
+    /// Tools whose per-operation gating is replaced by a blanket `allow`.
+    ///
+    /// A blunt instrument, and deliberately so — naming a tool here says "stop
+    /// asking me about this one". It cannot name `memory`: `[memory.policy]`
+    /// decides memory, and a config that says both fails to load rather than
+    /// letting one silently win (M7 / `MEM-001`).
     pub allowlist: Vec<Arc<str>>,
     /// Senders who may answer any approval prompt, not only their own.
     ///

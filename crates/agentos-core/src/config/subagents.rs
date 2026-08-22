@@ -7,13 +7,31 @@ use std::sync::Arc;
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct SubAgentConfig {
+    /// Human-readable name, for logs and the resource catalog.
     pub name: Arc<str>,
+    /// The agent id a `Plan::Delegate` names. Together with `policy_id` it
+    /// identifies one delegatee, and it becomes one path segment for the
+    /// sub-agent's task workspace — so it is validated as a single segment
+    /// rather than rewritten.
     pub id: Arc<str>,
+    /// What this sub-agent is for, as the parent's model reads it when
+    /// deciding whether to delegate.
     pub description: Arc<str>,
+    /// The standing brief prepended to this sub-agent's own context on every
+    /// delegation.
     pub developer_instructions: Arc<str>,
+    /// Which policy this entry defines. One sub-agent id may appear under
+    /// several policy ids; each pair is a separate delegatee with separate
+    /// permissions.
     pub policy_id: Arc<str>,
+    /// Which orchestrator drives the child loop: `builtin.max` or
+    /// `builtin.min`.
     pub orchestrator: Arc<str>,
+    /// Which model this sub-agent calls: `high`, `medium`, or `low`. A
+    /// bounded task under a narrowed policy is often the place to spend less.
     pub model_tier: Arc<str>,
+    /// Tools this sub-agent may call, by name. Listing a tool *selects* it; it
+    /// does not elevate it — see `delegation_grants`.
     pub tools: Vec<Arc<str>>,
     /// Skills (by name) this sub-agent is permitted to dispatch. Each entry
     /// must also appear in the parent runtime's `resources.skills.enabled`
@@ -21,10 +39,23 @@ pub struct SubAgentConfig {
     /// is opt-in: an empty vector means the sub-agent cannot dispatch any
     /// skill, even if the parent has them loaded.
     pub skills: Vec<Arc<str>>,
+    /// How much memory this sub-agent sees: `none`, `own` (its own scopes
+    /// only), `shared_readonly`, or `shared_readwrite`. Only the last permits
+    /// a shared-domain write, and only for domains the deployment already
+    /// allows (M7 / `MEM-001`).
     pub memory_view: Arc<str>,
+    /// Which shared domains this sub-agent names, for the two `shared_*`
+    /// views. Intersected with `[[memory.shared_domains]]`: naming a domain
+    /// the deployment does not share grants nothing.
     pub memory_domains: Vec<Arc<str>>,
+    /// Which `memory` tool operations this sub-agent may call: any of `read`,
+    /// `write`, `forget`. Empty means it gets no memory tool at all.
     pub memory_tools: Vec<Arc<str>>,
+    /// Tool cycles this sub-agent's own run may take. Exhausting it ends the
+    /// child with a partial answer rather than failing the parent.
     pub max_turns: usize,
+    /// Whether the parent runtime's input, tool, and output guardrails also
+    /// apply to this sub-agent's run.
     pub inherit_guardrails: bool,
     /// Opt-in: permits this sub-agent to write inside the skill-bundle
     /// directory. Defaults to `false`, so every sub-agent is blocked from

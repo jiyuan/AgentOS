@@ -741,7 +741,7 @@ Primary files: `crates/agentos-core/src/loop/`, `crates/agentos-core/src/runner.
 
 Priority: P1
 Size: M — mechanical, but `deny_unknown_fields` will break existing `agent.toml`s
-Status: **deliverables 2–6 and 9 done**; 1, 7, 8, 10 open
+Status: **deliverables 2–6, 8, and 9 done**; 1, 7, 10 open
 Dependencies: M0; memory authorization depends on M3
 
 Current state, verified field by field:
@@ -763,7 +763,7 @@ Current state, verified field by field:
   `memory` from the allowlist; this milestone makes `[memory.policy]` the
   authority.
 - `config/undocumented.txt` is 118 lines with a 16-line header — exactly 102
-  undocumented keys, already behind a two-way ratchet.
+  undocumented keys, already behind a two-way ratchet. **Closed by `CFG-001`.**
 - `spill/mod.rs:170-178` rendered the locator as an **absolute host path** and
   embedded it in a `retrieval_hint` instructing the model to open it with the
   `file` tool. It landed in the durable transcript (`loop/items.rs:67-80`) and
@@ -811,7 +811,12 @@ Deliverables:
    and conflicts. **Do not extend `print_effective_config`** — it is 55
    hand-written `println!`s that will go stale. Derive it from the same
    `config/catalog.rs` machinery that generates the catalogs.
-8. Reduce undocumented stable config keys from 102 to zero.
+8. **Done.** Zero. `config/undocumented.txt` holds only its header, and the
+   two-way ratchet keeps it that way: a new key with no `///` fails the check,
+   and a listed key that gains one fails it too. Splitting `[policy]` and
+   `[guardrails]` into `config/policy.rs` also exposed a gap in the ratchet —
+   `catalog.rs` reads a fixed list of `include_str!`ed sources, so a new config
+   module is invisible to it until it is added there.
 9. **Done.** `SpillLocator` is `spill:<run>/<artifact>` — two sanitized
    segments, no host path in the transcript. Retrieval is the `spill_read`
    tool, resolved through `paths::RootDir` against the configured store and
@@ -825,6 +830,11 @@ Acceptance criteria:
 
 - A typo such as `max_reocrds` is a load-time error. **Met.**
 - Every stable config key has a behavioral assertion, not only a parse test.
+  **Partly met.** Every key now has a *description*, and the keys the audit
+  named as inert have behavioural tests (`tests/config_authority.rs`,
+  `tests/memory_authority.rs`). A behavioural assertion for every one of the
+  158 keys is not there and is not obviously worth its cost; the maturity
+  inventory (deliverable 1) is what would say which ones still need one.
 - Memory writes and forgets produce the configured decision; a general tool
   allowlist cannot silently override it. **Met** — the allowlist entry is a
   load-time error naming both settings.

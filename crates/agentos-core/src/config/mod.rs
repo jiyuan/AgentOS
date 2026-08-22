@@ -131,8 +131,13 @@ impl Default for AgentConfig {
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ChannelsConfig {
+    /// The interactive terminal. On by default; it is the channel the CLI
+    /// speaks over.
     pub tui: ChannelConfig,
+    /// Telegram, over the Bot API. Needs `TELEGRAM_BOT_TOKEN` and an
+    /// `[approval] `-answerable sender allowlist in the environment.
     pub telegram: ChannelConfig,
+    /// Feishu / Lark, over its long-connection websocket or webhook.
     pub feishu: ChannelConfig,
     /// Forward assistant text as the model produces it, before the output
     /// guardrails have seen any of it. Off by default.
@@ -174,7 +179,13 @@ impl Default for ChannelsConfig {
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ChannelConfig {
+    /// Whether this deployment answers on the channel at all. A disabled
+    /// channel is not constructed, so its credentials are never read.
     pub enabled: bool,
+    /// How the channel is driven: `interactive` (the TUI's read-eval loop),
+    /// `poll_once` / `poll` (ask the transport for updates), or
+    /// `long_connection` (hold a socket open). `disabled` is the default and
+    /// means the same as `enabled = false`.
     pub mode: Arc<str>,
 }
 
@@ -190,7 +201,17 @@ impl Default for ChannelConfig {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct IsolationConfig {
+    /// Path to the `agentos-tool-worker` binary that runs sandboxed tools in
+    /// a child process. Unset falls back to `worker_path_env`, then to the
+    /// worker beside the running executable.
+    ///
+    /// A tool declaring anything but `full_access` will not run without one
+    /// (M4 / `SBX-001`): where no executor can enforce the mode, the call is
+    /// refused rather than run unsandboxed.
     pub worker_path: Option<PathBuf>,
+    /// Name of an environment variable holding the worker path, for a
+    /// deployment that installs the worker somewhere the config cannot name
+    /// at authoring time.
     pub worker_path_env: Option<String>,
     /// Environment variable *names* a tool subprocess may see beyond the
     /// built-in allowlist (M4 / `PROC-001`).
@@ -210,17 +231,32 @@ pub struct IsolationConfig {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct McpServerConfig {
+    /// The name this server is referred to by, in `[resources.mcp].enabled`
+    /// and in each `[[mcp_tools]].server_id`.
     pub id: Arc<str>,
+    /// Where the server is: an `http(s)://` URL, or a command line for a
+    /// stdio server. An address written here is an operator's decision, so it
+    /// is not subject to the egress policy that judges model-chosen URLs.
     pub endpoint: Arc<str>,
+    /// How long one call to this server may take. Unset uses
+    /// `[limits].tool_timeout_ms`.
     pub timeout_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct McpToolConfig {
+    /// Which `[[mcp_servers]]` entry serves this tool, by its `id`.
     pub server_id: Arc<str>,
+    /// The tool name the model calls. Shares one namespace with the built-in
+    /// tools, so it must not collide with one.
     pub name: Arc<str>,
+    /// What the tool does, as the model reads it. This is the whole of what
+    /// the model knows about it when choosing.
     pub description: Arc<str>,
+    /// A canned response, for a statically declared tool that needs no live
+    /// server — the reference `remote_echo` is one. Ignored by tools whose
+    /// server answers for itself.
     pub response: Arc<str>,
     /// What this MCP-backed tool may do to the filesystem (roadmap X2).
     ///
@@ -301,6 +337,11 @@ pub struct ResourceSection {
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct TaskWorkspaceConfig {
+    /// Where per-task scratch directories are created. A relative path
+    /// resolves against the directory holding `agent.toml`.
+    ///
+    /// Each task gets one directory named by its id, which is validated as a
+    /// single path segment rather than rewritten (M4 / `FS-001`).
     pub root: PathBuf,
 }
 

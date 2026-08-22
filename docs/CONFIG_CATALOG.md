@@ -12,77 +12,85 @@ Every key `agent.toml` accepts, derived from the config structs. Edit the doc co
 | `agent.orchestrator` | `Arc<str>` | `builtin.max` | Which orchestrator drives the loop: `builtin.max` (tool-selecting) or `builtin.min` (a single LLM call). |
 | `agent.memory` | `Option<Arc<str>>` | (unset) | **Deprecated.** Use `[memory].backend`. Absent in a new config; a value here is warned about at load time and otherwise ignored.  It was always a duplicate — nothing outside `config/` ever read it — and two keys naming the same backend is one more than can be right (M7 / `CFG-001`). |
 | `agent.max_turns` | `usize` | `16` | Tool cycles one run may take before the loop synthesizes a terminal answer from what it has. |
-| `policy` | `PolicyConfig` | `{"allowlist":[],"approval_administrators":[],"default":"deny"}` | The authorization default and the tools exempt from it. |
-| `guardrails` | `GuardrailsConfig` | `{"shell_allowlist":["printf","echo","pwd","ls","find","cat","head","tail"],"shell_profiles":[{"deny_args":["-exec","-execdir","-ok","-okdir","-delete","-fprint","-fprint0","-fprintf","-fls"],"program":"find","require_first_arg_suffix":[]}]}` | Content checks applied to input, tool calls, and output. |
+| `policy` | `PolicyConfig` | (table) | The authorization default and the tools exempt from it. |
+| `policy.default` | `Arc<str>` | `deny` | What happens to an action no rule covers: `allow`, `ask_user`, or `deny`. `deny` is the shipped value and the only one that fails closed. |
+| `policy.allowlist` | `Vec<Arc<str>>` | (empty) | Tools whose per-operation gating is replaced by a blanket `allow`.  A blunt instrument, and deliberately so — naming a tool here says "stop asking me about this one". It cannot name `memory`: `[memory.policy]` decides memory, and a config that says both fails to load rather than letting one silently win (M7 / `MEM-001`). |
+| `policy.approval_administrators` | `Vec<Arc<str>>` | (empty) | Senders who may answer any approval prompt, not only their own.  Empty by default: a prompt is answerable by the person it was put to. In a group conversation that is what stops one participant deciding another's approval. Name a sender id here only when someone genuinely needs to unblock other people's prompts. |
+| `guardrails` | `GuardrailsConfig` | (table) | Content checks applied to input, tool calls, and output. |
+| `guardrails.shell_allowlist` | `Vec<Arc<str>>` | `["printf","echo","pwd","ls","find","cat","head","tail"]` | Programs the shell tool guardrail permits in a call's `command` field. Each entry is a bare program name — arguments belong in the structured args array, not here. Defaults to `DEFAULT_SHELL_ALLOWLIST`. |
+| `guardrails.shell_profiles` | `Vec<ShellProfileConfig>` | (none) | Programs whose structured args array is checked too, not only the program name. Required for anything that can be argued into running other code. Defaults to `default_shell_profiles`. |
+| `guardrails.shell_profiles.program` | `Arc<str>` | — | Program this profile governs, as a bare name matching the call's `command` field. A profile also admits its program, so a program named here need not repeat itself in `shell_allowlist`; when it appears in both, the profile still applies. |
+| `guardrails.shell_profiles.require_first_arg_suffix` | `Vec<Arc<str>>` | — | When non-empty, the first entry of the structured args array must end with one of these suffixes. Pins an interpreter to a script file. |
+| `guardrails.shell_profiles.deny_args` | `Vec<Arc<str>>` | — | Arguments refused outright, compared literally against each entry of the structured args array. |
 | `memory` | `MemoryConfig` | (table) | Long-term memory: storage, what gets recalled into a request, and what a run is allowed to write back. |
-| `memory.backend` | `Arc<str>` | `sqlite` | *(undocumented — see `config/undocumented.txt`)* |
-| `memory.path` | `Option<PathBuf>` | (unset) | *(undocumented — see `config/undocumented.txt`)* |
-| `memory.default_domain` | `Arc<str>` | `general` | *(undocumented — see `config/undocumented.txt`)* |
-| `memory.hydration_enabled` | `bool` | `false` | *(undocumented — see `config/undocumented.txt`)* |
-| `memory.hydrate_strategy` | `Arc<str>` | `hybrid` | *(undocumented — see `config/undocumented.txt`)* |
-| `memory.hydrate_max_fragments` | `usize` | `5` | *(undocumented — see `config/undocumented.txt`)* |
-| `memory.hydrate_max_estimated_tokens` | `usize` | `1200` | *(undocumented — see `config/undocumented.txt`)* |
-| `memory.hydrate_stores` | `Vec<Arc<str>>` | `["semantic","episodic"]` | *(undocumented — see `config/undocumented.txt`)* |
-| `memory.semantic_backend` | `Arc<str>` | `none` | *(undocumented — see `config/undocumented.txt`)* |
-| `memory.qdrant` | `MemoryQdrantConfig` | (table) | *(undocumented — see `config/undocumented.txt`)* |
-| `memory.qdrant.url` | `Arc<str>` | `http://127.0.0.1:6333` | *(undocumented — see `config/undocumented.txt`)* |
-| `memory.qdrant.collection` | `Arc<str>` | `agentos_memory` | *(undocumented — see `config/undocumented.txt`)* |
-| `memory.qdrant.vector_name` | `Option<Arc<str>>` | (unset) | *(undocumented — see `config/undocumented.txt`)* |
-| `memory.qdrant.vector_dimensions` | `usize` | `384` | *(undocumented — see `config/undocumented.txt`)* |
-| `memory.qdrant.api_key` | `Option<Arc<str>>` | (unset) | *(undocumented — see `config/undocumented.txt`)* |
-| `memory.qdrant.timeout_ms` | `u64` | `3000` | *(undocumented — see `config/undocumented.txt`)* |
-| `memory.sqlite_vec` | `MemorySqliteVecConfig` | (table) | *(undocumented — see `config/undocumented.txt`)* |
-| `memory.sqlite_vec.table` | `Arc<str>` | `memory_records_vec` | *(undocumented — see `config/undocumented.txt`)* |
-| `memory.sqlite_vec.vector_dimensions` | `usize` | `384` | *(undocumented — see `config/undocumented.txt`)* |
-| `memory.episode_recording_enabled` | `bool` | `false` | *(undocumented — see `config/undocumented.txt`)* |
-| `memory.reflection` | `MemoryReflectionConfig` | (table) | *(undocumented — see `config/undocumented.txt`)* |
-| `memory.reflection.enabled` | `bool` | `false` | *(undocumented — see `config/undocumented.txt`)* |
+| `memory.backend` | `Arc<str>` | `sqlite` | Where records live: `sqlite` (durable, the default) or `in_memory` (lost on restart). This is the authority; the deprecated `agent.memory` is not. |
+| `memory.path` | `Option<PathBuf>` | (unset) | The SQLite file, when the backend is `sqlite`. A relative path resolves against the directory holding `agent.toml`. Unset uses the session database, so memory and transcripts share one file. |
+| `memory.default_domain` | `Arc<str>` | `general` | The domain a read or write lands in when the caller names none.  Part of every namespace, so two deployments with different defaults keep separate bodies of memory even in one store. It reached nothing before M7 / `MEM-001`: every unnamed scope read as the literal `general`. |
+| `memory.hydration_enabled` | `bool` | `false` | Whether the orchestrator recalls memory into a request at all. Off by default; with it off none of the `hydrate_*` keys below do anything. |
+| `memory.hydrate_strategy` | `Arc<str>` | `hybrid` | How recalled fragments are chosen: `hybrid` (lexical and recency fused), `lexical`, `recency`, or `semantic`. |
+| `memory.hydrate_max_fragments` | `usize` | `5` | The most fragments one request may recall, whatever the budget allows. |
+| `memory.hydrate_max_estimated_tokens` | `usize` | `1200` | The token budget recalled memory may occupy in a request. The estimate is `prompt::tokens`', which is a heuristic rather than a tokenizer. |
+| `memory.hydrate_stores` | `Vec<Arc<str>>` | `["semantic","episodic"]` | Which stores are searched: any of `working`, `episodic`, `semantic`, `procedural`, `audit`. |
+| `memory.semantic_backend` | `Arc<str>` | `none` | The vector index behind semantic retrieval: `none`, `sqlite_vec` (built in), `qdrant`, or `vector` for the compiled-in extension. |
+| `memory.qdrant` | `MemoryQdrantConfig` | (table) | Connection details for `semantic_backend = "qdrant"`. |
+| `memory.qdrant.url` | `Arc<str>` | `http://127.0.0.1:6333` | Base URL of the Qdrant instance. An operator-configured endpoint, so it uses the shared HTTP client and is deliberately not subject to the egress policy that judges model-chosen URLs. |
+| `memory.qdrant.collection` | `Arc<str>` | `agentos_memory` | The collection records are stored in. |
+| `memory.qdrant.vector_name` | `Option<Arc<str>>` | (unset) | Named vector to use, for a collection configured with several. Unset uses the unnamed default vector. |
+| `memory.qdrant.vector_dimensions` | `usize` | `384` | Embedding width, which must match both the collection's and the embedder's. |
+| `memory.qdrant.api_key` | `Option<Arc<str>>` | (unset) | API key, for a Qdrant that requires one. A secret in the config file; prefer an environment-substituted value where the deployment can. |
+| `memory.qdrant.timeout_ms` | `u64` | `3000` | How long one Qdrant request may take before it is abandoned. |
+| `memory.sqlite_vec` | `MemorySqliteVecConfig` | (table) | Table and dimensions for `semantic_backend = "sqlite_vec"`. |
+| `memory.sqlite_vec.table` | `Arc<str>` | `memory_records_vec` | The virtual table the `sqlite-vec` index lives in, inside the memory database. |
+| `memory.sqlite_vec.vector_dimensions` | `usize` | `384` | Embedding width. It has to match what the embedder produces; a mismatch is a runtime error on the first write, not a load error, because only the embedder knows. |
+| `memory.episode_recording_enabled` | `bool` | `false` | Whether a finished run records an episode — what it was asked, which tools it used, and how it ended. Episodes are what reflection promotes into semantic facts, so this is off by default and enabling it is what makes the agent learn across conversations. |
+| `memory.reflection` | `MemoryReflectionConfig` | (table) | The scheduled maintenance sweep: promotion, supersession, and the lexical index rebuild. |
+| `memory.reflection.enabled` | `bool` | `false` | Whether the sweep runs at all. Off by default; with it off, retention budgets are never applied either. |
 | `memory.reflection.schedule` | `Arc<str>` | `0 3 * * *` | Cron expression (minute-resolution) for the sweep. |
 | `memory.reflection.min_episode_repetitions` | `usize` | `2` | Minimum repeated episodes (by summary) before promotion to a semantic fact. Floored at 2 by the reflection engine. |
-| `memory.reflection.rebuild_lexical_index` | `bool` | `true` | *(undocumented — see `config/undocumented.txt`)* |
-| `memory.retention` | `MemoryRetentionConfig` | (table) | *(undocumented — see `config/undocumented.txt`)* |
+| `memory.reflection.rebuild_lexical_index` | `bool` | `true` | Whether the sweep rebuilds the full-text index from active records. Cheap on a small store and the only thing that repairs an index left stale by a crash mid-write. |
+| `memory.retention` | `MemoryRetentionConfig` | (table) | Ceilings on how much memory is kept. Applied by the reflection sweep, so a deployment with reflection disabled prunes nothing. |
 | `memory.retention.max_records` | `Option<usize>` | (unset) | Ceiling on active memory records. Unset keeps everything. |
 | `memory.retention.max_bytes` | `Option<usize>` | (unset) | Ceiling on the total stored size of active records, in bytes. |
 | `memory.retention.max_age_days` | `Option<u64>` | (unset) | Ceiling on a record's age, in days. |
-| `memory.policy` | `MemoryPolicyConfig` | (table) | *(undocumented — see `config/undocumented.txt`)* |
+| `memory.policy` | `MemoryPolicyConfig` | (table) | Who may read, write, and forget. The sole authority over the `memory` tool's permissions (M7 / `MEM-001`). |
 | `memory.policy.reads` | `Arc<str>` | `allow` | What happens when the model reads memory: `allow`, `ask_user`, or `deny`. |
 | `memory.policy.writes` | `Arc<str>` | `ask_user` | What happens when the model writes memory. |
 | `memory.policy.forgets` | `Arc<str>` | `ask_user` | What happens when the model forgets a record. |
 | `memory.policy.shared_writes` | `bool` | `false` | Whether *any* write to a shared domain is permitted in this deployment.  The first of three gates, and the coarsest. A write into `[[memory.shared_domains]]` also needs that domain's own `write = true` and a caller holding it — see `memory::authorize`. Off by default, because shared memory is the one scope where one conversation's writes are another's reads. |
-| `memory.shared_domains` | `Vec<MemorySharedDomainConfig>` | (none) | *(undocumented — see `config/undocumented.txt`)* |
-| `memory.shared_domains.name` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `memory.shared_domains.read` | `bool` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `memory.shared_domains.write` | `bool` | — | *(undocumented — see `config/undocumented.txt`)* |
+| `memory.shared_domains` | `Vec<MemorySharedDomainConfig>` | (none) | Domains whose records are visible across conversations, and whether each may be written as well as read. |
+| `memory.shared_domains.name` | `Arc<str>` | — | The domain's name, as it appears in a namespace and in a sub-agent's `memory_domains`. |
+| `memory.shared_domains.read` | `bool` | — | Whether records in this domain are visible across conversations. |
+| `memory.shared_domains.write` | `bool` | — | Whether they may be written. One of the three gates a shared write needs — the others are `[memory.policy].shared_writes` and a caller holding the domain under a `shared_readwrite` memory view. |
 | `channels` | `ChannelsConfig` | (table) | Which channels this deployment answers on, and in what mode. |
-| `channels.tui` | `ChannelConfig` | (table) | *(undocumented — see `config/undocumented.txt`)* |
-| `channels.tui.enabled` | `bool` | `true` | *(undocumented — see `config/undocumented.txt`)* |
-| `channels.tui.mode` | `Arc<str>` | `interactive` | *(undocumented — see `config/undocumented.txt`)* |
-| `channels.telegram` | `ChannelConfig` | (table) | *(undocumented — see `config/undocumented.txt`)* |
-| `channels.telegram.enabled` | `bool` | `false` | *(undocumented — see `config/undocumented.txt`)* |
-| `channels.telegram.mode` | `Arc<str>` | `poll_once` | *(undocumented — see `config/undocumented.txt`)* |
-| `channels.feishu` | `ChannelConfig` | (table) | *(undocumented — see `config/undocumented.txt`)* |
-| `channels.feishu.enabled` | `bool` | `false` | *(undocumented — see `config/undocumented.txt`)* |
-| `channels.feishu.mode` | `Arc<str>` | `long_connection` | *(undocumented — see `config/undocumented.txt`)* |
+| `channels.tui` | `ChannelConfig` | (table) | The interactive terminal. On by default; it is the channel the CLI speaks over. |
+| `channels.tui.enabled` | `bool` | `true` | Whether this deployment answers on the channel at all. A disabled channel is not constructed, so its credentials are never read. |
+| `channels.tui.mode` | `Arc<str>` | `interactive` | How the channel is driven: `interactive` (the TUI's read-eval loop), `poll_once` / `poll` (ask the transport for updates), or `long_connection` (hold a socket open). `disabled` is the default and means the same as `enabled = false`. |
+| `channels.telegram` | `ChannelConfig` | (table) | Telegram, over the Bot API. Needs `TELEGRAM_BOT_TOKEN` and an `[approval] `-answerable sender allowlist in the environment. |
+| `channels.telegram.enabled` | `bool` | `false` | Whether this deployment answers on the channel at all. A disabled channel is not constructed, so its credentials are never read. |
+| `channels.telegram.mode` | `Arc<str>` | `poll_once` | How the channel is driven: `interactive` (the TUI's read-eval loop), `poll_once` / `poll` (ask the transport for updates), or `long_connection` (hold a socket open). `disabled` is the default and means the same as `enabled = false`. |
+| `channels.feishu` | `ChannelConfig` | (table) | Feishu / Lark, over its long-connection websocket or webhook. |
+| `channels.feishu.enabled` | `bool` | `false` | Whether this deployment answers on the channel at all. A disabled channel is not constructed, so its credentials are never read. |
+| `channels.feishu.mode` | `Arc<str>` | `long_connection` | How the channel is driven: `interactive` (the TUI's read-eval loop), `poll_once` / `poll` (ask the transport for updates), or `long_connection` (hold a socket open). `disabled` is the default and means the same as `enabled = false`. |
 | `channels.provisional_streaming` | `bool` | `false` | Forward assistant text as the model produces it, before the output guardrails have seen any of it. Off by default.  Provisional, and the name says why: output guardrails run at the end of a turn, so on a streaming channel the check happens after the user has already read the output. Turning this on trades that guarantee for latency, knowingly. It becomes eligible for a stable default when an incremental output-guardrail interface exists; the reasoning is in `docs/adr/0007-BUFFERED_OUTPUT.md`.  Named as a path rather than linked because this comment is rendered into `docs/CONFIG_CATALOG.md`, where a source-relative link resolves nowhere — `scripts/check-release-archive.sh` checks that every link in the packaged docs points at something in the bundle. |
 | `isolation` | `IsolationConfig` | (table) | Where the subprocess worker that runs sandboxed tools is found. |
-| `isolation.worker_path` | `Option<PathBuf>` | (unset) | *(undocumented — see `config/undocumented.txt`)* |
-| `isolation.worker_path_env` | `Option<String>` | (unset) | *(undocumented — see `config/undocumented.txt`)* |
+| `isolation.worker_path` | `Option<PathBuf>` | (unset) | Path to the `agentos-tool-worker` binary that runs sandboxed tools in a child process. Unset falls back to `worker_path_env`, then to the worker beside the running executable.  A tool declaring anything but `full_access` will not run without one (M4 / `SBX-001`): where no executor can enforce the mode, the call is refused rather than run unsandboxed. |
+| `isolation.worker_path_env` | `Option<String>` | (unset) | Name of an environment variable holding the worker path, for a deployment that installs the worker somewhere the config cannot name at authoring time. |
 | `isolation.env_passthrough` | `Vec<String>` | (empty) | Environment variable *names* a tool subprocess may see beyond the built-in allowlist (M4 / `PROC-001`).  Every child the runtime starts — the isolation worker, every `shell` command — begins with a cleared environment and is given back only `PATH`, `HOME`, `TMPDIR`, the locale, the proxy settings, and `AGENTOS_HOME`. Before that, a child inherited every provider and channel credential the gateway holds and could print them with `env`.  Names, never values: this says which of the *deployment's own* variables a tool is allowed to read. Adding a credential's name here hands that credential to every command the model chooses to run. |
 | `subagents` | `Vec<SubAgentConfig>` | (none) | Sub-agents this agent may delegate to. Each carries its own tools and inherits the parent's rules for them, so a sub-agent can never decide a call more permissively than its parent — arguments included. Listing a tool selects it; it does not elevate it. See `subagents.delegation_grants` for the declared exception. |
-| `subagents.name` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `subagents.id` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `subagents.description` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `subagents.developer_instructions` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `subagents.policy_id` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `subagents.orchestrator` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `subagents.model_tier` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `subagents.tools` | `Vec<Arc<str>>` | — | *(undocumented — see `config/undocumented.txt`)* |
+| `subagents.name` | `Arc<str>` | — | Human-readable name, for logs and the resource catalog. |
+| `subagents.id` | `Arc<str>` | — | The agent id a `Plan::Delegate` names. Together with `policy_id` it identifies one delegatee, and it becomes one path segment for the sub-agent's task workspace — so it is validated as a single segment rather than rewritten. |
+| `subagents.description` | `Arc<str>` | — | What this sub-agent is for, as the parent's model reads it when deciding whether to delegate. |
+| `subagents.developer_instructions` | `Arc<str>` | — | The standing brief prepended to this sub-agent's own context on every delegation. |
+| `subagents.policy_id` | `Arc<str>` | — | Which policy this entry defines. One sub-agent id may appear under several policy ids; each pair is a separate delegatee with separate permissions. |
+| `subagents.orchestrator` | `Arc<str>` | — | Which orchestrator drives the child loop: `builtin.max` or `builtin.min`. |
+| `subagents.model_tier` | `Arc<str>` | — | Which model this sub-agent calls: `high`, `medium`, or `low`. A bounded task under a narrowed policy is often the place to spend less. |
+| `subagents.tools` | `Vec<Arc<str>>` | — | Tools this sub-agent may call, by name. Listing a tool *selects* it; it does not elevate it — see `delegation_grants`. |
 | `subagents.skills` | `Vec<Arc<str>>` | — | Skills (by name) this sub-agent is permitted to dispatch. Each entry must also appear in the parent runtime's `resources.skills.enabled` list — unknown names are silently dropped at build time. Skill access is opt-in: an empty vector means the sub-agent cannot dispatch any skill, even if the parent has them loaded. |
-| `subagents.memory_view` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `subagents.memory_domains` | `Vec<Arc<str>>` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `subagents.memory_tools` | `Vec<Arc<str>>` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `subagents.max_turns` | `usize` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `subagents.inherit_guardrails` | `bool` | — | *(undocumented — see `config/undocumented.txt`)* |
+| `subagents.memory_view` | `Arc<str>` | — | How much memory this sub-agent sees: `none`, `own` (its own scopes only), `shared_readonly`, or `shared_readwrite`. Only the last permits a shared-domain write, and only for domains the deployment already allows (M7 / `MEM-001`). |
+| `subagents.memory_domains` | `Vec<Arc<str>>` | — | Which shared domains this sub-agent names, for the two `shared_*` views. Intersected with `[[memory.shared_domains]]`: naming a domain the deployment does not share grants nothing. |
+| `subagents.memory_tools` | `Vec<Arc<str>>` | — | Which `memory` tool operations this sub-agent may call: any of `read`, `write`, `forget`. Empty means it gets no memory tool at all. |
+| `subagents.max_turns` | `usize` | — | Tool cycles this sub-agent's own run may take. Exhausting it ends the child with a partial answer rather than failing the parent. |
+| `subagents.inherit_guardrails` | `bool` | — | Whether the parent runtime's input, tool, and output guardrails also apply to this sub-agent's run. |
 | `subagents.skill_bundle_writer` | `bool` | — | Opt-in: permits this sub-agent to write inside the skill-bundle directory. Defaults to `false`, so every sub-agent is blocked from tampering with `SKILL.md` bundles by the skill-bundle write guardrail unless it is the designated skill editor. This is a permission grant, not a convenience toggle — set it only on the dedicated skill editor. |
 | `subagents.seed_from_parent` | `bool` | — | Seed this sub-agent's conversation from the parent's history the first time it is delegated to (roadmap X6), instead of starting it empty.  Off by default, and the default is the conservative one. A sub-agent exists to work a bounded task under a narrowed policy; handing it the whole parent conversation costs tokens on every turn it takes and shows a possibly weaker model everything the parent has seen. Turn it on for the sub-agent that needs the discussion so far — a reviewer, an editor, a second opinion — not for one that fetches a URL.  Seeding happens once. A sub-agent's conversation id is stable across a conversation, so the second and every later delegation find history already there and leave it alone. |
 | `subagents.max_output_chars` | `usize` | — | Character cap for `MaxOutputLength` when `inherit_guardrails = true`. Tripped output aborts the run, so this needs to comfortably exceed any reply you expect from the model. Defaults are tuned for chat: long enough to fit a thorough multi-paragraph answer, short enough to catch runaway generation. |
@@ -93,14 +101,14 @@ Every key `agent.toml` accepts, derived from the config structs. Edit the doc co
 | `subagents.delegation_grants.reason` | `Arc<str>` | — | Why this sub-agent needs authority its parent withheld. Required: a grant nobody can explain is a grant nobody can review. |
 | `subagents.delegation_grants.expires_at` | `Option<u64>` | — | Unix seconds after which the grant stops applying. Omit for a standing grant. |
 | `mcp_servers` | `Vec<McpServerConfig>` | (none) | MCP servers to connect to. |
-| `mcp_servers.id` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `mcp_servers.endpoint` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `mcp_servers.timeout_ms` | `Option<u64>` | — | *(undocumented — see `config/undocumented.txt`)* |
+| `mcp_servers.id` | `Arc<str>` | — | The name this server is referred to by, in `[resources.mcp].enabled` and in each `[[mcp_tools]].server_id`. |
+| `mcp_servers.endpoint` | `Arc<str>` | — | Where the server is: an `http(s)://` URL, or a command line for a stdio server. An address written here is an operator's decision, so it is not subject to the egress policy that judges model-chosen URLs. |
+| `mcp_servers.timeout_ms` | `Option<u64>` | — | How long one call to this server may take. Unset uses `[limits].tool_timeout_ms`. |
 | `mcp_tools` | `Vec<McpToolConfig>` | (none) | Tools served by a static MCP server, declared inline. |
-| `mcp_tools.server_id` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `mcp_tools.name` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `mcp_tools.description` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `mcp_tools.response` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
+| `mcp_tools.server_id` | `Arc<str>` | — | Which `[[mcp_servers]]` entry serves this tool, by its `id`. |
+| `mcp_tools.name` | `Arc<str>` | — | The tool name the model calls. Shares one namespace with the built-in tools, so it must not collide with one. |
+| `mcp_tools.description` | `Arc<str>` | — | What the tool does, as the model reads it. This is the whole of what the model knows about it when choosing. |
+| `mcp_tools.response` | `Arc<str>` | — | A canned response, for a statically declared tool that needs no live server — the reference `remote_echo` is one. Ignored by tools whose server answers for itself. |
 | `mcp_tools.sandbox` | `SandboxMode` | — | What this MCP-backed tool may do to the filesystem (roadmap X2).  Defaults to `full_access`, which is exactly what the old `requires_isolation = false` meant: the call is made in-process by the MCP client, so there is no child process for a sandbox to restrict. |
 | `resources` | `ResourceConfig` | (table) | Which skills, tools, MCP tools, and LLM entries are enabled, and in what order they are offered to the model. |
 | `resources.priority` | `Vec<Arc<str>>` | `["skills","tools","mcp","llm"]` | The order resources are offered to the model, over the four kinds: `skills`, `tools`, `mcp`, `llm`. Dropping a kind omits it entirely.  This decides the order of the catalog the model reads. It used not to: the orchestrator re-sorted the index by an internal `DispatchPriority` that nothing else reads, so every deployment got the default order whatever it wrote here (M7 / `CFG-001`). |
@@ -109,34 +117,34 @@ Every key `agent.toml` accepts, derived from the config structs. Edit the doc co
 | `resources.mcp` | `ResourceSection` | `{"enabled":[]}` | MCP servers to offer, by the name they are declared under. |
 | `resources.llm` | `ResourceSection` | `{"enabled":[]}` | **Deprecated.** Whether the LLM fallback is offered is decided by listing (or omitting) `llm` in `priority`; this section could only ever hold the single literal `"llm"`, so setting it said nothing that `priority` did not already say. Warned about at load time and otherwise ignored. |
 | `routing` | `RoutingConfig` | (table) | How inbound work is classified and where each class is dispatched. |
-| `routing.rules` | `Vec<RoutingRuleConfig>` | (none) | *(undocumented — see `config/undocumented.txt`)* |
-| `routing.rules.domain` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `routing.rules.description` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `routing.rules.examples` | `Vec<Arc<str>>` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `routing.rules.dispatch` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `routing.rules.template` | `Option<Arc<str>>` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `routing.rules.agent_id` | `Option<Arc<str>>` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `routing.rules.policy_id` | `Option<Arc<str>>` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `routing.fallback` | `Option<RoutingRuleConfig>` | (table) | *(undocumented — see `config/undocumented.txt`)* |
-| `routing.fallback.domain` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `routing.fallback.description` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `routing.fallback.examples` | `Vec<Arc<str>>` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `routing.fallback.dispatch` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `routing.fallback.template` | `Option<Arc<str>>` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `routing.fallback.agent_id` | `Option<Arc<str>>` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `routing.fallback.policy_id` | `Option<Arc<str>>` | — | *(undocumented — see `config/undocumented.txt`)* |
+| `routing.rules` | `Vec<RoutingRuleConfig>` | (none) | Where each class of work goes. The classifier picks one by matching a prompt against the rules' descriptions and examples. |
+| `routing.rules.domain` | `Arc<str>` | — | The class of work this rule covers, as a stable name the trace records. |
+| `routing.rules.description` | `Arc<str>` | — | What the class is, in the classifier's own prompt. This is the whole of what it has to go on besides `examples`, so it is worth writing well. |
+| `routing.rules.examples` | `Vec<Arc<str>>` | — | Representative prompts for the class. Few-shot material for the classifier, not patterns — they are never matched literally. |
+| `routing.rules.dispatch` | `Arc<str>` | — | What to do with a matching prompt: `direct` (the main agent handles it), `subagent`, or `template`. |
+| `routing.rules.template` | `Option<Arc<str>>` | — | The `[[orchestrator_templates]]` name, for `dispatch = "template"`. |
+| `routing.rules.agent_id` | `Option<Arc<str>>` | — | The sub-agent to delegate to, for `dispatch = "subagent"`. |
+| `routing.rules.policy_id` | `Option<Arc<str>>` | — | Which of that sub-agent's policies to run under. A sub-agent is identified by the pair, so two policies are two delegatees. |
+| `routing.fallback` | `Option<RoutingRuleConfig>` | (table) | Where work goes when no rule matches, or when `llm_classifier` is off. Unset dispatches directly to the main agent. |
+| `routing.fallback.domain` | `Arc<str>` | — | The class of work this rule covers, as a stable name the trace records. |
+| `routing.fallback.description` | `Arc<str>` | — | What the class is, in the classifier's own prompt. This is the whole of what it has to go on besides `examples`, so it is worth writing well. |
+| `routing.fallback.examples` | `Vec<Arc<str>>` | — | Representative prompts for the class. Few-shot material for the classifier, not patterns — they are never matched literally. |
+| `routing.fallback.dispatch` | `Arc<str>` | — | What to do with a matching prompt: `direct` (the main agent handles it), `subagent`, or `template`. |
+| `routing.fallback.template` | `Option<Arc<str>>` | — | The `[[orchestrator_templates]]` name, for `dispatch = "template"`. |
+| `routing.fallback.agent_id` | `Option<Arc<str>>` | — | The sub-agent to delegate to, for `dispatch = "subagent"`. |
+| `routing.fallback.policy_id` | `Option<Arc<str>>` | — | Which of that sub-agent's policies to run under. A sub-agent is identified by the pair, so two policies are two delegatees. |
 | `routing.llm_classifier` | `bool` | `true` | When false, routing never spends an LLM classifier round-trip: deterministic routes still apply, and everything else goes to the fallback dispatch. |
 | `orchestrator_templates` | `Vec<TemplateConfig>` | (none) | Multi-stage sub-orchestrator templates a run can escalate into. |
-| `orchestrator_templates.name` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `orchestrator_templates.description` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `orchestrator_templates.developer_instructions` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `orchestrator_templates.stages` | `Vec<StageConfig>` | (none) | *(undocumented — see `config/undocumented.txt`)* |
-| `orchestrator_templates.stages.name` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `orchestrator_templates.stages.agent_id` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `orchestrator_templates.stages.policy_id` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
-| `orchestrator_templates.stages.depends_on` | `Vec<Arc<str>>` | — | *(undocumented — see `config/undocumented.txt`)* |
+| `orchestrator_templates.name` | `Arc<str>` | — | The template's name, as a routing rule refers to it. |
+| `orchestrator_templates.description` | `Arc<str>` | — | What the template is for, as the classifier reads it. |
+| `orchestrator_templates.developer_instructions` | `Arc<str>` | — | Instructions prepended to every stage's own context — the standing brief for the whole multi-stage run. |
+| `orchestrator_templates.stages` | `Vec<StageConfig>` | (none) | The stages, in declaration order. Execution order comes from `depends_on`, and a cycle is a load-time error. |
+| `orchestrator_templates.stages.name` | `Arc<str>` | — | The stage's name, which later stages name in `depends_on` and which the trace records. |
+| `orchestrator_templates.stages.agent_id` | `Arc<str>` | — | The sub-agent that runs this stage. |
+| `orchestrator_templates.stages.policy_id` | `Arc<str>` | — | Which of that sub-agent's policies the stage runs under. |
+| `orchestrator_templates.stages.depends_on` | `Vec<Arc<str>>` | — | Stages that must finish first. Empty means the stage can start immediately; a cycle is refused at load time. |
 | `task_workspace` | `TaskWorkspaceConfig` | (table) | Where per-task scratch directories are created. |
-| `task_workspace.root` | `PathBuf` | `tasks` | *(undocumented — see `config/undocumented.txt`)* |
+| `task_workspace.root` | `PathBuf` | `tasks` | Where per-task scratch directories are created. A relative path resolves against the directory holding `agent.toml`.  Each task gets one directory named by its id, which is validated as a single path segment rather than rewritten (M4 / `FS-001`). |
 | `limits` | `LimitsConfig` | (table) | Sizes and deadlines a deployment has real reason to change. |
 | `limits.tool_result_inline_bytes` | `usize` | `65536` | Bytes of a tool result kept inline in the transcript. The rest is spilled to a file the model can read back. |
 | `limits.tool_timeout_ms` | `u64` | `60000` | Deadline for a tool that declares none of its own, in milliseconds (roadmap item D2). |
@@ -165,6 +173,4 @@ Every key `agent.toml` accepts, derived from the config structs. Edit the doc co
 | `spill` | `SpillConfig` | (table) | Where oversized tool output is written, and how long it is kept. |
 | `spill.root` | `PathBuf` | `spill` | Where artifacts are written. Relative paths resolve against the workspace root; an absolute path is taken as given, for a deployment that wants spill on a different volume from the session database. |
 | `spill.retention_days` | `u64` | `0` | Days an artifact is kept, or `0` to keep everything.  `0` is a choice rather than a disabled feature — see the module docs. |
-
-85 of 158 keys have no description yet. They are listed in `crates/agentos-core/src/config/undocumented.txt`; writing the doc comment on the field is what removes a line from it.
 <!-- END GENERATED: config -->
