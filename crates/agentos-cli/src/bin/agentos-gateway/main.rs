@@ -1031,8 +1031,7 @@ async fn fire_due_crons(
                 )?;
                 if let Some(approval_id) = paused
                     .state
-                    .pending_approvals
-                    .first()
+                    .pending_approval()
                     .map(|approval| approval.id.clone())
                 {
                     // Fails the run closed; the error is the expected shape.

@@ -37,8 +37,7 @@ fn pause_run(
 
 fn approve_first_pending(state: &mut RunState) {
     let id = state
-        .pending_approvals
-        .first()
+        .pending_approval()
         .expect("paused run has a pending approval")
         .id
         .clone();

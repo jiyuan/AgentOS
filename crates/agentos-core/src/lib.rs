@@ -4,6 +4,7 @@
 //! errors. It must not depend on workspace-owned content.
 
 pub mod approve;
+pub mod audit;
 pub mod channels;
 pub mod config;
 pub mod crons;

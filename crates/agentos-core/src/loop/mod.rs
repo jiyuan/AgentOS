@@ -1,4 +1,5 @@
-use crate::approve::Policy;
+use crate::approve::{DelegationGrant, Policy};
+use crate::audit::{ArgumentDigest, SafetyEvent, SafetyEventKind, SafetyJournal, SafetyOutcome};
 use crate::hooks::Hooks;
 use crate::prompt::Compaction;
 use crate::spill::ContentLimits;
@@ -10,7 +11,7 @@ use agentos_interfaces::guardrail::{
     GuardrailOutcome, Input, InputGuardrail, OutputGuardrail, ToolGuardrail,
 };
 use agentos_interfaces::orchestrator::{Orchestrator, Plan, RunContext, StreamSink};
-use agentos_interfaces::run_state::{ApprovalStatus, Interruption, InterruptionAction, RunState};
+use agentos_interfaces::run_state::{Interruption, InterruptionAction, RunState};
 use agentos_proto::{AgentId, InterruptionId, Message, SpanKind};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -81,6 +82,15 @@ pub struct LoopDeps<'a> {
     /// `None` means nothing can steer this run, which is every entrypoint that
     /// does not multiplex a conversation.
     pub steering: Option<Steering>,
+    /// Where this run's safety-boundary decisions are recorded (M6 /
+    /// `AUD-001`). A detached journal writes nowhere, which is what an
+    /// entrypoint with no store configured gets.
+    pub audit: SafetyJournal<'a>,
+    /// Authority this run holds that its parent does not, from
+    /// `[[subagents.delegation_grants]]`. Empty for every run that is not a
+    /// sub-agent whose narrowing needed a grant. The `Approve` state records
+    /// a use when a call falls under one of these.
+    pub granted_authority: &'a [DelegationGrant],
 }
 
 pub struct InputGuardrailEntry<'a> {
@@ -217,7 +227,13 @@ async fn start(ctx: StartCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunEr
         };
         for entry in deps.input_guardrails {
             let outcome = entry.guardrail.check(&input, &run_ctx).await?;
-            ensure_guardrail_passed(&entry.name, outcome)?;
+            ensure_guardrail_passed(
+                deps,
+                SafetyEventKind::InputGuardrailTrip,
+                SafetyOutcome::Tripped,
+                &entry.name,
+                outcome,
+            )?;
         }
     }
     Ok(RunLoopState::Plan(PlanCtx {
@@ -374,7 +390,13 @@ async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunErro
             run_ctx.cancel = deps.cancel.clone();
             for entry in deps.output_guardrails {
                 let outcome = entry.guardrail.check(&message, &run_ctx).await?;
-                ensure_guardrail_passed(&entry.name, outcome)?;
+                ensure_guardrail_passed(
+                    deps,
+                    SafetyEventKind::OutputGuardrailTrip,
+                    SafetyOutcome::Tripped,
+                    &entry.name,
+                    outcome,
+                )?;
             }
             Ok(RunLoopState::Finish(FinalOutput { state, message }))
         }
@@ -417,27 +439,77 @@ async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunErro
 /// `orchestrator.plan()` returns and calls this for every entry — including
 /// calls whose plan was `Plan::CallTool`, `Plan::Delegate`, etc.
 async fn approve(ctx: ApproveCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunError> {
-    match approve_transition(ctx, deps.policy) {
-        ApproveTransition::Allow { state, plan, turns } => Ok(RunLoopState::Act(ActCtx {
-            state,
-            plan,
-            turns,
-            denied: None,
-        })),
+    match approve_transition(ctx, deps) {
+        ApproveTransition::Allow { state, plan, turns } => {
+            // The elevation was recorded when narrowing admitted it; this is
+            // the record that it was exercised. Only on `Allow`: a grant that
+            // covers a call the child was denied anyway granted nothing.
+            for grant in deps.granted_authority {
+                if grant.covers(&plan) {
+                    deps.audit.record(
+                        SafetyEvent::new(
+                            SafetyEventKind::DelegationGrantUsed,
+                            SafetyOutcome::Used,
+                            plan_subject(&plan),
+                        )
+                        .with_detail(grant.reason.as_ref()),
+                    );
+                }
+            }
+            Ok(RunLoopState::Act(ActCtx {
+                state,
+                plan,
+                turns,
+                denied: None,
+            }))
+        }
         ApproveTransition::DenyTool {
             state,
             call,
             reason,
             turns,
-        } => Ok(RunLoopState::Act(ActCtx {
-            state,
-            plan: Plan::CallTool(call),
-            turns,
-            denied: Some(reason),
-        })),
-        ApproveTransition::Deny { reason } => Err(RunError::ApprovalDenied { reason }),
+        } => {
+            deps.audit.record(
+                SafetyEvent::new(
+                    SafetyEventKind::PolicyDenial,
+                    SafetyOutcome::Denied,
+                    Arc::clone(&call.name),
+                )
+                .with_detail(reason.as_ref())
+                .with_digest(ArgumentDigest::of(call.args.get().as_bytes())),
+            );
+            Ok(RunLoopState::Act(ActCtx {
+                state,
+                plan: Plan::CallTool(call),
+                turns,
+                denied: Some(reason),
+            }))
+        }
+        ApproveTransition::Deny { subject, reason } => {
+            deps.audit.record_reason(
+                SafetyEventKind::PolicyDenial,
+                SafetyOutcome::Denied,
+                subject,
+                reason.as_ref(),
+            );
+            Err(RunError::ApprovalDenied { reason })
+        }
         ApproveTransition::Pause { state } => Ok(RunLoopState::Paused(state)),
         ApproveTransition::Unsupported { reason } => Err(RunError::ApprovalUnsupported { reason }),
+    }
+}
+
+/// What a plan is *about*, for the `subject` of a safety event: the tool a
+/// call names, the agent a handoff targets, the sub-agent a delegation runs.
+fn plan_subject(plan: &Plan) -> Arc<str> {
+    match plan {
+        Plan::CallTool(call) => Arc::clone(&call.name),
+        Plan::CallTools(_) => Arc::from("tool_batch"),
+        Plan::Delegate(spec) => Arc::from(spec.agent_id.as_str()),
+        Plan::Escalate(spec) => Arc::clone(&spec.template.name),
+        Plan::Handoff(agent_id, _) => Arc::from(agent_id.as_str()),
+        Plan::ResumeSubAgent { spec, .. } => Arc::from(spec.agent_id.as_str()),
+        Plan::Reply(_) => Arc::from("reply"),
     }
 }
 
@@ -562,24 +634,22 @@ fn pause_for_subagent_approval(
 ) -> Result<RunLoopState, RunError> {
     let child_approval = paused
         .state
-        .pending_approvals
-        .first()
+        .pending_approval()
         .ok_or(RunError::SubAgent(SubAgentError::Paused))?;
     let approval_id = InterruptionId::new(format!(
         "approval-subagent-{}-{}",
         spec.agent_id.as_str(),
         child_approval.id.as_str()
     ));
-    state.pending_approvals.push(Interruption {
-        id: approval_id,
-        action: InterruptionAction::ResumeSubAgent {
+    state.approvals.push(Interruption::pending(
+        approval_id,
+        InterruptionAction::ResumeSubAgent {
             spec,
             child_channel_id: paused.channel_id,
             child_conversation_id: paused.conversation_id,
             child_state: Box::new(paused.state),
         },
-        status: ApprovalStatus::Pending,
-    });
+    ));
     Ok(RunLoopState::Paused(state))
 }
 
@@ -629,13 +699,32 @@ async fn observe(ctx: ObserveCtx) -> Result<RunLoopState, RunError> {
     }))
 }
 
-fn ensure_guardrail_passed(name: &Arc<str>, outcome: GuardrailOutcome) -> Result<(), RunError> {
+/// Turn a guardrail verdict into control flow, recording the trip on the way
+/// past.
+///
+/// The record happens here rather than at each call site because a guardrail
+/// that trips without leaving a trace is indistinguishable from one that never
+/// ran — which is exactly the gap M6 exists to close. `kind` says which
+/// boundary this was, and `outcome_kind` distinguishes a call that was stopped
+/// before it ran from one whose output was withheld afterwards; see
+/// [`SafetyEventKind`].
+fn ensure_guardrail_passed(
+    deps: &LoopDeps<'_>,
+    kind: SafetyEventKind,
+    outcome_kind: SafetyOutcome,
+    name: &Arc<str>,
+    outcome: GuardrailOutcome,
+) -> Result<(), RunError> {
     match outcome {
         GuardrailOutcome::Passed => Ok(()),
-        GuardrailOutcome::Tripped(reason) => Err(RunError::GuardrailTripped {
-            guardrail: Arc::clone(name),
-            reason,
-        }),
+        GuardrailOutcome::Tripped(reason) => {
+            deps.audit
+                .record_reason(kind, outcome_kind, Arc::clone(name), reason.as_ref());
+            Err(RunError::GuardrailTripped {
+                guardrail: Arc::clone(name),
+                reason,
+            })
+        }
     }
 }
 

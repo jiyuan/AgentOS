@@ -10,6 +10,7 @@
 //! Run with `cargo bench -p agentos-core --bench loop_overhead`.
 
 use agentos_core::approve::Policy;
+use agentos_core::audit::SafetyJournal;
 use agentos_core::r#loop::{LoopDeps, RunLoopState, StartCtx};
 use agentos_interfaces::session::{Item, Transcript};
 use agentos_interfaces::test_support::MockOrchestrator;
@@ -75,6 +76,8 @@ fn bench_reply_turn(c: &mut Criterion) {
                 compaction: Default::default(),
                 cancel: Default::default(),
                 steering: None,
+                audit: SafetyJournal::detached(),
+                granted_authority: &[],
             };
             black_box(runtime.block_on(drive_to_finish(&deps)));
         });

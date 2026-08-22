@@ -219,6 +219,8 @@ fn runner_deps<'a>(
         compaction: Default::default(),
         cancel: Default::default(),
         steering: None,
+        safety_log: None,
+        granted_authority: &[],
     }
 }
 
@@ -276,7 +278,7 @@ async fn parent_tool_call_still_requires_approval_when_child_declares_allow() {
         panic!("parent tool call must pause for approval, got a finished run");
     };
     assert_eq!(
-        state.pending_approvals.len(),
+        state.approvals.len(),
         1,
         "exactly one pending approval for the parent's gated tool call"
     );

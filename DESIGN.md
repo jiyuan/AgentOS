@@ -74,6 +74,16 @@ Above both, conversations are actors. Each has a bounded `Inbox` and is assigned
 3. Approve: every boundary action receives an allow, deny, or ask-user decision from the concrete policy engine. `Approve` is concrete, not an extension trait.
 4. Isolation: a tool declares a `SandboxMode` — `read_only`, `workspace_write`, or `full_access`. Anything but `full_access` runs the tool in a child process whose filesystem writes the kernel refuses: Landlock on Linux, Seatbelt on macOS, and the restriction is inherited by every descendant. `full_access` means no sandbox, which is what a tool that does its work in-process declares — the only restriction available to those would apply to the whole agent, permanently, so they are bounded by rings 2 and 3 instead. Reads are not restricted, and neither is the network. Where no backend exists, a sandboxed tool fails rather than running unsandboxed, and `agentos-gateway config` prints which mechanism (if any) this machine enforces with. Two things can carry the mode: an isolated executor the registry dispatches to, whose `--capabilities` handshake reports what it can actually run and enforce, or the tool's own hardening of its own child (`Isolation::SelfHardened`, which only `shell` claims). A tool that declares a mode and provides neither is refused at startup and at every call.
 
+Rings 5 through 9 are stated in full in
+[`docs/ARCHITECTURE.md` §10](docs/ARCHITECTURE.md): filesystem containment
+(`openat(O_NOFOLLOW)`, directory-relative, symlinks refused rather than
+resolved), subprocess environment and lifetime (`env_clear` plus a named
+allowlist, one process group per child), tool egress (decided on the resolved
+address inside the DNS resolver, bodies bounded, ambient proxy off), bounded
+ingress (nothing off the wire sizes an allocation), and durable safety events
+(every decision above appends an append-only, redacted row; deletion is never
+the record of an outcome).
+
 ### Checked invariants
 
 Three relationships the rings depend on are asserted in debug builds
@@ -83,7 +93,7 @@ request; every delegation's effective policy reaches no action its parent
 cannot; and every tool result in the transcript follows an assistant item
 carrying its call id.
 
-These are **not a fifth ring**. They are compiled out of release builds
+These are **not a ring of their own**. They are compiled out of release builds
 entirely, so they protect development rather than deployment — a violation is a
 bug in the core, not a state a deployment can reach by configuration. Each
 states a relationship between two pieces of authoritative state rather than

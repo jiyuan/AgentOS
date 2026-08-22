@@ -2,6 +2,7 @@ use super::telemetry::{
     field_key, record_subagent_failure, record_telemetry_event, subagent_telemetry_fields,
 };
 use super::{LoopDeps, RunError};
+use crate::audit::{SafetyEvent, SafetyEventKind, SafetyOutcome};
 use crate::runner::ResumeDecision;
 use crate::subagents::{
     child_input_envelope, child_run_id, parent_conversation_id, ParentSeed, SubAgentError,
@@ -103,6 +104,20 @@ pub(super) async fn execute_delegate(
             return Err(error.into());
         }
     };
+    // Narrowing happens per delegation, so this is where a standing grant in
+    // `agent.toml` becomes authority actually conferred on a running child.
+    // Recorded by the parent, because the parent is the principal the
+    // elevation was made against (M6 / `AUD-001`).
+    for grant in invocation.grants_relied_on() {
+        deps.audit.record(
+            SafetyEvent::new(
+                SafetyEventKind::DelegationGrantIssued,
+                SafetyOutcome::Issued,
+                spec.agent_id.as_str(),
+            )
+            .with_detail(grant.reason.as_ref()),
+        );
+    }
     record_telemetry_event(
         state,
         deps.hooks,

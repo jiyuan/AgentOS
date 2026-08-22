@@ -1,15 +1,16 @@
-use crate::approve::Policy;
+use crate::approve::{DelegationGrant, Policy};
+use crate::audit::{SafetyJournal, SafetyLog, SafetyOutcome};
 use crate::hooks::Hooks;
+mod audit;
 mod episodes;
+mod prompt;
 mod task_session;
 
 use crate::memory::MemoryManager;
 use crate::prompt::Compaction;
 use crate::r#loop::{
-    prompt_actions, resume_approved, ApprovalOutcome, ApprovalTicket, FinalOutput,
-    InputGuardrailEntry, LoopDeps, OutputGuardrailEntry, RunError, RunLoopState, StartCtx,
-    Steering, ToolGuardrailEntry, ACTIONS_KEY, EXPIRES_AT_KEY, INTERRUPTION_KEY, PROMPT_KIND,
-    TICKET_KEY,
+    resume_approved, ApprovalOutcome, FinalOutput, InputGuardrailEntry, LoopDeps,
+    OutputGuardrailEntry, RunError, RunLoopState, StartCtx, Steering, ToolGuardrailEntry,
 };
 use crate::spill::ContentLimits;
 use crate::subagents::SubAgentRegistry;
@@ -17,14 +18,15 @@ use crate::task_workspace::{TaskWorkspace, TaskWorkspaceError};
 use crate::tools::ToolRegistry;
 use crate::trace;
 use agentos_interfaces::orchestrator::{Orchestrator, StreamSink};
-use agentos_interfaces::run_state::InterruptionAction;
 use agentos_interfaces::session::{Item, Session, SessionError, Transcript};
 use agentos_interfaces::RunState;
 use agentos_proto::{
-    AgentId, ChannelId, ConversationId, Envelope, InterruptionId, Message, MessageRole, RunId,
-    SpanKind,
+    AgentId, ChannelId, ConversationId, Envelope, InterruptionId, Principal, RunId, SpanKind,
 };
+use audit::{record_resolution, record_terminal_error};
 use episodes::{record_denied_episode, record_error_episode, record_finished_episode, EpisodeSeed};
+use prompt::approval_action_label;
+pub use prompt::approval_prompt_envelope;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -119,6 +121,14 @@ pub struct RunnerDeps<'a> {
     /// the running turn instead of starting a second, racing run on the same
     /// conversation; a one-shot entrypoint leaves it `None`.
     pub steering: Option<Steering>,
+    /// The append-only store this run's safety-boundary decisions go to
+    /// (M6 / `AUD-001`). `None` records nothing, which is what an entrypoint
+    /// with no store configured gets.
+    pub safety_log: Option<&'a dyn SafetyLog>,
+    /// Authority this run holds that its parent does not. Set only when this
+    /// is a sub-agent run whose narrowing needed a
+    /// `[[subagents.delegation_grants]]` entry.
+    pub granted_authority: &'a [DelegationGrant],
 }
 
 pub trait TraceSink: Send + Sync {
@@ -197,128 +207,6 @@ impl ResumeDecision {
     }
 }
 
-/// Build the envelope that asks a user to decide a pending approval.
-///
-/// `ticket` names *this asking* (roadmap G2): an answer has to carry it back or
-/// it decides nothing. `expires_at` is unix seconds after which the prompt
-/// stops counting, carried in metadata so a channel can render it and the
-/// gateway can sweep it.
-///
-/// The `InterruptionId` travels alongside as `approval_id`. It says what is
-/// being authorised where the ticket says which asking, and the pair is what
-/// makes a decision traceable back to the action it permitted.
-pub fn approval_prompt_envelope(
-    paused: &PausedRun,
-    sender: Arc<str>,
-    ticket: &ApprovalTicket,
-    expires_at: Option<u64>,
-) -> Option<Envelope> {
-    let approval = paused.state.pending_approvals.first()?;
-    let mut metadata = BTreeMap::new();
-    metadata.insert(Arc::from("kind"), Value::String(PROMPT_KIND.to_owned()));
-    metadata.insert(
-        Arc::from(INTERRUPTION_KEY),
-        Value::String(approval.id.as_str().to_owned()),
-    );
-    metadata.insert(
-        Arc::from(TICKET_KEY),
-        Value::String(ticket.as_str().to_owned()),
-    );
-    metadata.insert(Arc::from(ACTIONS_KEY), prompt_actions(ticket));
-    if let Some(expires_at) = expires_at {
-        metadata.insert(Arc::from(EXPIRES_AT_KEY), Value::from(expires_at));
-    }
-    metadata.insert(
-        Arc::from("run_id"),
-        Value::String(paused.state.run_id.as_str().to_owned()),
-    );
-    let (action_kind, action_label) = approval_action_label(&approval.action);
-    metadata.insert(
-        Arc::from("action_kind"),
-        Value::String(action_kind.to_owned()),
-    );
-    metadata.insert(
-        Arc::from("action_label"),
-        Value::String(action_label.clone()),
-    );
-    if let Some(call) = approval_tool_call(&approval.action) {
-        metadata.insert(
-            Arc::from("tool_name"),
-            Value::String(call.name.as_ref().to_owned()),
-        );
-    }
-
-    Some(Envelope {
-        channel_id: paused.channel_id.clone(),
-        conversation_id: paused.conversation_id.clone(),
-        sender,
-        message: Message {
-            role: MessageRole::Assistant,
-            // The ticket is spelled out because on a channel with no buttons
-            // it is the only way to answer, and a user who cannot see it
-            // cannot approve anything.
-            content: Arc::from(format!(
-                "Approve {action_kind} '{action_label}'?\n\
-                 Reply /approve {ticket} to allow it, or /deny {ticket} <reason> to refuse.",
-            )),
-            attachments: Vec::new(),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            metadata: BTreeMap::new(),
-        },
-        metadata,
-    })
-}
-
-fn approval_action_label(action: &InterruptionAction) -> (&'static str, String) {
-    match action {
-        InterruptionAction::ToolCall(call) => ("tool", call.name.as_ref().to_owned()),
-        InterruptionAction::Delegate(spec) => (
-            "delegate",
-            format!("{} ({})", spec.agent_id.as_str(), spec.policy_id),
-        ),
-        InterruptionAction::Escalate(spec) => (
-            "escalate",
-            format!("{} ({})", spec.template.name, spec.task_id.as_str()),
-        ),
-        InterruptionAction::Handoff { agent_id, .. } => ("handoff", agent_id.as_str().to_owned()),
-        InterruptionAction::ResumeSubAgent {
-            spec, child_state, ..
-        } => {
-            let child_label = child_state
-                .pending_approvals
-                .first()
-                .map(|approval| {
-                    let (kind, label) = approval_action_label(&approval.action);
-                    format!("{kind} '{label}'")
-                })
-                .unwrap_or_else(|| "unknown child approval".to_owned());
-            (
-                "subagent",
-                format!(
-                    "{} ({}) waiting on {}",
-                    spec.agent_id.as_str(),
-                    spec.policy_id,
-                    child_label
-                ),
-            )
-        }
-    }
-}
-
-fn approval_tool_call(action: &InterruptionAction) -> Option<&agentos_proto::ToolCall> {
-    match action {
-        InterruptionAction::ToolCall(call) => Some(call),
-        InterruptionAction::ResumeSubAgent { child_state, .. } => child_state
-            .pending_approvals
-            .first()
-            .and_then(|approval| approval_tool_call(&approval.action)),
-        InterruptionAction::Delegate(_)
-        | InterruptionAction::Escalate(_)
-        | InterruptionAction::Handoff { .. } => None,
-    }
-}
-
 pub async fn run_envelope(
     input: Envelope,
     run_id: RunId,
@@ -365,6 +253,20 @@ pub async fn run_envelope(
     );
     record_run_start(&mut state, deps.hooks);
 
+    // The sender is part of the principal here and not in `resume_run`: a run
+    // is started by somebody, and which participant that was decides who an
+    // approval prompt may be answered by. A resume is keyed on the pause it
+    // answers, which the interruption id already names.
+    let audit = SafetyJournal::new(deps.safety_log).for_run(
+        Principal::conversation(
+            deps.active_agent.clone(),
+            input.channel_id.clone(),
+            input.conversation_id.clone(),
+        )
+        .with_sender(Arc::clone(&input.sender)),
+        run_id.clone(),
+    );
+
     let loop_deps = LoopDeps {
         orchestrator: deps.orchestrator,
         max_turns: deps.max_turns,
@@ -381,6 +283,8 @@ pub async fn run_envelope(
         compaction: deps.compaction,
         cancel: deps.cancel.clone(),
         steering: deps.steering.clone(),
+        audit: audit.clone(),
+        granted_authority: deps.granted_authority,
     };
     let mut current = RunLoopState::Start(StartCtx { state });
 
@@ -388,6 +292,7 @@ pub async fn run_envelope(
         current = match current.step(&loop_deps).await {
             Ok(next) => next,
             Err(err) => {
+                record_terminal_error(&audit, &err);
                 record_error_episode(&episode_seed, &err, deps).await;
                 return Err(err.into());
             }
@@ -437,12 +342,38 @@ pub async fn resume_run(
     let trace_event_start = paused.state.trace_events.len();
     let task_session = activate_task_workspace_for_resume(&mut paused.state, deps)?;
     let outcome = decision.outcome();
+    let audit = SafetyJournal::new(deps.safety_log).for_run(
+        Principal::conversation(
+            paused.state.active_agent.clone(),
+            paused.channel_id.clone(),
+            paused.conversation_id.clone(),
+        ),
+        paused.state.run_id.clone(),
+    );
+    // What the pause was about, read before the decision is applied — the
+    // interruption stops being the pending one the moment it is answered.
+    let subject: Arc<str> = paused
+        .state
+        .pending_approval()
+        .map(|approval| Arc::from(approval_action_label(&approval.action).1))
+        .unwrap_or_else(|| Arc::from("unknown"));
     match decision {
         ResumeDecision::Approve => {
             paused.state.approve(approval_id);
+            // The record that used to be a deletion. `take_approved_action`
+            // now marks the interruption rather than removing it, and this is
+            // the durable half of the same change (M6 / `AUD-001`).
+            record_resolution(&audit, SafetyOutcome::Approved, &subject, approval_id, None);
         }
         ResumeDecision::Reject { reason } => {
             paused.state.reject(approval_id, Arc::clone(&reason));
+            record_resolution(
+                &audit,
+                SafetyOutcome::Rejected,
+                &subject,
+                approval_id,
+                Some(reason.as_ref()),
+            );
             record_denied_episode(
                 &paused.state,
                 &paused.channel_id,
@@ -451,6 +382,13 @@ pub async fn resume_run(
                 deps,
             )
             .await;
+            persist_trace_records_with_sink(
+                &paused.state,
+                deps.trace_sink,
+                trace_span_start,
+                trace_event_start,
+                "denied",
+            )?;
             return Err(RunError::ApprovalDenied { reason }.into());
         }
         // Expired, or nobody to ask. Fails the run closed like a denial, but
@@ -461,6 +399,20 @@ pub async fn resume_run(
             paused
                 .state
                 .mark_unanswered(approval_id, Arc::clone(&reason));
+            record_resolution(
+                &audit,
+                SafetyOutcome::Unanswered,
+                &subject,
+                approval_id,
+                Some(reason.as_ref()),
+            );
+            persist_trace_records_with_sink(
+                &paused.state,
+                deps.trace_sink,
+                trace_span_start,
+                trace_event_start,
+                "unanswered",
+            )?;
             return Err(RunError::ApprovalUnanswered { reason }.into());
         }
     }
@@ -483,10 +435,13 @@ pub async fn resume_run(
         compaction: deps.compaction,
         cancel: deps.cancel.clone(),
         steering: deps.steering.clone(),
+        audit: audit.clone(),
+        granted_authority: deps.granted_authority,
     };
     let mut current = match resume_approved(paused.state) {
         Ok(current) => current,
         Err(err) => {
+            record_terminal_error(&audit, &err);
             record_error_episode(&episode_seed, &err, deps).await;
             return Err(err.into());
         }
@@ -496,6 +451,7 @@ pub async fn resume_run(
         current = match current.step(&loop_deps).await {
             Ok(next) => next,
             Err(err) => {
+                record_terminal_error(&audit, &err);
                 record_error_episode(&episode_seed, &err, deps).await;
                 return Err(err.into());
             }
@@ -776,7 +732,7 @@ mod tests {
     use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
     use agentos_interfaces::{InterruptionAction, Orchestrator};
     use agentos_proto::{
-        AgentId, ConversationId, MessageRole, ToolCall, ToolCallId, ToolResult, ToolStatus,
+        AgentId, ConversationId, Message, MessageRole, ToolCall, ToolCallId, ToolResult, ToolStatus,
     };
     use async_trait::async_trait;
     use serde_json::{json, value::RawValue};
@@ -837,6 +793,8 @@ mod tests {
             compaction: Default::default(),
             cancel: Default::default(),
             steering: None,
+            safety_log: None,
+            granted_authority: &[],
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),
@@ -854,13 +812,12 @@ mod tests {
             RunOutcome::Finished { .. } => panic!("expected parent pause"),
         };
         let approval = paused_state
-            .pending_approvals
-            .first()
+            .pending_approval()
             .expect("parent approval expected");
         assert!(matches!(
             &approval.action,
             InterruptionAction::ResumeSubAgent { child_state, .. }
-                if child_state.pending_approvals.len() == 1
+                if child_state.approvals.len() == 1
         ));
         let approval_id = approval.id.clone();
 
@@ -954,6 +911,8 @@ mod tests {
             compaction: Default::default(),
             cancel: Default::default(),
             steering: None,
+            safety_log: None,
+            granted_authority: &[],
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),
@@ -1007,6 +966,8 @@ mod tests {
             compaction: Default::default(),
             cancel: Default::default(),
             steering: None,
+            safety_log: None,
+            granted_authority: &[],
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),
@@ -1061,6 +1022,8 @@ mod tests {
             compaction: Default::default(),
             cancel: Default::default(),
             steering: None,
+            safety_log: None,
+            granted_authority: &[],
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),
@@ -1128,6 +1091,8 @@ mod tests {
             compaction: Default::default(),
             cancel: Default::default(),
             steering: None,
+            safety_log: None,
+            granted_authority: &[],
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),
@@ -1207,6 +1172,8 @@ mod tests {
             compaction: Default::default(),
             cancel: Default::default(),
             steering: None,
+            safety_log: None,
+            granted_authority: &[],
         };
         let mut metadata = BTreeMap::new();
         metadata.insert(
@@ -1497,6 +1464,8 @@ mod tests {
             compaction: Default::default(),
             cancel: Default::default(),
             steering: None,
+            safety_log: None,
+            granted_authority: &[],
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),

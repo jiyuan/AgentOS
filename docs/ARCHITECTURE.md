@@ -442,7 +442,7 @@ Roadmap D1–D3 and G1–G2. All of this sits around the loop, not inside it.
 
 ## 10. Safety Architecture
 
-AgentOS uses four independent safety rings:
+AgentOS uses nine independent safety rings:
 
 1. **Type system.** Loop states and plan variants enumerate valid control flow.
 2. **Guardrails.** Input, output, and tool checks inspect content and halt with
@@ -531,6 +531,32 @@ AgentOS uses four independent safety rings:
    one message can cause. Provider response bodies are read to a ceiling
    rather than buffered whole.
 
+9. **Durable safety events.** Every decision the rings above make appends a
+   row to `safety_events` through `crates/agentos-core/src/audit/`: approval
+   requested and resolved, policy denial, guardrail trip, sandbox refusal,
+   cancellation, delegation-grant issuance and use, terminal error. The store
+   is modelled on `memory_access_log` — append-only, never updated, never
+   deleted on the normal path — and the events go in at the moment of the
+   decision, so a run that fails still leaves them behind.
+
+   This ring exists because the strongest signal for a *successful* approval
+   used to be a deletion: `take_approved_action` removed the pending
+   interruption and the CLI unlinked the paused-run file. An absence cannot be
+   told apart from a record that was never written, one that was cleaned up,
+   and one that was removed to hide something. A resolved interruption is now
+   marked `consumed` and retained.
+
+   What a row may carry is decided per event kind at the point of emission. A
+   subject (a tool name, a guardrail name, a sub-agent id), a `Principal`, and
+   a reason bounded at 512 bytes; a tool's arguments only as
+   `ArgumentDigest`, which is enough to tell two events apart and to spot a
+   retried call, and not enough to recover what was in it. `SafetyEvent` has
+   no field that would accept the arguments, which is what makes that
+   structural rather than a habit. `SafetyLog` is defined in the core, not in
+   `agentos-interfaces`, for the same reason `approve` is: an extension that
+   can replace the audit sink decides what the audit trail says. See
+   [`docs/adr/0005-SAFETY_EVENTS.md`](adr/0005-SAFETY_EVENTS.md).
+
 ### Checked invariants
 
 Three relationships the rings depend on are asserted in debug builds
@@ -542,7 +568,7 @@ Three relationships the rings depend on are asserted in debug builds
 - every tool result in the transcript follows an assistant item carrying its
   call id.
 
-These are **not a fifth ring**. They compile out of release builds entirely, so
+These are **not a ring of their own**. They compile out of release builds entirely, so
 they protect development rather than deployment: a violation is a bug in the
 core, not a state a deployment can reach by configuration. Each states a
 relationship between two pieces of authoritative state rather than re-running the
@@ -808,6 +834,10 @@ Supporting tables:
 - `memory_links` for provenance, supersession, promotion, and compression
   relationships.
 - `memory_access_log` for reads, writes, forgets, promotions, and prunes.
+- `safety_events` for every safety-boundary decision (§10, ring 9). Append-only
+  and never updated. The principal is stored twice — as `Principal::storage_name`
+  for exact lookup and as its components, so "everything this channel was
+  allowed to do" is a query a human can write.
 - Optional FTS/vector tables for retrieval acceleration.
 
 Existing databases open through idempotent migrations.

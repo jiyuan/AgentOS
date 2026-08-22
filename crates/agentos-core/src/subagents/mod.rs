@@ -1,4 +1,5 @@
 use crate::approve::{DelegationGrant, Policy, PolicyError};
+use crate::audit::SafetyLog;
 use crate::config::CompactionConfig;
 use crate::memory::{InMemorySession, MemoryManager};
 use crate::prompt::Compaction;
@@ -198,6 +199,9 @@ pub enum SubAgentRun {
 pub struct SubAgentInvocation {
     definition: Arc<SubAgentDefinition>,
     policy: Policy,
+    /// The grants narrowing had to invoke to admit this child's policy. The
+    /// parent records their issuance; the child's `Approve` records each use.
+    grants_relied_on: Vec<DelegationGrant>,
     input: Envelope,
     run_id: RunId,
     channel_capacity: usize,
@@ -219,6 +223,9 @@ pub struct SubAgentInvocation {
     /// definition asks for it (roadmap X6). Supplied by the loop, which is
     /// what holds the parent run; whether it is used is the definition's call.
     parent_seed: Option<ParentSeed>,
+    /// The parent's safety log, so a child's approvals, denials, and guardrail
+    /// trips land in the same durable record as the parent's (M6 / `AUD-001`).
+    safety_log: Option<Arc<dyn SafetyLog>>,
 }
 
 /// The point in a parent conversation a child is branched from.
@@ -242,6 +249,7 @@ pub struct SubAgentRegistry {
     tool_result_inline_bytes: usize,
     summarizer: Option<Arc<dyn Llm>>,
     compaction_config: CompactionConfig,
+    safety_log: Option<Arc<dyn SafetyLog>>,
 }
 
 impl Default for SubAgentRegistry {
@@ -262,7 +270,17 @@ impl SubAgentRegistry {
             summarizer: None,
             compaction_config: CompactionConfig::default(),
             session: None,
+            safety_log: None,
         }
+    }
+
+    /// Share the parent's safety-event store. Without it a sub-agent's
+    /// decisions are logged and traced but not durably recorded, which is the
+    /// gap M6 closes for the parent — a delegation must not be the way around
+    /// it.
+    pub fn with_safety_log(mut self, safety_log: Option<Arc<dyn SafetyLog>>) -> Self {
+        self.safety_log = safety_log;
+        self
     }
 
     pub fn with_trace_sink(mut self, trace_sink: Arc<dyn TraceSink>) -> Self {
@@ -334,7 +352,7 @@ impl SubAgentRegistry {
                 agent_id: spec.agent_id.clone(),
                 policy_id: Arc::clone(&spec.policy_id),
             })?;
-        let child_policy = Policy::narrow_with_grants(
+        let narrowed = Policy::narrow_with_grants(
             parent_policy,
             &definition.policy,
             &definition.delegation_grants,
@@ -343,10 +361,11 @@ impl SubAgentRegistry {
         // actually handed, rather than trusting that the call above produced
         // it. Independent of how `narrow` decides individual rules.
         #[cfg(debug_assertions)]
-        crate::invariants::delegation_narrows(parent_policy, &child_policy);
+        crate::invariants::delegation_narrows(parent_policy, &narrowed.policy);
         Ok(SubAgentInvocation {
             definition,
-            policy: child_policy,
+            policy: narrowed.policy,
+            grants_relied_on: narrowed.grants_relied_on,
             input,
             run_id,
             channel_capacity: self.channel_capacity,
@@ -361,11 +380,19 @@ impl SubAgentRegistry {
             // loop always does.
             cancel: CancellationToken::new(),
             parent_seed: None,
+            safety_log: self.safety_log.clone(),
         })
     }
 }
 
 impl SubAgentInvocation {
+    /// The grants narrowing had to invoke to admit this delegation. The
+    /// caller records their issuance — it is the one that holds the parent
+    /// run, and therefore the principal the grant was exercised for.
+    pub fn grants_relied_on(&self) -> &[DelegationGrant] {
+        &self.grants_relied_on
+    }
+
     /// Tie this child run to `parent`, so cancelling the parent cancels it.
     pub fn with_cancel(mut self, parent: &CancellationToken) -> Self {
         self.cancel = parent.child_token();
@@ -390,6 +417,8 @@ impl SubAgentInvocation {
 
         let definition = self.definition;
         let child_policy = self.policy;
+        let granted_authority = self.grants_relied_on;
+        let safety_log = self.safety_log;
         let run_id = self.run_id;
         let trace_sink = self.trace_sink;
         let task_workspace = self.task_workspace;
@@ -481,6 +510,8 @@ impl SubAgentInvocation {
                 steering: None,
                 // Sub-agents never stream to the parent's egress.
                 stream_sink: None,
+                safety_log: safety_log.as_deref(),
+                granted_authority: &granted_authority,
             };
             let result = match run_envelope(input, run_id, &deps).await {
                 Ok(RunOutcome::Finished { state, output }) => {
@@ -524,6 +555,8 @@ impl SubAgentInvocation {
     ) -> Result<SubAgentRun, SubAgentError> {
         let definition = self.definition;
         let child_policy = self.policy;
+        let granted_authority = self.grants_relied_on;
+        let safety_log = self.safety_log;
         let trace_sink = self.trace_sink;
         let task_workspace = self.task_workspace;
         let injected_session = self.session;
@@ -534,8 +567,7 @@ impl SubAgentInvocation {
         let cancel = self.cancel;
         let child_approval_id = paused
             .state
-            .pending_approvals
-            .first()
+            .pending_approval()
             .map(|approval| approval.id.clone())
             .ok_or_else(|| SubAgentError::Run(Arc::from("paused child has no pending approval")))?;
         let local = LocalSet::new();
@@ -601,6 +633,8 @@ impl SubAgentInvocation {
                     },
                     cancel: cancel.clone(),
                     steering: None,
+                    safety_log: safety_log.as_deref(),
+                    granted_authority: &granted_authority,
                 };
                 let paused_run = PausedRun {
                     channel_id: paused.channel_id.clone(),

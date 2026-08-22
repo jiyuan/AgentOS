@@ -12,8 +12,7 @@ use crate::orchestrator::{
     EchoOrchestrator, MaxOrchestrator, MemoryHydrationSettings, MinOrchestrator,
 };
 use crate::prompt::Compaction;
-use crate::r#loop::{InputGuardrailEntry, OutputGuardrailEntry, ToolGuardrailEntry};
-use crate::runner::{JsonlTraceSink, RunnerDeps, TraceSink};
+use crate::runner::{JsonlTraceSink, TraceSink};
 use crate::skills::WorkspaceSkillCatalog;
 use crate::spill::{ContentLimits, SpillStore};
 use crate::subagents::{SubAgentDefinition, SubAgentRegistry};
@@ -30,6 +29,8 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+mod deps;
+pub use deps::RuntimeDepsScope;
 mod isolation;
 pub use isolation::isolation_worker_path;
 use isolation::refuse_unenforceable_isolation;
@@ -353,6 +354,7 @@ impl AgentRuntime {
                 .with_session(session.clone())
                 .with_content_limits(spill.clone(), tool_result_inline_bytes)
                 .with_compaction(Some(high_llm.clone()), workspace_config.compaction)
+                .with_safety_log(Some(session.clone()))
         });
         let shell_allowlist =
             ShellCommandAllowlist::new(workspace_config.guardrails.shell_allowlist.iter().cloned())
@@ -528,100 +530,6 @@ fn build_memory_manager(
     }
 
     Ok(Arc::new(manager))
-}
-
-pub struct RuntimeDepsScope<'a> {
-    runtime: &'a AgentRuntime,
-}
-
-impl<'a> RuntimeDepsScope<'a> {
-    pub fn deps(&'a self) -> RunnerDeps<'a> {
-        RunnerDeps {
-            orchestrator: &self.runtime.orchestrator,
-            session: self.runtime.session.as_ref(),
-            memory_manager: self.episode_memory_manager(),
-            hooks: None,
-            max_turns: main_max_turns(&self.runtime.workspace_config),
-            active_agent: self.runtime.active_agent.clone(),
-            tools: Some(&self.runtime.tools),
-            trace_sink: Some(self.runtime.trace_sink.as_ref()),
-            task_workspace: Some(self.runtime.task_workspace.as_ref()),
-            policy: &self.runtime.policy,
-            subagents: self.runtime.subagents.as_ref(),
-            input_guardrails: &[],
-            output_guardrails: &[],
-            tool_guardrails: &[],
-            stream_sink: None,
-            content_limits: self.runtime.content_limits(),
-            compaction: self.runtime.compaction(),
-            cancel: self.runtime.cancel.child_token(),
-            // The caller decides whether this run can be steered: only a
-            // gateway that multiplexes conversations has anywhere for
-            // mid-run input to arrive from.
-            steering: None,
-        }
-    }
-
-    pub fn input_guardrails(&'a self) -> [InputGuardrailEntry<'a>; 1] {
-        [InputGuardrailEntry {
-            name: Arc::from("PiiFilter"),
-            guardrail: &self.runtime.pii_filter,
-        }]
-    }
-
-    pub fn output_guardrails(&'a self) -> [OutputGuardrailEntry<'a>; 1] {
-        [OutputGuardrailEntry {
-            name: Arc::from("MaxOutputLength"),
-            guardrail: &self.runtime.max_output_length,
-        }]
-    }
-
-    pub fn tool_guardrails(&'a self) -> [ToolGuardrailEntry<'a>; 1] {
-        [ToolGuardrailEntry {
-            name: Arc::from("ShellCommandAllowlist"),
-            guardrail: &self.runtime.shell_allowlist,
-        }]
-    }
-
-    pub fn deps_with_guardrails(
-        &'a self,
-        input_guardrails: &'a [InputGuardrailEntry<'a>],
-        output_guardrails: &'a [OutputGuardrailEntry<'a>],
-        tool_guardrails: &'a [ToolGuardrailEntry<'a>],
-    ) -> RunnerDeps<'a> {
-        RunnerDeps {
-            orchestrator: &self.runtime.orchestrator,
-            session: self.runtime.session.as_ref(),
-            memory_manager: self.episode_memory_manager(),
-            hooks: None,
-            max_turns: main_max_turns(&self.runtime.workspace_config),
-            active_agent: self.runtime.active_agent.clone(),
-            tools: Some(&self.runtime.tools),
-            trace_sink: Some(self.runtime.trace_sink.as_ref()),
-            task_workspace: Some(self.runtime.task_workspace.as_ref()),
-            policy: &self.runtime.policy,
-            subagents: self.runtime.subagents.as_ref(),
-            input_guardrails,
-            output_guardrails,
-            tool_guardrails,
-            stream_sink: None,
-            content_limits: self.runtime.content_limits(),
-            compaction: self.runtime.compaction(),
-            cancel: self.runtime.cancel.child_token(),
-            // The caller decides whether this run can be steered: only a
-            // gateway that multiplexes conversations has anywhere for
-            // mid-run input to arrive from.
-            steering: None,
-        }
-    }
-
-    fn episode_memory_manager(&'a self) -> Option<&'a MemoryManager> {
-        self.runtime
-            .workspace_config
-            .memory
-            .episode_recording_enabled
-            .then_some(self.runtime.memory_manager.as_ref())
-    }
 }
 
 pub fn build_subagents(

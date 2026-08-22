@@ -1,6 +1,7 @@
 use super::{
     record_matches_query, MemoryAccessLogEntry, MemoryAccounting, MemoryCaller, MemoryError,
 };
+use crate::audit::SafetyLogError;
 use agentos_interfaces::memory::{Memory, Query, Record, Selector};
 use agentos_interfaces::session::{Item, Session, SessionError, Transcript};
 use agentos_proto::{ConversationId, Namespace, RecordId};
@@ -126,6 +127,7 @@ impl SqliteStore {
             "#,
         )
         .map_err(memory_sqlite_error)?;
+        crate::audit::init_schema(&conn).map_err(memory_sqlite_error)?;
         Self::backfill_fts_records(&conn)?;
         Ok(())
     }
@@ -134,6 +136,17 @@ impl SqliteStore {
         self.conn
             .lock()
             .map_err(|_| MemoryError::Backend(Arc::from("sqlite store lock poisoned")))
+    }
+
+    /// The connection, for the safety-event log. One accessor per consumer,
+    /// each mapping the poisoned-lock case into that consumer's error type —
+    /// the same shape as `memory_conn` and `session_conn`.
+    pub(crate) fn audit_conn(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, Connection>, SafetyLogError> {
+        self.conn
+            .lock()
+            .map_err(|_| SafetyLogError::Backend(Arc::from("sqlite store lock poisoned")))
     }
 
     fn session_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, SessionError> {

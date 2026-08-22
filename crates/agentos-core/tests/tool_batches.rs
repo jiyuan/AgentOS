@@ -256,7 +256,7 @@ async fn a_batch_pausing_for_approval_keeps_the_rest_queued() {
         panic!("a gated call must pause");
     };
     assert_eq!(
-        state.pending_approvals.len(),
+        state.approvals.iter().filter(|a| a.is_pending()).count(),
         1,
         "one call is asked about at a time"
     );

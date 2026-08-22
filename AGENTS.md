@@ -16,6 +16,7 @@ agentos/
 │   │   ├── gateway/          # Bounded ingress queue, per-conversation inbox, shard threads.
 │   │   ├── orchestrator/     # builtin.max (tool-selecting) and builtin.min (LLM fallback).
 │   │   ├── approve/          # Concrete policy engine (NOT a trait).
+│   │   ├── audit/            # Durable, redacted safety events. Append-only; NOT a trait.
 │   │   ├── guardrails/       # Input, tool, and output content checks.
 │   │   ├── runner/           # Envelope → run driving, task sessions, episode recording.
 │   │   ├── runtime/          # AgentRuntime construction, RuntimePaths, tool/MCP wiring.
@@ -88,6 +89,7 @@ These rules are load-bearing. Violating any of them breaks the extension model o
 - **Approve is concrete, not a trait.** The policy engine in `agentos-core/approve/` must not be defined as a trait in `agentos-interfaces`. Extensions must not be able to replace the authorization layer. If you need to add policy verbs, add them to the concrete engine.
 - **Run loop is a typed state machine.** `RunLoopState` is an enum (`Start`, `Plan`, `Approve`, `Act`, `Observe`, `Paused`, `Finish`). `step()` consumes `self` and returns the next state, and its `match` is exhaustive, so a state it fails to handle is a compile error. The *ordering* is not compiler-enforced: the variants and their context structs have public fields, so a caller can hand-build an `ActCtx` and skip `Approve` entirely. Never add a transition that skips a state — review enforces that today, not the type system. Closing it is M6 in `docs/AUDIT_REMEDIATION_PLAN.md`.
 - **Guardrails ≠ Approve.** Guardrails check content (input/tool/output). Approve checks permission (allow/deny/ask_user). Both are required at their designated points in the loop.
+- **A safety decision is an event, never an absence.** Approval requested and resolved, policy denial, guardrail trip, sandbox refusal, cancellation, delegation-grant issuance and use, and terminal error all append a row to `safety_events` through `crates/agentos-core/src/audit/`. Deletion is never the record of an outcome: a resolved interruption is marked `consumed` and retained, not removed. Events carry a `Principal`, a subject, and a bounded reason; a tool's arguments enter only as `ArgumentDigest`, and `SafetyEvent` has no field that would accept them. `SafetyLog` lives in the core, not in `agentos-interfaces`, for the same reason `approve` does.
 - **Sub-agent policies only narrow.** `Policy::narrow(&parent, &child)` returns `Err` when the child would decide any call more permissively than the parent, arguments included. It checks this by *deciding* a finite set of witness calls with both policies rather than by comparing rules, so first-match ordering is respected for free. Every tool call in a sub-agent re-enters the loop at the Approve state — no shortcuts, including for MCP-originated calls. A sub-agent that must exceed its parent needs an explicit `DelegationGrant` (`[[subagents.delegation_grants]]`), which names one tool, may pin exact arguments, and applies only against the immediate parent.
 - **All channels are bounded.** Every `tokio::mpsc` channel must use `channel(cap)`, never `unbounded_channel()`.
 - **One authority over the request.** `crates/agentos-core/src/prompt/` is the only path from a `RunContext` to the messages a provider sees, and `prompt::gateway` is the only path from a built request to a provider — `scripts/check-provider-calls.sh` fails CI when a direct call is added elsewhere. Never build a message vector at a call site; add a named `SectionId` instead. Every request declares a `RequestKind` and records what it was made of in a `RequestHeader`, usage included. A kind determines the section set, and two kinds legitimately carry no transcript: the routing classifier and the compaction summarizer are isolated from recalled memory on purpose, and the invariant refuses a non-turn request that reaches turn context.
@@ -140,7 +142,7 @@ These rules are load-bearing. Violating any of them breaks the extension model o
 | File | Purpose |
 |------|---------|
 | `workspace/agent.toml` | Agent wiring: which orchestrator, memory, channels, and policy to use. |
-| `DESIGN.md` | Loop state machine diagram and four-ring safety architecture. |
+| `DESIGN.md` | Loop state machine diagram and the nine-ring safety architecture. |
 | `BENCHMARKS.md` | Loop overhead target: ≤2ms per turn excluding LLM/tool latency. |
 | `crates/agentos-interfaces/src/` | Every public trait. Read this first when writing an extension. |
 | `crates/agentos-core/src/loop/` | `RunLoopState` enum and `step()` transitions. The heart of the system. |

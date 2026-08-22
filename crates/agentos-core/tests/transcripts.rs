@@ -248,8 +248,7 @@ async fn golden_approval_pause_and_resume() {
     // Resume the way the gateway does: by the id the paused run is actually
     // waiting on, not a guessed one.
     let approval_id = state
-        .pending_approvals
-        .first()
+        .pending_approval()
         .map(|approval| approval.id.clone())
         .expect("a paused run carries the approval it is waiting on");
 

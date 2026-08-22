@@ -120,6 +120,7 @@
           "name": "echo"
         }
       },
+      "consumed": false,
       "id": "approval-call-gated",
       "status": "pending"
     }

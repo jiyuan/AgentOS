@@ -389,8 +389,7 @@ where
             save_paused_run(state_path, &paused)?;
             let Some(approval_id) = paused
                 .state
-                .pending_approvals
-                .first()
+                .pending_approval()
                 .map(|approval| approval.id.clone())
             else {
                 eprintln!("run paused without a pending approval");
@@ -541,8 +540,7 @@ async fn run_tui_loop(
                 save_paused_run(state_path, &paused)?;
                 let Some(approval_id) = paused
                     .state
-                    .pending_approvals
-                    .first()
+                    .pending_approval()
                     .map(|approval| approval.id.clone())
                 else {
                     eprintln!("run paused without a pending approval");
@@ -586,8 +584,7 @@ where
     let paused = load_paused_run(state_path)?;
     let Some(approval_id) = paused
         .state
-        .pending_approvals
-        .first()
+        .pending_approval()
         .map(|approval| approval.id.clone())
     else {
         eprintln!("paused run has no pending approval");

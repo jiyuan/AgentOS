@@ -284,8 +284,7 @@ impl ShardTurns<'_> {
                 let Some(approval_id) = pending
                     .paused
                     .state
-                    .pending_approvals
-                    .first()
+                    .pending_approval()
                     .map(|approval| approval.id.clone())
                 else {
                     log_line(
@@ -453,8 +452,7 @@ impl ShardTurns<'_> {
         let Some(approval_id) = pending
             .paused
             .state
-            .pending_approvals
-            .first()
+            .pending_approval()
             .map(|approval| approval.id.clone())
         else {
             return Ok(());

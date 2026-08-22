@@ -15,6 +15,7 @@ use super::cancel::unless_cancelled;
 use super::items::{metadata_value, tool_status_name};
 use super::telemetry::field_key;
 use super::{ensure_guardrail_passed, LoopDeps, RunError};
+use crate::audit::{ArgumentDigest, SafetyEvent, SafetyEventKind, SafetyOutcome};
 use crate::spill::{SpillRef, SpillSource};
 use crate::tools::ToolRegistryError;
 use crate::trace;
@@ -102,6 +103,17 @@ pub(super) async fn execute_tool(
         for entry in deps.tool_guardrails {
             let outcome = entry.guardrail.check_call(&call, &run_ctx).await?;
             if let GuardrailOutcome::Tripped(reason) = outcome {
+                // `Refused`, not `Tripped`: this one stops the call before it
+                // runs. The post-result pass below is the `Tripped` case.
+                deps.audit.record(
+                    SafetyEvent::new(
+                        SafetyEventKind::ToolGuardrailTrip,
+                        SafetyOutcome::Refused,
+                        Arc::clone(&entry.name),
+                    )
+                    .with_detail(reason.as_ref())
+                    .with_digest(ArgumentDigest::of(call.args.get().as_bytes())),
+                );
                 failure = Some(guardrail_tool_result(&call, &entry.name, reason));
                 break;
             }
@@ -136,7 +148,30 @@ pub(super) async fn execute_tool(
                 content: Arc::from(tool_err.to_string()),
                 metadata: BTreeMap::new(),
             },
-            Err(other) => return Err(other.into()),
+            Err(other) => {
+                // A tool that declared a sandbox mode the runtime cannot
+                // enforce is refused rather than run unsandboxed (M4 /
+                // `SBX-001`). That refusal is a safety decision and gets a
+                // durable record; the other registry errors are ordinary
+                // misconfiguration and do not.
+                if matches!(
+                    other,
+                    ToolRegistryError::NoIsolatedExecutor { .. }
+                        | ToolRegistryError::IncompatibleExecutor { .. }
+                        | ToolRegistryError::SandboxExecutionFailed { .. }
+                ) {
+                    deps.audit.record(
+                        SafetyEvent::new(
+                            SafetyEventKind::SandboxRefusal,
+                            SafetyOutcome::Refused,
+                            Arc::clone(&call.name),
+                        )
+                        .with_detail(other.to_string())
+                        .with_digest(ArgumentDigest::of(call.args.get().as_bytes())),
+                    );
+                }
+                return Err(other.into());
+            }
         }
     };
 
@@ -145,7 +180,13 @@ pub(super) async fn execute_tool(
         run_ctx.cancel = deps.cancel.clone();
         for entry in deps.tool_guardrails {
             let outcome = entry.guardrail.check_result(&result, &run_ctx).await?;
-            ensure_guardrail_passed(&entry.name, outcome)?;
+            ensure_guardrail_passed(
+                deps,
+                SafetyEventKind::ToolGuardrailTrip,
+                SafetyOutcome::Tripped,
+                &entry.name,
+                outcome,
+            )?;
         }
     }
 

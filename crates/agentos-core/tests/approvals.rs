@@ -194,8 +194,7 @@ async fn the_prompt_carries_its_ticket_and_what_it_gates() {
         paused
             .paused
             .state
-            .pending_approvals
-            .first()
+            .pending_approval()
             .map(|approval| approval.id.as_str())
     );
     assert!(paused.prompt.metadata.contains_key(EXPIRES_AT_KEY));
@@ -452,8 +451,7 @@ fn every_resume_decision_names_its_outcome() {
 
 fn approval_id(state: &RunState) -> agentos_proto::InterruptionId {
     state
-        .pending_approvals
-        .first()
+        .pending_approval()
         .map(|approval| approval.id.clone())
         .expect("a paused run carries the approval it is waiting on")
 }

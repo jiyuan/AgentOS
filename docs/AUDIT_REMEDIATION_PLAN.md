@@ -642,7 +642,7 @@ Primary files: `crates/agentos-core/src/prompt/mod.rs`,
 
 Priority: P1
 Size: M — ~400–600 LOC, and safety events have **no durable substrate today**
-Status: **not started**
+Status: **deliverables 1–3 done** (`AUD-001`); 4–8 open (`STATE-001`)
 Dependencies: M3, M4, M5
 
 Current state: `memory_access_log` (`memory/sqlite.rs:112`) is the only durable
@@ -655,13 +655,26 @@ file. `Hooks::try_emit` (`trace.rs:40`) is the existing fan-out seam.
 
 Deliverables:
 
-1. Add immutable safety events for approval requested/resolved/denied, guardrail
-   trips, sandbox refusal, cancellation, delegation-grant issuance and use, and
-   terminal errors, in a durable store modelled on `memory_access_log`.
-2. Replace pending-state deletion as the only record of a successful approval;
-   retain resolved interruptions rather than removing them.
-3. Persist error-path state before returning from the runner. Redact or digest
-   sensitive tool arguments rather than duplicating them into audit logs.
+1. **Done.** Immutable safety events for approval requested/resolved/denied,
+   guardrail trips (split by stage), sandbox refusal, cancellation,
+   delegation-grant issuance and use, and terminal errors, in `safety_events` —
+   append-only, modelled on `memory_access_log`. `crates/agentos-core/src/audit/`.
+2. **Done.** `Interruption::consumed` replaces removal: `take_approved_action`
+   marks and retains. `RunState::approvals` (wire name unchanged) holds the
+   history; `RunState::pending_approval()` is the live one.
+
+   This is a **deliberate `agentos-interfaces` semver break** —
+   `RunState.pending_approvals` renamed, two new public fields. Kept rather
+   than aliased because the field no longer holds only pending approvals, and
+   a name that lies is what let the deletion-as-record pattern go unnoticed.
+   The serde name is unchanged, so paused-run files written before M6 still
+   load.
+3. **Partly done.** Tool arguments reach the store only as `ArgumentDigest`, and
+   `SafetyEvent` has no field that would accept them; reasons are bounded at 512
+   bytes. The two `resume_run` refusal paths now persist trace records before
+   returning. The run-loop error path still cannot: `RunLoopState::step` consumes
+   `self`, so a failing step drops the state before the runner sees the error.
+   Closing that needs `step` to hand the state back.
 4. Define recoverable tool denial separately from fatal structural denial and
    update the state diagram and tests.
 5. Make `/clear` create a new session epoch or tombstone instead of
@@ -686,7 +699,12 @@ Deliverables:
 Acceptance criteria:
 
 - Approval and guardrail history survives pause, resume, restart, and error.
-- Audit events do not expose raw secrets or unrestricted tool arguments.
+  **Met for the events themselves** — they are written at the moment of the
+  decision, so nothing about the run ending afterwards can lose them
+  (`tests/safety_events.rs` reopens the file before reading). The in-memory
+  *trace* is still lost on a run-loop error; see deliverable 3.
+- Audit events do not expose raw secrets or unrestricted tool arguments. **Met**
+  — canary test over every field of every stored event.
 - Normal `/clear` performs no session-item `DELETE`.
 - A seeded output-policy violation emits zero user-visible bytes in stable mode.
 - A directly constructed `ActCtx` carrying a tool call cannot execute it without
@@ -927,7 +945,7 @@ a slice moves off `not started` only when the named artifact exists in the tree.
 | `NET-001` | M4 | Egress policy and bounded HTTP | TEST-001 | **done** — `egress::policy` by resolved address, `GuardedResolver` inside DNS, bounded redirects, streamed `[limits].http_response_bytes` |
 | `ING-001` | M4 | Attachment and frame limits | ID-001 | **done** — Feishu `FragmentBuffer` (count, pending-event and byte ceilings), streamed attachment downloads under `[limits].attachment_bytes` / `attachments_per_message`, capped provider bodies |
 | `REQ-001` | M5 | Unified provider-call gateway, request kinds, compaction usage accounting | ADR-001 | **done** — `RequestKind`, `RequestBuilder`, `prompt::gateway`, per-kind invariant branch, `scripts/check-provider-calls.sh` |
-| `AUD-001` | M6 | Durable, redacted safety events | REQ-001, ID-001 | not started |
+| `AUD-001` | M6 | Durable, redacted safety events | REQ-001, ID-001 | **mostly done** — `audit::` module, append-only `safety_events`, nine event kinds, `ArgumentDigest`-only arguments, retained (`consumed`) interruptions, resume-path trace persistence; run-loop error paths still drop the trace (deliverable 3) |
 | `STATE-001` | M6 | Clear epochs, denial semantics, terminal output gate, `act()` policy re-assertion | AUD-001 | not started |
 | `CFG-001` | M7 | Unknown-key rejection and effective-config inventory | ADR-001 | not started |
 | `MEM-001` | M7 | Effective memory policy, domains, shared writes, retention | ID-001, CFG-001, CFG-000 | not started |
@@ -995,7 +1013,7 @@ them.
 | Task/path traversal and symlink escape | P1 | M4 | Core filesystem | Open |
 | SSRF, inherited secrets, process descendants, unbounded ingress | P1 | M4 | Tool security | Open |
 | Routing/compaction record no manifest; compaction usage dropped | P1 | M5 | Prompt/orchestration | Open — see §4.1 for corrected framing |
-| Safety events not durably reconstructible | P1 | M6 | Run loop/observability | Open |
+| Safety events not durably reconstructible | P1 | M6 | Run loop/observability | Closed by `AUD-001` |
 | Append-only, transition, denial, cancellation, streaming contract gaps | P1 | M6 | Run loop/session | Open |
 | Inert/conflicting config and memory policy | P1 | M7 | Config/memory | Open |
 | Retention and default domain not wired | P1 | M7 | Memory | Open |

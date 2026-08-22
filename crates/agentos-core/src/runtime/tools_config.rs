@@ -585,6 +585,11 @@ mod tests {
         let effective =
             Policy::narrow_with_grants(&parent, &child, &grants).expect("the granted tool narrows");
         assert_eq!(
+            effective.grants_relied_on, grants,
+            "the grant is reported as relied on, which is what gets an issuance record"
+        );
+        let effective = effective.policy;
+        assert_eq!(
             effective.decide(&tool_plan("shell", json!({ "command": "ls" }))),
             PolicyDecision::Allow
         );

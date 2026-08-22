@@ -351,6 +351,8 @@ pub fn runner_deps<'a>(
         compaction: Default::default(),
         cancel: Default::default(),
         steering: None,
+        safety_log: None,
+        granted_authority: &[],
     }
 }
 
@@ -434,12 +436,16 @@ pub fn normalize_outcome(outcome: &RunOutcome) -> Value {
 pub fn normalize_approvals(state: &RunState) -> Value {
     Value::Array(
         state
-            .pending_approvals
+            .approvals
             .iter()
             .map(|approval| {
                 json!({
                     "id": approval.id.as_str(),
                     "status": approval.status,
+                    // Pinned because M6 retains resolved interruptions rather
+                    // than removing them: a golden that showed only the live
+                    // one could not tell retention from deletion.
+                    "consumed": approval.consumed,
                     "action": serde_json::to_value(&approval.action)
                         .expect("interruption actions serialize"),
                 })

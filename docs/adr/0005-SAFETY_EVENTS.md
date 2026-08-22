@@ -1,6 +1,6 @@
 # ADR-0005 — Safety decisions are immutable events, not absence of state
 
-- Status: accepted
+- Status: accepted; implemented by M6 / `AUD-001` except error-path trace persistence
 - Date: 2026-08-21
 - Milestone: M6
 
@@ -62,3 +62,23 @@ diagram wrong and the events unreadable.
 - Canary secrets planted in tool arguments do not appear in the event store.
 - A recoverable denial and a structural denial produce distinct event types
   and distinct run outcomes.
+
+## Implementation notes
+
+`crates/agentos-core/src/audit/`, verified by `tests/safety_events.rs`, which
+reopens the store file before reading so nothing passes on writer-side state.
+
+Two things the decision above did not settle, resolved during implementation:
+
+- **A failed append does not fail the run.** It is logged at `error!` as
+  `safety_log_write_failed`. Every event here records a refusal, a pause, or a
+  stop except approval-approved and grant-used, so failing closed on a write
+  error would turn a full disk into a denial of service without protecting
+  anything. The guarantee is therefore "durably recorded wherever a store is
+  configured".
+- **A reason is bounded, not banned.** Several guardrails interpolate a
+  model-chosen fragment — a program name, a path — into the sentence they
+  refuse with, and a log that could not say *why* would not be readable. The
+  fragment is already in the transcript and the trace; this store outlives
+  both, so the reason gets a 512-byte ceiling rather than the guardrail's word
+  for it. Arguments remain digest-only, which is the line that does not move.

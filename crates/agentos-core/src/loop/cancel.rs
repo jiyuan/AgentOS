@@ -39,6 +39,7 @@
 
 use super::telemetry::field_key;
 use super::{FinalOutput, LoopDeps};
+use crate::audit::{SafetyEventKind, SafetyOutcome};
 use crate::trace;
 use agentos_interfaces::run_state::RunState;
 use agentos_proto::{Message, MessageRole, SpanKind};
@@ -96,6 +97,16 @@ pub(super) fn cancelled_finish(
         active_agent = state.active_agent.as_str(),
         reason = at,
         "run_cancelled"
+    );
+    // A stop is a safety-boundary decision: it is the reason the work the run
+    // was authorised for did not happen, and "the tool never ran" and "the
+    // tool ran and the answer was dropped" are different facts. `at` says
+    // which await lost the race, which is the part that decides that.
+    deps.audit.record_reason(
+        SafetyEventKind::Cancellation,
+        SafetyOutcome::Stopped,
+        state.active_agent.as_str(),
+        at,
     );
 
     FinalOutput {

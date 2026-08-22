@@ -13,6 +13,38 @@ pub struct Interruption {
     pub id: InterruptionId,
     pub action: InterruptionAction,
     pub status: ApprovalStatus,
+    /// Whether the loop has already carried `status` out.
+    ///
+    /// Separate from the status because the status is *what was decided* and
+    /// this is *whether it has been acted on*, and an interruption is no
+    /// longer removed once it has been (M6 / `AUD-001`,
+    /// [ADR-0005](../../../docs/adr/0005-SAFETY_EVENTS.md)). Deleting the
+    /// record used to be the only evidence that an approval succeeded, and an
+    /// absence cannot be told apart from a record that was never written, one
+    /// that was cleaned up, and one that was removed to hide something.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub consumed: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+impl Interruption {
+    /// A new interruption, awaiting a decision.
+    pub fn pending(id: InterruptionId, action: InterruptionAction) -> Self {
+        Self {
+            id,
+            action,
+            status: ApprovalStatus::Pending,
+            consumed: false,
+        }
+    }
+
+    /// Whether this one is still waiting on somebody.
+    pub fn is_pending(&self) -> bool {
+        self.status == ApprovalStatus::Pending
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -62,7 +94,14 @@ pub struct RunState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_session_id: Option<Arc<str>>,
     pub transcript: Transcript,
-    pub pending_approvals: Vec<Interruption>,
+    /// Every approval this run has asked for, decided or not.
+    ///
+    /// Retained rather than drained: see [`Interruption::consumed`]. The wire
+    /// name stays `pending_approvals` so state written before M6 still loads,
+    /// but the Rust name says what the field now holds — use
+    /// [`RunState::pending_approval`] for the one that is actually waiting.
+    #[serde(rename = "pending_approvals")]
+    pub approvals: Vec<Interruption>,
     /// Tool calls the model asked for that this run has not reached yet
     /// (roadmap item X1).
     ///
@@ -89,7 +128,7 @@ impl RunState {
             task_id: None,
             task_session_id: None,
             transcript: Transcript::default(),
-            pending_approvals: Vec::new(),
+            approvals: Vec::new(),
             queued_tool_calls: Vec::new(),
             usage: Usage::default(),
             version: SchemaVersion::default(),
@@ -98,8 +137,18 @@ impl RunState {
         }
     }
 
+    /// The interruption still waiting on somebody, if any.
+    ///
+    /// A run pauses on one approval at a time, so this is the pause a caller
+    /// is answering. Resolved interruptions stay in `approvals` behind it.
+    pub fn pending_approval(&self) -> Option<&Interruption> {
+        self.approvals
+            .iter()
+            .find(|interruption| interruption.is_pending())
+    }
+
     pub fn approve(&mut self, id: &InterruptionId) -> bool {
-        for interruption in &mut self.pending_approvals {
+        for interruption in &mut self.approvals {
             if &interruption.id == id {
                 interruption.status = ApprovalStatus::Approved;
                 return true;
@@ -110,7 +159,7 @@ impl RunState {
 
     pub fn reject(&mut self, id: &InterruptionId, reason: impl Into<Arc<str>>) -> bool {
         let reason = reason.into();
-        for interruption in &mut self.pending_approvals {
+        for interruption in &mut self.approvals {
             if &interruption.id == id {
                 interruption.status = ApprovalStatus::Rejected {
                     reason: Arc::clone(&reason),
@@ -121,12 +170,18 @@ impl RunState {
         false
     }
 
+    /// The action of the first approved-but-not-yet-acted-on interruption,
+    /// marking it acted on.
+    ///
+    /// Marks rather than removes. The name is kept because the *effect* on the
+    /// caller is unchanged — each approval yields its action exactly once —
+    /// but the record survives, which is the point.
     pub fn take_approved_action(&mut self) -> Option<InterruptionAction> {
-        let index = self
-            .pending_approvals
-            .iter()
-            .position(|interruption| interruption.status == ApprovalStatus::Approved)?;
-        Some(self.pending_approvals.remove(index).action)
+        let interruption = self.approvals.iter_mut().find(|interruption| {
+            !interruption.consumed && interruption.status == ApprovalStatus::Approved
+        })?;
+        interruption.consumed = true;
+        Some(interruption.action.clone())
     }
 
     pub fn take_approved_tool_call(&mut self) -> Option<ToolCall> {
@@ -143,7 +198,7 @@ impl RunState {
     /// [`ApprovalStatus::Unanswered`].
     pub fn mark_unanswered(&mut self, id: &InterruptionId, reason: impl Into<Arc<str>>) -> bool {
         let reason = reason.into();
-        for interruption in &mut self.pending_approvals {
+        for interruption in &mut self.approvals {
             if &interruption.id == id {
                 interruption.status = ApprovalStatus::Unanswered {
                     reason: Arc::clone(&reason),
@@ -155,12 +210,12 @@ impl RunState {
     }
 
     pub fn take_rejected_reason(&mut self) -> Option<Arc<str>> {
-        let index = self.pending_approvals.iter().position(|interruption| {
-            matches!(interruption.status, ApprovalStatus::Rejected { .. })
+        let interruption = self.approvals.iter_mut().find(|interruption| {
+            !interruption.consumed && matches!(interruption.status, ApprovalStatus::Rejected { .. })
         })?;
-        let interruption = self.pending_approvals.remove(index);
-        match interruption.status {
-            ApprovalStatus::Rejected { reason } => Some(reason),
+        interruption.consumed = true;
+        match &interruption.status {
+            ApprovalStatus::Rejected { reason } => Some(Arc::clone(reason)),
             ApprovalStatus::Pending
             | ApprovalStatus::Approved
             | ApprovalStatus::Unanswered { .. } => None,
@@ -169,12 +224,13 @@ impl RunState {
 
     /// Take the reason an approval ended without a decision, removing it.
     pub fn take_unanswered_reason(&mut self) -> Option<Arc<str>> {
-        let index = self.pending_approvals.iter().position(|interruption| {
-            matches!(interruption.status, ApprovalStatus::Unanswered { .. })
+        let interruption = self.approvals.iter_mut().find(|interruption| {
+            !interruption.consumed
+                && matches!(interruption.status, ApprovalStatus::Unanswered { .. })
         })?;
-        let interruption = self.pending_approvals.remove(index);
-        match interruption.status {
-            ApprovalStatus::Unanswered { reason } => Some(reason),
+        interruption.consumed = true;
+        match &interruption.status {
+            ApprovalStatus::Unanswered { reason } => Some(Arc::clone(reason)),
             ApprovalStatus::Pending
             | ApprovalStatus::Approved
             | ApprovalStatus::Rejected { .. } => None,

@@ -10,9 +10,11 @@
 //!   the regression gate for any future wire-format change to `RunState`).
 
 use agentos_core::approve::Policy;
+use agentos_core::audit::SafetyJournal;
 use agentos_core::r#loop::{resume_approved, LoopDeps, RunLoopState, StartCtx};
 use agentos_core::tools::ToolRegistry;
 use agentos_interfaces::orchestrator::{Orchestrator, OrchestratorError, Plan, RunContext};
+use agentos_interfaces::run_state::ApprovalStatus;
 use agentos_interfaces::session::{Item, Transcript};
 use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
 use agentos_interfaces::RunState;
@@ -128,6 +130,8 @@ fn deps<'a>(
         compaction: Default::default(),
         cancel: Default::default(),
         steering: None,
+        audit: SafetyJournal::detached(),
+        granted_authority: &[],
     }
 }
 
@@ -196,7 +200,7 @@ async fn paused_run_state_json_round_trips_and_resumes_with_trace_continuity() {
     let RunLoopState::Paused(paused) = terminal else {
         panic!("expected paused run, got {terminal:?}");
     };
-    assert_eq!(paused.pending_approvals.len(), 1);
+    assert_eq!(paused.approvals.len(), 1);
 
     // Persist to JSON and restore, as a gateway process restart would.
     let json = serde_json::to_string(&paused).expect("paused RunState serializes");
@@ -218,7 +222,7 @@ async fn paused_run_state_json_round_trips_and_resumes_with_trace_continuity() {
     );
 
     // Approve and resume the restored state to completion.
-    let approval_id = restored.pending_approvals[0].id.clone();
+    let approval_id = restored.approvals[0].id.clone();
     assert!(restored.approve(&approval_id));
     let mut current = resume_approved(restored).expect("approved state resumes");
     let finished = loop {
@@ -268,5 +272,11 @@ async fn paused_run_state_json_round_trips_and_resumes_with_trace_continuity() {
     // Identity is preserved across the round-trip.
     assert_eq!(output.state.run_id.as_str(), "invariant-run");
     assert_eq!(output.state.active_agent.as_str(), "invariant-agent");
-    assert!(output.state.pending_approvals.is_empty());
+    // M6 / `AUD-001`: the approval is *retained*, marked approved and acted
+    // on, rather than deleted. Deleting it used to be the only evidence the
+    // approval had ever succeeded.
+    assert_eq!(output.state.approvals.len(), 1);
+    assert!(output.state.pending_approval().is_none());
+    assert!(output.state.approvals[0].consumed);
+    assert_eq!(output.state.approvals[0].status, ApprovalStatus::Approved);
 }

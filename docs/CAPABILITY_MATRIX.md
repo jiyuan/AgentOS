@@ -35,13 +35,14 @@ something that no longer exists — the two-way ratchet
 | Pause / resume over a serialized `RunState` | Stable | all | — | Paused-run state is written with plain `fs::write`: no temp+rename, no fsync, mode 0644 (M8) | integration, golden |
 | Ticketed approval | Stable | all | `[policy]` | A prompt is answerable only by the sender it was put to, or a `[policy] approval_administrators` entry. Tickets are still minted from a clock-seeded counter rather than a CSPRNG | unit, integration |
 | Policy engine (`allow` / `deny` / `ask_user`) | Stable | all | `[policy]` | — | unit, integration |
-| Sub-agent policy narrowing | **Preview** | all | `[[subagents]]` | Narrowing is by tool name only; a sub-agent naming a tool the parent gates behind `ask_user` receives it as a blanket `allow` ([ADR-0001](adr/0001-POLICY_NARROWING.md), M3) | unit, integration, property |
+| Sub-agent policy narrowing | Stable | all | `[[subagents]]` | Exact over actions *and* arguments, decided by witness calls rather than by comparing rules. An elevation needs a declared `[[subagents.delegation_grants]]` entry, whose issuance and every use are safety events ([ADR-0001](adr/0001-POLICY_NARROWING.md), closed by M3 / `AUTH-002` and M6 / `AUD-001`) | unit, integration, property |
 | Input / tool / output guardrails | Stable | all | `[guardrails]` | Output guardrails run after streaming has already forwarded chunks; see *Provisional streaming* | unit, integration |
 | Shell command profiles (argument constraints) | Stable | all | `[[guardrails.shell_profiles]]` | Matches literal argument tokens; no shell-metacharacter parsing, because the tool takes structured argv rather than a command string | unit, integration |
 | Run cancellation and mid-run steering | Stable | all | — | Cancellation does not route through the declared output policy (M6) | integration |
 | `max_turns` budget | Stable | all | `[agent] max_turns` | — | integration |
 | Tool batches | Stable | all | — | — | integration |
 | Per-tool deadlines | Stable | all | `[limits]` | A deadline bounds the direct child only; a grandchild survives it (M4) | integration |
+| Durable safety events (`safety_events`) | Stable | all | a SQLite session/memory store | Nine event kinds, append-only, principal-stamped. Tool arguments enter only as a SHA-256 digest and reasons are capped at 512 bytes. A failed append is logged as `safety_log_write_failed` and does not fail the run; an entrypoint with no store records nothing ([ADR-0005](adr/0005-SAFETY_EVENTS.md)) | unit, integration |
 
 ## Prompt and session
 
@@ -133,7 +134,7 @@ parsing, streaming assembly, and retry behavior.
 | `builtin.max` (tool-selecting) | Stable | all | `[agent] orchestrator` | — | integration, golden |
 | `builtin.min` (LLM fallback) | Stable | all | `[agent] orchestrator` | — | integration, golden |
 | LLM routing classifier | Stable | all | `[routing]` | Records a `routing` header carrying its two own sections and none of the turn's. Its isolation from prompt assembly is a prompt-injection defence, now enforced by `invariants::request_derives_from_state` rather than by convention ([ADR-0004](adr/0004-REQUEST_KINDS.md)) | unit, integration |
-| Sub-agents | **Preview** | all | `[[subagents]]` | See *Sub-agent policy narrowing* | integration |
+| Sub-agents | Stable | all | `[[subagents]]` | See *Sub-agent policy narrowing* | integration |
 | Workspace skills | Stable | all | `[skills]` | Loaded from workspace content, which is data the agent can modify | unit, integration |
 | Deterministic skill planners | Stable | all | `[skills]` | — | unit |
 | Lifecycle hooks | Stable | all | `[hooks]` | — | unit |

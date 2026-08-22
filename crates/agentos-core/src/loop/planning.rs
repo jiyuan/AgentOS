@@ -410,6 +410,8 @@ mod tests {
             content_limits: Default::default(),
             cancel: Default::default(),
             steering: None,
+            audit: crate::audit::SafetyJournal::detached(),
+            granted_authority: &[],
             compaction: Compaction {
                 summarizer,
                 config: CompactionConfig::default(),

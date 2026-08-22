@@ -8,6 +8,7 @@
 #![allow(dead_code)]
 
 use agentos_core::approve::Policy;
+use agentos_core::audit::SafetyJournal;
 use agentos_core::r#loop::{LoopDeps, RunLoopState, StartCtx};
 use agentos_core::tools::ToolRegistry;
 use agentos_interfaces::orchestrator::{Orchestrator, OrchestratorError, Plan, RunContext};
@@ -143,6 +144,8 @@ pub fn make_deps<'a>(
         compaction: Default::default(),
         cancel: Default::default(),
         steering: None,
+        audit: SafetyJournal::detached(),
+        granted_authority: &[],
     }
 }
 

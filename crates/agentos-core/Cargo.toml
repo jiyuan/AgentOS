@@ -21,6 +21,10 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Digests for the safety-event log: an audit row names the call it decided
+# without copying the call's arguments (M6 / ADR-0005). Pinned to 0.10 so it
+# shares the `digest` version already in the tree.
+sha2 = "0.10"
 sqlite-vec.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "fs", "process", "time"] }

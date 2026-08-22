@@ -150,7 +150,7 @@ impl Policy {
     ///
     /// See [`Self::narrow_with_grants`] for the rule this enforces.
     pub fn narrow(parent: &Self, child: &Self) -> Result<Self, PolicyError> {
-        Self::narrow_with_grants(parent, child, &[])
+        Ok(Self::narrow_with_grants(parent, child, &[])?.policy)
     }
 
     /// Narrow `child` against `parent`, treating `grants` as authority the
@@ -176,7 +176,7 @@ impl Policy {
         parent: &Self,
         child: &Self,
         grants: &[DelegationGrant],
-    ) -> Result<Self, PolicyError> {
+    ) -> Result<Narrowed, PolicyError> {
         if !default_decision_covers(&parent.default_decision, &child.default_decision) {
             return Err(PolicyError::Widened(Arc::from("default")));
         }
@@ -194,6 +194,7 @@ impl Policy {
         // two policies, and ask both of them. Two calls that agree on every
         // (key, value) pair any rule mentions are indistinguishable to every
         // rule, so a representative of each equivalence class is enough.
+        let mut relied_on: Vec<DelegationGrant> = Vec::new();
         for witness in witnesses(parent, child)? {
             let child_decision = child.decide(&witness);
             let parent_decision = parent.decide(&witness);
@@ -201,17 +202,40 @@ impl Policy {
             {
                 continue;
             }
-            if grants
+            let Some(grant) = grants
                 .iter()
-                .any(|grant| grant.permits(&witness, &child_decision, parent))
-            {
-                continue;
+                .find(|grant| grant.permits(&witness, &child_decision, parent))
+            else {
+                return Err(PolicyError::Widened(witness_label(&witness)));
+            };
+            // One entry per grant, not per witness it covered: the audit
+            // question is which authority was invoked, and a grant that
+            // admits four calls is still one grant.
+            if !relied_on.contains(grant) {
+                relied_on.push(grant.clone());
             }
-            return Err(PolicyError::Widened(witness_label(&witness)));
         }
 
-        Ok(child.clone())
+        Ok(Narrowed {
+            policy: child.clone(),
+            grants_relied_on: relied_on,
+        })
     }
+}
+
+/// What narrowing produced, and what it had to invoke to produce it.
+///
+/// The grant list is the runtime half of
+/// [ADR-0001](../../../../docs/adr/0001-POLICY_NARROWING.md): a grant declared
+/// in `agent.toml` is visible, but "visible" is not "used". Narrowing happens
+/// per delegation, so this list is the issuance record the safety log writes
+/// (M6 / `AUD-001`) — this parent, this delegatee, this authority, now.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Narrowed {
+    pub policy: Policy,
+    /// The grants narrowing had to invoke. Empty in the ordinary case, which
+    /// is a delegation that only ever restricts.
+    pub grants_relied_on: Vec<DelegationGrant>,
 }
 
 /// Standing authority for one delegatee to hold a decision its parent does not.
@@ -275,6 +299,26 @@ impl DelegationGrant {
             return false;
         }
         !matches!(parent.decide(call), PolicyDecision::Deny { .. })
+    }
+
+    /// Whether this grant is the authority a live call is running under.
+    ///
+    /// Narrower than [`Self::permits`] on purpose: `permits` answers "may this
+    /// elevation exist", which needs the parent policy and the decision being
+    /// justified. This answers "is this the call the grant named", which is
+    /// what the safety log records when the child actually makes it (M6 /
+    /// `AUD-001`). An expired grant covers nothing — narrowing would not have
+    /// admitted the delegation, and a long-running child must not keep an
+    /// authority past its expiry.
+    pub fn covers(&self, plan: &Plan) -> bool {
+        if self.is_expired(now_unix_seconds()) {
+            return false;
+        }
+        let tool_args = match plan {
+            Plan::CallTool(tool_call) => serde_json::from_str::<Value>(tool_call.args.get()).ok(),
+            _ => None,
+        };
+        self.as_rule().matches(plan, tool_args.as_ref())
     }
 
     fn is_expired(&self, now: u64) -> bool {
