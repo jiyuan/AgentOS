@@ -266,8 +266,11 @@ impl AgentRuntime {
                 .map_err(|err| format!("failed to register sqlite-vec extension: {err}"))?;
         }
         let session = Arc::new(
-            SqliteStore::open(paths.session_db_path)
-                .map_err(|err| format!("failed to open session store: {err}"))?,
+            SqliteStore::open_with_connections(
+                paths.session_db_path,
+                workspace_config.memory.max_connections,
+            )
+            .map_err(|err| format!("failed to open session store: {err}"))?,
         );
         let memory_manager =
             build_memory_manager(&workspace_config, session.clone(), semantic_factory)?;
@@ -520,13 +523,30 @@ fn build_memory_manager(
             None,
         )
     } else if let Some(path) = &config.memory.path {
-        let store = Arc::new(SqliteStore::open(path).map_err(|err| {
-            format!(
-                "failed to open configured memory store '{}': {err}",
-                path.display()
-            )
-        })?);
-        (MemoryManager::new_sqlite(store.clone()), Some(store))
+        // One persistence authority per database (M8 / `GW-001`, deliverable
+        // 1). A `[memory].path` naming the file the session store already has
+        // open used to produce a *second* pool onto it — two sets of
+        // connections in one process, contending for the same write lock for
+        // no reason. Same file, same store.
+        let same_file = session.database_path().is_some_and(|open| {
+            path.canonicalize()
+                .is_ok_and(|configured| configured == open)
+        });
+        if same_file {
+            (MemoryManager::new_sqlite(session.clone()), Some(session))
+        } else {
+            let store = Arc::new(
+                SqliteStore::open_with_connections(path, config.memory.max_connections).map_err(
+                    |err| {
+                        format!(
+                            "failed to open configured memory store '{}': {err}",
+                            path.display()
+                        )
+                    },
+                )?,
+            );
+            (MemoryManager::new_sqlite(store.clone()), Some(store))
+        }
     } else {
         (MemoryManager::new_sqlite(session.clone()), Some(session))
     };

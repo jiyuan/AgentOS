@@ -7,7 +7,9 @@ use agentos_core::gateway::{
     shard_set, GatewayRun, GatewayService, Router, ShardConfig, DEFAULT_IDLE_INTERVAL,
 };
 use agentos_core::memory::migrate::{self, MigrationSettings};
-use agentos_core::memory::{MemoryManager, SqliteStore};
+use agentos_core::memory::{
+    lease_holder_id, MemoryManager, SqliteStore, DEFAULT_LEASE_TTL, REFLECTION_LEASE,
+};
 use agentos_core::runner::ResumeDecision;
 use agentos_core::runtime::{AgentRuntime, RuntimePaths};
 use agentos_core::sandbox;
@@ -82,16 +84,39 @@ fn build_reflection_cron(
 /// Drive the reflection cron on an idle tick, logging a one-line summary when a
 /// sweep runs. Reflection is best-effort maintenance — a failure is logged, not
 /// propagated, so it never takes the gateway loop down.
+///
+/// Guarded by the `memory.reflection` lease (M8 / `GW-001`, deliverable 2).
+/// Shard 0 exists once per *channel*, so a Telegram-and-Feishu deployment used
+/// to sweep the one database twice, concurrently — and a TUI on the same file
+/// made it three. The lease is a row in that database, which is the only thing
+/// all of them share.
 async fn run_memory_reflection(
     config: &ServiceConfig,
     channel_name: &str,
     cron: Option<&mut MemoryMaintenanceCron>,
     manager: &MemoryManager,
+    session: &SqliteStore,
     now_unix: u64,
 ) -> Result<(), String> {
     let Some(cron) = cron else {
         return Ok(());
     };
+    // Asked on every idle tick rather than once at startup, because this is
+    // also the renewal: a leader that stops asking loses the lease and another
+    // contender picks the sweep up.
+    let holder = lease_holder_id(channel_name);
+    match session.try_acquire_lease(REFLECTION_LEASE, &holder, DEFAULT_LEASE_TTL) {
+        Ok(Some(_lease)) => {}
+        // Somebody else is the leader. The ordinary answer for every channel
+        // but one, and not worth a log line every thirty seconds.
+        Ok(None) => return Ok(()),
+        Err(err) => {
+            return log_line(
+                config,
+                &format!("{channel_name} could not ask for the reflection lease: {err}"),
+            );
+        }
+    }
     match cron.run_due(now_unix, manager).await {
         Ok(Some(report)) => log_line(
             config,

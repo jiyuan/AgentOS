@@ -1,3 +1,4 @@
+use super::pool::{apply_pragmas, ConnectionPool, PooledConnection, DEFAULT_MAX_CONNECTIONS};
 use super::{
     record_matches_query, MemoryAccessLogEntry, MemoryAccounting, MemoryCaller, MemoryError,
 };
@@ -9,15 +10,32 @@ use async_trait::async_trait;
 use rusqlite::{params, params_from_iter, Connection};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub struct SqliteStore {
-    conn: Mutex<Connection>,
+    /// The process's connections to this database. One `Mutex<Connection>`
+    /// used to serialize every shard thread behind every other one; see
+    /// [`pool`](super::pool) for why that had to change and what WAL buys.
+    pool: ConnectionPool,
+    /// Where the database is, or `None` for an in-memory one. Kept so the
+    /// runtime can tell whether a configured `[memory].path` names the file
+    /// the session store already has open rather than opening it twice.
+    path: Option<PathBuf>,
 }
 
 impl SqliteStore {
+    /// Open the database at `path` with [`DEFAULT_MAX_CONNECTIONS`].
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MemoryError> {
+        Self::open_with_connections(path, DEFAULT_MAX_CONNECTIONS)
+    }
+
+    /// Open the database at `path` with an explicit pool size, from
+    /// `[memory] max_connections`.
+    pub fn open_with_connections(
+        path: impl AsRef<Path>,
+        max_connections: usize,
+    ) -> Result<Self, MemoryError> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|err| {
@@ -28,20 +46,45 @@ impl SqliteStore {
             })?;
         }
 
-        let conn = Connection::open(path).map_err(memory_sqlite_error)?;
+        let pool = ConnectionPool::build(max_connections, || {
+            let conn = Connection::open(path).map_err(memory_sqlite_error)?;
+            apply_pragmas(&conn, true)?;
+            Ok(conn)
+        })?;
         let store = Self {
-            conn: Mutex::new(conn),
+            pool,
+            path: Some(path.to_path_buf()),
         };
         store.init_schema()?;
         Ok(store)
     }
 
+    /// An in-memory database, for tests and ephemeral runs.
+    ///
+    /// Always one connection: `:memory:` is per connection, so a pool of two
+    /// would be two unrelated databases wearing one name.
     pub fn open_in_memory() -> Result<Self, MemoryError> {
-        let store = Self {
-            conn: Mutex::new(Connection::open_in_memory().map_err(memory_sqlite_error)?),
-        };
+        let pool = ConnectionPool::build(1, || {
+            let conn = Connection::open_in_memory().map_err(memory_sqlite_error)?;
+            apply_pragmas(&conn, false)?;
+            Ok(conn)
+        })?;
+        let store = Self { pool, path: None };
         store.init_schema()?;
         Ok(store)
+    }
+
+    /// The database file this store is backed by, or `None` when it is in
+    /// memory. Canonicalized where the filesystem allows it, so two spellings
+    /// of one path compare equal.
+    pub fn database_path(&self) -> Option<PathBuf> {
+        let path = self.path.as_ref()?;
+        Some(path.canonicalize().unwrap_or_else(|_| path.clone()))
+    }
+
+    /// How many connections this store may use at once.
+    pub fn max_connections(&self) -> usize {
+        self.pool.size()
     }
 
     fn init_schema(&self) -> Result<(), MemoryError> {
@@ -138,33 +181,30 @@ impl SqliteStore {
         )
         .map_err(memory_sqlite_error)?;
         crate::audit::init_schema(&conn).map_err(memory_sqlite_error)?;
+        super::lease::init_schema(&conn).map_err(memory_sqlite_error)?;
         Self::backfill_fts_records(&conn)?;
         Ok(())
     }
 
-    pub(crate) fn memory_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, MemoryError> {
-        self.conn
-            .lock()
-            .map_err(|_| MemoryError::Backend(Arc::from("sqlite store lock poisoned")))
+    /// A connection, waiting for one if every connection is in use.
+    ///
+    /// Still `Result`-shaped after M8 even though checkout itself no longer
+    /// fails: three consumers map the failure into three error types, the call
+    /// sites all `?` it, and the next thing that can fail here — a pool closed
+    /// during shutdown — wants exactly this signature.
+    pub(crate) fn memory_conn(&self) -> Result<PooledConnection<'_>, MemoryError> {
+        Ok(self.pool.get())
     }
 
-    /// The connection, for the safety-event log. One accessor per consumer,
-    /// each mapping the poisoned-lock case into that consumer's error type —
-    /// the same shape as `memory_conn` and `session_conn`.
-    pub(crate) fn audit_conn(
-        &self,
-    ) -> Result<std::sync::MutexGuard<'_, Connection>, SafetyLogError> {
-        self.conn
-            .lock()
-            .map_err(|_| SafetyLogError::Backend(Arc::from("sqlite store lock poisoned")))
+    /// A connection, for the safety-event log. One accessor per consumer, each
+    /// in that consumer's error type — the same shape as `memory_conn` and
+    /// `session_conn`.
+    pub(crate) fn audit_conn(&self) -> Result<PooledConnection<'_>, SafetyLogError> {
+        Ok(self.pool.get())
     }
 
-    pub(super) fn session_conn(
-        &self,
-    ) -> Result<std::sync::MutexGuard<'_, Connection>, SessionError> {
-        self.conn
-            .lock()
-            .map_err(|_| SessionError::Backend(Arc::from("sqlite store lock poisoned")))
+    pub(super) fn session_conn(&self) -> Result<PooledConnection<'_>, SessionError> {
+        Ok(self.pool.get())
     }
 }
 

@@ -1,7 +1,7 @@
 use super::normalize::{normalize_config_token, normalize_domain};
 use crate::memory::{
     MemoryStore, QdrantSemanticConfig, ReflectionParams, RetentionRequest, RetrievalStrategy,
-    SharedDomainGrants, SqliteVecConfig,
+    SharedDomainGrants, SqliteVecConfig, DEFAULT_MAX_CONNECTIONS, MAX_MAX_CONNECTIONS,
 };
 use crate::orchestrator::MemoryHydrationSettings;
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,13 @@ pub struct MemoryConfig {
     /// against the directory holding `agent.toml`. Unset uses the session
     /// database, so memory and transcripts share one file.
     pub path: Option<PathBuf>,
+    /// How many SQLite connections this process may use at once.
+    ///
+    /// The concurrency bound for every store in the database — memory,
+    /// sessions, and safety events. Under WAL a reader never blocks a writer,
+    /// so more than a handful buys nothing: the writes serialize inside SQLite
+    /// whatever this says. Raise it only if profiling shows readers queueing.
+    pub max_connections: usize,
     /// The domain a read or write lands in when the caller names none.
     ///
     /// Part of every namespace, so two deployments with different defaults
@@ -71,6 +78,7 @@ impl Default for MemoryConfig {
         Self {
             backend: Arc::from("sqlite"),
             path: None,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
             default_domain: Arc::from("general"),
             hydration_enabled: false,
             hydrate_strategy: Arc::from("hybrid"),
@@ -318,6 +326,19 @@ impl MemoryConfig {
         }
         validate_qdrant_config(&self.qdrant)?;
         validate_sqlite_vec_config(&self.sqlite_vec)?;
+
+        if self.max_connections == 0 {
+            return Err(
+                "memory.max_connections must be at least 1; zero would deadlock every query"
+                    .to_owned(),
+            );
+        }
+        if self.max_connections > MAX_MAX_CONNECTIONS {
+            return Err(format!(
+                "memory.max_connections must be at most {MAX_MAX_CONNECTIONS}, got {}",
+                self.max_connections
+            ));
+        }
 
         self.default_domain = normalize_domain(&self.default_domain, "memory.default_domain")?;
         if self.hydrate_max_fragments == 0 {

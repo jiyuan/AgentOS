@@ -621,6 +621,7 @@ impl ShardTurns<'_> {
             self.context.channel_name,
             reflection.as_mut(),
             &self.context.runtime.memory_manager,
+            &self.context.runtime.session,
             now,
         )
         .await;
