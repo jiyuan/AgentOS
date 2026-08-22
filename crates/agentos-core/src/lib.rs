@@ -7,6 +7,7 @@ pub mod approve;
 pub mod channels;
 pub mod config;
 pub mod crons;
+pub mod egress;
 pub mod gateway;
 pub mod guardrails;
 pub mod hooks;

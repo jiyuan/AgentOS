@@ -5,6 +5,7 @@
 //! not configurability). X3 folds the remaining hardcoded sizes in here rather
 //! than adding a section per item.
 
+use crate::egress::DEFAULT_MAX_RESPONSE_BYTES;
 use crate::spill::DEFAULT_TOOL_RESULT_INLINE_BYTES;
 use crate::tools::{
     DEFAULT_DIRECTORY_LIST_ENTRIES, DEFAULT_FILE_READ_BYTES, DEFAULT_MAX_OUTPUT_BYTES,
@@ -40,6 +41,10 @@ const MIN_FILE_READ_BYTES: usize = 256;
 /// capture cap become indistinguishable to a caller reading the result.
 const MIN_TOOL_OUTPUT_BYTES: usize = 1_024;
 
+/// Smallest useful HTTP response. Below a small page's worth, every fetch
+/// comes back truncated and the tool stops being one.
+const MIN_HTTP_RESPONSE_BYTES: usize = 1_024;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LimitsConfig {
@@ -70,6 +75,14 @@ pub struct LimitsConfig {
     /// Bounds memory against a runaway process; it is not what shapes what the
     /// model sees, which is `tool_result_inline_bytes` and the spill store.
     pub tool_output_bytes: usize,
+    /// Bytes of an HTTP response body the `http` tool keeps before it stops
+    /// reading and closes the connection (M4 / `NET-001`).
+    ///
+    /// A bound on what the far end can make this process allocate. `.text()`
+    /// on an unbounded response was an out-of-memory kill for the gateway and
+    /// every conversation on it, and `Content-Length` is a claim the sender
+    /// makes rather than one it is held to.
+    pub http_response_bytes: usize,
 }
 
 impl Default for LimitsConfig {
@@ -82,6 +95,7 @@ impl Default for LimitsConfig {
             file_read_bytes: DEFAULT_FILE_READ_BYTES,
             file_read_max_bytes: MAX_FILE_READ_BYTES,
             tool_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            http_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
         }
     }
 }
@@ -139,6 +153,12 @@ pub fn validate_limits(config: &LimitsConfig) -> Result<(), String> {
             "limits.file_read_bytes ({}) cannot exceed limits.file_read_max_bytes ({}); the \
              default read would always be clamped",
             config.file_read_bytes, config.file_read_max_bytes
+        ));
+    }
+    if config.http_response_bytes < MIN_HTTP_RESPONSE_BYTES {
+        return Err(format!(
+            "limits.http_response_bytes must be at least {MIN_HTTP_RESPONSE_BYTES}, got {}",
+            config.http_response_bytes
         ));
     }
     if config.tool_output_bytes < MIN_TOOL_OUTPUT_BYTES {

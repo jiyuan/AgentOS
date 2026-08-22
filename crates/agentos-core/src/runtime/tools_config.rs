@@ -304,7 +304,7 @@ pub fn register_builtin_tool(
             ShellTool::with_output_limit(limits.tool_output_bytes)
                 .with_env_passthrough(env_passthrough.iter().cloned()),
         ),
-        "http" => tools.register(HttpTool),
+        "http" => tools.register(HttpTool::with_response_limit(limits.http_response_bytes)),
         "file" => tools.register(FileTool::with_limits(
             limits.directory_list_entries,
             limits.file_read_bytes,

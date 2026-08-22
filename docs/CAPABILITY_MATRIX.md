@@ -61,7 +61,7 @@ something that no longer exists — the two-way ratchet
 |---|---|---|---|---|---|
 | `tool:shell` | Stable | all | `[resources.tools]`, `[guardrails] shell_allowlist` | Sandboxed to `workspace_write`; the deployment's allowlist is the whole boundary on which programs run | unit, integration |
 | `tool:file` | Stable | all | `[resources.tools]` | `full_access`: an in-process tool the kernel sandbox cannot bound. Contained by `paths::RootDir` instead — every open is an `openat(O_NOFOLLOW)` walk from a workspace-root descriptor, so symlinks are refused rather than followed | unit, integration |
-| `tool:http` | **Preview** | all | `[resources.tools]` | No egress policy: loopback, RFC1918, link-local, and cloud metadata addresses are all reachable, redirects are not revalidated, responses are not bounded (M4) | unit |
+| `tool:http` | Stable | all | `[resources.tools]`, `[limits] http_response_bytes` | Destinations are judged by resolved address inside the DNS resolver, so names and redirects are covered; bodies are streamed to a cap. Does **not** bound a `shell` command that runs `curl` — the sandbox restricts writes, not the network | unit, integration |
 | `tool:skill_validate` | Stable | all | `[resources.tools]` | — | unit |
 | `tool:cron_create` | Stable | all | `[resources.tools]`, gateway running | Writes a TOML file the scheduler replays; the prompt it stores is executed later with no further approval | unit, integration |
 | `tool:cron_list` | Stable | all | `[resources.tools]` | — | unit |

@@ -471,6 +471,21 @@ AgentOS uses four independent safety rings:
    cleanly is left alone, because something it started on purpose is its
    business.
 
+7. **Tool egress.** A URL the model chose is fetched through
+   `crates/agentos-core/src/egress/`, never through the shared client. The
+   decision is made on the *resolved address*, inside the DNS resolver: a
+   hostname is not a destination, `localtest.me` resolves to `127.0.0.1`, and
+   filtering after resolution and before the connection means there is no
+   second lookup for a rebinding attack to win. Everything that is not
+   globally routable unicast is refused, plus the cloud metadata addresses,
+   which are globally routable and are the highest-value SSRF target there is.
+   A literal-address URL and every redirect hop are checked separately,
+   because neither reaches DNS. Bodies are streamed and stop at
+   `[limits].http_response_bytes`. Endpoints the operator configured — a local
+   Qdrant, an Ollama, a loopback proxy — go through `http::shared_client` and
+   are deliberately not policed: an address written into `agent.toml` is the
+   decision.
+
 ### Checked invariants
 
 Three relationships the rings depend on are asserted in debug builds

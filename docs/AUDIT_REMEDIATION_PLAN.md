@@ -923,7 +923,7 @@ a slice moves off `not started` only when the named artifact exists in the tree.
 | `SBX-001` | M4 | Fail-closed registry and executor capability protocol | ADR-001 | **done** — `Dispatch` enum, `Isolation::{RequiresExecutor,SelfHardened}`, `--capabilities` handshake, startup refusal |
 | `FS-001` | M4 | Validated path segments and no-follow containment | TEST-001 | **done** — `paths::segment`, `paths::RootDir` (`openat(O_NOFOLLOW)` walk), symlink-race test with a lexical control |
 | `PROC-001` | M4 | Minimal tool environment and process-group termination | SBX-001 | **done** — `tools::child_env` allowlist for every child incl. MCP servers, `[isolation].env_passthrough`, process-group kill on deadline and cancellation |
-| `NET-001` | M4 | Egress policy and bounded HTTP | TEST-001 | not started |
+| `NET-001` | M4 | Egress policy and bounded HTTP | TEST-001 | **done** — `egress::policy` by resolved address, `GuardedResolver` inside DNS, bounded redirects, streamed `[limits].http_response_bytes` |
 | `ING-001` | M4 | Attachment and frame limits | ID-001 | not started |
 | `REQ-001` | M5 | Unified provider-call gateway, request kinds, compaction usage accounting | ADR-001 | not started |
 | `AUD-001` | M6 | Durable, redacted safety events | REQ-001, ID-001 | not started |
