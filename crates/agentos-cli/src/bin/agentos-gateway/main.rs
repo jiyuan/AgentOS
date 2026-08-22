@@ -4,7 +4,7 @@ use agentos_core::channels::{feishu::FeishuChannel, telegram::TelegramChannel};
 use agentos_core::config::{effective, WorkspaceConfig};
 use agentos_core::crons::{CronSchedule, CronStore, MemoryMaintenanceCron};
 use agentos_core::gateway::{
-    shard_set, Admission, GatewayRun, GatewayService, IngressLedger, Router, ShardConfig,
+    self, shard_set, Admission, GatewayRun, GatewayService, IngressLedger, Router, ShardConfig,
     DEFAULT_IDLE_INTERVAL,
 };
 use agentos_core::memory::migrate::{self, MigrationSettings};
@@ -158,12 +158,6 @@ struct ServiceConfig {
     session_db_path: Option<PathBuf>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct PidRecord {
-    pid: u32,
-    owner_token: Option<String>,
-}
-
 impl ServiceConfig {
     fn from_home(home: PathBuf) -> Self {
         Self {
@@ -277,7 +271,7 @@ If unset, $AGENTOS_HOME defaults to the parent dir of the loaded .env file,
 or the current working directory.
 
 Options:
-  --pid-path PATH             PID file. Default: $AGENTOS_HOME/{DEFAULT_PID_RELPATH}
+  --pid-path PATH             Control file (locked PID record). Default: $AGENTOS_HOME/{DEFAULT_PID_RELPATH}
   --log-path PATH             Log file. Default: $AGENTOS_HOME/{DEFAULT_LOG_RELPATH}
   --config PATH               Agent workspace config path. Default: $AGENTOS_HOME/workspace/agent.toml
   --session-db-path PATH      Session database path. Default: $AGENTOS_HOME/workspace/agentos.sqlite
@@ -382,24 +376,20 @@ fn start(config: ServiceConfig) -> Result<(), String> {
     ensure_parent_dir(&config.pid_path)?;
     ensure_parent_dir(&config.log_path)?;
 
-    if let Some(pid) = read_pid(&config.pid_path)? {
-        if process_is_running(pid) {
-            println!(
-                "AgentOS gateway is already running: pid {pid}, pid file {}",
-                config.pid_path.display()
-            );
-            return Ok(());
-        }
-        eprintln!(
-            "Removing stale AgentOS gateway pid file: {}",
+    // The lock, not the pid, answers "is one already running" (M8 /
+    // `GW-001`, deliverable 5). A file left by a crashed process reads
+    // identically to one left by a live one; only the lock tells them apart,
+    // and a stale file needs no removing because the next acquisition simply
+    // takes it.
+    if let Some(record) = gateway::holder(&config.pid_path)
+        .map_err(|err| format!("failed to read the gateway control file: {err}"))?
+    {
+        println!(
+            "AgentOS gateway is already running: pid {}, control file {}",
+            record.pid,
             config.pid_path.display()
         );
-        fs::remove_file(&config.pid_path).map_err(|err| {
-            format!(
-                "failed to remove stale pid file {}: {err}",
-                config.pid_path.display()
-            )
-        })?;
+        return Ok(());
     }
 
     let exe = env::current_exe().map_err(|err| format!("failed to locate executable: {err}"))?;
@@ -436,72 +426,133 @@ fn start(config: ServiceConfig) -> Result<(), String> {
         .spawn()
         .map_err(|err| format!("failed to start gateway service: {err}"))?;
     let pid = child.id();
-    write_pid_record(&config.pid_path, pid, Some(&owner_token))?;
-    thread::sleep(Duration::from_secs(1));
-    if let Some(status) = child
-        .try_wait()
-        .map_err(|err| format!("failed to inspect gateway service: {err}"))?
-    {
-        let _ = fs::remove_file(&config.pid_path);
+
+    // The child takes the lock; this process only watches for it. That is the
+    // whole reason the record is trustworthy — a lock written by the parent
+    // would be released the moment `start` returned.
+    let started = wait_for_control_file(&config, pid, &owner_token, &mut child)?;
+    if !started {
         return Err(format!(
-            "AgentOS gateway service exited during startup with {status}; see {}",
-            config.log_path.display()
-        ));
-    }
-    if !process_is_running(pid) {
-        let _ = fs::remove_file(&config.pid_path);
-        return Err(format!(
-            "AgentOS gateway service exited during startup; see {}",
+            "AgentOS gateway service did not take its control file within {}s; see {}",
+            STARTUP_TIMEOUT.as_secs(),
             config.log_path.display()
         ));
     }
 
     println!(
-        "AgentOS gateway started: pid {pid}, pid file {}, log {}",
+        "AgentOS gateway started: pid {pid}, control file {}, log {}",
         config.pid_path.display(),
         config.log_path.display()
     );
     Ok(())
 }
 
+/// How long `start` waits for the spawned service to take its control file.
+///
+/// The child loads the whole workspace config, opens the store and builds the
+/// runtime before it serves, but it takes the lock *first*, so this only has
+/// to cover a fork and an exec.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Wait until the spawned gateway holds the control file with the token this
+/// start issued, or until it exits.
+fn wait_for_control_file(
+    config: &ServiceConfig,
+    pid: u32,
+    owner_token: &str,
+    child: &mut std::process::Child,
+) -> Result<bool, String> {
+    let deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        if let Some(record) = gateway::holder(&config.pid_path)
+            .map_err(|err| format!("failed to read the gateway control file: {err}"))?
+        {
+            // The token, not just the pid: two starts racing would otherwise
+            // each see "something holds it" and each claim success.
+            if record.token.as_ref() == owner_token && record.pid == pid {
+                return Ok(true);
+            }
+        }
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|err| format!("failed to inspect gateway service: {err}"))?
+        {
+            return Err(format!(
+                "AgentOS gateway service exited during startup with {status}; see {}",
+                config.log_path.display()
+            ));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// How long `stop` waits for a `SIGTERM`ed gateway to drain before escalating.
+///
+/// Deliberately longer than the gateway's own
+/// `[gateway] shutdown_grace_secs`, so the service gets to finish its drain
+/// and report what it abandoned rather than being killed halfway through
+/// doing so.
+const STOP_TIMEOUT: Duration = Duration::from_secs(45);
+
 fn stop(config: &ServiceConfig) -> Result<(), String> {
-    let Some(pid) = read_pid(&config.pid_path)? else {
-        println!(
-            "AgentOS gateway is not running: pid file {} does not exist",
-            config.pid_path.display()
-        );
+    // Signalled by lock holder, never by a pid read out of a file (M8 /
+    // `GW-001`, deliverable 5). Pids are recycled: `kill -0` succeeding says a
+    // process exists, not that it is the gateway, and a stale record plus a
+    // busy box is all it takes for `stop` to `SIGTERM` and then `SIGKILL` a
+    // stranger.
+    let signalled = gateway::terminate_holder(&config.pid_path)
+        .map_err(|err| format!("failed to signal the gateway: {err}"))?;
+    let Some(record) = signalled else {
+        match gateway::read_record(&config.pid_path)
+            .map_err(|err| format!("failed to read the gateway control file: {err}"))?
+        {
+            Some(stale) => {
+                let _ = fs::remove_file(&config.pid_path);
+                println!(
+                    "AgentOS gateway was not running; removed the control file left by pid {}",
+                    stale.pid
+                );
+            }
+            None => println!(
+                "AgentOS gateway is not running: control file {} does not exist",
+                config.pid_path.display()
+            ),
+        }
         return Ok(());
     };
 
-    if !process_is_running(pid) {
-        fs::remove_file(&config.pid_path).map_err(|err| {
-            format!(
-                "failed to remove stale pid file {}: {err}",
-                config.pid_path.display()
-            )
-        })?;
-        println!("AgentOS gateway was not running; removed stale pid file");
-        return Ok(());
-    }
-
-    send_signal(pid, "TERM")?;
-    for _ in 0..50 {
-        if !process_is_running(pid) {
+    // The lock releasing is the definitive "it exited": the kernel drops it
+    // when the process ends, however it ends.
+    let deadline = std::time::Instant::now() + STOP_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        if gateway::holder(&config.pid_path)
+            .map_err(|err| format!("failed to read the gateway control file: {err}"))?
+            .is_none()
+        {
             let _ = fs::remove_file(&config.pid_path);
-            println!("AgentOS gateway stopped: pid {pid}");
+            println!("AgentOS gateway stopped: pid {}", record.pid);
             return Ok(());
         }
         thread::sleep(Duration::from_millis(100));
     }
 
-    send_signal(pid, "KILL")?;
+    gateway::kill_holder(&config.pid_path)
+        .map_err(|err| format!("failed to kill the gateway: {err}"))?;
     let _ = fs::remove_file(&config.pid_path);
-    println!("AgentOS gateway killed after timeout: pid {pid}");
+    println!(
+        "AgentOS gateway killed after {}s: pid {}. Work in flight was abandoned; the next start \
+         reports it from the ingress ledger.",
+        STOP_TIMEOUT.as_secs(),
+        record.pid
+    );
     Ok(())
 }
 
 fn stop_if_running(config: &ServiceConfig) -> Result<(), String> {
-    if read_pid(&config.pid_path)?.is_some() {
+    if config.pid_path.exists() {
         stop(config)?;
     }
     Ok(())
@@ -524,18 +575,26 @@ fn detach_gateway_process(command: &mut Command) {
 fn detach_gateway_process(_command: &mut Command) {}
 
 fn status(config: &ServiceConfig) -> Result<(), String> {
-    let Some(pid) = read_pid(&config.pid_path)? else {
-        println!("AgentOS gateway status: stopped");
-        return Ok(());
-    };
-
-    if process_is_running(pid) {
-        println!("AgentOS gateway status: running, pid {pid}");
-    } else {
+    if let Some(record) = gateway::holder(&config.pid_path)
+        .map_err(|err| format!("failed to read the gateway control file: {err}"))?
+    {
         println!(
-            "AgentOS gateway status: stale pid file {}, pid {pid}",
-            config.pid_path.display()
+            "AgentOS gateway status: running, pid {}, since {}",
+            record.pid, record.started_at
         );
+        return Ok(());
+    }
+    match gateway::read_record(&config.pid_path)
+        .map_err(|err| format!("failed to read the gateway control file: {err}"))?
+    {
+        // A record with no lock behind it. Reported as stale rather than as
+        // running, which is the distinction `kill -0` could not make.
+        Some(stale) => println!(
+            "AgentOS gateway status: stopped; control file {} is stale (pid {})",
+            config.pid_path.display(),
+            stale.pid
+        ),
+        None => println!("AgentOS gateway status: stopped"),
     }
     Ok(())
 }
@@ -591,7 +650,26 @@ fn print_effective_config(config: &ServiceConfig) -> Result<(), String> {
 fn serve(config: &ServiceConfig) -> Result<(), String> {
     ensure_parent_dir(&config.pid_path)?;
     ensure_parent_dir(&config.log_path)?;
-    wait_for_pid_ownership(config)?;
+
+    // Taken here and held for the life of this process (M8 / `GW-001`,
+    // deliverable 5). Not by `start`: a lock the parent held would be released
+    // the moment `start` returned, and the record would be back to being a
+    // number in a file.
+    let control = gateway::ControlFile::acquire(
+        &config.pid_path,
+        &gateway::ControlRecord::new(
+            process::id(),
+            env::var(OWNER_TOKEN_ENV).unwrap_or_default(),
+            unix_seconds(),
+        ),
+    )
+    .map_err(|err| format!("failed to take the gateway control file: {err}"))?;
+
+    // Installed before anything is served, so a `SIGTERM` that arrives during
+    // startup is a drain rather than a half-built runtime dying.
+    gateway::install_shutdown_handler()
+        .map_err(|err| format!("failed to install the shutdown handler: {err}"))?;
+
     log_line(config, "AgentOS gateway service starting")?;
     log_line(
         config,
@@ -605,28 +683,44 @@ fn serve(config: &ServiceConfig) -> Result<(), String> {
     let workspace_config = WorkspaceConfig::load(&agent_config_path(config))
         .map_err(|err| format!("failed to load workspace config: {err}"))?;
     let channels = persistent_channels(&workspace_config)?;
-    if !channels.is_empty() {
+    let outcome = if channels.is_empty() {
+        log_line(
+            config,
+            "no persistent channels enabled; enable [channels.telegram]/[channels.feishu] or set AGENTOS_ENABLED_CHANNELS=telegram,feishu",
+        )?;
+        idle_until_shutdown(config)
+    } else {
         for channel in &channels {
             log_line(config, &format!("{channel} channel enabled"))?;
         }
-        return run_persistent_gateways(config, &channels);
-    }
+        run_persistent_gateways(config, &channels)
+    };
 
-    log_line(
-        config,
-        "no persistent channels enabled; enable [channels.telegram]/[channels.feishu] or set AGENTOS_ENABLED_CHANNELS=telegram,feishu",
-    )?;
-    loop {
-        thread::sleep(Duration::from_secs(60));
-        if !pid_file_owned_by_current_process(config)? {
-            log_line(
-                config,
-                "AgentOS gateway exiting because pid file belongs to another process",
-            )?;
-            return Ok(());
+    log_line(config, "AgentOS gateway service stopped")?;
+    control.release();
+    outcome
+}
+
+/// The no-channels case: nothing to serve, but the control file is held and a
+/// `SIGTERM` must still land somewhere.
+fn idle_until_shutdown(config: &ServiceConfig) -> Result<(), String> {
+    let mut ticks = 0u64;
+    while !gateway::shutdown_requested() {
+        thread::sleep(Duration::from_secs(1));
+        ticks += 1;
+        if ticks.is_multiple_of(60) {
+            log_line(config, "AgentOS gateway heartbeat")?;
         }
-        log_line(config, "AgentOS gateway heartbeat")?;
     }
+    log_line(config, "AgentOS gateway shutting down on signal")?;
+    Ok(())
+}
+
+fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
 }
 
 fn run_persistent_gateways(
@@ -643,11 +737,19 @@ fn run_persistent_gateways(
 
     loop {
         thread::sleep(Duration::from_secs(1));
-        if !pid_file_owned_by_current_process(config)? {
-            log_line(
-                config,
-                "AgentOS gateway exiting because pid file belongs to another process",
-            )?;
+        if gateway::shutdown_requested() && handles.iter().all(|(_, handle)| handle.is_finished()) {
+            // Every channel loop has noticed the signal and drained. Fall
+            // through to the join below so their outcomes are still reported.
+            log_line(config, "every channel gateway drained")?;
+            for (channel, handle) in handles {
+                match handle.join() {
+                    Ok(Ok(())) => log_line(config, &format!("{channel} gateway loop exited"))?,
+                    Ok(Err(err)) => {
+                        log_line(config, &format!("{channel} gateway loop failed: {err}"))?
+                    }
+                    Err(_) => log_line(config, &format!("{channel} gateway loop panicked"))?,
+                }
+            }
             return Ok(());
         }
         let mut index = 0;
@@ -817,14 +919,40 @@ where
     .await;
 
     // Dropping the router closes every shard queue, which ends each shard once
-    // it has drained. Join so a shard's in-flight turn finishes before the
-    // process moves on.
+    // it has drained. The wait is *bounded* (M8 / `GW-001`, deliverable 5): a
+    // shard wedged on a tool that ignores its deadline must not turn a
+    // `SIGTERM` into a hang, so past the grace period the gateway says what it
+    // is abandoning and exits.
     drop(router);
+    let grace = Duration::from_secs(runtime.workspace_config.gateway.shutdown_grace_secs);
+    let deadline = std::time::Instant::now() + grace;
+    let mut wedged = Vec::new();
     for (shard, handle) in shards.into_iter().enumerate() {
+        while !handle.is_finished() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        if !handle.is_finished() {
+            // Deliberately not joined: joining is what would hang.
+            wedged.push(shard);
+            continue;
+        }
         if handle.join().is_err() {
             log_line(config, &format!("{channel_name} shard {shard} panicked"))?;
         }
     }
+    if !wedged.is_empty() {
+        log_line(
+            config,
+            &format!(
+                "{channel_name} shard(s) {wedged:?} did not drain within {}s; exiting anyway",
+                grace.as_secs()
+            ),
+        )?;
+    }
+    // What this process accepted and never settled. The turns that were still
+    // running when the deadline passed are in here, which is the "reports
+    // abandoned work" half of the shutdown criterion.
+    report_abandoned_work(config, channel_name, &ledger, &channel.id())?;
     outcome
 }
 
@@ -841,12 +969,13 @@ where
     C: Channel,
 {
     loop {
-        if !pid_file_owned_by_current_process(config)? {
+        // The one place the router stops accepting (M8 / `GW-001`,
+        // deliverable 5). Everything already queued still runs: the drain is
+        // below, in `run_channel_gateway`.
+        if gateway::shutdown_requested() {
             log_line(
                 config,
-                &format!(
-                    "{channel_name} gateway loop exiting because pid file belongs to another process"
-                ),
+                &format!("{channel_name} gateway loop draining on shutdown"),
             )?;
             return Ok(());
         }
@@ -1436,102 +1565,14 @@ fn ensure_parent_dir(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn read_pid(path: &Path) -> Result<Option<u32>, String> {
-    Ok(read_pid_record(path)?.map(|record| record.pid))
-}
-
-fn read_pid_record(path: &Path) -> Result<Option<PidRecord>, String> {
-    match fs::read_to_string(path) {
-        Ok(contents) => {
-            let mut parts = contents.split_whitespace();
-            let Some(pid) = parts.next() else {
-                return Ok(None);
-            };
-            let pid = pid
-                .parse::<u32>()
-                .map_err(|err| format!("invalid pid in {}: {err}", path.display()))?;
-            Ok(Some(PidRecord {
-                pid,
-                owner_token: parts.next().map(ToOwned::to_owned),
-            }))
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(format!("failed to read {}: {err}", path.display())),
-    }
-}
-
-/// Write the control record, atomically and privately (M8 / `GW-001`).
-///
-/// The owner token in it is what `stop` checks before signalling, so a reader
-/// who catches this file mid-rewrite reads a pid with no token and a writer
-/// who crashes mid-rewrite leaves one. Neither is possible through a rename.
-fn write_pid_record(path: &Path, pid: u32, owner_token: Option<&str>) -> Result<(), String> {
-    let contents = match owner_token {
-        Some(owner_token) => format!("{pid} {owner_token}\n"),
-        None => format!("{pid}\n"),
-    };
-    agentos_core::paths::write_private_atomic(path, contents.as_bytes())
-        .map_err(|err| format!("failed to write pid file {}: {err}", path.display()))
-}
-
-fn wait_for_pid_ownership(config: &ServiceConfig) -> Result<(), String> {
-    for _ in 0..20 {
-        if pid_file_owned_by_current_process(config)? {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    let owner = read_pid(&config.pid_path)?
-        .map(|pid| pid.to_string())
-        .unwrap_or_else(|| "<missing>".to_owned());
-    Err(format!(
-        "pid file {} is not owned by this gateway process {}; owner={owner}",
-        config.pid_path.display(),
-        process::id()
-    ))
-}
-
-fn pid_file_owned_by_current_process(config: &ServiceConfig) -> Result<bool, String> {
-    let Some(record) = read_pid_record(&config.pid_path)? else {
-        return Ok(false);
-    };
-    if let Ok(owner_token) = env::var(OWNER_TOKEN_ENV) {
-        let token_matches =
-            !owner_token.is_empty() && record.owner_token.as_deref() == Some(&owner_token);
-        return Ok(token_matches || record.pid == process::id());
-    }
-    Ok(record.pid == process::id())
-}
-
+/// A value naming one particular start, so `start` can tell the gateway it
+/// spawned from one that was already there.
 fn gateway_owner_token() -> Result<String, String> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|err| format!("failed to generate gateway owner token: {err}"))?
         .as_nanos();
     Ok(format!("{}-{now}", process::id()))
-}
-
-fn process_is_running(pid: u32) -> bool {
-    Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-fn send_signal(pid: u32, signal: &str) -> Result<(), String> {
-    let status = Command::new("kill")
-        .arg(format!("-{signal}"))
-        .arg(pid.to_string())
-        .status()
-        .map_err(|err| format!("failed to invoke kill: {err}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("failed to send {signal} to pid {pid}"))
-    }
 }
 
 fn log_line(config: &ServiceConfig, message: &str) -> Result<(), String> {

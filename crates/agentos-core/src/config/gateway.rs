@@ -1,10 +1,13 @@
 //! `[gateway]` — how the persistent gateway spreads conversations over threads.
 //!
-//! Roadmap item G1. Two numbers, both about isolation rather than speed: how
-//! many shard threads conversations are hashed across, and how much one
-//! conversation may have waiting before the gateway starts refusing its input.
+//! Roadmap item G1, extended by M8 / `GW-001`. Three numbers: how many shard
+//! threads conversations are hashed across, how much one conversation may have
+//! waiting before the gateway starts refusing its input, and how long a
+//! `SIGTERM` waits for the turns already running. The first two are about
+//! isolation rather than speed; the third is about not ending a turn between
+//! two instructions.
 
-use crate::gateway::DEFAULT_INBOX_CAPACITY;
+use crate::gateway::{DEFAULT_INBOX_CAPACITY, DEFAULT_SHUTDOWN_GRACE_SECS};
 use serde::{Deserialize, Serialize};
 
 /// Ceiling on `shards`. Each shard is an OS thread with its own tokio runtime;
@@ -12,6 +15,12 @@ use serde::{Deserialize, Serialize};
 /// context switches, and a typo (`shards = 640`) should fail rather than
 /// quietly spawn 640 runtimes.
 const MAX_SHARDS: usize = 64;
+
+/// Ceiling on `shutdown_grace_secs`. Ten minutes is already far past what a
+/// service manager will wait before sending `SIGKILL` itself, so a larger
+/// value is a typo rather than a policy. Zero is allowed and means "do not
+/// wait": abandon whatever is in flight and exit.
+const MAX_SHUTDOWN_GRACE_SECS: u64 = 600;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -29,6 +38,14 @@ pub struct GatewayConfig {
     /// Per conversation, not per process: a user typing faster than the agent
     /// answers hits their own bound and nobody else's.
     pub inbox_capacity: usize,
+    /// Seconds the gateway waits for in-flight turns after `SIGTERM` before
+    /// exiting anyway.
+    ///
+    /// The router stops accepting immediately; this bounds the *drain*. A
+    /// shard wedged on a tool that ignores its deadline must not turn a stop
+    /// into a hang, so past this the gateway reports what it is abandoning —
+    /// from the ingress ledger — and exits.
+    pub shutdown_grace_secs: u64,
 }
 
 impl Default for GatewayConfig {
@@ -36,6 +53,7 @@ impl Default for GatewayConfig {
         Self {
             shards: 0,
             inbox_capacity: DEFAULT_INBOX_CAPACITY,
+            shutdown_grace_secs: DEFAULT_SHUTDOWN_GRACE_SECS,
         }
     }
 }
@@ -67,6 +85,12 @@ pub fn validate_gateway(config: &GatewayConfig) -> Result<(), String> {
         return Err(
             "gateway.inbox_capacity must be at least 1; zero would refuse every message".to_owned(),
         );
+    }
+    if config.shutdown_grace_secs > MAX_SHUTDOWN_GRACE_SECS {
+        return Err(format!(
+            "gateway.shutdown_grace_secs must be at most {MAX_SHUTDOWN_GRACE_SECS}, got {}",
+            config.shutdown_grace_secs
+        ));
     }
     Ok(())
 }
@@ -118,6 +142,25 @@ mod tests {
         assert!(validate_gateway(&config)
             .expect_err("zero must be rejected")
             .contains("inbox_capacity"));
+    }
+
+    /// Zero is a policy ("do not wait"); ten minutes is a typo, because no
+    /// service manager waits that long before sending `SIGKILL` itself.
+    #[test]
+    fn the_shutdown_grace_admits_zero_and_rejects_the_absurd() {
+        let config = GatewayConfig {
+            shutdown_grace_secs: 0,
+            ..Default::default()
+        };
+        assert!(validate_gateway(&config).is_ok());
+
+        let config = GatewayConfig {
+            shutdown_grace_secs: 86_400,
+            ..Default::default()
+        };
+        assert!(validate_gateway(&config)
+            .expect_err("a day must be rejected")
+            .contains("shutdown_grace_secs"));
     }
 
     #[test]

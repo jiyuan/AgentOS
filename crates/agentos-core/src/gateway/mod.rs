@@ -6,18 +6,30 @@
 //! actors, sharded across threads, serial within one. [`ingress`] is the
 //! durability half (M8 / `GW-001`): what the gateway has accepted from a
 //! transport and how far each of those got, so a crash neither loses an
-//! accepted message nor answers a redelivered one twice.
+//! accepted message nor answers a redelivered one twice. [`control`] and
+//! [`shutdown`] are the lifecycle half: who is serving, established by a held
+//! lock rather than by a pid in a file, and how a `SIGTERM` becomes a bounded
+//! drain instead of a turn that ends between two instructions.
 
+mod control;
 mod inbox;
 mod ingress;
 mod shard;
+mod shutdown;
 
+pub use control::{
+    holder, kill_holder, read_record, signal_holder, terminate_holder, ControlError, ControlFile,
+    ControlRecord,
+};
 pub use inbox::{Admitted, Inbox, DEFAULT_INBOX_CAPACITY};
 pub(crate) use ingress::init_schema as init_ingress_schema;
 pub use ingress::{AbandonedEvent, Admission, IngressError, IngressLedger, Settlement};
 pub use shard::{
     run_shard, shard_set, RouteError, Router, ShardConfig, ShardInbound, Turn, TurnHandler,
     DEFAULT_IDLE_INTERVAL,
+};
+pub use shutdown::{
+    install_shutdown_handler, request_shutdown, shutdown_requested, DEFAULT_SHUTDOWN_GRACE_SECS,
 };
 
 use crate::r#loop::ApprovalTicket;
