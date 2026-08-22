@@ -1,0 +1,26 @@
+# Config keys that are not plainly effective, and which kind of not-effective
+# they are.
+#
+# M7 / `CFG-001`, deliverable 1. Every key `agent.toml` accepts is one of
+# three things, and an operator has no way to tell them apart from the catalog
+# alone:
+#
+#   effective   — decides something. The default, and not listed here.
+#   deprecated  — still parses so an older agent.toml keeps loading, warns at
+#                 load, and decides nothing. On its way out.
+#   preview     — decides something, but carries an exposure or a missing
+#                 contract. Off by default; see docs/CAPABILITY_MATRIX.md.
+#
+# One `<kind> <key>` per line. Ratcheted both ways by
+# `catalog::tests`: a key here that the config no longer has fails, and a key
+# whose doc comment says "**Deprecated.**" but is not listed here fails too.
+# So the list cannot go stale and a deprecation cannot be announced in prose
+# alone.
+#
+# There is deliberately no way to mark a key effective. Effective is what a key
+# is when nobody had to make an excuse for it.
+
+deprecated agent.memory
+deprecated resources.llm
+
+preview channels.provisional_streaming

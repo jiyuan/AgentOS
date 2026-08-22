@@ -12,6 +12,7 @@ use std::sync::Arc;
 mod approval;
 pub mod catalog;
 mod compaction;
+pub mod effective;
 mod gateway;
 mod jobs;
 mod limits;

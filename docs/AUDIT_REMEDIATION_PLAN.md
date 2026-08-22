@@ -741,7 +741,7 @@ Primary files: `crates/agentos-core/src/loop/`, `crates/agentos-core/src/runner.
 
 Priority: P1
 Size: M — mechanical, but `deny_unknown_fields` will break existing `agent.toml`s
-Status: **deliverables 2–6, 8, and 9 done**; 1, 7, 10 open
+Status: **deliverables 1–9 done**; 10 (cross-subsystem retention and quotas) open
 Dependencies: M0; memory authorization depends on M3
 
 Current state, verified field by field:
@@ -772,8 +772,14 @@ Current state, verified field by field:
 
 Deliverables:
 
-1. Inventory every accepted key as effective, deprecated, or preview. Remove or
-   wire every inert stable key.
+1. **Done.** `config/maturity.txt` names every key that is not plainly
+   effective, as `deprecated` or `preview`; everything unlisted is effective,
+   and there is deliberately no way to *mark* a key effective. Ratcheted both
+   ways: a listed key the config no longer has fails, and a doc comment saying
+   `**Deprecated.**` without a matching line fails too, so a deprecation cannot
+   be announced in prose alone. The inert stable keys the audit named are wired
+   (`agent.id`, `default_domain`, shared domains, retention) or deprecated
+   (`agent.memory`, `[resources.llm]`).
 2. **Done.** `AgentRuntime` takes its `active_agent` from `[agent].id` rather
    than the constant `main-agent`, so every trace, episode, memory record, and
    safety event is stamped and keyed by it; a blank id is a load-time error.
@@ -807,10 +813,18 @@ Deliverables:
    gone. `[resources.llm]` is deprecated instead of fixed: validation only ever
    accepted the single literal `"llm"`, so a list-shaped key could say nothing
    `priority` did not already say.
-7. Add an effective-config diagnostic showing resolved values, source, maturity,
-   and conflicts. **Do not extend `print_effective_config`** — it is 55
-   hand-written `println!`s that will go stale. Derive it from the same
-   `config/catalog.rs` machinery that generates the catalogs.
+7. **Done.** `config/effective.rs`, derived from the same walk that generates
+   the catalogs, so a key in the structs cannot be missing from it.
+   `agentos-gateway config` now prints deployment facts the file does not
+   contain (resolved paths, sandbox mechanism, which channels will be served)
+   and then every key with its value, whether it was set, its default, and its
+   maturity — closing with a `note:` line per deprecated-or-preview key the
+   deployment turned on. The 55 `println!`s are gone.
+
+   One honest limit: `source` says `file` when the effective value differs from
+   the default, so an `agent.toml` that writes the default explicitly reports
+   `default`. Telling those apart needs presence tracking against the raw TOML,
+   which is worth doing if the ambiguity ever bites.
 8. **Done.** Zero. `config/undocumented.txt` holds only its header, and the
    two-way ratchet keeps it that way: a new key with no `///` fails the check,
    and a listed key that gains one fails it too. Splitting `[policy]` and
@@ -1015,7 +1029,7 @@ a slice moves off `not started` only when the named artifact exists in the tree.
 | `REQ-001` | M5 | Unified provider-call gateway, request kinds, compaction usage accounting | ADR-001 | **done** — `RequestKind`, `RequestBuilder`, `prompt::gateway`, per-kind invariant branch, `scripts/check-provider-calls.sh` |
 | `AUD-001` | M6 | Durable, redacted safety events | REQ-001, ID-001 | **done** — `audit::` module, append-only `safety_events`, eleven event kinds, `ArgumentDigest`-only arguments, retained (`consumed`) interruptions, `StepFailure` so a failed step persists its trace |
 | `STATE-001` | M6 | Clear epochs, denial semantics, terminal output gate, `act()` policy re-assertion | AUD-001 | **done** — `session_epochs` + `agentos-gateway purge`, `RunError::StructuralDenial`, `loop/output.rs` gating every synthesized terminal reply, private `Authorization` on `ActCtx` + `tests/loop_transitions.rs`, `[channels] provisional_streaming = false` |
-| `CFG-001` | M7 | Unknown-key rejection and effective-config inventory | ADR-001 | not started |
+| `CFG-001` | M7 | Unknown-key rejection and effective-config inventory | ADR-001 | **done** — `deny_unknown_fields` on all 32 structs, `agent.id` wired, two keys deprecated, `config/maturity.txt` inventory, catalog-derived `agentos-gateway config`, zero undocumented keys |
 | `MEM-001` | M7 | Effective memory policy, domains, shared writes, retention | ID-001, CFG-001, CFG-000 | **done** — `[memory.policy]` is the authority (allowlist conflict rejected at load), three-gate shared writes, `default_domain` reaches writes and hydration, count/age/byte retention |
 | `SPILL-001` | M7 | Opaque spill locator and scoped retrieval | FS-001 | **done** — `spill:<run>/<artifact>`, `spill_read` tool authorized by the transcript, contained by `RootDir` |
 | `GW-001` | M8 | Durable ingress, WAL, maintenance leadership, atomic state files, shutdown | ID-002 | not started |

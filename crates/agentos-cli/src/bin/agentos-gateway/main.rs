@@ -1,7 +1,7 @@
 use agentos_cli::slash::{self, Parsed, SessionUsage, SlashCommand};
 use agentos_core::audit::{SafetyEvent, SafetyEventKind, SafetyJournal, SafetyOutcome};
 use agentos_core::channels::{feishu::FeishuChannel, telegram::TelegramChannel};
-use agentos_core::config::WorkspaceConfig;
+use agentos_core::config::{effective, WorkspaceConfig};
 use agentos_core::crons::{CronSchedule, CronStore, MemoryMaintenanceCron};
 use agentos_core::gateway::{
     shard_set, GatewayRun, GatewayService, Router, ShardConfig, DEFAULT_IDLE_INTERVAL,
@@ -514,12 +514,27 @@ fn status(config: &ServiceConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Print what this deployment's config resolved to.
+///
+/// Two halves, and the split is the point. The first is *deployment* facts the
+/// config file does not contain — where the paths landed, which sandbox this
+/// kernel offers, which channels will actually be served. The second is every
+/// key `agent.toml` accepts, derived from the same walk that generates
+/// `docs/CONFIG_CATALOG.md`.
+///
+/// The second half used to be fifty-five hand-written `println!`s naming a
+/// subset of the keys (M7 / `CFG-001`, deliverable 7). It went stale silently,
+/// and it could not answer the questions an operator opens this command for:
+/// did I set that, or is it the default; is this key still effective; is
+/// anything I wrote being ignored. Deriving it from the walk means a key in
+/// the structs cannot be missing from it.
 fn print_effective_config(config: &ServiceConfig) -> Result<(), String> {
     let path = agent_config_path(config);
     let runtime_paths = runtime_paths(config);
     let workspace_config = WorkspaceConfig::load(&path)
         .map_err(|err| format!("failed to load workspace config: {err}"))?;
     let channels = persistent_channels(&workspace_config)?;
+
     println!("config.path={}", path.display());
     println!(
         "paths.workspace_root={}",
@@ -531,149 +546,20 @@ fn print_effective_config(config: &ServiceConfig) -> Result<(), String> {
         "paths.attachments_dir={}",
         attachments_dir_path(config).display()
     );
+    println!("paths.session_db={}", session_path(config).display());
     println!("paths.home={}", config.home.display());
-    println!("agent.id={}", workspace_config.agent.id);
-    println!("agent.orchestrator={}", workspace_config.agent.orchestrator);
-    println!("agent.max_turns={}", workspace_config.agent.max_turns);
-    println!("policy.default={}", workspace_config.policy.default);
-    println!(
-        "channels.tui={} ({})",
-        workspace_config.channels.tui.enabled, workspace_config.channels.tui.mode
-    );
-    println!(
-        "channels.telegram={} ({})",
-        workspace_config.channels.telegram.enabled, workspace_config.channels.telegram.mode
-    );
-    println!(
-        "channels.feishu={} ({})",
-        workspace_config.channels.feishu.enabled, workspace_config.channels.feishu.mode
-    );
-    println!("channels.persistent={}", channels.join(","));
-    println!(
-        "gateway.shards={} (resolved: {})",
-        workspace_config.gateway.shards,
-        workspace_config.gateway.shard_count()
-    );
-    println!(
-        "gateway.inbox_capacity={}",
-        workspace_config.gateway.inbox_capacity
-    );
-    println!(
-        "approval.expiry_seconds={}",
-        workspace_config.approval.expiry_seconds
-    );
-    // A fact about this machine, not about the config: a sandboxed tool fails
-    // rather than runs where there is no backend, so an operator needs to know
-    // before a tool call tells them.
     println!("sandbox.enforcement={}", sandbox::availability().describe());
     println!(
-        "limits.tool_result_inline_bytes={}",
-        workspace_config.limits.tool_result_inline_bytes
+        "channels.persistent={}",
+        if channels.is_empty() {
+            "(none)".to_owned()
+        } else {
+            channels.join(",")
+        }
     );
-    println!(
-        "limits.tool_timeout_ms={}",
-        workspace_config.limits.tool_timeout_ms
-    );
-    println!(
-        "limits.tool_timeout_overrides={}",
-        workspace_config
-            .limits
-            .tool_timeout_overrides
-            .iter()
-            .map(|(tool, ms)| format!("{tool}={ms}"))
-            .collect::<Vec<_>>()
-            .join(",")
-    );
-    println!(
-        "limits.directory_list_entries={}",
-        workspace_config.limits.directory_list_entries
-    );
-    println!(
-        "limits.file_read_bytes={}",
-        workspace_config.limits.file_read_bytes
-    );
-    println!(
-        "limits.file_read_max_bytes={}",
-        workspace_config.limits.file_read_max_bytes
-    );
-    println!(
-        "limits.tool_output_bytes={}",
-        workspace_config.limits.tool_output_bytes
-    );
-    println!("compaction.enabled={}", workspace_config.compaction.enabled);
-    println!(
-        "compaction.pressure_percent={}",
-        workspace_config.compaction.pressure_percent
-    );
-    println!(
-        "compaction.retain_tail_turns={}",
-        workspace_config.compaction.retain_tail_turns
-    );
-    println!(
-        "compaction.model={}",
-        workspace_config.compaction.model.name()
-    );
-    println!(
-        "spill.root={}",
-        workspace_config
-            .spill
-            .root_in(&runtime_paths.workspace_root)
-            .display()
-    );
-    println!(
-        "spill.retention_days={}",
-        workspace_config.spill.retention_days
-    );
-    println!(
-        "jobs.max_concurrent={}",
-        workspace_config.jobs.max_concurrent
-    );
-    println!(
-        "jobs.output_limit_bytes={}",
-        workspace_config.jobs.output_limit_bytes
-    );
-    println!(
-        "jobs.promotable={}",
-        join_arcs(&workspace_config.jobs.promotable)
-    );
-    println!(
-        "resources.priority={}",
-        join_arcs(&workspace_config.resources.priority)
-    );
-    println!(
-        "resources.skills.enabled={}",
-        join_arcs(&workspace_config.resources.skills.enabled)
-    );
-    println!(
-        "resources.tools.enabled={}",
-        join_arcs(&workspace_config.resources.tools.enabled)
-    );
-    println!(
-        "resources.mcp.enabled={}",
-        join_arcs(&workspace_config.resources.mcp.enabled)
-    );
-    println!(
-        "resources.llm.enabled={}",
-        join_arcs(&workspace_config.resources.llm.enabled)
-    );
-    println!("subagents.count={}", workspace_config.subagents.len());
-    println!(
-        "orchestrator_templates.count={}",
-        workspace_config.orchestrator_templates.len()
-    );
-    println!(
-        "task_workspace.root={}",
-        workspace_config.task_workspace.root.display()
-    );
+    println!();
+    print!("{}", effective::report(&workspace_config));
     Ok(())
-}
-
-fn join_arcs(values: &[Arc<str>]) -> String {
-    values
-        .iter()
-        .map(|value| value.as_ref())
-        .collect::<Vec<_>>()
-        .join(",")
 }
 
 fn serve(config: &ServiceConfig) -> Result<(), String> {

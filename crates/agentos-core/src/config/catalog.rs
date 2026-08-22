@@ -54,6 +54,70 @@ const SOURCES: &[&str] = &[
 /// tolerates. A ratchet in both directions — see the file's own header.
 const UNDOCUMENTED: &str = include_str!("undocumented.txt");
 
+/// Keys that are deprecated or preview rather than plainly effective. See the
+/// file's own header for why the list exists and what is not on it.
+const MATURITY: &str = include_str!("maturity.txt");
+
+/// The maturity of every key that is not plainly effective.
+pub(super) fn maturity_table() -> BTreeMap<&'static str, super::effective::Maturity> {
+    use super::effective::Maturity;
+    MATURITY
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| {
+            let (kind, key) = line.split_once(char::is_whitespace)?;
+            let maturity = match kind {
+                "deprecated" => Maturity::Deprecated,
+                "preview" => Maturity::Preview,
+                // Unreadable lines are dropped rather than guessed at; the
+                // test below fails on anything this cannot parse.
+                _ => return None,
+            };
+            Some((key.trim(), maturity))
+        })
+        .collect()
+}
+
+/// Every key paired with `(value, default)` for this config.
+///
+/// The same walk `config_markdown` uses, run twice — once against the loaded
+/// config and once against the default — so the effective-config diagnostic
+/// cannot enumerate a different set of keys from the catalog.
+pub(super) fn rows_against(config: &WorkspaceConfig) -> Vec<(String, String, String)> {
+    let parsed = structs();
+    let allowed = undocumented();
+    let render = |value: &WorkspaceConfig| {
+        let serialized = serde_json::to_value(value)
+            .expect("the workspace config serializes; every field derives Serialize");
+        let mut rows = Vec::new();
+        let mut problems = Vec::new();
+        walk(
+            "WorkspaceConfig",
+            "",
+            Some(&serialized),
+            &parsed,
+            &allowed,
+            &mut rows,
+            &mut problems,
+            0,
+        );
+        rows
+    };
+    let effective = render(config);
+    let defaults: BTreeMap<String, String> = render(&WorkspaceConfig::default())
+        .into_iter()
+        .map(|row| (row.key, row.default))
+        .collect();
+    effective
+        .into_iter()
+        .map(|row| {
+            let default = defaults.get(&row.key).cloned().unwrap_or_default();
+            (row.key, row.default, default)
+        })
+        .collect()
+}
+
 /// Markers the generated block sits between, so a file can carry prose the
 /// generator does not own.
 pub const BEGIN_MARKER: &str = "<!-- BEGIN GENERATED: config -->";
@@ -553,5 +617,62 @@ mod tests {
         assert_eq!(nested_struct("Option<MemoryConfig>"), Some("MemoryConfig"));
         assert_eq!(nested_struct("usize"), None);
         assert_eq!(nested_struct("BTreeMap<Arc<str>, u64>"), None);
+    }
+}
+
+#[cfg(test)]
+mod maturity_tests {
+    use super::*;
+
+    /// Every line parses, so a typo is not silently dropped into "effective".
+    #[test]
+    fn the_maturity_list_is_wholly_readable() {
+        let declared = MATURITY
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .count();
+        assert_eq!(
+            declared,
+            maturity_table().len(),
+            "a line in maturity.txt did not parse as `<deprecated|preview> <key>`"
+        );
+    }
+
+    /// A key that no longer exists cannot stay listed, and every key that is
+    /// listed has to be one the config actually accepts.
+    #[test]
+    fn every_listed_key_still_exists() {
+        let keys: std::collections::BTreeSet<String> = rows_against(&WorkspaceConfig::default())
+            .into_iter()
+            .map(|(key, _, _)| key)
+            .collect();
+        for key in maturity_table().keys() {
+            assert!(
+                keys.contains(*key),
+                "maturity.txt lists '{key}', which the config no longer has"
+            );
+        }
+    }
+
+    /// A deprecation announced in a doc comment has to be in the list too, so
+    /// the diagnostic and the catalog cannot disagree about which keys are on
+    /// their way out.
+    #[test]
+    fn a_doc_comment_cannot_deprecate_a_key_on_its_own() {
+        let table = maturity_table();
+        let (rows, problems) = rows();
+        assert!(problems.is_empty(), "{problems:?}");
+        for row in rows {
+            if !row.doc.contains("**Deprecated.**") {
+                continue;
+            }
+            assert_eq!(
+                table.get(row.key.as_str()).copied(),
+                Some(super::super::effective::Maturity::Deprecated),
+                "'{}' says it is deprecated but maturity.txt does not list it",
+                row.key
+            );
+        }
     }
 }

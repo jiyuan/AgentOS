@@ -217,7 +217,35 @@ tools that resolve paths from environment variables.
 - loads `suborchs/*.toml`;
 - validates memory, policy, channels, resources, limits, sub-agents, templates,
   and routing — including cross-section checks such as compaction triggering
-  above the elision threshold.
+  above the elision threshold, and contradictions such as `[policy] allowlist`
+  naming `memory` when `[memory.policy]` is the authority over it.
+
+Every section rejects an unknown key, so a typo is a load-time error rather
+than a silent default — `[memory.polcy]` used to load with defaults and say
+nothing (M7 / `CFG-001`).
+
+### Every key is one of three things
+
+| Maturity | Meaning | Where recorded |
+|---|---|---|
+| effective | decides something, no caveat | the default; nothing to record |
+| deprecated | still parses so an older `agent.toml` loads, warns, decides nothing | `config/maturity.txt` |
+| preview | decides something, with a stated exposure; off by default | `config/maturity.txt` and `CAPABILITY_MATRIX.md` |
+
+`config/maturity.txt` is ratcheted both ways: a listed key the config no longer
+has fails the build, and a doc comment announcing `**Deprecated.**` without a
+matching line fails too — a deprecation cannot be declared in prose alone.
+There is deliberately no way to *mark* a key effective; effective is what a key
+is when nobody had to make an excuse for it.
+
+`agentos-gateway config` prints the resolved deployment — paths, sandbox
+mechanism, the channels that will be served — and then every key with its
+value, whether it was set, its default, and its maturity. It is derived from
+the same walk that generates `docs/CONFIG_CATALOG.md`, so a key present in the
+structs cannot be missing from it; it used to be fifty-five hand-written
+`println!`s over a subset. `source` reads `file` when the effective value
+differs from the default, so a config that writes a default explicitly reports
+`default` — distinguishing those needs presence tracking against the raw TOML.
 
 Effective config sections:
 
