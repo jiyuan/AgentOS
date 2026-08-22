@@ -1,3 +1,4 @@
+use super::retention::{RetentionReport, RetentionRequest};
 use super::{
     memory_json_error, memory_sqlite_error, record_is_active, MemoryCaller, MemoryManager,
     MemoryOwner, MemoryScope, MemoryStore, MemoryVisibility, SqliteStore,
@@ -19,6 +20,14 @@ pub struct ReflectionParams {
     pub min_episode_repetitions: usize,
     #[serde(default)]
     pub rebuild_lexical_index: bool,
+    /// The deployment's `[memory.retention]` budgets, applied once per sweep
+    /// after every conversation has been promoted.
+    ///
+    /// Empty by default. Before M7 / `MEM-001` the sweep overwrote whatever it
+    /// was given with `RetentionRequest::default()`, so the three configured
+    /// budgets parsed, validated, appeared in the catalog, and pruned nothing.
+    #[serde(default)]
+    pub retention: RetentionRequest,
 }
 
 impl Default for ReflectionParams {
@@ -26,6 +35,7 @@ impl Default for ReflectionParams {
         Self {
             min_episode_repetitions: default_min_episode_repetitions(),
             rebuild_lexical_index: true,
+            retention: RetentionRequest::default(),
         }
     }
 }
@@ -87,25 +97,6 @@ pub struct PromotionReport {
     pub record_id: RecordId,
     pub source_record_ids: Vec<RecordId>,
     pub summary: Arc<str>,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RetentionRequest {
-    #[serde(default)]
-    pub store_budgets: Vec<StoreRetentionBudget>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct StoreRetentionBudget {
-    pub store: MemoryStore,
-    pub max_active_records: usize,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RetentionReport {
-    pub checked_records: usize,
-    pub archived_records: Vec<RecordId>,
-    pub pruned_records: Vec<RecordId>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -283,6 +274,7 @@ impl MemoryManager {
                 conversation_id: principal.conversation.clone(),
                 user_id: None,
                 allowed_shared_domains: Vec::new(),
+                writable_shared_domains: Vec::new(),
                 audit_read_access: false,
             };
             // Per-conversation: promotion + supersession only. Retention and the
@@ -301,6 +293,11 @@ impl MemoryManager {
                 .superseded_records
                 .extend(report.superseded_records);
         }
+        // Retention and the index rebuild are global, so they run once after
+        // the per-conversation passes rather than once per conversation — and
+        // after promotion, so a fact promoted out of episodes on this tick is
+        // not archived for age on the same tick that created it.
+        combined.retention = maintenance.apply_retention(&params.retention)?;
         if params.rebuild_lexical_index {
             combined.index = maintenance.rebuild_lexical_index()?;
         }
@@ -310,6 +307,7 @@ impl MemoryManager {
             promoted_records = combined.promoted_records.len(),
             procedural_candidates = combined.procedural_candidates.len(),
             superseded_records = combined.superseded_records.len(),
+            archived_records = combined.retention.archived_records.len(),
             indexed_records = combined.index.indexed_records,
             "memory reflection sweep finished"
         );
@@ -511,29 +509,7 @@ impl MemoryMaintenance for SqliteStore {
     }
 
     fn apply_retention(&self, request: &RetentionRequest) -> Result<RetentionReport, MemoryError> {
-        let mut report = RetentionReport::default();
-        for budget in &request.store_budgets {
-            let records = self.active_records_for_store(budget.store)?;
-            report.checked_records += records.len();
-            let overflow = records.len().saturating_sub(budget.max_active_records);
-            if overflow == 0 {
-                continue;
-            }
-
-            let mut ranked = records;
-            ranked.sort_by(|left, right| {
-                left.importance
-                    .partial_cmp(&right.importance)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(left.access_count.cmp(&right.access_count))
-                    .then(left.row_id.cmp(&right.row_id))
-            });
-            for record in ranked.into_iter().take(overflow) {
-                self.mark_record_status(&record.id, "archived", "retention_budget")?;
-                report.archived_records.push(record.id);
-            }
-        }
-        Ok(report)
+        self.apply_retention_budgets(request)
     }
 
     fn rebuild_lexical_index(&self) -> Result<LexicalIndexReport, MemoryError> {
@@ -584,56 +560,6 @@ impl MemoryMaintenance for SqliteStore {
             indexed_records: active_records.len(),
         })
     }
-}
-
-impl SqliteStore {
-    fn active_records_for_store(
-        &self,
-        store: MemoryStore,
-    ) -> Result<Vec<RetentionCandidate>, MemoryError> {
-        let conn = self.memory_conn()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT row_id, id, metadata_json, access_count \
-                 FROM memory_records \
-                 WHERE store = ?1 AND status = 'active'",
-            )
-            .map_err(memory_sqlite_error)?;
-        let rows = stmt
-            .query_map(params![store.as_str()], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                ))
-            })
-            .map_err(memory_sqlite_error)?;
-
-        let mut records = Vec::new();
-        for row in rows {
-            let (row_id, id, metadata_json, access_count) = row.map_err(memory_sqlite_error)?;
-            let metadata: BTreeMap<Arc<str>, Value> =
-                serde_json::from_str(&metadata_json).map_err(memory_json_error)?;
-            records.push(RetentionCandidate {
-                row_id,
-                id: RecordId::new(id),
-                importance: metadata
-                    .get("importance")
-                    .and_then(Value::as_f64)
-                    .unwrap_or(0.0),
-                access_count,
-            });
-        }
-        Ok(records)
-    }
-}
-
-struct RetentionCandidate {
-    row_id: i64,
-    id: RecordId,
-    importance: f64,
-    access_count: i64,
 }
 
 fn is_promotable_episode(record: &Record) -> bool {

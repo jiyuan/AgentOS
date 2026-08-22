@@ -45,6 +45,7 @@ async fn manager_with_fact(fact: &str) -> Arc<MemoryManager> {
         conversation_id: ConversationId::new(CONVERSATION),
         user_id: None,
         allowed_shared_domains: Vec::new(),
+        writable_shared_domains: Vec::new(),
         audit_read_access: false,
     };
     let scope = MemoryScope::new(
@@ -73,7 +74,8 @@ fn hydration_settings() -> MemoryHydrationSettings {
         // reach the request, not how well retrieval ranks them.
         stores: vec![MemoryStore::Semantic],
         strategy: RetrievalStrategy::Recency,
-        allowed_shared_domains: Vec::new(),
+        shared_domains: Default::default(),
+        default_domain: Arc::from("general"),
     }
 }
 

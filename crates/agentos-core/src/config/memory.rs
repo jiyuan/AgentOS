@@ -1,6 +1,7 @@
 use super::normalize::{normalize_config_token, normalize_domain};
 use crate::memory::{
-    MemoryStore, QdrantSemanticConfig, ReflectionParams, RetrievalStrategy, SqliteVecConfig,
+    MemoryStore, QdrantSemanticConfig, ReflectionParams, RetentionRequest, RetrievalStrategy,
+    SharedDomainGrants, SqliteVecConfig,
 };
 use crate::orchestrator::MemoryHydrationSettings;
 use serde::{Deserialize, Serialize};
@@ -78,15 +79,6 @@ impl Default for MemoryReflectionConfig {
     }
 }
 
-impl MemoryReflectionConfig {
-    pub fn params(&self) -> ReflectionParams {
-        ReflectionParams {
-            min_episode_repetitions: self.min_episode_repetitions,
-            rebuild_lexical_index: self.rebuild_lexical_index,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct MemorySqliteVecConfig {
@@ -154,26 +146,68 @@ impl From<&MemoryQdrantConfig> for QdrantSemanticConfig {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct MemoryRetentionConfig {
+    /// Ceiling on active memory records. Unset keeps everything.
     pub max_records: Option<usize>,
+    /// Ceiling on the total stored size of active records, in bytes.
     pub max_bytes: Option<usize>,
+    /// Ceiling on a record's age, in days.
     pub max_age_days: Option<u64>,
+}
+
+impl MemoryRetentionConfig {
+    /// The budgets a reflection sweep applies.
+    pub fn request(&self) -> RetentionRequest {
+        RetentionRequest {
+            store_budgets: Vec::new(),
+            max_records: self.max_records,
+            max_bytes: self.max_bytes,
+            max_age_days: self.max_age_days,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct MemoryPolicyConfig {
+    /// What happens when the model reads memory: `allow`, `ask_user`, or
+    /// `deny`.
+    pub reads: Arc<str>,
+    /// What happens when the model writes memory.
     pub writes: Arc<str>,
+    /// What happens when the model forgets a record.
     pub forgets: Arc<str>,
+    /// Whether *any* write to a shared domain is permitted in this deployment.
+    ///
+    /// The first of three gates, and the coarsest. A write into
+    /// `[[memory.shared_domains]]` also needs that domain's own `write = true`
+    /// and a caller holding it — see `memory::authorize`. Off by default,
+    /// because shared memory is the one scope where one conversation's writes
+    /// are another's reads.
     pub shared_writes: bool,
 }
 
 impl Default for MemoryPolicyConfig {
     fn default() -> Self {
         Self {
+            reads: Arc::from("allow"),
             writes: Arc::from("ask_user"),
             forgets: Arc::from("ask_user"),
             shared_writes: false,
         }
+    }
+}
+
+impl MemoryPolicyConfig {
+    /// The three verbs, paired with the `memory` operation each governs.
+    ///
+    /// Returned as a list rather than read field by field so a new operation
+    /// cannot be added to the tool without something here failing to name it.
+    pub fn operations(&self) -> [(&'static str, &str); 3] {
+        [
+            ("read", self.reads.as_ref()),
+            ("write", self.writes.as_ref()),
+            ("forget", self.forgets.as_ref()),
+        ]
     }
 }
 
@@ -239,8 +273,10 @@ impl MemoryConfig {
         if self.retention.max_age_days == Some(0) {
             return Err("memory.retention.max_age_days must be greater than 0".to_owned());
         }
+        self.policy.reads = Arc::from(normalize_config_token(&self.policy.reads));
         self.policy.writes = Arc::from(normalize_config_token(&self.policy.writes));
         self.policy.forgets = Arc::from(normalize_config_token(&self.policy.forgets));
+        validate_memory_policy(&self.policy.reads, "memory.policy.reads")?;
         validate_memory_policy(&self.policy.writes, "memory.policy.writes")?;
         validate_memory_policy(&self.policy.forgets, "memory.policy.forgets")?;
         for domain in &mut self.shared_domains {
@@ -275,13 +311,53 @@ impl MemoryConfig {
                 .map(|store| parse_memory_store(store))
                 .collect::<Result<Vec<_>, _>>()?,
             strategy: parse_retrieval_strategy(&self.hydrate_strategy)?,
-            allowed_shared_domains: self
+            shared_domains: self.shared_domain_grants(),
+            default_domain: Arc::clone(&self.default_domain),
+        })
+    }
+
+    /// What a scheduled maintenance sweep does, from `[memory.reflection]`
+    /// *and* `[memory.retention]`.
+    ///
+    /// One method over both sections rather than a `params()` on the
+    /// reflection struct alone: the sweep is the only thing that applies
+    /// retention, and the previous split is why `[memory.retention]` ended up
+    /// unreachable — nothing that could see those budgets was on the path that
+    /// needed them.
+    pub fn reflection_params(&self) -> ReflectionParams {
+        ReflectionParams {
+            min_episode_repetitions: self.reflection.min_episode_repetitions,
+            rebuild_lexical_index: self.reflection.rebuild_lexical_index,
+            retention: self.retention.request(),
+        }
+    }
+
+    /// What `[[memory.shared_domains]]` permit, with
+    /// `[memory.policy].shared_writes` folded in.
+    ///
+    /// The global switch is applied here rather than at the point of decision
+    /// so there is one place where "this deployment allows shared writes at
+    /// all" is read. A domain marked `write = true` under
+    /// `shared_writes = false` grants nothing, which is the conservative
+    /// reading and the one an operator flipping the global switch off expects.
+    pub fn shared_domain_grants(&self) -> SharedDomainGrants {
+        SharedDomainGrants {
+            readable: self
                 .shared_domains
                 .iter()
                 .filter(|domain| domain.read)
                 .map(|domain| Arc::clone(&domain.name))
                 .collect(),
-        })
+            writable: if self.policy.shared_writes {
+                self.shared_domains
+                    .iter()
+                    .filter(|domain| domain.write)
+                    .map(|domain| Arc::clone(&domain.name))
+                    .collect()
+            } else {
+                Vec::new()
+            },
+        }
     }
 }
 

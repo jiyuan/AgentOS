@@ -74,7 +74,7 @@ fn build_reflection_cron(
     Ok(Some(MemoryMaintenanceCron::new(
         "memory-maintenance",
         runtime.active_agent.clone(),
-        reflection.params(),
+        runtime.workspace_config.memory.reflection_params(),
         schedule,
     )))
 }

@@ -488,6 +488,7 @@ pub async fn format_memory(
         conversation_id: conversation_id.clone(),
         user_id: None,
         allowed_shared_domains: Vec::new(),
+        writable_shared_domains: Vec::new(),
         audit_read_access: false,
     };
     let request = HydrationRequest {

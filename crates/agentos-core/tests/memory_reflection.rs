@@ -41,6 +41,7 @@ fn caller(conversation: &str) -> MemoryCaller {
         conversation_id: ConversationId::new(conversation),
         user_id: None,
         allowed_shared_domains: Vec::new(),
+        writable_shared_domains: Vec::new(),
         audit_read_access: false,
     }
 }

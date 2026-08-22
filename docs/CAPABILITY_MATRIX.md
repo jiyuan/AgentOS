@@ -67,7 +67,7 @@ something that no longer exists — the two-way ratchet
 | `tool:cron_create` | Stable | all | `[resources.tools]`, gateway running | Writes a TOML file the scheduler replays; the prompt it stores is executed later with no further approval | unit, integration |
 | `tool:cron_list` | Stable | all | `[resources.tools]` | — | unit |
 | `tool:cron_remove` | Stable | all | `[resources.tools]` | — | unit |
-| `tool:memory` | Stable | all | `[resources.tools]`, `[memory]` | `[memory.policy]` is pre-empted by a coarse `[policy] allowlist` entry (M7) | unit, integration |
+| `tool:memory` | Stable | all | `[resources.tools]`, `[memory]` | `[memory.policy]` decides read, write, and forget; a `[policy] allowlist` entry naming `memory` is a load-time error rather than a silent override | unit, integration |
 | `tool:job_status` | Stable | all | `[resources.tools]`, `[jobs]` | — | integration |
 | `tool:job_output` | Stable | all | `[resources.tools]`, `[jobs]` | — | integration |
 | `tool:job_kill` | Stable | all | `[resources.tools]`, `[jobs]` | — | integration |
@@ -96,12 +96,12 @@ something that no longer exists — the two-way ratchet
 | SQLite reference backend | Stable | all | `[memory] backend = "sqlite"` | One `Mutex<Connection>` shared across all shard threads — a global lock, not a pool. No WAL, no busy timeout (M8) | unit, integration |
 | In-memory backend | Stable | all | `[memory] backend = "in_memory"` | Not durable; for tests and ephemeral runs | unit |
 | Passive retrieval into planning context | Stable | all | `[memory]` | — | integration |
-| Reflection | Stable | all | `[memory.reflection]` | Overwrites the retention request with `RetentionRequest::default()`, discarding configured budgets (M7) | integration |
+| Reflection | Stable | all | `[memory.reflection]`, `[memory.retention]` | Promotion runs per conversation; retention and the index rebuild run once per sweep, after it | integration |
 | `sqlite-vec` semantic index | **Preview** | all | `[memory] semantic_backend = "sqlite_vec"` | Requires the sqlite backend; no end-to-end contract test | unit |
 | Qdrant semantic index | **Preview** | all | `[memory] semantic_backend = "qdrant"` | Requires an external service; not exercised in CI | unit |
 | `agentos-memory-vector` extension | **Preview** | all | wired by `agentos-cli` | Hashing fallback when no embedder is configured, which ranks token overlap rather than meaning | unit |
-| Memory retention (count / age / bytes) | **Deferred** | — | `[memory.retention]` | Parses, validates, appears in the catalog, and is never read outside `config/` (M7) | none |
-| Shared memory domains | **Deferred** | — | `[memory.shared_domains]` | Same: inert (M7) | none |
+| Memory retention (count / age / bytes) | Stable | all | `[memory.retention]`, `[memory.reflection] enabled` | Applied by the reflection sweep, so a deployment that has not enabled reflection prunes nothing. Records are archived, not deleted | unit, integration |
+| Shared memory domains | Stable | all | `[[memory.shared_domains]]`, `[memory.policy] shared_writes` | A write needs the global switch, the domain's own `write`, and a caller holding it — a top-level run declares no `memory_view`, so it writes to no shared domain | unit, integration |
 
 ## LLM providers
 

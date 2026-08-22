@@ -56,9 +56,28 @@ pub(super) fn authorize_scope(
             }
         }
         MemoryOwner::Shared => {
-            let shared_read = matches!(operation, MemoryOperation::Read)
-                && scope.visibility != MemoryVisibility::Private;
-            if shared_read && shared_domain_allowed(caller, scope) {
+            if scope.visibility == MemoryVisibility::Private {
+                // A private scope owned by nobody in particular is not a
+                // thing; refusing is the only honest reading.
+                return Err(unauthorized("shared memory cannot be private"));
+            }
+            let domain = scope.domain.as_deref().unwrap_or("general");
+            let permitted = match operation {
+                MemoryOperation::Read => caller
+                    .allowed_shared_domains
+                    .iter()
+                    .any(|allowed| allowed.as_ref() == domain),
+                // Everything that is not a read is a mutation, and a shared
+                // mutation needs the writable list — which the runtime built
+                // by intersecting the deployment's global switch, the
+                // domain's own `write`, and the caller's grant
+                // (M7 / `MEM-001`).
+                MemoryOperation::Write | MemoryOperation::Forget => caller
+                    .writable_shared_domains
+                    .iter()
+                    .any(|allowed| allowed.as_ref() == domain),
+            };
+            if permitted {
                 Ok(())
             } else {
                 Err(unauthorized(
@@ -117,14 +136,6 @@ pub(super) fn hydration_scopes(
         }
     }
     scopes
-}
-
-fn shared_domain_allowed(caller: &MemoryCaller, scope: &MemoryScope) -> bool {
-    let domain = scope.domain.as_deref().unwrap_or("general");
-    caller
-        .allowed_shared_domains
-        .iter()
-        .any(|allowed| allowed.as_ref() == domain)
 }
 
 pub(super) fn unauthorized(message: &'static str) -> MemoryError {

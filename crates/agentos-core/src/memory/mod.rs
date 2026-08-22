@@ -1,18 +1,20 @@
 use agentos_interfaces::memory::{Memory, MemoryError, Query, Record, Selector};
-use agentos_interfaces::orchestrator::{MemoryFragment, RunContext};
-use agentos_proto::{AgentId, ChannelId, ConversationId, Namespace, RecordId};
+use agentos_interfaces::orchestrator::MemoryFragment;
+use agentos_proto::{AgentId, Namespace, RecordId};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 mod accounting;
 mod authorize;
+mod context;
 mod hybrid;
 mod in_memory;
 pub mod migrate;
 mod qdrant;
 mod query;
 mod reflection;
+mod retention;
 mod scope;
 mod session_store;
 mod sqlite;
@@ -20,6 +22,9 @@ mod sqlite_vec;
 
 use accounting::{managed_metadata, MemoryAccessLogEntry, MemoryAccounting, MemoryOperation};
 use authorize::{authorize_scope, hydration_scopes, unauthorized};
+pub use context::{
+    channel_id_from_context, conversation_id_from_context, memory_caller_from_context,
+};
 use hybrid::reciprocal_rank_fusion;
 pub use hybrid::{SemanticIndex, SemanticSearchHit};
 pub use in_memory::{InMemoryMemory, InMemorySession};
@@ -28,11 +33,12 @@ use query::{estimate_fragment_tokens, selector_matches_record};
 pub(crate) use query::{record_is_active, record_matches_query};
 pub use reflection::{
     LexicalIndexReport, MemoryMaintenance, PromotionReport, ReflectionParams, ReflectionReport,
-    ReflectionRequest, RetentionReport, RetentionRequest, StoreRetentionBudget,
+    ReflectionRequest,
 };
+pub use retention::{RetentionReport, RetentionRequest, StoreRetentionBudget};
 pub use scope::{
     EpisodeOutcome, EpisodeRecord, HydrationRequest, HydrationResult, HydrationStats, MemoryCaller,
-    MemoryOwner, MemoryScope, MemoryStore, MemoryVisibility, RetrievalStrategy,
+    MemoryOwner, MemoryScope, MemoryStore, MemoryVisibility, RetrievalStrategy, SharedDomainGrants,
 };
 pub use sqlite::SqliteStore;
 pub(crate) use sqlite::{memory_json_error, memory_sqlite_error};
@@ -335,6 +341,7 @@ impl MemoryManager {
             conversation_id: episode.conversation_id.clone(),
             user_id: episode.user_id.clone(),
             allowed_shared_domains: Vec::new(),
+            writable_shared_domains: Vec::new(),
             audit_read_access: false,
         };
         let scope = MemoryScope::new(
@@ -652,135 +659,15 @@ impl MemoryManager {
     }
 }
 
-pub fn memory_caller_from_context(
-    ctx: &RunContext<'_>,
-    allowed_shared_domains: Vec<Arc<str>>,
-) -> MemoryCaller {
-    let metadata = caller_metadata_from_context(ctx);
-    let conversation_id = conversation_id_from_context(ctx)
-        .unwrap_or_else(|| ConversationId::new(ctx.state.run_id.as_str()));
-    let user_id_key = if metadata
-        .get("kind")
-        .and_then(Value::as_str)
-        .is_some_and(|kind| kind == "subagent_input")
-    {
-        "user_id"
-    } else {
-        "sender"
-    };
-    let user_id = metadata
-        .get(user_id_key)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|sender| !sender.is_empty())
-        .map(Arc::from);
-    let mut allowed_shared_domains = allowed_shared_domains;
-    if let Some(view) = metadata.get("memory_view").and_then(Value::as_str) {
-        if matches!(view, "shared_readonly" | "shared_readwrite") {
-            allowed_shared_domains.extend(
-                metadata
-                    .get("memory_domains")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                    .map(Arc::from),
-            );
-            allowed_shared_domains.sort();
-            allowed_shared_domains.dedup();
-        }
-    }
-
-    MemoryCaller {
-        agent_id: ctx.system.active_agent.clone(),
-        task_id: ctx.system.task_id.clone(),
-        channel_id: channel_id_from_context(ctx),
-        conversation_id,
-        user_id,
-        allowed_shared_domains,
-        audit_read_access: audit_read_access_from_context(ctx),
-    }
-}
-
-/// The conversation a run belongs to, if the transcript records one.
-///
-/// `RunState` does not carry a conversation id — it arrives on the `Envelope`
-/// and is stamped onto the input item's metadata — so this is the one place
-/// that resolution lives. Shared with the job registry (roadmap D3) rather than
-/// duplicated: both use it to fence one conversation's data off from another's,
-/// and two copies of a security boundary are two chances to drift.
-///
-/// `None` when nothing in the transcript names one, which callers must treat as
-/// "no owner" rather than substituting a default.
-pub fn conversation_id_from_context(ctx: &RunContext<'_>) -> Option<ConversationId> {
-    caller_metadata_from_context(ctx)
-        .get("conversation_id")
-        .and_then(Value::as_str)
-        .map(ConversationId::new)
-}
-
-/// The channel the conversation arrived on, which is half of what makes a
-/// conversation id unique: `telegram:42` and `feishu:42` are both `"42"`.
-///
-/// Falls back to the reserved `unknown-channel` rather than to an empty
-/// string, so a context that never carried one is visibly distinct from a
-/// channel actually named "".
-pub fn channel_id_from_context(ctx: &RunContext<'_>) -> ChannelId {
-    caller_metadata_from_context(ctx)
-        .get("channel_id")
-        .and_then(Value::as_str)
-        .map_or_else(|| ChannelId::new("unknown-channel"), ChannelId::new)
-}
-
-fn caller_metadata_from_context<'a>(ctx: &'a RunContext<'_>) -> &'a BTreeMap<Arc<str>, Value> {
-    ctx.transcript
-        .items
-        .iter()
-        .rev()
-        .map(|item| &item.metadata)
-        .find(|metadata| {
-            metadata.contains_key("conversation_id")
-                || metadata.contains_key("sender")
-                || metadata.contains_key("user_id")
-                || metadata.contains_key("memory_view")
-        })
-        .unwrap_or_else(|| {
-            ctx.transcript
-                .items
-                .last()
-                .map(|item| &item.metadata)
-                .unwrap_or(&ctx.system.metadata)
-        })
-}
-
-fn audit_read_access_from_context(ctx: &RunContext<'_>) -> bool {
-    let Some(item) = ctx.transcript.items.iter().rev().find(|item| {
-        item.metadata
-            .get("channel_id")
-            .and_then(Value::as_str)
-            .is_some()
-    }) else {
-        return false;
-    };
-    let channel_is_trusted_parent = item
-        .metadata
-        .get("channel_id")
-        .and_then(Value::as_str)
-        .is_some_and(|channel| matches!(channel, "tui" | "telegram" | "feishu"));
-    let not_subagent = item
-        .metadata
-        .get("kind")
-        .and_then(Value::as_str)
-        .is_none_or(|kind| kind != "subagent_input");
-    channel_is_trusted_parent && not_subagent
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentos_interfaces::orchestrator::RunContext;
     use agentos_interfaces::session::Item;
     use agentos_interfaces::RunState;
-    use agentos_proto::{AgentId, ChannelId, Message, MessageRole, Principal, RunId, TaskId};
+    use agentos_proto::{
+        AgentId, ChannelId, ConversationId, Message, MessageRole, Principal, RunId, TaskId,
+    };
     use serde_json::json;
 
     #[test]
@@ -804,7 +691,7 @@ mod tests {
         });
 
         let ctx = RunContext::from_state(&state);
-        let caller = memory_caller_from_context(&ctx, Vec::new());
+        let caller = memory_caller_from_context(&ctx, &SharedDomainGrants::default());
 
         assert_eq!(caller.conversation_id.as_str(), "chat-1");
         assert_eq!(caller.user_id.as_deref(), Some("user-1"));
@@ -832,6 +719,7 @@ mod tests {
             conversation_id: ConversationId::new("chat-1"),
             user_id: None,
             allowed_shared_domains: Vec::new(),
+            writable_shared_domains: Vec::new(),
             audit_read_access: false,
         };
         let err = manager

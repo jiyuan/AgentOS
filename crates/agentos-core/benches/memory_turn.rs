@@ -40,6 +40,7 @@ fn bench_caller(ctx: &RunContext<'_>) -> MemoryCaller {
         conversation_id: ConversationId::new("bench-conv"),
         user_id: None,
         allowed_shared_domains: Vec::new(),
+        writable_shared_domains: Vec::new(),
         audit_read_access: false,
     }
 }
@@ -90,6 +91,7 @@ fn populated_manager(runtime: &tokio::runtime::Runtime) -> Arc<MemoryManager> {
         conversation_id: ConversationId::new("bench-conv"),
         user_id: None,
         allowed_shared_domains: Vec::new(),
+        writable_shared_domains: Vec::new(),
         audit_read_access: false,
     };
 

@@ -612,6 +612,7 @@ mod tests {
             conversation_id: ConversationId::new("c1"),
             user_id: None,
             allowed_shared_domains: Vec::new(),
+            writable_shared_domains: Vec::new(),
             audit_read_access: false,
         }
     }

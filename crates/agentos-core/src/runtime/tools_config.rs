@@ -1,5 +1,5 @@
 use crate::approve::{DelegationGrant, Policy, PolicyAction, PolicyRule, PolicyVerb};
-use crate::config::{LimitsConfig, SubAgentConfig, WorkspaceConfig};
+use crate::config::{LimitsConfig, MemoryPolicyConfig, SubAgentConfig, WorkspaceConfig};
 use crate::jobs::JobRegistry;
 use crate::memory::MemoryManager;
 use crate::spill::SpillStore;
@@ -24,7 +24,12 @@ pub(super) fn build_parent_tools(
             // These need a runtime-owned handle rather than just a name, so
             // they cannot go through `register_builtin_tool`. Kept in step with
             // `RUNTIME_TOOL_NAMES`.
-            "memory" => tools.register(MemoryTool::with_manager(memory_manager.clone())),
+            "memory" => tools.register(
+                MemoryTool::with_manager(memory_manager.clone()).with_domains(
+                    config.memory.shared_domain_grants(),
+                    Arc::clone(&config.memory.default_domain),
+                ),
+            ),
             "job_status" => tools.register(JobStatusTool::new(jobs.clone())),
             "job_output" => tools.register(JobOutputTool::new(jobs.clone())),
             "job_kill" => tools.register(JobKillTool::new(jobs.clone())),
@@ -61,7 +66,12 @@ pub fn phase5_policy(config: &WorkspaceConfig, mcp_specs: &[ToolSpec]) -> Policy
     policy.default_decision = policy_default_decision(&config.policy.default);
     let allowlist = &config.policy.allowlist;
     for tool in &config.resources.tools.enabled {
-        if is_allowlisted(allowlist, tool) {
+        // `memory` is never allowlist-able; `WorkspaceConfig::validate`
+        // rejects a config that tries, so this is the second half of one rule
+        // rather than a silent precedence decision.
+        if tool.as_ref() == "memory" {
+            add_memory_policy(&mut policy, &config.memory.policy);
+        } else if is_allowlisted(allowlist, tool) {
             allowlist_tool(&mut policy, Arc::clone(tool));
         } else {
             add_builtin_tool_policy(&mut policy, tool);
@@ -94,8 +104,8 @@ fn is_allowlisted(allowlist: &[Arc<str>], tool: &Arc<str>) -> bool {
 }
 
 // Bypass any `AskUser` gating for a tool the operator has explicitly
-// allowlisted. Unlike `allow_tool_once`, this does not exempt `memory` —
-// the operator's intent in naming the tool is to suppress the prompts.
+// allowlisted. `memory` never reaches here: it is decided by `[memory.policy]`
+// and a config that allowlists it fails to load (M7 / `MEM-001`).
 fn allowlist_tool(policy: &mut Policy, tool: Arc<str>) {
     if policy.rules.iter().any(|rule| {
         rule.action == PolicyAction::Tool(Arc::clone(&tool))
@@ -338,6 +348,38 @@ pub fn register_builtin_tool(
     Ok(())
 }
 
+/// Turn `[memory.policy]` into the `memory` tool's rules.
+///
+/// One rule per operation, in the order `decide` will read them, so the
+/// deployment's three verbs are the whole of what the policy engine says about
+/// memory. Before M7 / `MEM-001` this was hardcoded as
+/// allow-read/ask-write/ask-forget and the config keys were parsed, validated,
+/// documented, and never read — and a `[policy] allowlist` entry naming
+/// `memory` silently overrode even that.
+///
+/// `deny` emits a rule rather than omitting one: falling through to
+/// `[policy].default` would make the meaning of `deny` depend on a second
+/// setting.
+fn add_memory_policy(policy: &mut Policy, memory: &MemoryPolicyConfig) {
+    for (operation, verb) in memory.operations() {
+        let decision = match verb {
+            "allow" => PolicyVerb::Allow,
+            "deny" => PolicyVerb::Deny,
+            // Validated at load time, so anything else cannot reach here; the
+            // safe reading of an unrecognised verb is still "ask".
+            _ => PolicyVerb::AskUser,
+        };
+        policy.rules.push(PolicyRule {
+            action: PolicyAction::Tool(Arc::from("memory")),
+            decision,
+            reason: Some(Arc::from(format!(
+                "[memory.policy] decides memory {operation}"
+            ))),
+            arg_equals: BTreeMap::from([(Arc::from("operation"), Value::from(operation))]),
+        });
+    }
+}
+
 fn add_builtin_tool_policy(policy: &mut Policy, tool: &str) {
     match tool {
         "shell" => ask_tool_once(
@@ -360,21 +402,10 @@ fn add_builtin_tool_policy(policy: &mut Policy, tool: &str) {
             allow_tool_operation(policy, "file", "read");
             ask_tool_operation(policy, "file", "write", "file write requires user approval");
         }
-        "memory" => {
-            allow_tool_operation(policy, "memory", "read");
-            ask_tool_operation(
-                policy,
-                "memory",
-                "write",
-                "memory write requires user approval",
-            );
-            ask_tool_operation(
-                policy,
-                "memory",
-                "forget",
-                "memory forget requires user approval",
-            );
-        }
+        // `memory` is handled by `add_memory_policy`, which reads
+        // `[memory.policy]`. Nothing hardcoded here, because hardcoding it is
+        // what made those keys inert (M7 / `MEM-001`).
+        "memory" => {}
         "cron_list" => allow_tool_once(policy, Arc::from("cron_list")),
         "cron_create" => ask_tool_once(
             policy,
@@ -393,9 +424,6 @@ fn add_builtin_tool_policy(policy: &mut Policy, tool: &str) {
 }
 
 fn allow_tool_once(policy: &mut Policy, tool: Arc<str>) {
-    if tool.as_ref() == "memory" {
-        return;
-    }
     if !policy.rules.iter().any(|rule| {
         rule.action == PolicyAction::Tool(Arc::clone(&tool))
             && rule.decision == PolicyVerb::Allow

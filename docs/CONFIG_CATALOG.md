@@ -12,16 +12,8 @@ Every key `agent.toml` accepts, derived from the config structs. Edit the doc co
 | `agent.orchestrator` | `Arc<str>` | `builtin.max` | *(undocumented — see `config/undocumented.txt`)* |
 | `agent.memory` | `Arc<str>` | `memory.in_memory` | *(undocumented — see `config/undocumented.txt`)* |
 | `agent.max_turns` | `usize` | `16` | *(undocumented — see `config/undocumented.txt`)* |
-| `policy` | `PolicyConfig` | (table) | The authorization default and the tools exempt from it. |
-| `policy.default` | `Arc<str>` | `deny` | *(undocumented — see `config/undocumented.txt`)* |
-| `policy.allowlist` | `Vec<Arc<str>>` | (empty) | *(undocumented — see `config/undocumented.txt`)* |
-| `policy.approval_administrators` | `Vec<Arc<str>>` | (empty) | Senders who may answer any approval prompt, not only their own.  Empty by default: a prompt is answerable by the person it was put to. In a group conversation that is what stops one participant deciding another's approval. Name a sender id here only when someone genuinely needs to unblock other people's prompts. |
-| `guardrails` | `GuardrailsConfig` | (table) | Content checks applied to input, tool calls, and output. |
-| `guardrails.shell_allowlist` | `Vec<Arc<str>>` | `["printf","echo","pwd","ls","find","cat","head","tail"]` | Programs the shell tool guardrail permits in a call's `command` field. Each entry is a bare program name — arguments belong in the structured args array, not here. Defaults to `DEFAULT_SHELL_ALLOWLIST`. |
-| `guardrails.shell_profiles` | `Vec<ShellProfileConfig>` | (none) | Programs whose structured args array is checked too, not only the program name. Required for anything that can be argued into running other code. Defaults to `default_shell_profiles`. |
-| `guardrails.shell_profiles.program` | `Arc<str>` | — | Program this profile governs, as a bare name matching the call's `command` field. A profile also admits its program, so a program named here need not repeat itself in `shell_allowlist`; when it appears in both, the profile still applies. |
-| `guardrails.shell_profiles.require_first_arg_suffix` | `Vec<Arc<str>>` | — | When non-empty, the first entry of the structured args array must end with one of these suffixes. Pins an interpreter to a script file. |
-| `guardrails.shell_profiles.deny_args` | `Vec<Arc<str>>` | — | Arguments refused outright, compared literally against each entry of the structured args array. |
+| `policy` | `PolicyConfig` | `{"allowlist":[],"approval_administrators":[],"default":"deny"}` | The authorization default and the tools exempt from it. |
+| `guardrails` | `GuardrailsConfig` | `{"shell_allowlist":["printf","echo","pwd","ls","find","cat","head","tail"],"shell_profiles":[{"deny_args":["-exec","-execdir","-ok","-okdir","-delete","-fprint","-fprint0","-fprintf","-fls"],"program":"find","require_first_arg_suffix":[]}]}` | Content checks applied to input, tool calls, and output. |
 | `memory` | `MemoryConfig` | (table) | Long-term memory: storage, what gets recalled into a request, and what a run is allowed to write back. |
 | `memory.backend` | `Arc<str>` | `sqlite` | *(undocumented — see `config/undocumented.txt`)* |
 | `memory.path` | `Option<PathBuf>` | (unset) | *(undocumented — see `config/undocumented.txt`)* |
@@ -49,13 +41,14 @@ Every key `agent.toml` accepts, derived from the config structs. Edit the doc co
 | `memory.reflection.min_episode_repetitions` | `usize` | `2` | Minimum repeated episodes (by summary) before promotion to a semantic fact. Floored at 2 by the reflection engine. |
 | `memory.reflection.rebuild_lexical_index` | `bool` | `true` | *(undocumented — see `config/undocumented.txt`)* |
 | `memory.retention` | `MemoryRetentionConfig` | (table) | *(undocumented — see `config/undocumented.txt`)* |
-| `memory.retention.max_records` | `Option<usize>` | (unset) | *(undocumented — see `config/undocumented.txt`)* |
-| `memory.retention.max_bytes` | `Option<usize>` | (unset) | *(undocumented — see `config/undocumented.txt`)* |
-| `memory.retention.max_age_days` | `Option<u64>` | (unset) | *(undocumented — see `config/undocumented.txt`)* |
+| `memory.retention.max_records` | `Option<usize>` | (unset) | Ceiling on active memory records. Unset keeps everything. |
+| `memory.retention.max_bytes` | `Option<usize>` | (unset) | Ceiling on the total stored size of active records, in bytes. |
+| `memory.retention.max_age_days` | `Option<u64>` | (unset) | Ceiling on a record's age, in days. |
 | `memory.policy` | `MemoryPolicyConfig` | (table) | *(undocumented — see `config/undocumented.txt`)* |
-| `memory.policy.writes` | `Arc<str>` | `ask_user` | *(undocumented — see `config/undocumented.txt`)* |
-| `memory.policy.forgets` | `Arc<str>` | `ask_user` | *(undocumented — see `config/undocumented.txt`)* |
-| `memory.policy.shared_writes` | `bool` | `false` | *(undocumented — see `config/undocumented.txt`)* |
+| `memory.policy.reads` | `Arc<str>` | `allow` | What happens when the model reads memory: `allow`, `ask_user`, or `deny`. |
+| `memory.policy.writes` | `Arc<str>` | `ask_user` | What happens when the model writes memory. |
+| `memory.policy.forgets` | `Arc<str>` | `ask_user` | What happens when the model forgets a record. |
+| `memory.policy.shared_writes` | `bool` | `false` | Whether *any* write to a shared domain is permitted in this deployment.  The first of three gates, and the coarsest. A write into `[[memory.shared_domains]]` also needs that domain's own `write = true` and a caller holding it — see `memory::authorize`. Off by default, because shared memory is the one scope where one conversation's writes are another's reads. |
 | `memory.shared_domains` | `Vec<MemorySharedDomainConfig>` | (none) | *(undocumented — see `config/undocumented.txt`)* |
 | `memory.shared_domains.name` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
 | `memory.shared_domains.read` | `bool` | — | *(undocumented — see `config/undocumented.txt`)* |
@@ -173,5 +166,5 @@ Every key `agent.toml` accepts, derived from the config structs. Edit the doc co
 | `spill.root` | `PathBuf` | `spill` | Where artifacts are written. Relative paths resolve against the workspace root; an absolute path is taken as given, for a deployment that wants spill on a different volume from the session database. |
 | `spill.retention_days` | `u64` | `0` | Days an artifact is kept, or `0` to keep everything.  `0` is a choice rather than a disabled feature — see the module docs. |
 
-102 of 165 keys have no description yet. They are listed in `crates/agentos-core/src/config/undocumented.txt`; writing the doc comment on the field is what removes a line from it.
+94 of 158 keys have no description yet. They are listed in `crates/agentos-core/src/config/undocumented.txt`; writing the doc comment on the field is what removes a line from it.
 <!-- END GENERATED: config -->

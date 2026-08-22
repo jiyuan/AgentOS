@@ -1,6 +1,6 @@
 use crate::memory::{
     memory_caller_from_context, MemoryCaller, MemoryManager, MemoryOwner, MemoryScope, MemoryStore,
-    MemoryVisibility,
+    MemoryVisibility, SharedDomainGrants,
 };
 use agentos_interfaces::memory::{Query, Selector};
 use agentos_interfaces::orchestrator::RunContext;
@@ -21,6 +21,15 @@ const LEGACY_FACTS_NAMESPACE: &str = "facts";
 pub struct MemoryTool {
     manager: Arc<MemoryManager>,
     legacy_namespace: Namespace,
+    /// What `[[memory.shared_domains]]` permit, with
+    /// `[memory.policy].shared_writes` already folded in. Empty means the tool
+    /// reaches no shared domain at all, which is what it did unconditionally
+    /// before M7 / `MEM-001` — the config keys parsed, validated, appeared in
+    /// the catalog, and were read nowhere.
+    shared_domains: SharedDomainGrants,
+    /// `[memory].default_domain`: the domain a write or read lands in when the
+    /// call names none.
+    default_domain: Arc<str>,
 }
 
 impl MemoryTool {
@@ -28,7 +37,20 @@ impl MemoryTool {
         Self {
             manager,
             legacy_namespace: Namespace::new(LEGACY_FACTS_NAMESPACE),
+            shared_domains: SharedDomainGrants::default(),
+            default_domain: Arc::from("general"),
         }
+    }
+
+    /// Bind the tool to this deployment's memory configuration.
+    pub fn with_domains(
+        mut self,
+        shared_domains: SharedDomainGrants,
+        default_domain: Arc<str>,
+    ) -> Self {
+        self.shared_domains = shared_domains;
+        self.default_domain = default_domain;
+        self
     }
 }
 
@@ -96,7 +118,7 @@ impl Tool for MemoryTool {
         args: &RawValue,
         ctx: &RunContext<'_>,
     ) -> Result<ToolResult, ToolError> {
-        let caller = memory_caller_from_context(ctx, Vec::new());
+        let caller = memory_caller_from_context(ctx, &self.shared_domains);
         let default_owner = context_default_owner(ctx, &caller);
         self.call_scoped(
             call,
@@ -157,7 +179,13 @@ impl MemoryTool {
             .body
             .clone()
             .ok_or_else(|| ToolError::Failed(Arc::from("memory write requires body")))?;
-        let scope = scope_from_args(caller, &parsed, &self.legacy_namespace, default_owner)?;
+        let scope = scope_from_args(
+            caller,
+            &parsed,
+            &self.legacy_namespace,
+            default_owner,
+            &self.default_domain,
+        )?;
         let mut record_metadata = BTreeMap::new();
         record_metadata.insert(
             Arc::from("tool_operation"),
@@ -210,7 +238,13 @@ impl MemoryTool {
             parsed.text.clone().unwrap_or_default(),
             parsed.limit.unwrap_or(5),
         );
-        let scope = scope_from_args(caller, &parsed, &self.legacy_namespace, default_owner)?;
+        let scope = scope_from_args(
+            caller,
+            &parsed,
+            &self.legacy_namespace,
+            default_owner,
+            &self.default_domain,
+        )?;
         let mut records = self
             .manager
             .read_scoped_with_reason(caller, scope.clone(), &query, Arc::from("memory_tool_read"))
@@ -267,7 +301,13 @@ impl MemoryTool {
         start: Instant,
         default_owner: Option<MemoryOwner>,
     ) -> Result<ToolResult, ToolError> {
-        let scope = scope_from_args(caller, &parsed, &self.legacy_namespace, default_owner)?;
+        let scope = scope_from_args(
+            caller,
+            &parsed,
+            &self.legacy_namespace,
+            default_owner,
+            &self.default_domain,
+        )?;
         let namespace = scope.namespace();
         let selector = Selector {
             id: parsed.id.map(RecordId::new),
@@ -307,6 +347,7 @@ fn scope_from_args(
     parsed: &MemoryArgs,
     legacy_namespace: &Namespace,
     default_owner: Option<MemoryOwner>,
+    default_domain: &Arc<str>,
 ) -> Result<MemoryScope, ToolError> {
     if let Some(namespace) = parsed.namespace.as_deref() {
         if namespace != legacy_namespace.as_str() {
@@ -339,12 +380,17 @@ fn scope_from_args(
         store,
         owner,
         visibility,
-        parsed
-            .domain
-            .as_deref()
-            .map(str::trim)
-            .filter(|domain| !domain.is_empty())
-            .map(Arc::from),
+        // `[memory].default_domain` when the call names none. It used to be
+        // `None`, which every scope then read as the literal `general`, so
+        // configuring a default domain changed nothing (M7 / `MEM-001`).
+        Some(
+            parsed
+                .domain
+                .as_deref()
+                .map(str::trim)
+                .filter(|domain| !domain.is_empty())
+                .map_or_else(|| Arc::clone(default_domain), Arc::from),
+        ),
     ))
 }
 
@@ -524,6 +570,7 @@ fn fallback_caller() -> MemoryCaller {
         conversation_id: ConversationId::new("memory-tool"),
         user_id: None,
         allowed_shared_domains: Vec::new(),
+        writable_shared_domains: Vec::new(),
         audit_read_access: false,
     }
 }

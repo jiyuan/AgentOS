@@ -143,10 +143,48 @@ pub struct MemoryCaller {
     pub conversation_id: ConversationId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_id: Option<Arc<str>>,
+    /// Shared domains this caller may *read*.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_shared_domains: Vec<Arc<str>>,
+    /// Shared domains this caller may *write*.
+    ///
+    /// Always a subset of what the deployment permits: the runtime intersects
+    /// `[memory.policy].shared_writes`, the domain's own `write = true`, and
+    /// the caller's own grant before this list is built, so `authorize_scope`
+    /// checks one thing and the three gates cannot get out of order
+    /// (M7 / `MEM-001`). Empty in every configuration that has not
+    /// deliberately opened one, which is the default.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writable_shared_domains: Vec<Arc<str>>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub audit_read_access: bool,
+}
+
+/// What a deployment's `[[memory.shared_domains]]` permit, with
+/// `[memory.policy].shared_writes` already folded in.
+///
+/// Two lists rather than a list of triples because every consumer wants one or
+/// the other, and the intersection with a caller's own grant is a set
+/// operation either way.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SharedDomainGrants {
+    pub readable: Vec<Arc<str>>,
+    pub writable: Vec<Arc<str>>,
+}
+
+impl SharedDomainGrants {
+    /// Read-only access to the named domains, which is what a deployment that
+    /// has not enabled shared writes gets.
+    pub fn read_only(domains: impl IntoIterator<Item = Arc<str>>) -> Self {
+        Self {
+            readable: domains.into_iter().collect(),
+            writable: Vec::new(),
+        }
+    }
+
+    pub fn permits_write(&self, domain: &str) -> bool {
+        self.writable.iter().any(|name| name.as_ref() == domain)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

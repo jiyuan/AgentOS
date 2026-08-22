@@ -776,12 +776,21 @@ Deliverables:
 2. Make `agent.id` reach runtime context, traces, sessions, and memory — starting
    with `runtime/mod.rs:354` — or remove it. Deprecate the duplicate
    `agent.memory` key in favor of `[memory].backend`.
-3. Make `[memory.policy]` the sole authority for read, write, forget, and shared
-   writes. Reject conflicting coarse allowlist rules at load time.
-4. Wire `memory.default_domain`, `[memory.shared_domains]`, and
-   record/age/byte retention into runtime behavior. Retention is the cheapest
-   revival: `reflection.rs:278` currently overwrites the request with
-   `RetentionRequest::default()`, discarding the configured budgets.
+3. **Done.** `[memory.policy]` gained a `reads` verb and now emits all three of
+   the `memory` tool's policy rules; the hardcoded allow-read/ask-write/
+   ask-forget is gone. `[policy] allowlist` naming `memory` is a load-time
+   error rather than a silent override, which also removed the `memory`
+   carve-out that `allow_tool_once` used to carry. Shared writes need all
+   three of `[memory.policy].shared_writes`, the domain's own `write`, and a
+   caller holding it; the runtime intersects them before `authorize_scope`
+   sees them, so the order cannot be got wrong at a call site.
+4. **Done.** `[memory].default_domain` reaches the `memory` tool's scopes and
+   the hydration request (both used a literal `general` before).
+   `[[memory.shared_domains]]` reaches the tool as well as hydration — it
+   previously reached neither, because the tool built its caller with an empty
+   grant list. `[memory.retention]` reaches `reflect_all` through
+   `MemoryConfig::reflection_params`, and `RetentionRequest` grew the age and
+   byte ceilings it was missing; only the count budget existed.
 5. Apply `deny_unknown_fields` consistently or provide an equivalent complete
    unknown-key collector. Stage it — it will reject configs that load today.
 6. Make `resources.llm.enabled` and resource ordering observable, or remove the
@@ -805,10 +814,15 @@ Acceptance criteria:
 - A typo such as `max_reocrds` is a load-time error.
 - Every stable config key has a behavioral assertion, not only a parse test.
 - Memory writes and forgets produce the configured decision; a general tool
-  allowlist cannot silently override it.
-- Shared writes require global, domain, and caller permission.
-- Changing the default domain changes writes and hydration.
-- Count, age, and byte retention prune deterministic seeded data.
+  allowlist cannot silently override it. **Met** — the allowlist entry is a
+  load-time error naming both settings.
+- Shared writes require global, domain, and caller permission. **Met** —
+  tested by removing each of the three in turn.
+- Changing the default domain changes writes and hydration. **Met**.
+- Count, age, and byte retention prune deterministic seeded data. **Met** —
+  count and bytes end to end through `reflect_all`; the age branch is unit
+  tested against a backdated `created_at`, because an integration test cannot
+  age a record without sleeping.
 - A large tool result is recovered through the normal loop and registry with an
   opaque locator, including when spill storage is outside the workspace.
   **Met** — `tests/spill_retrieval.rs` drives a real run whose store is under
@@ -980,7 +994,7 @@ a slice moves off `not started` only when the named artifact exists in the tree.
 | `AUD-001` | M6 | Durable, redacted safety events | REQ-001, ID-001 | **done** — `audit::` module, append-only `safety_events`, eleven event kinds, `ArgumentDigest`-only arguments, retained (`consumed`) interruptions, `StepFailure` so a failed step persists its trace |
 | `STATE-001` | M6 | Clear epochs, denial semantics, terminal output gate, `act()` policy re-assertion | AUD-001 | **done** — `session_epochs` + `agentos-gateway purge`, `RunError::StructuralDenial`, `loop/output.rs` gating every synthesized terminal reply, private `Authorization` on `ActCtx` + `tests/loop_transitions.rs`, `[channels] provisional_streaming = false` |
 | `CFG-001` | M7 | Unknown-key rejection and effective-config inventory | ADR-001 | not started |
-| `MEM-001` | M7 | Effective memory policy, domains, shared writes, retention | ID-001, CFG-001, CFG-000 | not started |
+| `MEM-001` | M7 | Effective memory policy, domains, shared writes, retention | ID-001, CFG-001, CFG-000 | **done** — `[memory.policy]` is the authority (allowlist conflict rejected at load), three-gate shared writes, `default_domain` reaches writes and hydration, count/age/byte retention |
 | `SPILL-001` | M7 | Opaque spill locator and scoped retrieval | FS-001 | **done** — `spill:<run>/<artifact>`, `spill_read` tool authorized by the transcript, contained by `RootDir` |
 | `GW-001` | M8 | Durable ingress, WAL, maintenance leadership, atomic state files, shutdown | ID-002 | not started |
 | `MCP-001` | M8 | Standard lifecycle, request-id correlation, bounds, interoperability, server isolation | SBX-001 | not started |

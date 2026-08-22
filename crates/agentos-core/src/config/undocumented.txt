@@ -46,9 +46,6 @@ memory.hydrate_strategy
 memory.hydration_enabled
 memory.path
 memory.policy
-memory.policy.forgets
-memory.policy.shared_writes
-memory.policy.writes
 memory.qdrant
 memory.qdrant.api_key
 memory.qdrant.collection
@@ -60,9 +57,6 @@ memory.reflection
 memory.reflection.enabled
 memory.reflection.rebuild_lexical_index
 memory.retention
-memory.retention.max_age_days
-memory.retention.max_bytes
-memory.retention.max_records
 memory.semantic_backend
 memory.shared_domains
 memory.shared_domains.name

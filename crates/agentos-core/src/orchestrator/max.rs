@@ -6,6 +6,7 @@ use super::routing::{
 };
 use crate::memory::{
     memory_caller_from_context, HydrationRequest, MemoryManager, MemoryStore, RetrievalStrategy,
+    SharedDomainGrants,
 };
 use crate::prompt::{self, SkillPrelude};
 use crate::skills::{
@@ -75,7 +76,12 @@ pub struct MemoryHydrationSettings {
     pub max_estimated_tokens: usize,
     pub stores: Vec<MemoryStore>,
     pub strategy: RetrievalStrategy,
-    pub allowed_shared_domains: Vec<Arc<str>>,
+    /// What the deployment's `[[memory.shared_domains]]` permit, already
+    /// intersected with `[memory.policy].shared_writes`.
+    pub shared_domains: SharedDomainGrants,
+    /// The domain a hydration request uses when the caller names none
+    /// (`[memory].default_domain`).
+    pub default_domain: Arc<str>,
 }
 
 impl Default for MemoryHydrationSettings {
@@ -86,7 +92,8 @@ impl Default for MemoryHydrationSettings {
             max_estimated_tokens: DEFAULT_MEMORY_HYDRATION_MAX_TOKENS,
             stores: vec![MemoryStore::Semantic, MemoryStore::Episodic],
             strategy: RetrievalStrategy::Hybrid,
-            allowed_shared_domains: Vec::new(),
+            shared_domains: SharedDomainGrants::default(),
+            default_domain: Arc::from("general"),
         }
     }
 }
@@ -471,14 +478,18 @@ impl MemoryHydrator {
             return Ok(());
         }
 
-        let caller = memory_caller_from_context(ctx, self.settings.allowed_shared_domains.clone());
+        let caller = memory_caller_from_context(ctx, &self.settings.shared_domains);
         let result = self
             .manager
             .hydrate_with_stats(
                 &caller,
                 HydrationRequest {
                     query,
-                    domain: None,
+                    // `[memory].default_domain`, so changing it changes what
+                    // hydration recalls — it used to be `None`, which pinned
+                    // every deployment to `general` regardless (M7 /
+                    // `MEM-001`).
+                    domain: Some(Arc::clone(&self.settings.default_domain)),
                     max_fragments: self.settings.max_fragments,
                     max_tokens: self.settings.max_estimated_tokens,
                     stores: self.settings.stores.clone(),

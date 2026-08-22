@@ -691,6 +691,27 @@ hidden runtime.
 
 ## 13. Memory Architecture
 
+### Who decides what memory may do
+
+`[memory.policy]`, and nothing else. Its three verbs — `reads`, `writes`,
+`forgets` — become the `memory` tool's policy rules directly, rather than the
+hardcoded allow-read/ask-write/ask-forget they used to be pre-empted by. A
+`[policy] allowlist` entry naming `memory` would turn all three into a blanket
+`Allow`; it used to, silently, and is now a load-time error that names both
+settings so the operator says which they meant.
+
+A write into a shared domain needs **three** permissions, and losing any one of
+them refuses the write: `[memory.policy].shared_writes` for the deployment, the
+`[[memory.shared_domains]]` entry's own `write = true` for the domain, and a
+caller holding it — a sub-agent acting under a `shared_readwrite` memory view
+that names the domain. The runtime intersects all three into
+`MemoryCaller::writable_shared_domains` before `authorize_scope` runs, so the
+check is one comparison and the gates cannot be applied out of order by a call
+site. A top-level run declares no memory view and therefore writes to no shared
+domain.
+
+### Layers
+
 Memory has three layers:
 
 1. Session memory: exact transcript continuity, owned by `Session`.
@@ -817,7 +838,23 @@ Reflection can:
 - promote repeated successful workflows into procedural candidates;
 - compress old episodes;
 - supersede contradicted facts;
-- archive or prune low-value records by policy.
+- archive low-value records by policy.
+
+Promotion runs per conversation; **retention** and the index rebuild run once
+per sweep, after it — so a fact promoted out of episodes on a tick is not
+archived for age on the same tick that created it. `[memory.retention]` offers
+three independent ceilings, and `memory/retention.rs` applies them in the order
+age, count, bytes: a record past its age is gone whatever the other two say,
+and dropping it may bring the other two back under on its own. Records are
+**archived, not deleted** (`status = 'archived'`), which drops them out of
+every read path while the row stays — the same choice `/clear` makes for
+session items, and for the same reason: an operator who set a budget too low
+should be able to see what it cost them. Retention rides the reflection sweep,
+so a deployment with `[memory.reflection] enabled = false` prunes nothing.
+
+All three ceilings, `[memory].default_domain`, and `[[memory.shared_domains]]`
+parsed, validated, appeared in `docs/CONFIG_CATALOG.md`, and changed no
+behaviour before M7 / `MEM-001`.
 
 Retrieval is deterministic by default: lexical plus recency, with SQLite FTS
 where available. Vector retrieval is available through `[memory].semantic_backend`
