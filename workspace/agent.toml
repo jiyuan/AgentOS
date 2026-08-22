@@ -1,7 +1,11 @@
+# This agent's identity. It is stamped on every trace, episode, memory record,
+# and safety event, and is part of the principal those are keyed by — so two
+# deployments sharing a store keep separate memory only if they have separate
+# ids. It used to be read by nothing: the runtime hardcoded `main-agent`.
 [agent]
 id = "default"
 orchestrator = "builtin.max"
-memory = "memory.in_memory"
+# `agent.memory` is deprecated and ignored; the backend is `[memory].backend`.
 # Tool cycles one run may take. A model that asks for several tools in one
 # response spends one turn per call — they run in order, each crossing the
 # policy engine on its own — so a batch is bounded by this like any other work.
@@ -246,8 +250,8 @@ enabled = ["file", "http", "memory", "shell", "skill_validate", "cron_create", "
 [resources.mcp]
 enabled = ["remote_echo"]
 
-[resources.llm]
-enabled = ["llm"]
+# `[resources.llm]` is deprecated and ignored: whether the LLM fallback is
+# offered is decided by listing "llm" in [resources].priority above.
 
 [task_workspace]
 root = "tasks"

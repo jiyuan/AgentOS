@@ -377,13 +377,19 @@ impl AgentRuntime {
             ShellCommandAllowlist::new(workspace_config.guardrails.shell_allowlist.iter().cloned())
                 .with_profiles(workspace_config.guardrails.shell_profiles.iter().cloned());
 
+        // `[agent].id`, not a constant. Every trace, episode, memory record,
+        // and safety event is stamped with this and keyed by the principal it
+        // belongs to, so a hardcoded name made two deployments sharing a store
+        // into one agent (M7 / `CFG-001`).
+        let active_agent = AgentId::new(workspace_config.agent.id.as_ref());
+
         Ok(Self {
             workspace_config,
             session,
             memory_manager,
             model_controller,
             orchestrator,
-            active_agent: AgentId::new("main-agent"),
+            active_agent,
             skill_catalog,
             tools,
             policy,

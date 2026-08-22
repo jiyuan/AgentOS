@@ -118,8 +118,18 @@ impl MaxOrchestrator {
         }
     }
 
+    /// Install the resource catalog the model is shown, in the order it was
+    /// built.
+    ///
+    /// Deliberately *not* `.sorted()`. `WorkspaceConfig::resource_index`
+    /// assembles entries in `[resources].priority` order, and re-sorting them
+    /// by `DispatchPriority` here threw that away — nothing else reads
+    /// `DispatchPriority`, so the configured ordering was inert and a
+    /// deployment that put `llm` first got exactly the default (M7 /
+    /// `CFG-001`). `ResourceIndex::sorted` remains for the tools-derived
+    /// default, where there is no configured order to respect.
     pub fn with_resource_index(mut self, resource_index: ResourceIndex) -> Self {
-        self.resource_index = resource_index.sorted();
+        self.resource_index = resource_index;
         self
     }
 

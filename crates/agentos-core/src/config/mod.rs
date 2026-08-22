@@ -46,7 +46,7 @@ use orchestrator::rule_from_config;
 use subagents::{normalize_memory_tool, normalize_memory_view, subagent_metadata};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct WorkspaceConfig {
     /// Which orchestrator, memory backend, and turn budget this agent runs on.
     pub agent: AgentConfig,
@@ -95,11 +95,25 @@ pub struct WorkspaceConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AgentConfig {
+    /// This agent's identity. Stamped onto every trace, episode, memory
+    /// record, and safety event, and part of the `Principal` that keys them —
+    /// so two deployments sharing a store keep separate memory only if they
+    /// have separate ids.
     pub id: Arc<str>,
+    /// Which orchestrator drives the loop: `builtin.max` (tool-selecting) or
+    /// `builtin.min` (a single LLM call).
     pub orchestrator: Arc<str>,
-    pub memory: Arc<str>,
+    /// **Deprecated.** Use `[memory].backend`. Absent in a new config; a value
+    /// here is warned about at load time and otherwise ignored.
+    ///
+    /// It was always a duplicate — nothing outside `config/` ever read it —
+    /// and two keys naming the same backend is one more than can be right
+    /// (M7 / `CFG-001`).
+    pub memory: Option<Arc<str>>,
+    /// Tool cycles one run may take before the loop synthesizes a terminal
+    /// answer from what it has.
     pub max_turns: usize,
 }
 
@@ -108,14 +122,14 @@ impl Default for AgentConfig {
         Self {
             id: Arc::from("default"),
             orchestrator: Arc::from("builtin.max"),
-            memory: Arc::from("memory.in_memory"),
+            memory: None,
             max_turns: 16,
         }
     }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ChannelsConfig {
     pub tui: ChannelConfig,
     pub telegram: ChannelConfig,
@@ -158,7 +172,7 @@ impl Default for ChannelsConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ChannelConfig {
     pub enabled: bool,
     pub mode: Arc<str>,
@@ -174,7 +188,7 @@ impl Default for ChannelConfig {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct IsolationConfig {
     pub worker_path: Option<PathBuf>,
     pub worker_path_env: Option<String>,
@@ -194,7 +208,7 @@ pub struct IsolationConfig {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct McpServerConfig {
     pub id: Arc<str>,
     pub endpoint: Arc<str>,
@@ -202,7 +216,7 @@ pub struct McpServerConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct McpToolConfig {
     pub server_id: Arc<str>,
     pub name: Arc<str>,
@@ -230,12 +244,27 @@ impl Default for McpToolConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ResourceConfig {
+    /// The order resources are offered to the model, over the four kinds:
+    /// `skills`, `tools`, `mcp`, `llm`. Dropping a kind omits it entirely.
+    ///
+    /// This decides the order of the catalog the model reads. It used not to:
+    /// the orchestrator re-sorted the index by an internal `DispatchPriority`
+    /// that nothing else reads, so every deployment got the default order
+    /// whatever it wrote here (M7 / `CFG-001`).
     pub priority: Vec<Arc<str>>,
+    /// Workspace skills to load and offer, by folder name.
     pub skills: ResourceSection,
+    /// Built-in tools to register, by name. See `docs/TOOL_CATALOG.md`.
     pub tools: ResourceSection,
+    /// MCP servers to offer, by the name they are declared under.
     pub mcp: ResourceSection,
+    /// **Deprecated.** Whether the LLM fallback is offered is decided by
+    /// listing (or omitting) `llm` in `priority`; this section could only ever
+    /// hold the single literal `"llm"`, so setting it said nothing that
+    /// `priority` did not already say. Warned about at load time and
+    /// otherwise ignored.
     pub llm: ResourceSection,
 }
 
@@ -264,13 +293,13 @@ impl Default for ResourceConfig {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ResourceSection {
     pub enabled: Vec<Arc<str>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct TaskWorkspaceConfig {
     pub root: PathBuf,
 }
@@ -292,6 +321,7 @@ impl WorkspaceConfig {
             Err(err) => return Err(err),
         };
         config.resolve_paths(config_dir);
+        config.validate_agent().map_err(std::io::Error::other)?;
         config.validate_memory().map_err(std::io::Error::other)?;
         config.subagents.extend(load_subagent_files(config_dir)?);
         config
@@ -350,6 +380,34 @@ impl WorkspaceConfig {
 
     pub fn validate_memory(&mut self) -> Result<(), String> {
         self.memory.validate()
+    }
+
+    /// Check `[agent]`, and say so about anything deprecated.
+    ///
+    /// A deprecation is a load-time `warn!` rather than an error: the key
+    /// still parses, so an existing `agent.toml` keeps loading, and the
+    /// operator finds out on the next start rather than on the next release.
+    pub fn validate_agent(&self) -> Result<(), String> {
+        if self.agent.id.trim().is_empty() {
+            return Err(
+                "agent.id must not be empty: it identifies this agent in every trace, \
+                 episode, memory record, and safety event"
+                    .to_owned(),
+            );
+        }
+        if let Some(backend) = &self.agent.memory {
+            tracing::warn!(
+                value = backend.as_ref(),
+                "agent.memory is deprecated and ignored; set [memory].backend instead"
+            );
+        }
+        if !self.resources.llm.enabled.is_empty() {
+            tracing::warn!(
+                "[resources.llm] is deprecated and ignored; whether the LLM fallback is \
+                 offered is decided by listing 'llm' in [resources].priority"
+            );
+        }
+        Ok(())
     }
 
     pub fn validate_policy(&self) -> Result<(), String> {
@@ -462,7 +520,8 @@ impl WorkspaceConfig {
         for llm in &self.resources.llm.enabled {
             if llm.as_ref() != "llm" {
                 return Err(format!(
-                    "unknown resources.llm.enabled entry '{llm}'; only 'llm' is supported"
+                    "unknown resources.llm.enabled entry '{llm}'; the section is deprecated \
+                     and only ever accepted 'llm'"
                 ));
             }
         }
@@ -568,25 +627,15 @@ impl WorkspaceConfig {
                         });
                     }
                 }
-                "llm" => {
-                    if self.resources.llm.enabled.is_empty() {
-                        entries.push(ResourceEntry {
-                            name: Arc::from("llm"),
-                            kind: ResourceKind::Llm,
-                            summary: Arc::from("Fallback language model reasoning"),
-                            priority: DispatchPriority::LlmFallback,
-                        });
-                    } else {
-                        for llm in &self.resources.llm.enabled {
-                            entries.push(ResourceEntry {
-                                name: Arc::clone(llm),
-                                kind: ResourceKind::Llm,
-                                summary: Arc::from("Configured language model fallback"),
-                                priority: DispatchPriority::LlmFallback,
-                            });
-                        }
-                    }
-                }
+                // One entry, from `priority` alone. `[resources.llm].enabled`
+                // is deprecated: it could only ever hold the literal "llm",
+                // so both spellings produced exactly this (M7 / `CFG-001`).
+                "llm" => entries.push(ResourceEntry {
+                    name: Arc::from("llm"),
+                    kind: ResourceKind::Llm,
+                    summary: Arc::from("Fallback language model reasoning"),
+                    priority: DispatchPriority::LlmFallback,
+                }),
                 _ => {}
             }
         }
@@ -795,6 +844,8 @@ stages = [
             vec![Arc::from("file"), Arc::from("memory")]
         );
         assert_eq!(config.resources.mcp.enabled, vec![Arc::from("remote_echo")]);
+        // Deprecated but still accepted, which is what keeps an `agent.toml`
+        // written before M7 loading.
         assert_eq!(config.resources.llm.enabled, vec![Arc::from("llm")]);
         assert_eq!(config.task_workspace.root, root.join("tasks"));
         assert_eq!(config.subagents.len(), 1);
@@ -943,7 +994,14 @@ stages = [
             ]
         );
         assert_eq!(config.resources.mcp.enabled, vec![Arc::from("remote_echo")]);
-        assert_eq!(config.resources.llm.enabled, vec![Arc::from("llm")]);
+        // `[resources.llm]` is deprecated and no longer shipped; the LLM
+        // fallback is offered because `priority` names `llm`.
+        assert!(config.resources.llm.enabled.is_empty());
+        assert!(config
+            .resources
+            .priority
+            .iter()
+            .any(|kind| kind.as_ref() == "llm"));
         assert_eq!(
             config
                 .routing_table()

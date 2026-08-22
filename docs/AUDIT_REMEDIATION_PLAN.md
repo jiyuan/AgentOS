@@ -741,17 +741,18 @@ Primary files: `crates/agentos-core/src/loop/`, `crates/agentos-core/src/runner.
 
 Priority: P1
 Size: M — mechanical, but `deny_unknown_fields` will break existing `agent.toml`s
-Status: **not started**
+Status: **deliverables 2–6 and 9 done**; 1, 7, 8, 10 open
 Dependencies: M0; memory authorization depends on M3
 
 Current state, verified field by field:
 
 - **6 of 36** config structs use `deny_unknown_fields`. A typo such as
-  `[memory.polcy]` loads silently with defaults.
+  `[memory.polcy]` loads silently with defaults. **Closed by `CFG-001`.**
 - `agent.id` is inert — read only by `print_effective_config`
   (`agentos-gateway/main.rs:509`). The runtime hardcodes
   `active_agent: AgentId::new("main-agent")` (`runtime/mod.rs:354`), so every
-  trace, episode, and memory record is stamped `main-agent` regardless of config.
+  trace, episode, and memory record is stamped `main-agent` regardless of
+  config. **Closed by `CFG-001`.**
 - `memory.default_domain`, all three `memory.retention.*`, all three
   `memory.policy.*`, and `[memory.shared_domains]` parse, validate, appear in
   `docs/CONFIG_CATALOG.md`, and are never read outside `config/`.
@@ -773,9 +774,11 @@ Deliverables:
 
 1. Inventory every accepted key as effective, deprecated, or preview. Remove or
    wire every inert stable key.
-2. Make `agent.id` reach runtime context, traces, sessions, and memory — starting
-   with `runtime/mod.rs:354` — or remove it. Deprecate the duplicate
-   `agent.memory` key in favor of `[memory].backend`.
+2. **Done.** `AgentRuntime` takes its `active_agent` from `[agent].id` rather
+   than the constant `main-agent`, so every trace, episode, memory record, and
+   safety event is stamped and keyed by it; a blank id is a load-time error.
+   `agent.memory` is deprecated: `Option<Arc<str>>`, warned about at load, read
+   by nothing.
 3. **Done.** `[memory.policy]` gained a `reads` verb and now emits all three of
    the `memory` tool's policy rules; the hardcoded allow-read/ask-write/
    ask-forget is gone. `[policy] allowlist` naming `memory` is a load-time
@@ -791,10 +794,19 @@ Deliverables:
    grant list. `[memory.retention]` reaches `reflect_all` through
    `MemoryConfig::reflection_params`, and `RetentionRequest` grew the age and
    byte ceilings it was missing; only the count budget existed.
-5. Apply `deny_unknown_fields` consistently or provide an equivalent complete
-   unknown-key collector. Stage it — it will reject configs that load today.
-6. Make `resources.llm.enabled` and resource ordering observable, or remove the
-   misleading fields.
+5. **Done.** All 32 deserializable config structs carry `deny_unknown_fields`
+   (6 did). `tests/config_authority.rs` types one bad key into each of twenty
+   sections, so a struct that loses the attribute later fails there rather than
+   silently accepting nonsense again. This will reject an `agent.toml` with a
+   typo that loads today — which is the point, and the staging is that the
+   deprecated keys still parse.
+6. **Done, both ways.** Ordering is now observable: `resource_index` built
+   entries in `[resources].priority` order and `MaxOrchestrator::
+   with_resource_index` re-sorted them by an internal `DispatchPriority` that
+   nothing else reads, so the configured order was discarded. The re-sort is
+   gone. `[resources.llm]` is deprecated instead of fixed: validation only ever
+   accepted the single literal `"llm"`, so a list-shaped key could say nothing
+   `priority` did not already say.
 7. Add an effective-config diagnostic showing resolved values, source, maturity,
    and conflicts. **Do not extend `print_effective_config`** — it is 55
    hand-written `println!`s that will go stale. Derive it from the same
@@ -811,7 +823,7 @@ Deliverables:
 
 Acceptance criteria:
 
-- A typo such as `max_reocrds` is a load-time error.
+- A typo such as `max_reocrds` is a load-time error. **Met.**
 - Every stable config key has a behavioral assertion, not only a parse test.
 - Memory writes and forgets produce the configured decision; a general tool
   allowlist cannot silently override it. **Met** — the allowlist entry is a

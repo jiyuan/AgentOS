@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RoutingConfig {
     pub rules: Vec<RoutingRuleConfig>,
     pub fallback: Option<RoutingRuleConfig>,
@@ -30,7 +30,7 @@ impl Default for RoutingConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RoutingRuleConfig {
     pub domain: Arc<str>,
     pub description: Arc<str>,
@@ -56,7 +56,7 @@ impl Default for RoutingRuleConfig {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct TemplateConfig {
     pub name: Arc<str>,
     pub description: Arc<str>,
@@ -65,7 +65,7 @@ pub struct TemplateConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct StageConfig {
     pub name: Arc<str>,
     pub agent_id: Arc<str>,

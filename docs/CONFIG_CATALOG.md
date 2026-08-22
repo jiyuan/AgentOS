@@ -8,10 +8,10 @@ Every key `agent.toml` accepts, derived from the config structs. Edit the doc co
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `agent` | `AgentConfig` | (table) | Which orchestrator, memory backend, and turn budget this agent runs on. |
-| `agent.id` | `Arc<str>` | `default` | *(undocumented — see `config/undocumented.txt`)* |
-| `agent.orchestrator` | `Arc<str>` | `builtin.max` | *(undocumented — see `config/undocumented.txt`)* |
-| `agent.memory` | `Arc<str>` | `memory.in_memory` | *(undocumented — see `config/undocumented.txt`)* |
-| `agent.max_turns` | `usize` | `16` | *(undocumented — see `config/undocumented.txt`)* |
+| `agent.id` | `Arc<str>` | `default` | This agent's identity. Stamped onto every trace, episode, memory record, and safety event, and part of the `Principal` that keys them — so two deployments sharing a store keep separate memory only if they have separate ids. |
+| `agent.orchestrator` | `Arc<str>` | `builtin.max` | Which orchestrator drives the loop: `builtin.max` (tool-selecting) or `builtin.min` (a single LLM call). |
+| `agent.memory` | `Option<Arc<str>>` | (unset) | **Deprecated.** Use `[memory].backend`. Absent in a new config; a value here is warned about at load time and otherwise ignored.  It was always a duplicate — nothing outside `config/` ever read it — and two keys naming the same backend is one more than can be right (M7 / `CFG-001`). |
+| `agent.max_turns` | `usize` | `16` | Tool cycles one run may take before the loop synthesizes a terminal answer from what it has. |
 | `policy` | `PolicyConfig` | `{"allowlist":[],"approval_administrators":[],"default":"deny"}` | The authorization default and the tools exempt from it. |
 | `guardrails` | `GuardrailsConfig` | `{"shell_allowlist":["printf","echo","pwd","ls","find","cat","head","tail"],"shell_profiles":[{"deny_args":["-exec","-execdir","-ok","-okdir","-delete","-fprint","-fprint0","-fprintf","-fls"],"program":"find","require_first_arg_suffix":[]}]}` | Content checks applied to input, tool calls, and output. |
 | `memory` | `MemoryConfig` | (table) | Long-term memory: storage, what gets recalled into a request, and what a run is allowed to write back. |
@@ -103,11 +103,11 @@ Every key `agent.toml` accepts, derived from the config structs. Edit the doc co
 | `mcp_tools.response` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
 | `mcp_tools.sandbox` | `SandboxMode` | — | What this MCP-backed tool may do to the filesystem (roadmap X2).  Defaults to `full_access`, which is exactly what the old `requires_isolation = false` meant: the call is made in-process by the MCP client, so there is no child process for a sandbox to restrict. |
 | `resources` | `ResourceConfig` | (table) | Which skills, tools, MCP tools, and LLM entries are enabled, and in what order they are offered to the model. |
-| `resources.priority` | `Vec<Arc<str>>` | `["skills","tools","mcp","llm"]` | *(undocumented — see `config/undocumented.txt`)* |
-| `resources.skills` | `ResourceSection` | `{"enabled":[]}` | *(undocumented — see `config/undocumented.txt`)* |
-| `resources.tools` | `ResourceSection` | `{"enabled":["file","http","memory","shell"]}` | *(undocumented — see `config/undocumented.txt`)* |
-| `resources.mcp` | `ResourceSection` | `{"enabled":[]}` | *(undocumented — see `config/undocumented.txt`)* |
-| `resources.llm` | `ResourceSection` | `{"enabled":[]}` | *(undocumented — see `config/undocumented.txt`)* |
+| `resources.priority` | `Vec<Arc<str>>` | `["skills","tools","mcp","llm"]` | The order resources are offered to the model, over the four kinds: `skills`, `tools`, `mcp`, `llm`. Dropping a kind omits it entirely.  This decides the order of the catalog the model reads. It used not to: the orchestrator re-sorted the index by an internal `DispatchPriority` that nothing else reads, so every deployment got the default order whatever it wrote here (M7 / `CFG-001`). |
+| `resources.skills` | `ResourceSection` | `{"enabled":[]}` | Workspace skills to load and offer, by folder name. |
+| `resources.tools` | `ResourceSection` | `{"enabled":["file","http","memory","shell"]}` | Built-in tools to register, by name. See `docs/TOOL_CATALOG.md`. |
+| `resources.mcp` | `ResourceSection` | `{"enabled":[]}` | MCP servers to offer, by the name they are declared under. |
+| `resources.llm` | `ResourceSection` | `{"enabled":[]}` | **Deprecated.** Whether the LLM fallback is offered is decided by listing (or omitting) `llm` in `priority`; this section could only ever hold the single literal `"llm"`, so setting it said nothing that `priority` did not already say. Warned about at load time and otherwise ignored. |
 | `routing` | `RoutingConfig` | (table) | How inbound work is classified and where each class is dispatched. |
 | `routing.rules` | `Vec<RoutingRuleConfig>` | (none) | *(undocumented — see `config/undocumented.txt`)* |
 | `routing.rules.domain` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
@@ -166,5 +166,5 @@ Every key `agent.toml` accepts, derived from the config structs. Edit the doc co
 | `spill.root` | `PathBuf` | `spill` | Where artifacts are written. Relative paths resolve against the workspace root; an absolute path is taken as given, for a deployment that wants spill on a different volume from the session database. |
 | `spill.retention_days` | `u64` | `0` | Days an artifact is kept, or `0` to keep everything.  `0` is a choice rather than a disabled feature — see the module docs. |
 
-94 of 158 keys have no description yet. They are listed in `crates/agentos-core/src/config/undocumented.txt`; writing the doc comment on the field is what removes a line from it.
+85 of 158 keys have no description yet. They are listed in `crates/agentos-core/src/config/undocumented.txt`; writing the doc comment on the field is what removes a line from it.
 <!-- END GENERATED: config -->

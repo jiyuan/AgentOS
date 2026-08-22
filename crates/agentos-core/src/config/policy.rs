@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PolicyConfig {
     pub default: Arc<str>,
     pub allowlist: Vec<Arc<str>>,
@@ -98,7 +98,7 @@ pub fn default_shell_profiles() -> Vec<ShellProfileConfig> {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct GuardrailsConfig {
     /// Programs the shell tool guardrail permits in a call's `command` field.
     /// Each entry is a bare program name — arguments belong in the structured

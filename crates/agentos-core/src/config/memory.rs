@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct MemoryConfig {
     pub backend: Arc<str>,
     pub path: Option<PathBuf>,
@@ -57,7 +57,7 @@ impl Default for MemoryConfig {
 /// facts, and rebuilds the lexical index. Disabled in the conservative default;
 /// the deployment `agent.toml` opts in (mirroring `episode_recording_enabled`).
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct MemoryReflectionConfig {
     pub enabled: bool,
     /// Cron expression (minute-resolution) for the sweep.
@@ -80,7 +80,7 @@ impl Default for MemoryReflectionConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct MemorySqliteVecConfig {
     pub table: Arc<str>,
     pub vector_dimensions: usize,
@@ -106,7 +106,7 @@ impl From<&MemorySqliteVecConfig> for SqliteVecConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct MemoryQdrantConfig {
     pub url: Arc<str>,
     pub collection: Arc<str>,
@@ -144,7 +144,7 @@ impl From<&MemoryQdrantConfig> for QdrantSemanticConfig {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct MemoryRetentionConfig {
     /// Ceiling on active memory records. Unset keeps everything.
     pub max_records: Option<usize>,
@@ -167,7 +167,7 @@ impl MemoryRetentionConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct MemoryPolicyConfig {
     /// What happens when the model reads memory: `allow`, `ask_user`, or
     /// `deny`.
@@ -212,7 +212,7 @@ impl MemoryPolicyConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct MemorySharedDomainConfig {
     pub name: Arc<str>,
     pub read: bool,

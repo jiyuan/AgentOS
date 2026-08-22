@@ -14,10 +14,6 @@
 #
 # Delete a line by writing the doc comment on its field. Do not add lines to
 # make a check pass.
-agent.id
-agent.max_turns
-agent.memory
-agent.orchestrator
 channels.feishu
 channels.feishu.enabled
 channels.feishu.mode
@@ -75,11 +71,6 @@ orchestrator_templates.stages.name
 orchestrator_templates.stages.policy_id
 policy.allowlist
 policy.default
-resources.llm
-resources.mcp
-resources.priority
-resources.skills
-resources.tools
 routing.fallback
 routing.fallback.agent_id
 routing.fallback.description

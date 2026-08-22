@@ -139,6 +139,8 @@ parsing, streaming assembly, and retry behavior.
 | Workspace skills | Stable | all | `[skills]` | Loaded from workspace content, which is data the agent can modify | unit, integration |
 | Deterministic skill planners | Stable | all | `[skills]` | — | unit |
 | Lifecycle hooks | Stable | all | `[hooks]` | — | unit |
+| Strict config schema | Stable | all | — | Every section rejects an unknown key at load time, so a typo is an error rather than a silent default. Two keys are accepted-but-deprecated and warn: `agent.memory` (use `[memory].backend`) and `[resources.llm]` (use `[resources].priority`) | unit, integration |
+| Configured agent identity | Stable | all | `[agent] id` | Stamped on every trace, episode, memory record, and safety event, and part of the principal keying them. Changing it on an existing deployment orphans memory written under the old id — there is no rename path | unit, integration |
 | Persisted crons | Stable | all | gateway running | The scheduler replays a stored prompt with no further approval | integration |
 
 ## Gateway
