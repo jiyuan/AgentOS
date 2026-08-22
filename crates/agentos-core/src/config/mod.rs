@@ -3,7 +3,7 @@ use agentos_interfaces::orchestrator::{
     DispatchPriority, OrchestratorTemplate, ResourceEntry, ResourceIndex, ResourceKind,
     RoutingRule, RoutingTable, TaskDomain,
 };
-use agentos_interfaces::tool::{SandboxMode, ToolSpec};
+use agentos_interfaces::tool::ToolSpec;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -16,6 +16,7 @@ pub mod effective;
 mod gateway;
 mod jobs;
 mod limits;
+mod mcp;
 mod memory;
 mod normalize;
 mod orchestrator;
@@ -28,6 +29,7 @@ pub use compaction::CompactionConfig;
 pub use gateway::GatewayConfig;
 pub use jobs::JobsConfig;
 pub use limits::{LimitsConfig, DEFAULT_ATTACHMENTS_PER_MESSAGE, DEFAULT_ATTACHMENT_BYTES};
+pub use mcp::{McpServerConfig, McpToolConfig};
 pub use memory::{
     MemoryConfig, MemoryPolicyConfig, MemoryQdrantConfig, MemoryReflectionConfig,
     MemoryRetentionConfig, MemorySharedDomainConfig, MemorySqliteVecConfig,
@@ -227,57 +229,6 @@ pub struct IsolationConfig {
     /// variables a tool is allowed to read. Adding a credential's name here
     /// hands that credential to every command the model chooses to run.
     pub env_passthrough: Vec<String>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(default, deny_unknown_fields)]
-pub struct McpServerConfig {
-    /// The name this server is referred to by, in `[resources.mcp].enabled`
-    /// and in each `[[mcp_tools]].server_id`.
-    pub id: Arc<str>,
-    /// Where the server is: an `http(s)://` URL, or a command line for a
-    /// stdio server. An address written here is an operator's decision, so it
-    /// is not subject to the egress policy that judges model-chosen URLs.
-    pub endpoint: Arc<str>,
-    /// How long one call to this server may take. Unset uses
-    /// `[limits].tool_timeout_ms`.
-    pub timeout_ms: Option<u64>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(default, deny_unknown_fields)]
-pub struct McpToolConfig {
-    /// Which `[[mcp_servers]]` entry serves this tool, by its `id`.
-    pub server_id: Arc<str>,
-    /// The tool name the model calls. Shares one namespace with the built-in
-    /// tools, so it must not collide with one.
-    pub name: Arc<str>,
-    /// What the tool does, as the model reads it. This is the whole of what
-    /// the model knows about it when choosing.
-    pub description: Arc<str>,
-    /// A canned response, for a statically declared tool that needs no live
-    /// server — the reference `remote_echo` is one. Ignored by tools whose
-    /// server answers for itself.
-    pub response: Arc<str>,
-    /// What this MCP-backed tool may do to the filesystem (roadmap X2).
-    ///
-    /// Defaults to `full_access`, which is exactly what the old
-    /// `requires_isolation = false` meant: the call is made in-process by the
-    /// MCP client, so there is no child process for a sandbox to restrict.
-    #[serde(default)]
-    pub sandbox: SandboxMode,
-}
-
-impl Default for McpToolConfig {
-    fn default() -> Self {
-        Self {
-            server_id: Arc::from("static-mcp"),
-            name: Arc::from("remote_echo"),
-            description: Arc::from("Static MCP-backed tool"),
-            response: Arc::from("static MCP response"),
-            sandbox: SandboxMode::FullAccess,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]

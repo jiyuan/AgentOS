@@ -90,12 +90,12 @@ Extension crates (compiled in, selected by config — see §4):
 | `orchestrator/` | `MaxOrchestrator` (tool-selecting) and `MinOrchestrator` (LLM fallback), routing, streaming, slash-command handling. |
 | `approve/` | The concrete policy engine. Not a trait. |
 | `guardrails/` | Input, tool, and output content checks. |
-| `gateway/` | Bounded ingress queue, per-conversation inbox, and the shard threads that run conversations concurrently. |
+| `gateway/` | Bounded ingress queue, per-conversation inbox, the shard threads that run conversations concurrently, the durable ingress ledger, the locked control file, and the shutdown flag. |
 | `runner/` | Envelope-to-run driving, task sessions, episode recording. |
 | `runtime/` | `AgentRuntime` construction, `RuntimePaths`, tool/MCP wiring, policy build. |
 | `config/` | `agent.toml` parsing, normalization, validation, and catalog rendering. |
 | `memory/` | `MemoryManager`, scope/authorization, SQLite, sqlite-vec, Qdrant, hybrid retrieval, reflection. |
-| `tools/` | Registry, execution, deadlines, built-ins, MCP adapters, the `memory` tool. |
+| `tools/` | Registry, execution, deadlines, built-ins, the MCP client (protocol, stdio transport), the `memory` tool. |
 | `jobs/` | Background work that outlives the turn that started it. |
 | `spill/` | Oversized tool output persisted to disk behind an opaque locator. |
 | `sandbox/` | Kernel-enforced write restrictions (Landlock, Seatbelt). |
@@ -514,6 +514,32 @@ Roadmap D1–D3 and G1–G2. All of this sits around the loop, not inside it.
   Anything that is not an answer stays ordinary input. Prompts expire after
   `[approval].expiry_seconds` (default 900) and an expired prompt records
   `ApprovalStatus::Unanswered` — cancelled, not rejected.
+- **Durable ingress.** The transports AgentOS speaks are at-least-once, and no
+  acknowledgement a client can send makes a redelivery impossible — so the
+  redelivery has to be *recognised*. `gateway/ingress.rs` keys on
+  `(channel_id, transport event id)` and answers three ways: fresh (run it),
+  accepted-but-never-settled (run it again — the user asked and nobody
+  answered), and settled (suppress it). The row is written before the envelope
+  reaches a shard and settled once the turn ends, whatever the turn's outcome,
+  which is what puts the crash window inside the retry case rather than between
+  the two. A channel publishes its transport's own id under `INGRESS_ID_KEY`;
+  one that publishes none is delivered and not recorded, because the gateway
+  cannot dedupe what it cannot recognise and an invented id would either merge
+  two identical messages or call every redelivery new. A resumable cursor —
+  Telegram's `getUpdates` offset — is persisted only after the event at that
+  position is in the ledger; the reverse ordering is the one that cannot be
+  recovered from.
+- **One serving process, one sweeper.** Which process is the gateway is
+  established by `flock` on the control file, held for the life of that
+  process: locked means it is alive, unlocked means nobody is. There is no
+  `kill -0` liveness guess, because a pid is recycled and a stale record then
+  names a stranger. `SIGTERM` sets a flag — the only work safe inside a signal
+  handler — the router stops accepting, in-flight turns drain within
+  `[gateway] shutdown_grace_secs`, and past that the gateway reports the shards
+  that would not drain and every accepted-but-unsettled event rather than
+  hanging. Separately, reflection and retention run under a `memory.reflection`
+  lease so the one database gets one sweep, across every channel's shard set
+  and every process on the file.
 
 ## 10. Safety Architecture
 
@@ -689,6 +715,31 @@ Every tool's sandbox mode and deadline is generated into
 MCP-backed tools adapt remote tool specs into ordinary `Tool` implementations.
 The orchestrator does not need to know whether a tool is local or MCP-backed.
 Only MCP tools listed in `[resources.mcp].enabled` are registered.
+
+Two clients sit behind that. `StaticMcpClient` answers from a table in
+`agent.toml` and is not a protocol implementation. `StdioMcpClient` speaks the
+Model Context Protocol over stdio: JSON-RPC 2.0, pinned to revision
+`2025-06-18` and able to read `2025-03-26` and `2024-11-05`. It sends
+`initialize` before anything else, refuses a server that offers an unreadable
+revision or no `tools` capability, walks `tools/list` to the end of its
+`nextCursor` chain, and maps MCP content blocks into a `ToolResult` —
+`isError` becoming a failed *tool* rather than a failed call, because the model
+reads it and replans.
+
+A reply is matched to its request by JSON-RPC id. That is the load-bearing
+detail: before M8 the reply was whatever line came back next, so one stray line
+shifted every later answer onto the wrong question, permanently and silently.
+Correlation is also what makes concurrent calls, out-of-order replies, and a
+timeout that cancels one request rather than killing the server possible at
+all.
+
+Every bound is named in `tools/mcp/connection.rs`: frame bytes, in-flight
+requests, stderr retained, pages walked, tools per server, restarts per window.
+The server process itself runs under `[[mcp_servers]] sandbox` — the child that
+touches the filesystem is the one restricted, rather than a shell-only worker
+in front of it that could not run MCP calls at all. Interoperability is tested
+against `tests/fixtures/mcp_server.py`, which imports nothing from this
+repository.
 
 Workspace skills are loaded from the configured `skills_dir` and filtered by
 `[resources.skills].enabled`. Built-in deterministic planners can short-circuit
@@ -956,9 +1007,30 @@ Supporting tables:
   and never updated. The principal is stored twice — as `Principal::storage_name`
   for exact lookup and as its components, so "everything this channel was
   allowed to do" is a query a human can write.
+- `session_items` and `session_epochs` for the append-only session log and the
+  `/clear` projection over it (ADR-0006).
+- `ingress_events` and `ingress_cursors` for the gateway's durable record of
+  what it has accepted from a transport and how far it got (§9).
+- `maintenance_leases` for the single-sweeper election. One row, taken with a
+  single `INSERT … ON CONFLICT DO UPDATE … WHERE`, so SQLite's own write
+  serialization picks the winner across threads *and* across processes.
 - Optional FTS/vector tables for retrieval acceleration.
 
 Existing databases open through idempotent migrations.
+
+### Connections
+
+The database is opened in WAL mode with a five-second busy timeout, behind a
+fixed-size connection pool (`[memory] max_connections`, default 4). WAL is what
+makes concurrent access work at all: a reader never blocks a writer, and — the
+half no in-process lock can fix — the gateway and the TUI are two processes on
+one file. Connections are created up front rather than on demand, because a
+pool that grows under load is an unbounded queue with a different name.
+
+These are still synchronous calls made from async code. A pooled connection is
+never held across an `.await`, but a slow statement occupies the calling
+thread; moving the store behind `spawn_blocking` is a separate change with its
+own `!Send` consequences for the run loop.
 
 ## 16. Observability
 
@@ -1006,7 +1078,8 @@ Completed baselines:
   egress (Ollama uses the single-chunk fallback);
 - Telegram and Feishu reference channels;
 - configured sub-agents and sub-orchestrator templates;
-- static and stdio MCP registration;
+- static MCP declarations and a stdio MCP client speaking the pinned protocol
+  revision, with the server process sandboxed;
 - config authority with generated catalogs, effective-config diagnostics, and
   debug-build invariant assertions;
 - runtime path injection and an enforced extension boundary.
@@ -1015,7 +1088,12 @@ Remaining architecture work:
 
 - **X7, folded collaboration state** — the one open item in
   [`TRANSFER_ROADMAP.md`](TRANSFER_ROADMAP.md).
-- Harden stdio MCP toward the selected production protocol.
+- An MCP transport other than stdio (HTTP with SSE), and the client-side
+  capabilities — `roots`, `sampling`, `elicitation` — this build declines in
+  `initialize` and therefore refuses when a server asks.
+- Retention and quotas across sessions, traces, attachments, gateway logs, and
+  jobs, plus an authorized purge for the two append-only audit stores
+  (`QUOTA-001`).
 - Decide when channel and memory reference implementations should move into
   separate extension crates.
 - Make real embeddings the persistent default by injecting an embedder into the

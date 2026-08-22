@@ -2,7 +2,7 @@ mod builtin;
 pub mod child_env;
 pub mod exec;
 pub mod isolation;
-mod mcp;
+pub mod mcp;
 mod memory;
 mod registry;
 

@@ -43,6 +43,7 @@ const SOURCES: &[&str] = &[
     include_str!("gateway.rs"),
     include_str!("jobs.rs"),
     include_str!("limits.rs"),
+    include_str!("mcp.rs"),
     include_str!("memory.rs"),
     include_str!("orchestrator.rs"),
     include_str!("policy.rs"),

@@ -887,7 +887,12 @@ Primary files: `crates/agentos-core/src/config/`, `crates/agentos-core/src/runti
 
 Priority: P2 while both remain Preview; P1 if either is promoted to Stable
 Size: L
-Status: **not started**
+Status: **done** — all nine deliverables. `GW-001` closed deliverables 1–5 and
+`MCP-001` closed 6–9. Two things that were in the "current state" below are
+deliberately *not* closed here and are recorded elsewhere rather than left
+implied: storage convergence across sessions, traces, attachments, gateway
+logs, and jobs is `QUOTA-001` (M7 deliverable 10), and an MCP transport other
+than stdio is a deferral in §13.
 Dependencies: M3, M4
 
 This milestone absorbs the old "isolate the actual MCP server process" item: that
@@ -1043,8 +1048,8 @@ a slice moves off `not started` only when the named artifact exists in the tree.
 | `MEM-001` | M7 | Effective memory policy, domains, shared writes, retention | ID-001, CFG-001, CFG-000 | **done** — `[memory.policy]` is the authority (allowlist conflict rejected at load), three-gate shared writes, `default_domain` reaches writes and hydration, count/age/byte retention |
 | `QUOTA-001` | M7 | Retention and quotas for sessions, traces, attachments, gateway logs, and jobs; an authorized purge for the two append-only audit stores | MEM-001, AUD-001 | not started |
 | `SPILL-001` | M7 | Opaque spill locator and scoped retrieval | FS-001 | **done** — `spill:<run>/<artifact>`, `spill_read` tool authorized by the transcript, contained by `RootDir` |
-| `GW-001` | M8 | Durable ingress, WAL, maintenance leadership, atomic state files, shutdown | ID-002 | not started |
-| `MCP-001` | M8 | Standard lifecycle, request-id correlation, bounds, interoperability, server isolation | SBX-001 | not started |
+| `GW-001` | M8 | Durable ingress, WAL, maintenance leadership, atomic state files, shutdown | ID-002 | **done** — WAL + busy timeout behind a bounded pool, `memory.reflection` lease, `ingress_events`/`ingress_cursors` ledger, `paths::write_private_atomic` for every replaced state file, `flock`ed control file and a `SIGTERM` drain bounded by `[gateway] shutdown_grace_secs` |
+| `MCP-001` | M8 | Standard lifecycle, request-id correlation, bounds, interoperability, server isolation | SBX-001 | **done** — JSON-RPC 2.0 pinned to MCP `2025-06-18`, `initialize` + capability negotiation, `nextCursor` pagination, content blocks, id correlation, `notifications/cancelled`, named bounds on frames/pending/stderr/pages/tools/restarts, the server child sandboxed by `[[mcp_servers]] sandbox`, and an interop suite against a fixture that imports nothing from this repository |
 | `CI-002` | M9 | Required platform, artifact, gateway, migration, and semver gates | prior slices | not started |
 
 Each implementation PR should include the failing test, implementation, focused
@@ -1111,8 +1116,8 @@ them.
 | Inert/conflicting config and memory policy | P1 | M7 | Config/memory | Closed by `CFG-001` and `MEM-001` |
 | Retention and default domain not wired | P1 | M7 | Memory | Closed by `MEM-001` for memory; sessions, traces, attachments, gateway logs, and jobs are still unbounded (`QUOTA-001`) |
 | Spill locator is an absolute host path | P1 | M7 | Prompt/tools | Closed by `SPILL-001` |
-| SQLite contention, no WAL, no ingress idempotency, non-atomic state files | P1 | M8 | Gateway/persistence | Open; Preview until closed |
-| stdio MCP is not MCP; unbounded queues and frames; no tests | P1/P2 | M8 | Tool integrations | Open; Preview until closed |
+| SQLite contention, no WAL, no ingress idempotency, non-atomic state files | P1 | M8 | Gateway/persistence | Closed by `GW-001` |
+| stdio MCP is not MCP; unbounded queues and frames; no tests | P1/P2 | M8 | Tool integrations | Closed by `MCP-001`. The transport stays Preview: only stdio exists, and this client declares no `roots`/`sampling`/`elicitation` capability |
 | macOS, package, gateway, semver, supply-chain CI gaps | P0 release gate | M2, M9 | Release engineering | Open |
 
 ## 13. Explicit deferrals
@@ -1126,7 +1131,8 @@ Not release-rescue dependencies:
 - Feishu card approvals without a recorded live-tenant fixture.
 - Real-vector retrieval as the default until persistence, backfill, restart, and
   paraphrase-quality tests pass.
-- Production stdio MCP claims until M8 is complete.
+- An MCP transport other than stdio, and the client-side capabilities
+  (`roots`, `sampling`, `elicitation`) this build declines in `initialize`.
 - SBOM, provenance, artifact signing, and staged cohort rollout until the project
   ships to third parties.
 - New channel integrations before principal, containment, and durable-ingress

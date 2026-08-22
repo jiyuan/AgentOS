@@ -300,7 +300,9 @@ impl AgentRuntime {
                 .with_subprocess_isolation(path)
                 .with_env_passthrough(workspace_config.isolation.env_passthrough.iter().cloned());
         }
-        let mcp_specs = register_configured_mcp(&mut tools, &workspace_config).await?;
+        let mcp_specs =
+            register_configured_mcp(&mut tools, &workspace_config, &resolved_workspace_root)
+                .await?;
         refuse_unenforceable_isolation(&tools).await?;
         let model_controller = LlmModelController::new();
         // Pin `AGENTOS_HOME` to the absolute resolved workspace root so every
@@ -767,6 +769,7 @@ mod tests {
                 id: Arc::from("static-mcp"),
                 endpoint: Arc::from("static://local"),
                 timeout_ms: None,
+                sandbox: SandboxMode::FullAccess,
             }],
             mcp_tools: vec![
                 McpToolConfig {
@@ -794,7 +797,7 @@ mod tests {
         };
         let mut tools = ToolRegistry::new();
 
-        let specs = register_configured_mcp(&mut tools, &config)
+        let specs = register_configured_mcp(&mut tools, &config, std::path::Path::new("."))
             .await
             .expect("MCP registers");
 

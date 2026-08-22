@@ -16,6 +16,7 @@ use std::time::Duration;
 pub async fn register_configured_mcp(
     tools: &mut ToolRegistry,
     config: &WorkspaceConfig,
+    workspace_root: &std::path::Path,
 ) -> Result<Vec<ToolSpec>, String> {
     if config.mcp_servers.is_empty() || config.resources.mcp.enabled.is_empty() {
         return Ok(Vec::new());
@@ -55,7 +56,11 @@ pub async fn register_configured_mcp(
                     .unwrap_or_else(|| config.limits.tool_timeout());
                 Arc::new(
                     StdioMcpClient::with_timeout(timeout)
-                        .with_env_passthrough(config.isolation.env_passthrough.iter().cloned()),
+                        .with_env_passthrough(config.isolation.env_passthrough.iter().cloned())
+                        // The server *process* is what gets restricted
+                        // (M8 / `MCP-001`, deliverable 7). One client per
+                        // server, because the mode is per server.
+                        .with_sandbox(server.sandbox, workspace_root.to_path_buf()),
                 )
             } else if config
                 .mcp_tools

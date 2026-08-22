@@ -74,7 +74,8 @@ something that no longer exists — the two-way ratchet
 | `tool:spill_read` | Stable | all | `[resources.tools]`, `[spill]` | Reads back a tool result that outgrew the inline cap. A `spill:` locator is not a path; it resolves only inside the configured store, through an `openat(O_NOFOLLOW)` walk, and only when the calling run's own transcript cites it. Registered only when a spill store is configured | unit, integration |
 | Background jobs outliving their turn | Stable | all | `[jobs]` | Fenced to the conversation that started them | integration |
 | Static (in-process) MCP tools | Stable | all | `[[mcp_servers]]` | — | unit |
-| stdio MCP transport | **Preview** | all | `[[mcp_servers]]` | Not MCP: no `initialize`, no `protocolVersion`, no capability negotiation, no request-id correlation — one stray line desynchronizes every later call. Unbounded channel and `read_line`. **No test module and no integration test anywhere** (M8) | none |
+| stdio MCP transport | **Preview** | all | `[[mcp_servers]]` | Speaks MCP `2025-06-18` (accepts `2025-03-26` and `2024-11-05`): `initialize`, capability negotiation, paginated `tools/list`, content blocks, request-id correlation, `notifications/cancelled`, structured errors, graceful shutdown, bounded restart. Preview because only the stdio transport exists — no HTTP/SSE — and this client claims no `roots`, `sampling`, or `elicitation` capability, so a server needing one is refused rather than served | unit, integration (against an independent fixture) |
+| MCP server isolation | Stable | Linux, macOS | `[[mcp_servers]] sandbox` | The mode restricts the *server child*, which is the process that touches the filesystem. Defaults to `full_access`, an honest statement of what happened before M8 rather than a new grant; a `read_only` server on a host with no sandbox backend refuses to start | unit, integration |
 
 ## Isolation
 
@@ -93,7 +94,8 @@ something that no longer exists — the two-way ratchet
 | Capability | Status | Platforms | Required config | Limitations | Test level |
 |---|---|---|---|---|---|
 | Three-layer scoped memory (session, working, long-term) | Stable | all | `[memory]` | Namespaces are keyed by `Principal` and encoded injectively ([ADR-0003](adr/0003-TYPED_PRINCIPAL.md)). Memory written before this is under the old keys and needs the `ID-002` migration | unit, integration |
-| SQLite reference backend | Stable | all | `[memory] backend = "sqlite"` | One `Mutex<Connection>` shared across all shard threads — a global lock, not a pool. No WAL, no busy timeout (M8) | unit, integration |
+| SQLite reference backend | Stable | all | `[memory] backend = "sqlite"`, `[memory] max_connections` | WAL with a 5s busy timeout, behind a fixed-size connection pool. Still synchronous calls from async code: a pooled connection is never held across an `.await`, but a slow statement occupies the calling thread | unit, integration |
+| Single maintenance leader | Stable | all | — | Reflection and retention run under a `memory.reflection` lease in the database, so one sweep runs across every channel's shard set and every process on the file. The lease expires rather than locks, so a leader that wedges without dying can be overlapped after 5 minutes | unit, integration |
 | In-memory backend | Stable | all | `[memory] backend = "in_memory"` | Not durable; for tests and ephemeral runs | unit |
 | Passive retrieval into planning context | Stable | all | `[memory]` | — | integration |
 | Reflection | Stable | all | `[memory.reflection]`, `[memory.retention]` | Promotion runs per conversation; retention and the index rebuild run once per sweep, after it | integration |
@@ -124,8 +126,8 @@ parsing, streaming assembly, and retry behavior.
 |---|---|---|---|---|---|
 | TUI | Stable | all | — | — | integration |
 | One-shot CLI | Stable | all | — | — | integration |
-| Telegram | **Preview** | all | `[[channels]]`, bot token, an allowlist | Fails closed on identity, with a sender allowlist. The update offset still lives only in process memory and advances *before* the run, so a crash both replays and loses (M8) | unit |
-| Feishu | **Preview** | all | `[[channels]]`, app credentials, an allowlist | Fails closed on identity; fragment reassembly is bounded by count, pending events, and bytes. Still reads `event_id` and never dedupes on it (M8) | unit |
+| Telegram | **Preview** | all | `[[channels]]`, bot token, an allowlist | Fails closed on identity, with a sender allowlist. The `getUpdates` offset is persisted in the ingress ledger after the update is recorded, and every update carries its `update_id` as the dedupe key. Preview because the transport still shells out to `curl` | unit |
+| Feishu | **Preview** | all | `[[channels]]`, app credentials, an allowlist | Fails closed on identity; fragment reassembly is bounded by count, pending events, and bytes. `event_id` is now the ingress dedupe key, with `message_id` standing in when a payload carries no header id. Preview because the long-connection reconnect path has no end-to-end test | unit |
 | Attachments | Stable | all | `[limits] attachment_bytes`, `attachments_per_message` | Downloads are streamed and stop at the byte cap; per-message count is bounded and the surplus is reported, not silently dropped. Path components are injectively encoded, so two conversations cannot share a directory | unit |
 
 ## Orchestration and workspace
@@ -150,8 +152,9 @@ parsing, streaming assembly, and retry behavior.
 | Bounded ingress queue and per-conversation inbox | Stable | all | — | — | integration |
 | Shard threads | Stable | all | — | — | integration |
 | `start` / `status` / `config` / `catalog` / `calibrate` | Stable | all | — | — | integration |
-| `stop` | **Preview** | all | — | Shells out to `kill(1)` on a pid read from a plain `fs::write` pidfile, with no verification that the pid is still the gateway (M8) | none |
-| Durable ingress ledger | **Deferred** | — | — | Not implemented: a crash between accept and enqueue loses the message (M8) | none |
+| `stop` | Stable | Unix | — | Signals the holder of an `flock`ed control file, never a pid read out of a file: a stale record names nobody and is not signalled. Escalates to `SIGKILL` after 45s | unit, integration |
+| Graceful shutdown | Stable | Unix | `[gateway] shutdown_grace_secs` | `SIGTERM` stops the router accepting and drains in-flight turns within the grace period, then reports the shards that would not drain and every accepted-but-unsettled event | unit, integration |
+| Durable ingress ledger | Stable | all | — | `(channel_id, transport event id)` decides fresh / retry / suppress. A channel that publishes no `INGRESS_ID_KEY` is delivered and not recorded — the gateway cannot dedupe what it cannot recognise | unit, integration |
 
 ## Release and packaging
 
