@@ -741,7 +741,7 @@ Primary files: `crates/agentos-core/src/loop/`, `crates/agentos-core/src/runner.
 
 Priority: P1
 Size: M — mechanical, but `deny_unknown_fields` will break existing `agent.toml`s
-Status: **deliverables 1–9 done**; 10 (cross-subsystem retention and quotas) open
+Status: **deliverables 1–9 done** (`CFG-001`, `MEM-001`, `SPILL-001` all closed); 10 open as `QUOTA-001`
 Dependencies: M0; memory authorization depends on M3
 
 Current state, verified field by field:
@@ -837,12 +837,22 @@ Deliverables:
    authorized by the calling run's own transcript citing the locator. The
    `file` tool is no longer the retrieval path, which also fixes a spill root
    outside the workspace being unreadable.
-10. Add retention and quotas for sessions, traces, attachments, spill, gateway
-    logs, jobs, and access records.
+10. **Open, and it is a slice of its own** — `QUOTA-001` below. Two of the
+    seven have retention: spill (`[spill].retention_days`, swept from the
+    gateway's idle tick) and memory (M7 / `MEM-001`). The other five —
+    sessions, traces, attachments, gateway logs, jobs — grow without bound,
+    and the two append-only audit stores (`memory_access_log`,
+    `safety_events`) grow monotonically *by design*, so
+    [ADR-0005](adr/0005-SAFETY_EVENTS.md) asks for an explicitly authorized
+    purge rather than a background sweep. That is a different mechanism from
+    the other five, which is the main reason this is not one afternoon's work
+    bolted onto the end of `CFG-001`.
 
 Acceptance criteria:
 
 - A typo such as `max_reocrds` is a load-time error. **Met.**
+- Retention and quotas cover every growing store. **Not met** — see
+  deliverable 10 and `QUOTA-001`.
 - Every stable config key has a behavioral assertion, not only a parse test.
   **Partly met.** Every key now has a *description*, and the keys the audit
   named as inert have behavioural tests (`tests/config_authority.rs`,
@@ -1031,6 +1041,7 @@ a slice moves off `not started` only when the named artifact exists in the tree.
 | `STATE-001` | M6 | Clear epochs, denial semantics, terminal output gate, `act()` policy re-assertion | AUD-001 | **done** — `session_epochs` + `agentos-gateway purge`, `RunError::StructuralDenial`, `loop/output.rs` gating every synthesized terminal reply, private `Authorization` on `ActCtx` + `tests/loop_transitions.rs`, `[channels] provisional_streaming = false` |
 | `CFG-001` | M7 | Unknown-key rejection and effective-config inventory | ADR-001 | **done** — `deny_unknown_fields` on all 32 structs, `agent.id` wired, two keys deprecated, `config/maturity.txt` inventory, catalog-derived `agentos-gateway config`, zero undocumented keys |
 | `MEM-001` | M7 | Effective memory policy, domains, shared writes, retention | ID-001, CFG-001, CFG-000 | **done** — `[memory.policy]` is the authority (allowlist conflict rejected at load), three-gate shared writes, `default_domain` reaches writes and hydration, count/age/byte retention |
+| `QUOTA-001` | M7 | Retention and quotas for sessions, traces, attachments, gateway logs, and jobs; an authorized purge for the two append-only audit stores | MEM-001, AUD-001 | not started |
 | `SPILL-001` | M7 | Opaque spill locator and scoped retrieval | FS-001 | **done** — `spill:<run>/<artifact>`, `spill_read` tool authorized by the transcript, contained by `RootDir` |
 | `GW-001` | M8 | Durable ingress, WAL, maintenance leadership, atomic state files, shutdown | ID-002 | not started |
 | `MCP-001` | M8 | Standard lifecycle, request-id correlation, bounds, interoperability, server isolation | SBX-001 | not started |
@@ -1097,9 +1108,9 @@ them.
 | Routing/compaction record no manifest; compaction usage dropped | P1 | M5 | Prompt/orchestration | Open — see §4.1 for corrected framing |
 | Safety events not durably reconstructible | P1 | M6 | Run loop/observability | Closed by `AUD-001` |
 | Append-only, transition, denial, cancellation, streaming contract gaps | P1 | M6 | Run loop/session | Closed by `STATE-001` |
-| Inert/conflicting config and memory policy | P1 | M7 | Config/memory | Open |
-| Retention and default domain not wired | P1 | M7 | Memory | Open |
-| Spill locator is an absolute host path | P1 | M7 | Prompt/tools | Open |
+| Inert/conflicting config and memory policy | P1 | M7 | Config/memory | Closed by `CFG-001` and `MEM-001` |
+| Retention and default domain not wired | P1 | M7 | Memory | Closed by `MEM-001` for memory; sessions, traces, attachments, gateway logs, and jobs are still unbounded (`QUOTA-001`) |
+| Spill locator is an absolute host path | P1 | M7 | Prompt/tools | Closed by `SPILL-001` |
 | SQLite contention, no WAL, no ingress idempotency, non-atomic state files | P1 | M8 | Gateway/persistence | Open; Preview until closed |
 | stdio MCP is not MCP; unbounded queues and frames; no tests | P1/P2 | M8 | Tool integrations | Open; Preview until closed |
 | macOS, package, gateway, semver, supply-chain CI gaps | P0 release gate | M2, M9 | Release engineering | Open |
