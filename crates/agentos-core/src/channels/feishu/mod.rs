@@ -10,10 +10,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 use tracing::debug;
 
 mod egress;
 mod event;
+mod fragments;
 mod long_connection;
 mod proto;
 mod websocket;
@@ -136,7 +138,14 @@ impl FeishuChannel {
     }
 
     pub fn with_attachments_root(mut self, root: impl Into<PathBuf>) -> Self {
-        self.attachments = AttachmentStore::new(root, "feishu");
+        self.attachments = self.attachments.with_root(root);
+        self
+    }
+
+    /// Apply a deployment's `[limits]` to inbound attachments
+    /// (M4 / `ING-001`).
+    pub fn with_attachment_limits(mut self, max_bytes: u64, max_per_message: usize) -> Self {
+        self.attachments = self.attachments.with_limits(max_bytes, max_per_message);
         self
     }
 
@@ -166,17 +175,37 @@ impl FeishuChannel {
             "{}?type={kind}",
             self.api_url(&format!("im/v1/messages/{message_id}/resources/{key}"))
         );
-        let bytes = shared_client()
+        let mut response = shared_client()
             .get(url)
             .bearer_auth(token.as_ref())
             .send()
             .await
             .and_then(reqwest::Response::error_for_status)
-            .map_err(reqwest_to_channel_err)?
-            .bytes()
-            .await
             .map_err(reqwest_to_channel_err)?;
-        fs::write(target, &bytes)
+
+        // Streamed to a cap rather than `.bytes()` (M4 / `ING-001`): the whole
+        // resource used to be read into memory first, with no ceiling and no
+        // check on the size the sender declared, so one large upload was an
+        // out-of-memory kill for the gateway and every conversation on it.
+        let max_bytes = self.attachments.max_bytes();
+        let mut written: u64 = 0;
+        let mut file = fs::File::create(target)
+            .await
+            .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
+        while let Some(chunk) = response.chunk().await.map_err(reqwest_to_channel_err)? {
+            written += chunk.len() as u64;
+            if written > max_bytes {
+                drop(file);
+                let _ = fs::remove_file(target).await;
+                return Err(ChannelError::Backend(Arc::from(format!(
+                    "Feishu attachment exceeds the {max_bytes}-byte limit"
+                ))));
+            }
+            file.write_all(&chunk)
+                .await
+                .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
+        }
+        file.flush()
             .await
             .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
         Ok(())
@@ -188,8 +217,17 @@ impl FeishuChannel {
         conversation: &str,
         message_id: &str,
     ) -> Result<Vec<Attachment>, ChannelError> {
-        let mut out = Vec::with_capacity(descriptors.len());
-        for desc in descriptors {
+        // Bounded before the loop: `descriptors.len()` is a count the sender
+        // chose, and each entry is a download and a write.
+        let accepted = descriptors.len().min(self.attachments.max_per_message());
+        if descriptors.len() > accepted {
+            eprintln!(
+                "feishu message carries {} attachments; taking the first {accepted}",
+                descriptors.len()
+            );
+        }
+        let mut out = Vec::with_capacity(accepted);
+        for desc in descriptors.iter().take(accepted) {
             let target = self
                 .attachments
                 .target_path(conversation, message_id, &desc.name)?;

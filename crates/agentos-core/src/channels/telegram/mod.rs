@@ -163,7 +163,14 @@ impl TelegramChannel {
     }
 
     pub fn with_attachments_root(mut self, root: impl Into<PathBuf>) -> Self {
-        self.attachments = AttachmentStore::new(root, "telegram");
+        self.attachments = self.attachments.with_root(root);
+        self
+    }
+
+    /// Apply a deployment's `[limits]` to inbound attachments
+    /// (M4 / `ING-001`).
+    pub fn with_attachment_limits(mut self, max_bytes: u64, max_per_message: usize) -> Self {
+        self.attachments = self.attachments.with_limits(max_bytes, max_per_message);
         self
     }
 
@@ -247,18 +254,38 @@ impl TelegramChannel {
     fn download_to(&self, file_id: &str, target: &Path) -> Result<(), ChannelError> {
         let file_path = self.get_file_path(file_id)?;
         let url = self.file_url(&file_path);
+        // `--max-filesize` aborts on the declared length, which a sender
+        // controls, so the write is checked afterwards as well: between them,
+        // a header that lies in either direction still costs at most
+        // `max_bytes` on disk (M4 / `ING-001`).
+        let max_bytes = self.attachments.max_bytes();
         let output = Command::new("curl")
-            .args(["--silent", "--show-error", "--fail", "--max-time", "60"])
+            .args([
+                "--silent",
+                "--show-error",
+                "--fail",
+                "--max-time",
+                "60",
+                "--max-filesize",
+                &max_bytes.to_string(),
+            ])
             .arg("-o")
             .arg(target)
             .arg(url)
             .output()
             .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
         if !output.status.success() {
+            let _ = std::fs::remove_file(target);
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(ChannelError::Backend(Arc::from(format!(
                 "Telegram file download failed: {}",
                 stderr.trim()
+            ))));
+        }
+        if file_size(target).is_some_and(|size| size > max_bytes) {
+            let _ = std::fs::remove_file(target);
+            return Err(ChannelError::Backend(Arc::from(format!(
+                "Telegram attachment exceeds the {max_bytes}-byte limit"
             ))));
         }
         Ok(())
@@ -270,8 +297,17 @@ impl TelegramChannel {
         conversation: &str,
         message_id: &str,
     ) -> Result<Vec<Attachment>, ChannelError> {
-        let mut out = Vec::with_capacity(descriptors.len());
-        for desc in descriptors {
+        // Bounded before the loop: `descriptors.len()` is a count the sender
+        // chose, and each entry is a download and a write.
+        let accepted = descriptors.len().min(self.attachments.max_per_message());
+        if descriptors.len() > accepted {
+            eprintln!(
+                "telegram message carries {} attachments; taking the first {accepted}",
+                descriptors.len()
+            );
+        }
+        let mut out = Vec::with_capacity(accepted);
+        for desc in descriptors.iter().take(accepted) {
             let path = self
                 .attachments
                 .target_path(conversation, message_id, &desc.name)?;

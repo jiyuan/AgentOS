@@ -152,6 +152,8 @@ Every key `agent.toml` accepts, derived from the config structs. Edit the doc co
 | `limits.file_read_max_bytes` | `usize` | `262144` | Bytes the `file` tool will read however large a call asks for. The ceiling, where `file_read_bytes` is the default. |
 | `limits.tool_output_bytes` | `usize` | `4194304` | Bytes captured from each of a child process's stdout and stderr before the rest is read and discarded.  Bounds memory against a runaway process; it is not what shapes what the model sees, which is `tool_result_inline_bytes` and the spill store. |
 | `limits.http_response_bytes` | `usize` | `1048576` | Bytes of an HTTP response body the `http` tool keeps before it stops reading and closes the connection (M4 / `NET-001`).  A bound on what the far end can make this process allocate. `.text()` on an unbounded response was an out-of-memory kill for the gateway and every conversation on it, and `Content-Length` is a claim the sender makes rather than one it is held to. |
+| `limits.attachment_bytes` | `u64` | `33554432` | Bytes of one inbound channel attachment that are written to disk before the download is abandoned (M4 / `ING-001`).  A bound on what a sender can make the runtime store. The size a channel reports for a file is the sender's claim, not a limit the sender is held to, so this is enforced on the bytes as they arrive. |
+| `limits.attachments_per_message` | `usize` | `16` | Attachments accepted from one inbound message (M4 / `ING-001`).  Bounds a message that names a hundred files, each of which is a download, a write, and a turn's worth of context. |
 | `compaction` | `CompactionConfig` | (table) | When a conversation summarizes its own history, and with which model. |
 | `compaction.enabled` | `bool` | `true` | Whether a run may summarize its own history. Disabling it does not disable C2's elision — pruning is free and always applies. |
 | `compaction.pressure_percent` | `usize` | `84` | Percent of the context window above which the next turn compacts first. Derived from C1's measured estimator error — see this module's header before changing it, and re-derive it if the estimator changes. |
@@ -170,5 +172,5 @@ Every key `agent.toml` accepts, derived from the config structs. Edit the doc co
 | `spill.root` | `PathBuf` | `spill` | Where artifacts are written. Relative paths resolve against the workspace root; an absolute path is taken as given, for a deployment that wants spill on a different volume from the session database. |
 | `spill.retention_days` | `u64` | `0` | Days an artifact is kept, or `0` to keep everything.  `0` is a choice rather than a disabled feature — see the module docs. |
 
-102 of 162 keys have no description yet. They are listed in `crates/agentos-core/src/config/undocumented.txt`; writing the doc comment on the field is what removes a line from it.
+102 of 164 keys have no description yet. They are listed in `crates/agentos-core/src/config/undocumented.txt`; writing the doc comment on the field is what removes a line from it.
 <!-- END GENERATED: config -->

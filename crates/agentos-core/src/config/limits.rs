@@ -45,6 +45,20 @@ const MIN_TOOL_OUTPUT_BYTES: usize = 1_024;
 /// comes back truncated and the tool stops being one.
 const MIN_HTTP_RESPONSE_BYTES: usize = 1_024;
 
+/// Bytes of one inbound attachment kept by default.
+///
+/// Comfortably above a photo or a slide deck, comfortably below what would
+/// fill a small disk if someone sent a few dozen.
+pub const DEFAULT_ATTACHMENT_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Attachments accepted from one message by default. Well past what a person
+/// sends in one go.
+pub const DEFAULT_ATTACHMENTS_PER_MESSAGE: usize = 16;
+
+/// Smallest attachment ceiling worth having. Below this nothing a channel
+/// carries would arrive intact.
+const MIN_ATTACHMENT_BYTES: u64 = 4 * 1024;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LimitsConfig {
@@ -83,6 +97,18 @@ pub struct LimitsConfig {
     /// every conversation on it, and `Content-Length` is a claim the sender
     /// makes rather than one it is held to.
     pub http_response_bytes: usize,
+    /// Bytes of one inbound channel attachment that are written to disk before
+    /// the download is abandoned (M4 / `ING-001`).
+    ///
+    /// A bound on what a sender can make the runtime store. The size a channel
+    /// reports for a file is the sender's claim, not a limit the sender is
+    /// held to, so this is enforced on the bytes as they arrive.
+    pub attachment_bytes: u64,
+    /// Attachments accepted from one inbound message (M4 / `ING-001`).
+    ///
+    /// Bounds a message that names a hundred files, each of which is a
+    /// download, a write, and a turn's worth of context.
+    pub attachments_per_message: usize,
 }
 
 impl Default for LimitsConfig {
@@ -96,6 +122,8 @@ impl Default for LimitsConfig {
             file_read_max_bytes: MAX_FILE_READ_BYTES,
             tool_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             http_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+            attachment_bytes: DEFAULT_ATTACHMENT_BYTES,
+            attachments_per_message: DEFAULT_ATTACHMENTS_PER_MESSAGE,
         }
     }
 }
@@ -160,6 +188,19 @@ pub fn validate_limits(config: &LimitsConfig) -> Result<(), String> {
             "limits.http_response_bytes must be at least {MIN_HTTP_RESPONSE_BYTES}, got {}",
             config.http_response_bytes
         ));
+    }
+    if config.attachment_bytes < MIN_ATTACHMENT_BYTES {
+        return Err(format!(
+            "limits.attachment_bytes must be at least {MIN_ATTACHMENT_BYTES}, got {}",
+            config.attachment_bytes
+        ));
+    }
+    if config.attachments_per_message == 0 {
+        return Err(
+            "limits.attachments_per_message must be at least 1; set it to 1 to accept \
+             only the first attachment of a message"
+                .to_owned(),
+        );
     }
     if config.tool_output_bytes < MIN_TOOL_OUTPUT_BYTES {
         return Err(format!(

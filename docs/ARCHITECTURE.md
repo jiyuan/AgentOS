@@ -486,6 +486,19 @@ AgentOS uses four independent safety rings:
    are deliberately not policed: an address written into `agent.toml` is the
    decision.
 
+8. **Bounded ingress.** Nothing that arrived over the wire is allowed to
+   choose how much memory this process spends. Feishu's fragment reassembly
+   (`channels/feishu/fragments.rs`) took `sum` straight from a frame header
+   into `vec![None; sum]`, which a peer could turn into an allocation failure
+   before the event was parsed, let alone admitted; it now has ceilings on
+   fragments per event, on partially-received events held at once, and on the
+   reassembled total. Attachment downloads stream to
+   `[limits].attachment_bytes` and abandon what exceeds it, because the size a
+   channel reports is the sender's claim rather than a limit the sender is
+   held to, and `[limits].attachments_per_message` bounds how many downloads
+   one message can cause. Provider response bodies are read to a ceiling
+   rather than buffered whole.
+
 ### Checked invariants
 
 Three relationships the rings depend on are asserted in debug builds

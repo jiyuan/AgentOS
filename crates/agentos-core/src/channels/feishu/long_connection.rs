@@ -1,11 +1,11 @@
 use super::event::{feishu_drop_reason, parse_event, ParsedFeishuEvent};
+use super::fragments::FragmentBuffer;
 use super::proto::{header_value, pong_frame, success_frame, FeishuFrame};
 use super::websocket::WebSocketConnection;
 use crate::channels::admission::AdmissionPolicy;
 use agentos_interfaces::ChannelError;
 use agentos_proto::ChannelId;
 use serde_json::Value;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -16,14 +16,14 @@ pub(super) struct FeishuEndpoint {
 
 pub(super) struct FeishuLongConnection {
     socket: WebSocketConnection,
-    fragments: HashMap<String, Vec<Option<Vec<u8>>>>,
+    fragments: FragmentBuffer,
 }
 
 impl FeishuLongConnection {
     pub(super) async fn connect(endpoint: &FeishuEndpoint) -> Result<Self, ChannelError> {
         Ok(Self {
             socket: WebSocketConnection::connect(&endpoint.url).await?,
-            fragments: HashMap::new(),
+            fragments: FragmentBuffer::default(),
         })
     }
 
@@ -91,52 +91,11 @@ impl FeishuLongConnection {
         if frame.payload.is_empty() {
             return Ok(None);
         }
-        let sum = header_value(&frame.headers, "sum")
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(1);
-        if sum <= 1 {
-            return Ok(Some(frame.payload.clone()));
-        }
-        let seq = header_value(&frame.headers, "seq")
-            .and_then(|value| value.parse::<usize>().ok())
-            .ok_or_else(|| {
-                ChannelError::Backend(Arc::from("Feishu fragmented event is missing seq header"))
-            })?;
-        let message_id = header_value(&frame.headers, "message_id")
-            .ok_or_else(|| {
-                ChannelError::Backend(Arc::from(
-                    "Feishu fragmented event is missing message_id header",
-                ))
-            })?
-            .to_owned();
-        if seq >= sum {
-            return Err(ChannelError::Backend(Arc::from(format!(
-                "Feishu fragmented event has invalid seq={seq}, sum={sum}",
-            ))));
-        }
-        let entry = self
-            .fragments
-            .entry(message_id.clone())
-            .or_insert_with(|| vec![None; sum]);
-        if entry.len() != sum {
-            *entry = vec![None; sum];
-        }
-        entry[seq] = Some(frame.payload.clone());
-        if entry.iter().any(Option::is_none) {
-            return Ok(None);
-        }
-        let chunks = self
-            .fragments
-            .remove(&message_id)
-            .expect("fragment entry should exist");
-        let total = chunks
-            .iter()
-            .map(|chunk| chunk.as_ref().map_or(0, Vec::len))
-            .sum();
-        let mut combined = Vec::with_capacity(total);
-        for chunk in chunks.into_iter().flatten() {
-            combined.extend_from_slice(&chunk);
-        }
-        Ok(Some(combined))
+        self.fragments.accept(
+            header_value(&frame.headers, "sum"),
+            header_value(&frame.headers, "seq"),
+            header_value(&frame.headers, "message_id"),
+            &frame.payload,
+        )
     }
 }

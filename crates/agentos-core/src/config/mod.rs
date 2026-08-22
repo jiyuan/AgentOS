@@ -25,7 +25,7 @@ pub use approval::ApprovalConfig;
 pub use compaction::CompactionConfig;
 pub use gateway::GatewayConfig;
 pub use jobs::JobsConfig;
-pub use limits::LimitsConfig;
+pub use limits::{LimitsConfig, DEFAULT_ATTACHMENTS_PER_MESSAGE, DEFAULT_ATTACHMENT_BYTES};
 pub use memory::{
     MemoryConfig, MemoryPolicyConfig, MemoryQdrantConfig, MemoryReflectionConfig,
     MemoryRetentionConfig, MemorySharedDomainConfig, MemorySqliteVecConfig,

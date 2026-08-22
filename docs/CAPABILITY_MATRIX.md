@@ -123,8 +123,8 @@ parsing, streaming assembly, and retry behavior.
 | TUI | Stable | all | — | — | integration |
 | One-shot CLI | Stable | all | — | — | integration |
 | Telegram | **Preview** | all | `[[channels]]`, bot token, an allowlist | Fails closed on identity, with a sender allowlist. The update offset still lives only in process memory and advances *before* the run, so a crash both replays and loses (M8) | unit |
-| Feishu | **Preview** | all | `[[channels]]`, app credentials, an allowlist | Fails closed on identity. Still reads `event_id` and never dedupes on it (M8) | unit |
-| Attachments | **Preview** | all | — | Downloads are unbounded (M4). Path components are now injectively encoded, so two conversations can no longer share a directory | unit |
+| Feishu | **Preview** | all | `[[channels]]`, app credentials, an allowlist | Fails closed on identity; fragment reassembly is bounded by count, pending events, and bytes. Still reads `event_id` and never dedupes on it (M8) | unit |
+| Attachments | Stable | all | `[limits] attachment_bytes`, `attachments_per_message` | Downloads are streamed and stop at the byte cap; per-message count is bounded and the surplus is reported, not silently dropped. Path components are injectively encoded, so two conversations cannot share a directory | unit |
 
 ## Orchestration and workspace
 

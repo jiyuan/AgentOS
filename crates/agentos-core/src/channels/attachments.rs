@@ -9,6 +9,7 @@
 //! `from_env()` derives the root from `AGENTOS_HOME` joined with
 //! `workspace/attachments`, matching the layout the runtime sets up.
 
+use crate::config::{DEFAULT_ATTACHMENTS_PER_MESSAGE, DEFAULT_ATTACHMENT_BYTES};
 use crate::paths::path_segment;
 use agentos_interfaces::ChannelError;
 use std::fs;
@@ -18,6 +19,12 @@ use std::sync::Arc;
 pub(crate) struct AttachmentStore {
     root: PathBuf,
     channel: String,
+    /// `[limits].attachment_bytes` — what one file may cost this machine
+    /// (M4 / `ING-001`).
+    max_bytes: u64,
+    /// `[limits].attachments_per_message` — how many downloads one inbound
+    /// message may cause.
+    max_per_message: usize,
 }
 
 impl AttachmentStore {
@@ -32,7 +39,43 @@ impl AttachmentStore {
         Self {
             root: root.into(),
             channel: channel.to_owned(),
+            max_bytes: DEFAULT_ATTACHMENT_BYTES,
+            max_per_message: DEFAULT_ATTACHMENTS_PER_MESSAGE,
         }
+    }
+
+    /// Point this store at a different root, keeping its limits.
+    ///
+    /// Preserving the limits is what makes the channel builders
+    /// order-independent: `with_attachments_root().with_attachment_limits()`
+    /// and the reverse produce the same store, which is the sort of thing that
+    /// is otherwise discovered by a bound quietly not applying.
+    pub(crate) fn with_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.root = root.into();
+        self
+    }
+
+    /// Apply a deployment's `[limits]` to what this store will accept.
+    pub(crate) fn with_limits(mut self, max_bytes: u64, max_per_message: usize) -> Self {
+        self.max_bytes = max_bytes;
+        self.max_per_message = max_per_message;
+        self
+    }
+
+    /// Bytes of one attachment that may be written before the download is
+    /// abandoned.
+    ///
+    /// Enforced on the bytes as they arrive rather than on the size a channel
+    /// reports: that number is the sender's claim, and nothing holds the
+    /// sender to it.
+    pub(crate) fn max_bytes(&self) -> u64 {
+        self.max_bytes
+    }
+
+    /// How many attachments of one message are downloaded. The rest are
+    /// reported to the model as skipped rather than silently dropped.
+    pub(crate) fn max_per_message(&self) -> usize {
+        self.max_per_message
     }
 
     /// Build the on-disk path an inbound attachment should be written to.
@@ -204,5 +247,34 @@ mod tests {
         assert!(path.ends_with("telegram/12345/67/photo.jpg"));
         assert!(path.parent().unwrap().is_dir());
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// A store that has been given limits keeps them across a change of root,
+    /// so `with_attachments_root().with_attachment_limits()` and the reverse
+    /// agree. A bound that silently stops applying because two builder calls
+    /// were written in the other order is worse than no bound.
+    #[test]
+    fn limits_survive_a_change_of_root_in_either_order() {
+        let rooted_then_limited = AttachmentStore::new("/tmp/a", "telegram")
+            .with_root("/tmp/b")
+            .with_limits(4_096, 2);
+        let limited_then_rooted = AttachmentStore::new("/tmp/a", "telegram")
+            .with_limits(4_096, 2)
+            .with_root("/tmp/b");
+
+        for store in [&rooted_then_limited, &limited_then_rooted] {
+            assert_eq!(store.max_bytes(), 4_096);
+            assert_eq!(store.max_per_message(), 2);
+            assert_eq!(store.root, PathBuf::from("/tmp/b"));
+        }
+    }
+
+    /// The bound a channel reads when a deployment has said nothing. M4 /
+    /// `ING-001`: unbounded was the previous answer.
+    #[test]
+    fn an_unconfigured_store_is_still_bounded() {
+        let store = AttachmentStore::new("/tmp/a", "telegram");
+        assert_eq!(store.max_bytes(), DEFAULT_ATTACHMENT_BYTES);
+        assert_eq!(store.max_per_message(), DEFAULT_ATTACHMENTS_PER_MESSAGE);
     }
 }

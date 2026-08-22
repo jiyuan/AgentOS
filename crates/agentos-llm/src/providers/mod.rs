@@ -318,6 +318,16 @@ const RETRY_AFTER_CAP: Duration = Duration::from_secs(30);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const REQUEST_TIMEOUT_ENV: &str = "AGENTOS_LLM_REQUEST_TIMEOUT_SECS";
 
+/// Bytes of a provider response body read into memory (M4 / `ING-001`).
+///
+/// A completion is JSON; even a very long one with several tool calls is a
+/// few megabytes. This is not a limit on the model — it is a ceiling on what a
+/// broken or hostile endpoint can make this process allocate, which
+/// `.bytes()` on its own does not provide at any size. An endpoint the
+/// operator configured is more trusted than a URL the model chose, which is
+/// why the ceiling is generous rather than tight.
+const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+
 fn shared_client() -> &'static Client {
     static CLIENT: OnceLock<Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
@@ -406,8 +416,7 @@ pub(crate) async fn post_sse(
         return Ok(response);
     }
     let header_map = collect_headers(response.headers());
-    let bytes = response
-        .bytes()
+    let bytes = read_capped(response)
         .await
         .map_err(|err| ProviderError::Transport {
             detail: format!(
@@ -427,6 +436,25 @@ pub(crate) async fn post_sse(
     })
 }
 
+/// Read a response body, refusing one past [`MAX_RESPONSE_BYTES`].
+///
+/// Streamed rather than `.bytes()`, and an over-long body is an *error* rather
+/// than a truncation: a completion cut in half is not a completion, and
+/// handing the parser half a JSON document would surface as a confusing
+/// "malformed response" instead of "your endpoint sent 200 MB".
+async fn read_capped(mut response: reqwest::Response) -> Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|err| err.to_string())? {
+        if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            return Err(format!(
+                "provider response exceeds {MAX_RESPONSE_BYTES} bytes"
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 async fn send_once(
     client: &Client,
     url: &str,
@@ -444,8 +472,7 @@ async fn send_once(
         })?;
     let status = response.status().as_u16();
     let header_map = collect_headers(response.headers());
-    let bytes = response
-        .bytes()
+    let bytes = read_capped(response)
         .await
         .map_err(|err| ProviderError::Transport {
             detail: format!(

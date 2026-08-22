@@ -771,20 +771,36 @@ fn run_persistent_channel(config: &ServiceConfig, channel: &'static str) -> Resu
     }
 }
 
+/// The deployment's `[limits]` for inbound attachments (M4 / `ING-001`).
+///
+/// Falls back to the defaults when `agent.toml` cannot be read: a channel that
+/// starts with unbounded downloads because a config file was missing would be
+/// the failure this bound exists to prevent, arriving by a different route.
+fn attachment_limits(config: &ServiceConfig) -> (u64, usize) {
+    let limits = WorkspaceConfig::load(&agent_config_path(config))
+        .map(|workspace| workspace.limits)
+        .unwrap_or_default();
+    (limits.attachment_bytes, limits.attachments_per_message)
+}
+
 async fn run_telegram_gateway(config: &ServiceConfig) -> Result<(), String> {
     let attachments_dir = attachments_dir_path(config);
+    let (max_bytes, per_message) = attachment_limits(config);
     let channel = TelegramChannel::from_env()
         .map_err(|err| format!("failed to configure telegram channel: {err}"))?
         .with_attachments_root(attachments_dir)
+        .with_attachment_limits(max_bytes, per_message)
         .with_receive_error_logging(true);
     run_channel_gateway(config, channel, "telegram", RunId::new("telegram-gateway")).await
 }
 
 async fn run_feishu_gateway(config: &ServiceConfig) -> Result<(), String> {
     let attachments_dir = attachments_dir_path(config);
+    let (max_bytes, per_message) = attachment_limits(config);
     let channel = FeishuChannel::from_env()
         .map_err(|err| format!("failed to configure feishu channel: {err}"))?
         .with_attachments_root(attachments_dir)
+        .with_attachment_limits(max_bytes, per_message)
         .with_receive_error_logging(true);
     run_channel_gateway(config, channel, "feishu", RunId::new("feishu-gateway")).await
 }
