@@ -1,3 +1,4 @@
+use crate::prompt::{self, Request};
 use agentos_interfaces::orchestrator::{
     DispatchTarget, Plan, RoutingRule, RoutingTable, RunContext, SubOrchSpec, TaskDomain,
 };
@@ -48,8 +49,8 @@ pub(super) fn routing_domains_json(routing_table: &RoutingTable) -> String {
     serde_json::to_string_pretty(&domains).unwrap_or_else(|_| "[]".to_owned())
 }
 
-pub(super) fn routing_classifier_messages(input: &str, domains_json: &str) -> Vec<Message> {
-    vec![
+pub(super) fn routing_classifier_request(input: &str, domains_json: &str) -> Request {
+    prompt::routing_request(
         Message::text(
             MessageRole::System,
             "Classify the user's task using only the provided routing domains and their delegate/escalation target descriptions. Prefer the target whose functional description best matches the requested work; do not use keyword matching. Return only JSON with fields: domain, confidence.",
@@ -58,7 +59,7 @@ pub(super) fn routing_classifier_messages(input: &str, domains_json: &str) -> Ve
             MessageRole::User,
             format!("Routing domains:\n{domains_json}\n\nUser prompt:\n{input}"),
         ),
-    ]
+    )
 }
 
 /// Function words carrying no routing signal. Kept strictly grammatical so
@@ -344,7 +345,8 @@ mod tests {
         };
 
         let messages =
-            routing_classifier_messages("compare these sources", &routing_domains_json(&table));
+            routing_classifier_request("compare these sources", &routing_domains_json(&table))
+                .messages;
         let prompt = messages
             .iter()
             .map(|message| message.content.as_ref())

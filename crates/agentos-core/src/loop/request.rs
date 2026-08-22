@@ -35,6 +35,10 @@ pub(super) fn record_request_header(
     header: RequestHeader,
 ) {
     let mut fields = BTreeMap::new();
+    // First, because it decides how to read everything after it: a `routing`
+    // header with no transcript section is correct, and a `turn` header with
+    // none is a bug (M5 / `REQ-001`).
+    fields.insert(field_key("kind"), Value::from(header.kind.as_ref()));
     fields.insert(
         field_key("total_messages"),
         Value::from(header.total_messages),
@@ -75,6 +79,7 @@ pub(super) fn record_request_header(
     info!(
         run_id = state.run_id.as_str(),
         active_agent = state.active_agent.as_str(),
+        kind = header.kind.as_ref(),
         sections = header.sections.len(),
         total_messages = header.total_messages,
         total_chars = header.total_chars,
@@ -120,6 +125,7 @@ mod tests {
 
     fn header() -> RequestHeader {
         RequestHeader {
+            kind: Arc::from("turn"),
             sections: vec![
                 RequestSection {
                     id: Arc::from("skill_prelude"),

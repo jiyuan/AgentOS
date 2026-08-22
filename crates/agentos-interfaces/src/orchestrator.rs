@@ -339,15 +339,7 @@ impl<'a> RunContext<'a> {
     /// malformed; callers that pre-deserialize should use [`push_llm_usage`]
     /// directly.
     pub fn push_llm_usage_from_message(&self, message: &Message) {
-        let Some(raw) = message
-            .metadata
-            .get(agentos_proto::TOKEN_USAGE_METADATA_KEY)
-        else {
-            return;
-        };
-        // Deserialize by reference — `&Value` implements `Deserializer`, so
-        // there is no need to clone the metadata value first.
-        if let Ok(usage) = Usage::deserialize(raw) {
+        if let Some(usage) = Usage::from_message_metadata(message) {
             self.push_llm_usage(usage);
         }
     }

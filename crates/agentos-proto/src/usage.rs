@@ -44,6 +44,21 @@ pub struct Usage {
 }
 
 impl Usage {
+    /// Read a provider's per-call accounting off a reply message.
+    ///
+    /// `None` when the metadata key is absent or unreadable — a provider that
+    /// reports no usage is normal, and inventing zeros would make "not
+    /// reported" indistinguishable from "cost nothing" in a run total.
+    ///
+    /// Lives here rather than at the two call sites so the loop and the
+    /// provider gateway read usage the same way (M5 / `REQ-001`).
+    pub fn from_message_metadata(message: &crate::Message) -> Option<Self> {
+        let raw = message.metadata.get(TOKEN_USAGE_METADATA_KEY)?;
+        // Deserialize by reference — `&Value` implements `Deserializer`, so
+        // there is no need to clone the metadata value first.
+        serde::Deserialize::deserialize(raw).ok()
+    }
+
     /// Add every field of `other` into `self`, `tool_calls` included.
     /// Saturating so a pathological provider response cannot panic the caller
     /// on overflow. Use this to roll one run's accumulated usage into a wider

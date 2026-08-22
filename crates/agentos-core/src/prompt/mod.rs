@@ -12,24 +12,41 @@
 //! the model see" is answerable from the trace rather than by re-reading the
 //! orchestrator.
 //!
-//! One LLM call is deliberately **not** assembled here: the routing
-//! classifier's domain-selection round-trip in `orchestrator/routing.rs`. It is
-//! a fixed two-message prompt that classifies one input, not a turn in the
-//! conversation — routing it through this module would spend the skill prelude
-//! and recalled memory on a question that has no use for either, and would let
-//! a stored fact steer routing. Keep it separate.
+//! # Kinds, and why not every request is a turn
+//!
+//! M5 / `REQ-001` (`docs/adr/0004-REQUEST_KINDS.md`). Two production calls are
+//! deliberately **not** assembled from the transcript:
+//!
+//! - the **routing classifier**, a fixed two-message prompt that classifies
+//!   one input. Assembling it would spend the skill prelude and recalled
+//!   memory on a question that has no use for either, and — the part that
+//!   matters — would let a stored fact steer routing, so a memory-poisoning
+//!   attack could choose which orchestrator handles the next turn.
+//! - the **compaction summarizer**, which rewrites the oldest span of a
+//!   conversation and has no `RunContext` to be assembled from.
+//!
+//! Both used to be unrecorded, because "assembled here" and "recorded here"
+//! were the same thing. They are now separate: a [`RequestKind`] names the
+//! section set, [`RequestBuilder`] is the single path from sections to
+//! messages *and* manifest for every kind, and [`gateway`] is the single path
+//! from a [`Request`] to a provider. The invariant is **every provider call
+//! records what it was made of**, not *every provider call derives from the
+//! transcript* — and `invariants::request_derives_from_state` enforces the
+//! difference, refusing a non-turn request that carries turn context.
 
 pub mod calibration;
 mod compact;
+mod gateway;
 mod projection;
 mod prune;
 mod sections;
 mod tokens;
 
 pub use compact::{compact, compact_now, is_checkpoint, select_span, Compacted, Compaction, Span};
+pub use gateway::{call_detached, call_with_context, Exchange};
 pub use projection::{checkpoint, visible, visible_positions, TRANSCRIPT_SHADOW_KEY};
 pub use prune::{Elision, ELIDED_BYTES_KEY, PRUNE_TRIGGER_RATIO};
-pub use sections::{SectionId, SkillPrelude};
+pub use sections::{RequestKind, SectionId, SkillPrelude};
 pub use tokens::{estimate_message, estimate_text, estimate_tool_specs};
 
 use agentos_interfaces::orchestrator::RunContext;
@@ -38,9 +55,18 @@ use agentos_proto::{Message, RequestHeader, RequestSection, RequestSource};
 use std::sync::Arc;
 use tracing::info;
 
-/// One assembled provider request, plus the record of what went into it.
+/// One built provider request, plus the record of what went into it.
+///
+/// Every kind of request is one of these (M5 / `REQ-001`), so
+/// [`gateway::call_with_context`] and [`gateway::call_detached`] can take the
+/// request rather than a bare message vector — which is what makes "record a
+/// manifest" something the gateway does rather than something each call site
+/// remembers to do.
 #[derive(Clone, Debug)]
-pub struct Prompt {
+pub struct Request {
+    /// What sort of request this is, and therefore which sections it may
+    /// carry.
+    pub kind: RequestKind,
     /// The messages to send, in order.
     pub messages: Vec<Message>,
     /// What each section contributed.
@@ -66,8 +92,10 @@ pub struct SectionEntry {
 ///
 /// Sections that contributed nothing are absent, so an empty manifest and a
 /// manifest of empty sections are not confusable.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PromptManifest {
+    /// The kind of request this manifest describes.
+    pub kind: RequestKind,
     pub sections: Vec<SectionEntry>,
     /// Estimated tokens for the tool schemas sent with the request. Not a
     /// section — they carry no messages — but they occupy the same window.
@@ -77,6 +105,18 @@ pub struct PromptManifest {
     /// What elision removed from the transcript to fit that window. Zero on
     /// every request that was already under the trigger ratio.
     pub elided: Elision,
+}
+
+impl Default for PromptManifest {
+    fn default() -> Self {
+        Self {
+            kind: RequestKind::Turn,
+            sections: Vec::new(),
+            tool_tokens: 0,
+            context_budget_tokens: None,
+            elided: Elision::default(),
+        }
+    }
 }
 
 impl PromptManifest {
@@ -115,6 +155,7 @@ impl PromptManifest {
     /// Project this manifest into the durable header the loop traces.
     pub fn header(&self) -> RequestHeader {
         RequestHeader {
+            kind: Arc::from(self.kind.as_str()),
             sections: self
                 .sections
                 .iter()
@@ -152,19 +193,118 @@ pub struct Assembly<'a> {
     pub context_budget_tokens: Option<usize>,
 }
 
-/// Assemble the messages for one provider request.
+/// Accumulates one request's messages and the record of what produced them.
+///
+/// The single path from sections to a [`Request`] (M5 / `REQ-001`). Every
+/// kind builds through this, so a manifest is written by the same code that
+/// appends the messages and cannot describe content that was not sent —
+/// which is the property `invariants::request_derives_from_state` checks and
+/// the property a hand-written manifest would quietly lose.
+pub struct RequestBuilder {
+    kind: RequestKind,
+    messages: Vec<Message>,
+    manifest: PromptManifest,
+}
+
+impl RequestBuilder {
+    pub fn new(kind: RequestKind) -> Self {
+        Self {
+            kind,
+            messages: Vec::new(),
+            manifest: PromptManifest {
+                kind,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Pre-size the message vector for a caller that knows roughly how many
+    /// it will add. Purely an allocation hint.
+    fn with_capacity(mut self, capacity: usize) -> Self {
+        self.messages.reserve(capacity);
+        self
+    }
+
+    /// Append one section's messages and record what it contributed.
+    ///
+    /// A section that yields nothing is not recorded, so the manifest lists
+    /// contributions rather than attempts.
+    pub fn section(
+        &mut self,
+        id: SectionId,
+        sources: Vec<RequestSource>,
+        rendered: impl IntoIterator<Item = Message>,
+    ) -> &mut Self {
+        let mut count = 0;
+        let mut chars = 0;
+        let mut tokens = 0;
+        for message in rendered {
+            chars += message.content.len();
+            tokens += tokens::estimate_message(&message);
+            count += 1;
+            self.messages.push(message);
+        }
+        if count > 0 {
+            self.manifest.sections.push(SectionEntry {
+                id,
+                messages: count,
+                chars,
+                tokens,
+                sources,
+            });
+        }
+        self
+    }
+
+    /// Record the tool schemas sent alongside the messages. They carry no
+    /// messages but occupy the same window.
+    pub fn tools(&mut self, tools: &[ToolSpec]) -> &mut Self {
+        self.manifest.tool_tokens = tokens::estimate_tool_specs(tools);
+        self
+    }
+
+    pub fn context_budget(&mut self, budget: Option<usize>) -> &mut Self {
+        self.manifest.context_budget_tokens = budget;
+        self
+    }
+
+    /// Tokens recorded so far, for a caller sizing what it is about to add
+    /// against the remaining window.
+    fn reserved_tokens(&self) -> usize {
+        self.manifest.total_tokens()
+    }
+
+    fn record_elision(&mut self, elided: Elision) -> &mut Self {
+        self.manifest.elided = elided;
+        self
+    }
+
+    pub fn finish(self) -> Request {
+        Request {
+            kind: self.kind,
+            messages: self.messages,
+            manifest: self.manifest,
+        }
+    }
+}
+
+/// Assemble the turn's request from the run context.
 ///
 /// Hydrated memory comes first, then the projected conversation, so the request
 /// still ends on the latest turn.
-pub fn assemble(ctx: &RunContext<'_>, input: &Assembly<'_>) -> Prompt {
-    let skill_prelude = input.skill_prelude;
-    let mut messages = Vec::with_capacity(ctx.state.transcript.items.len().saturating_add(2));
-    let mut manifest = PromptManifest::default();
+///
+/// Records its header on the context immediately. The other two kinds do not:
+/// [`routing_request`] is built by a caller that holds a context and lets the
+/// gateway record it, and [`summary_request`] is built where no context exists
+/// at all. Assembly keeps its own push because a turn's header must survive
+/// even when the provider call that follows it *fails* — a request rejected
+/// for length is exactly the one whose header a reader wants.
+pub fn assemble(ctx: &RunContext<'_>, input: &Assembly<'_>) -> Request {
+    let mut builder = RequestBuilder::new(RequestKind::Turn)
+        .with_capacity(ctx.state.transcript.items.len().saturating_add(2));
 
-    if let Some(prelude) = skill_prelude {
-        push_section(
-            &mut messages,
-            &mut manifest,
+    if let Some(prelude) = input.skill_prelude {
+        builder.section(
             SectionId::SkillPrelude,
             prelude.sources(),
             [prelude.message.clone()],
@@ -172,17 +312,16 @@ pub fn assemble(ctx: &RunContext<'_>, input: &Assembly<'_>) -> Prompt {
     }
 
     if let Some(memory) = sections::memory_message(&ctx.memory_fragments) {
-        push_section(
-            &mut messages,
-            &mut manifest,
+        builder.section(
             SectionId::Memory,
             sections::memory_sources(&ctx.memory_fragments),
             [memory],
         );
     }
 
-    manifest.tool_tokens = tokens::estimate_tool_specs(input.tools);
-    manifest.context_budget_tokens = input.context_budget_tokens;
+    builder
+        .tools(input.tools)
+        .context_budget(input.context_budget_tokens);
 
     // The projected view, not the raw log: a checkpoint written by compaction
     // hides the span it summarizes without anything having been deleted.
@@ -195,37 +334,35 @@ pub fn assemble(ctx: &RunContext<'_>, input: &Assembly<'_>) -> Prompt {
     // what the provider was actually sent rather than what the log holds. It
     // is a property of this request alone — recomputed every turn, never
     // written back (see `prune`).
-    manifest.elided = prune::to_fit(
+    let elided = prune::to_fit(
         &mut transcript,
         &prune::Budget {
             context_budget_tokens: input.context_budget_tokens,
-            reserved_tokens: manifest.total_tokens(),
+            reserved_tokens: builder.reserved_tokens(),
         },
     );
+    builder.record_elision(elided);
 
-    push_section(
-        &mut messages,
-        &mut manifest,
-        SectionId::Transcript,
-        Vec::new(),
-        transcript,
-    );
+    builder.section(SectionId::Transcript, Vec::new(), transcript);
+    let request = builder.finish();
 
     // X5: the request the provider is about to see must derive from the run
     // state, and the manifest must describe it exactly. Checked here because
     // this is the only place both sides exist at once — the loop records the
     // header but never sees the messages.
     #[cfg(debug_assertions)]
-    crate::invariants::request_derives_from_state(ctx.state, &messages, &manifest);
+    crate::invariants::request_derives_from_state(ctx.state, &request);
 
     // Durable record of what this request was made of, drained by the loop
     // into a `request_header` trace event after `plan()` returns.
-    ctx.push_request_header(manifest.header());
+    ctx.push_request_header(request.manifest.header());
 
+    let manifest = &request.manifest;
     info!(
         operation = "prompt_assembly",
         run_id = ctx.state.run_id.as_str(),
         active_agent = ctx.state.active_agent.as_str(),
+        kind = manifest.kind.as_str(),
         skill_prelude_messages = manifest.messages_in(SectionId::SkillPrelude),
         memory_messages = manifest.messages_in(SectionId::Memory),
         memory_fragments = ctx.memory_fragments.len(),
@@ -239,37 +376,36 @@ pub fn assemble(ctx: &RunContext<'_>, input: &Assembly<'_>) -> Prompt {
         "prompt assembled"
     );
 
-    Prompt { messages, manifest }
+    request
 }
 
-/// Append one section's messages and record what it contributed. A section
-/// that yields nothing is not recorded, so the manifest lists contributions
-/// rather than attempts.
-fn push_section(
-    messages: &mut Vec<Message>,
-    manifest: &mut PromptManifest,
-    id: SectionId,
-    sources: Vec<RequestSource>,
-    rendered: impl IntoIterator<Item = Message>,
-) {
-    let mut count = 0;
-    let mut chars = 0;
-    let mut tokens = 0;
-    for message in rendered {
-        chars += message.content.len();
-        tokens += tokens::estimate_message(&message);
-        count += 1;
-        messages.push(message);
-    }
-    if count > 0 {
-        manifest.sections.push(SectionEntry {
-            id,
-            messages: count,
-            chars,
-            tokens,
-            sources,
-        });
-    }
+/// Build the routing classifier's request.
+///
+/// Two fixed messages: the instruction plus the domain table, and the one
+/// input being classified. **Deliberately not [`assemble`]** — see
+/// [`RequestKind`] and ADR-0004. Going through the builder anyway is what
+/// makes that isolation a recorded, checkable fact rather than an absence: the
+/// manifest names exactly two sections, neither of which is turn context, and
+/// `invariants::request_derives_from_state` refuses a routing request that
+/// carries any.
+pub fn routing_request(instruction: Message, input: Message) -> Request {
+    let mut builder = RequestBuilder::new(RequestKind::Routing).with_capacity(2);
+    builder.section(SectionId::RoutingInstruction, Vec::new(), [instruction]);
+    builder.section(SectionId::RoutingInput, Vec::new(), [input]);
+    builder.finish()
+}
+
+/// Build the compaction summarizer's request.
+///
+/// The instruction and the rendered span. Carries no live transcript section:
+/// the span is text this module rendered *from* the transcript, not the
+/// projected conversation, and recording it as `transcript` would make a
+/// summarization look like a turn in a replay.
+pub fn summary_request(instruction: Message, span: Message) -> Request {
+    let mut builder = RequestBuilder::new(RequestKind::Compaction).with_capacity(2);
+    builder.section(SectionId::SummaryInstruction, Vec::new(), [instruction]);
+    builder.section(SectionId::SummarySpan, Vec::new(), [span]);
+    builder.finish()
 }
 
 #[cfg(test)]

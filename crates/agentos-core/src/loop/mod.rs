@@ -289,17 +289,29 @@ async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunErro
         }));
     }
 
+    // Both compaction paths and the planning attempts share these, so a
+    // summarizer call is accounted for exactly like the turn's own request
+    // (M5 / `REQ-001`). Declared before `compact_under_pressure` because that
+    // one runs first and can spend a provider call of its own.
+    let mut pending_usage = Vec::new();
+    let mut pending_requests = Vec::new();
+
     // C3: summarize the oldest span if the run is already over the configured
     // pressure, before hydration so recall and the orchestrator both see the
     // compacted transcript.
-    planning::compact_under_pressure(&mut state, deps, &plan_span_id).await;
+    planning::compact_under_pressure(
+        &mut state,
+        deps,
+        &plan_span_id,
+        &mut pending_usage,
+        &mut pending_requests,
+    )
+    .await;
 
     // C4: one attempt, and if the provider rejects it for length, one forced
     // compaction and one retry. A second rejection comes back as a plan
     // carrying a truncation notice, which the reply arm below then takes
     // through the output guardrails like any other answer.
-    let mut pending_usage = Vec::new();
-    let mut pending_requests = Vec::new();
     let planned = unless_cancelled(
         &deps.cancel,
         planning::plan_with_overflow_recovery(

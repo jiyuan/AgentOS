@@ -10,11 +10,62 @@ use agentos_proto::{Message, MessageRole, RequestSource};
 use serde_json::Value;
 use std::sync::Arc;
 
+/// What sort of provider request this is (M5 / `REQ-001`).
+///
+/// A kind determines the section set, and **some kinds legitimately contribute
+/// no transcript**. That is the whole reason this enum exists rather than a
+/// list of exceptions: before it, the two calls that carry no conversation —
+/// the routing classifier and the compaction summarizer — could not be
+/// recorded at all without either lying about their contents or being folded
+/// into full assembly, and folding the classifier in would spend the skill
+/// prelude and recalled memory on a question that has no use for either *and*
+/// let a stored fact steer routing. See
+/// [ADR-0004](../../../../docs/adr/0004-REQUEST_KINDS.md).
+///
+/// The invariant is "every provider call records what it was made of", not
+/// "every provider call is assembled from the transcript". Conflating the two
+/// is what would break the injection defence.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum RequestKind {
+    /// The conversation turn itself: skill prelude, recalled memory, and the
+    /// projected transcript. The only kind that derives from run state.
+    Turn,
+    /// The routing classifier's fixed question about one input. Carries the
+    /// domain table and the input, and nothing else — deliberately.
+    Routing,
+    /// The compaction summarizer, rewriting the oldest span of a conversation
+    /// into one checkpoint.
+    Compaction,
+}
+
+impl RequestKind {
+    /// Stable identifier for the header, trace fields, and manifest rendering.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Turn => "turn",
+            Self::Routing => "routing",
+            Self::Compaction => "compaction",
+        }
+    }
+
+    /// Whether this kind's request is built from the run's transcript.
+    ///
+    /// `false` is not a weaker claim: it says the request is a fixed prompt
+    /// over supplied text, which is what makes the classifier's isolation from
+    /// stored memory checkable rather than merely intended.
+    pub fn derives_from_transcript(self) -> bool {
+        matches!(self, Self::Turn)
+    }
+}
+
 /// Identifies one contribution to an assembled request.
 ///
-/// The variants are the assembly order. Adding a section means adding a variant
-/// here and rendering it in [`super::assemble`] — there is no second place a
-/// contribution can enter a request.
+/// Adding a section means adding a variant here and rendering it through
+/// [`super::RequestBuilder`] — there is no second place a contribution can
+/// enter a request. Within one [`RequestKind`] the variants are the assembly
+/// order; across kinds they do not mix, and
+/// [`crate::invariants::request_derives_from_state`] enforces that a
+/// non-transcript kind carries none of the turn's sections.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum SectionId {
     /// The enabled workspace skills' `SKILL.md` bodies.
@@ -23,6 +74,17 @@ pub enum SectionId {
     Memory,
     /// The conversation itself.
     Transcript,
+    /// The routing classifier's instruction and the domain table it chooses
+    /// from. Derived from `[routing]`, not from anything the conversation
+    /// said.
+    RoutingInstruction,
+    /// The single input being classified. The only conversation content the
+    /// classifier sees, and it sees it as data rather than as a turn.
+    RoutingInput,
+    /// The compaction summarizer's instruction.
+    SummaryInstruction,
+    /// The rendered span of the conversation being summarized.
+    SummarySpan,
 }
 
 impl SectionId {
@@ -32,7 +94,21 @@ impl SectionId {
             Self::SkillPrelude => "skill_prelude",
             Self::Memory => "memory",
             Self::Transcript => "transcript",
+            Self::RoutingInstruction => "routing_instruction",
+            Self::RoutingInput => "routing_input",
+            Self::SummaryInstruction => "summary_instruction",
+            Self::SummarySpan => "summary_span",
         }
+    }
+
+    /// Whether this section carries content the conversation or the agent's
+    /// own memory chose.
+    ///
+    /// The classifier must contain none of these: a stored fact reaching the
+    /// routing decision would let a memory-poisoning attack pick which
+    /// orchestrator handles the next turn.
+    pub fn is_turn_context(self) -> bool {
+        matches!(self, Self::SkillPrelude | Self::Memory | Self::Transcript)
     }
 }
 

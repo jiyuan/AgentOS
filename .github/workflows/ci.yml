@@ -34,6 +34,8 @@ jobs:
         run: bash scripts/check-import-boundaries.sh
       - name: Module size ceiling
         run: bash scripts/check-module-size.sh
+      - name: Provider calls go through the request gateway
+        run: bash scripts/check-provider-calls.sh
       - name: Generated catalogs are current
         run: bash scripts/check-catalogs.sh
 

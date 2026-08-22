@@ -47,9 +47,9 @@ something that no longer exists — the two-way ratchet
 
 | Capability | Status | Platforms | Required config | Limitations | Test level |
 |---|---|---|---|---|---|
-| Single request authority (`prompt::assemble`) with `RequestHeader` | Stable | all | — | The routing classifier and the compaction summarizer record no header ([ADR-0004](adr/0004-REQUEST_KINDS.md), M5) | unit, golden |
+| Single request authority (`prompt::assemble`) with `RequestHeader` | Stable | all | — | Every provider call declares a `RequestKind` and records a header through `prompt::gateway`; `scripts/check-provider-calls.sh` fails CI on a direct call added elsewhere ([ADR-0004](adr/0004-REQUEST_KINDS.md)) | unit, integration, golden |
 | Append-only session log with projection | Stable | all | — | `/clear` deletes rather than projecting ([ADR-0006](adr/0006-CLEAR_EPOCH.md), M6) | integration, golden |
-| Span compaction | Stable | all | `[limits]` | Compaction usage is dropped from run totals (M5) | integration, golden |
+| Span compaction | Stable | all | `[limits]` | The summarizer records a `compaction` header and its tokens reach run totals; totals across a compaction are larger than before M5 because the old ones omitted them | integration, golden |
 | Tool-output elision under context pressure | Stable | all | `[limits]` | — | integration, golden |
 | Conversation fork | Stable | all | — | — | integration |
 | Tool-output spill | Stable | all | `[limits]` | The locator is an absolute host path embedded in a model-visible retrieval hint, and lands in the durable transcript (M7) | integration |
@@ -132,7 +132,7 @@ parsing, streaming assembly, and retry behavior.
 |---|---|---|---|---|---|
 | `builtin.max` (tool-selecting) | Stable | all | `[agent] orchestrator` | — | integration, golden |
 | `builtin.min` (LLM fallback) | Stable | all | `[agent] orchestrator` | — | integration, golden |
-| LLM routing classifier | Stable | all | `[routing]` | Records no `RequestHeader` (M5). Its isolation from prompt assembly is deliberate — a prompt-injection defence — and must be preserved ([ADR-0004](adr/0004-REQUEST_KINDS.md)) | integration |
+| LLM routing classifier | Stable | all | `[routing]` | Records a `routing` header carrying its two own sections and none of the turn's. Its isolation from prompt assembly is a prompt-injection defence, now enforced by `invariants::request_derives_from_state` rather than by convention ([ADR-0004](adr/0004-REQUEST_KINDS.md)) | unit, integration |
 | Sub-agents | **Preview** | all | `[[subagents]]` | See *Sub-agent policy narrowing* | integration |
 | Workspace skills | Stable | all | `[skills]` | Loaded from workspace content, which is data the agent can modify | unit, integration |
 | Deterministic skill planners | Stable | all | `[skills]` | — | unit |

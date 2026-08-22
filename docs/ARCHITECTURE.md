@@ -329,9 +329,32 @@ telemetry, and silently never sent.
 
 - **Assembly.** `prompt::assemble` is the only path from a `RunContext` to the
   messages a provider sees. Every contribution is a named `SectionId`.
+- **Kinds.** Every provider call declares a `RequestKind`, and the kind decides
+  the section set. Two kinds legitimately carry no transcript: the routing
+  classifier and the compaction summarizer. That is not an exception to the
+  recording rule but the reason the rule can be stated precisely — *every
+  provider call records what it was made of*, not *every provider call derives
+  from the transcript*. Conflating the two would mean assembling the
+  classifier, which would let a poisoned memory record choose which
+  orchestrator handles the next turn.
+  `invariants::request_derives_from_state` branches on the kind and refuses a
+  non-turn request that reaches the transcript, the skill prelude, or recalled
+  memory, so the injection defence is a compiled assertion rather than an
+  intention. See
+  [`ADR-0004`](adr/0004-REQUEST_KINDS.md).
+- **Gateway.** `prompt::gateway` is the only path from a built `Request` to a
+  provider, and it is what attaches the header and the usage record.
+  `prompt::call_with_context` records onto the run context's sinks;
+  `prompt::call_detached` hands the record back to a caller that has no context
+  — compaction holds `&mut RunState`, which is why its tokens went uncounted
+  for as long as they did. `scripts/check-provider-calls.sh` fails CI when a
+  direct provider call is added outside the gateway, because the rule is only
+  as good as the thing that notices it being broken.
 - **Manifest.** Each call returns a `PromptManifest`, recorded as a
   `RequestHeader` in the trace, so "what did the model see" is answered from the
-  trace rather than by re-reading the code.
+  trace rather than by re-reading the code. `RequestBuilder` is the single path
+  from sections to messages *and* manifest, so a manifest cannot describe
+  content that was not sent.
 - **Projection.** The session log is append-only — `/clear` excepted, see M6 in
   [`AUDIT_REMEDIATION_PLAN.md`](AUDIT_REMEDIATION_PLAN.md).
   `prompt::projection` computes the model-visible view over it. A *checkpoint* is an ordinary transcript item
@@ -355,7 +378,10 @@ telemetry, and silently never sent.
   rather than a rewrite.
 - **Compaction.** When elision is not enough, one model call summarizes the
   oldest span into a checkpoint. Governed by `[compaction]`; the tail
-  (`retain_tail_turns`) stays verbatim.
+  (`retain_tail_turns`) stays verbatim. The summarizer is a provider call like
+  any other: it goes through the gateway, records a `compaction` header, and
+  its tokens reach the run's totals. They did not before M5, so run totals
+  across a compaction were understated.
 - **Overflow recovery.** A provider that rejects a request for length is the one
   trigger that is never an estimate. The class stays typed
   (`ProviderError::ContextLength` → `LlmError::ContextLengthExceeded` →

@@ -25,9 +25,21 @@
 //!
 //! The summarizer is an LLM call made from inside the planning path, which is
 //! exactly where compaction is triggered. It is safe structurally rather than
-//! by a flag: [`compact`] calls [`Llm::complete_messages`] directly, never the
-//! orchestrator, so it assembles no prompt, pushes no request header, and
-//! records no pressure. There is nothing for a compaction request to trigger.
+//! by a flag: [`compact`] builds a [`RequestKind::Compaction`] request over
+//! rendered text and dispatches it through [`gateway::call_detached`], never
+//! through the orchestrator — so it assembles no turn, pushes nothing onto a
+//! context, and records no pressure. There is nothing for a compaction request
+//! to trigger.
+//!
+//! # What it records
+//!
+//! M5 / `REQ-001`. This call used to leave no trace at all: no request header,
+//! so a reader could not tell what the summarizer saw, and no usage, so its
+//! tokens were spent and never counted in the run's totals. It has no
+//! `RunContext` to push either onto — it holds `&mut RunState` — so
+//! [`Compacted`] carries them back out and `loop/planning.rs` emits them
+//! alongside the `conversation_compacted` event. Run token totals are larger
+//! than they used to be; the old ones were wrong.
 //!
 //! # One span per turn
 //!
@@ -35,12 +47,12 @@
 //! the trigger, the next turn compacts again. Looping here would mean an
 //! unbounded number of model calls inside one turn.
 
-use super::{projection, prune, tokens};
+use super::{gateway, projection, prune, tokens, RequestKind};
 use crate::config::CompactionConfig;
 use agentos_interfaces::run_state::RunState;
 use agentos_interfaces::session::{Item, Transcript};
 use agentos_llm::Llm;
-use agentos_proto::{Message, MessageRole};
+use agentos_proto::{Message, MessageRole, RequestHeader, Usage};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use tracing::{info, warn};
@@ -103,6 +115,14 @@ pub struct Compacted {
     /// Characters the checkpoint replaced, and characters it cost.
     pub replaced_chars: usize,
     pub summary_chars: usize,
+    /// What the summarization request was made of (M5 / `REQ-001`).
+    ///
+    /// Carried out rather than pushed, because this code has a `RunState` and
+    /// no `RunContext` to push onto. `loop/planning.rs` traces it.
+    pub header: RequestHeader,
+    /// What the summarization cost, when the provider reported it. Folded into
+    /// the run's totals by the same caller.
+    pub usage: Option<Usage>,
 }
 
 /// Summarize the oldest span of `state`'s transcript if the last request was
@@ -142,13 +162,13 @@ pub async fn compact_now(state: &mut RunState, compaction: &Compaction<'_>) -> O
     )?;
 
     let rendered = render_span(&state.transcript, &span, span_budget);
-    let request = [
+    let request = super::summary_request(
         Message::text(MessageRole::System, SUMMARY_INSTRUCTION),
         Message::text(MessageRole::User, rendered.text),
-    ];
+    );
 
-    let summary = match summarizer.complete_messages(&request, &[]).await {
-        Ok(summary) => summary,
+    let exchange = match gateway::call_detached(summarizer, &request, &[]).await {
+        Ok(exchange) => exchange,
         Err(error) => {
             warn!(
                 run_id = state.run_id.as_str(),
@@ -159,6 +179,7 @@ pub async fn compact_now(state: &mut RunState, compaction: &Compaction<'_>) -> O
             return None;
         }
     };
+    let summary = exchange.message;
     if summary.content.trim().is_empty() {
         warn!(
             run_id = state.run_id.as_str(),
@@ -177,6 +198,7 @@ pub async fn compact_now(state: &mut RunState, compaction: &Compaction<'_>) -> O
 
     info!(
         run_id = state.run_id.as_str(),
+        kind = RequestKind::Compaction.as_str(),
         span_start = span.start,
         span_end = span.end,
         span_items = span.items,
@@ -189,6 +211,8 @@ pub async fn compact_now(state: &mut RunState, compaction: &Compaction<'_>) -> O
         span,
         replaced_chars: rendered.replaced_chars,
         summary_chars,
+        header: exchange.header,
+        usage: exchange.usage,
     })
 }
 

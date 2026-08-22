@@ -7,6 +7,7 @@
   "request_headers": [
     {
       "context_budget_tokens": 4096,
+      "kind": "turn",
       "pressure_percent": 1,
       "prompt_estimated_tokens": 78,
       "sections": [

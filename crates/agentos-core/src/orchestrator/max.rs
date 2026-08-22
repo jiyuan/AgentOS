@@ -1,7 +1,7 @@
 use super::commands::deterministic_plan_from_user_text;
 use super::routing::{
     input_overlaps_vocabulary, latest_user_content, materialize_dispatch, parse_routing_decision,
-    routing_classifier_messages, routing_domains_json, routing_vocabulary, rule_for_domain_key,
+    routing_classifier_request, routing_domains_json, routing_vocabulary, rule_for_domain_key,
     ROUTER_CONFIDENCE_THRESHOLD,
 };
 use crate::memory::{
@@ -227,7 +227,7 @@ impl MaxOrchestrator {
             // description) and the memory fragments `hydrate()` selected, then
             // the conversation. Building a message vector here instead is what
             // let hydrated memory be computed and dropped (finding F1).
-            let prompt = prompt::assemble(
+            let request = prompt::assemble(
                 ctx,
                 &prompt::Assembly {
                     skill_prelude: self.skill_prelude.as_ref(),
@@ -235,15 +235,10 @@ impl MaxOrchestrator {
                     context_budget_tokens: llm.context_budget_tokens(),
                 },
             );
-            let response = super::streaming::complete_message(
-                llm.as_ref(),
-                ctx,
-                &prompt.messages,
-                &self.available_tools,
-            )
-            .await
-            .map_err(super::planning_error)?;
-            ctx.push_llm_usage_from_message(&response);
+            let response =
+                prompt::call_with_context(llm.as_ref(), ctx, &request, &self.available_tools)
+                    .await
+                    .map_err(super::planning_error)?;
             return Ok(super::plan_from_response(response));
         }
         if keep_skill_authoring_local
@@ -292,17 +287,20 @@ impl MaxOrchestrator {
         llm: &dyn Llm,
         input: &str,
     ) -> Result<Option<&RoutingRule>, OrchestratorError> {
-        let messages = routing_classifier_messages(input, &self.routing_domains_json);
+        let request = routing_classifier_request(input, &self.routing_domains_json);
         // Deliberately not `planning_error`: the classifier prompt is two
         // fixed messages that carry none of the conversation, so compacting
         // the transcript could not shorten it. Surfacing this as recoverable
         // would spend a summarization call and a retry on a request that will
         // fail identically.
-        let response = llm
-            .complete_messages(&messages, &[])
+        //
+        // Through the gateway since M5 / `REQ-001`, which is what gives this
+        // call a header and a usage record without giving it the transcript:
+        // `RequestKind::Routing` names a two-section manifest, and the
+        // invariant refuses one that carries turn context.
+        let response = prompt::call_with_context(llm, ctx, &request, &[])
             .await
             .map_err(|err| OrchestratorError::Backend(Arc::from(err.to_string())))?;
-        ctx.push_llm_usage_from_message(&response);
         let Some(decision) = parse_routing_decision(&response.content) else {
             return Ok(None);
         };

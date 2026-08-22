@@ -54,7 +54,7 @@ pub(super) async fn plan_with_overflow_recovery(
         error = %detail,
         "provider rejected the request for length; compacting and retrying once"
     );
-    if !compact_now(state, deps, plan_span_id).await {
+    if !compact_now(state, deps, plan_span_id, usage, requests).await {
         // Nothing left to summarize: the tail alone is too long for the model.
         // Retrying would send the same request and fail identically.
         return Ok(overflow_reply(
@@ -89,6 +89,8 @@ pub(super) async fn compact_under_pressure(
     state: &mut RunState,
     deps: &LoopDeps<'_>,
     plan_span_id: &SpanId,
+    usage: &mut Vec<Usage>,
+    requests: &mut Vec<RequestHeader>,
 ) {
     // Racing the token here is C3's outstanding promise: summarization is an
     // LLM round-trip inside the planning path, so a run cancelled while it is
@@ -99,12 +101,26 @@ pub(super) async fn compact_under_pressure(
     )
     .await
     .flatten();
-    record_compaction(state, deps, plan_span_id, compacted, "pressure");
+    record_compaction(
+        state,
+        deps,
+        plan_span_id,
+        compacted,
+        "pressure",
+        usage,
+        requests,
+    );
 }
 
 /// Summarize regardless of the measured pressure. `false` when there was
 /// nothing to summarize.
-async fn compact_now(state: &mut RunState, deps: &LoopDeps<'_>, plan_span_id: &SpanId) -> bool {
+async fn compact_now(
+    state: &mut RunState,
+    deps: &LoopDeps<'_>,
+    plan_span_id: &SpanId,
+    usage: &mut Vec<Usage>,
+    requests: &mut Vec<RequestHeader>,
+) -> bool {
     let compacted = super::unless_cancelled(
         &deps.cancel,
         crate::prompt::compact_now(state, &deps.compaction),
@@ -112,7 +128,15 @@ async fn compact_now(state: &mut RunState, deps: &LoopDeps<'_>, plan_span_id: &S
     .await
     .flatten();
     let did = compacted.is_some();
-    record_compaction(state, deps, plan_span_id, compacted, "overflow");
+    record_compaction(
+        state,
+        deps,
+        plan_span_id,
+        compacted,
+        "overflow",
+        usage,
+        requests,
+    );
     did
 }
 
@@ -122,10 +146,19 @@ fn record_compaction(
     plan_span_id: &SpanId,
     compacted: Option<crate::prompt::Compacted>,
     trigger: &'static str,
+    usage: &mut Vec<Usage>,
+    requests: &mut Vec<RequestHeader>,
 ) {
     let Some(compacted) = compacted else {
         return;
     };
+    // M5 / `REQ-001`: the summarizer is a provider call like any other, and
+    // these are the two things every provider call owes. Compaction has no
+    // `RunContext` to push them onto, so it hands them back and they join the
+    // turn's own here — which is also why compaction's tokens now appear in
+    // run totals that previously omitted them entirely.
+    requests.push(compacted.header.clone());
+    usage.extend(compacted.usage);
     let mut fields = BTreeMap::new();
     fields.insert(field_key("reason"), Value::from(trigger));
     fields.insert(field_key("span_start"), Value::from(compacted.span.start));

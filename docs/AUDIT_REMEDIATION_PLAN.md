@@ -597,7 +597,8 @@ Primary files: `crates/agentos-core/src/tools/registry.rs`,
 Priority: P1
 Size: M — ~200–300 LOC over six files; the blocker is that `compact()` holds
 `&mut RunState`, not a `RunContext`, so it has no `RequestHeader` sink
-Status: **not started**
+Status: **done** — resolved by returning the header and usage on `Compacted`
+rather than adding a sink to the `Copy` struct; `loop/planning.rs` emits them
 Dependencies: M0
 
 Read §4.1 before starting: this milestone must **preserve** routing's separation
@@ -925,7 +926,7 @@ a slice moves off `not started` only when the named artifact exists in the tree.
 | `PROC-001` | M4 | Minimal tool environment and process-group termination | SBX-001 | **done** — `tools::child_env` allowlist for every child incl. MCP servers, `[isolation].env_passthrough`, process-group kill on deadline and cancellation |
 | `NET-001` | M4 | Egress policy and bounded HTTP | TEST-001 | **done** — `egress::policy` by resolved address, `GuardedResolver` inside DNS, bounded redirects, streamed `[limits].http_response_bytes` |
 | `ING-001` | M4 | Attachment and frame limits | ID-001 | **done** — Feishu `FragmentBuffer` (count, pending-event and byte ceilings), streamed attachment downloads under `[limits].attachment_bytes` / `attachments_per_message`, capped provider bodies |
-| `REQ-001` | M5 | Unified provider-call gateway, request kinds, compaction usage accounting | ADR-001 | not started |
+| `REQ-001` | M5 | Unified provider-call gateway, request kinds, compaction usage accounting | ADR-001 | **done** — `RequestKind`, `RequestBuilder`, `prompt::gateway`, per-kind invariant branch, `scripts/check-provider-calls.sh` |
 | `AUD-001` | M6 | Durable, redacted safety events | REQ-001, ID-001 | not started |
 | `STATE-001` | M6 | Clear epochs, denial semantics, terminal output gate, `act()` policy re-assertion | AUD-001 | not started |
 | `CFG-001` | M7 | Unknown-key rejection and effective-config inventory | ADR-001 | not started |
