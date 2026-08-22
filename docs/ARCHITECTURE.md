@@ -446,6 +446,31 @@ AgentOS uses four independent safety rings:
    that failed. See
    [`docs/adr/0002-FAIL_CLOSED_ISOLATION.md`](adr/0002-FAIL_CLOSED_ISOLATION.md).
 
+5. **Filesystem containment.** A model-supplied path never reaches the
+   filesystem as a string. `crates/agentos-core/src/paths/RootDir` holds a
+   descriptor for the root and walks to the target with `openat(O_NOFOLLOW)`,
+   one component at a time, then acts on the descriptor it arrived at. A
+   symlink anywhere on the path is refused rather than resolved — including
+   one whose target is inside the root, because deciding that safely means
+   re-resolving, which is the race this replaces. Identifiers that become a
+   path component (task ids, sub-agent names, orchestrator template names,
+   session ids) are validated as single names by `paths::path_segment` and
+   rejected if they are not; they are never rewritten, because whoever chose
+   the name will use it again to find what was written under it.
+
+6. **Subprocess environment and lifetime.** Every child the runtime spawns —
+   the isolation worker, a `shell` command, a stdio MCP server — starts from
+   `env_clear` and is given back a named allowlist
+   (`crates/agentos-core/src/tools/child_env.rs`): `PATH`, `HOME`, `TMPDIR`,
+   the locale, proxy settings, and `AGENTOS_HOME`. No provider or channel
+   credential is inherited, so a tool the model drives cannot read the keys
+   the gateway holds. `[isolation].env_passthrough` names anything else a
+   deployment needs, by name and never by value. Each child is spawned into
+   its own process group; a deadline or a cancellation signals the *group*, so
+   a shell that forks does not leave a grandchild behind. A command that exits
+   cleanly is left alone, because something it started on purpose is its
+   business.
+
 ### Checked invariants
 
 Three relationships the rings depend on are asserted in debug builds

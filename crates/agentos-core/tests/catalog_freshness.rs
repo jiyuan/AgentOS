@@ -48,7 +48,7 @@ fn the_tool_catalog_matches_the_registered_specs() {
     let limits = WorkspaceConfig::default().limits;
     let mut registry = ToolRegistry::new();
     for name in BUILTIN_TOOL_NAMES {
-        register_builtin_tool(&mut registry, name, &limits).expect("a built-in registers");
+        register_builtin_tool(&mut registry, name, &limits, &[]).expect("a built-in registers");
     }
     let body = catalog::tool_markdown(&registry.specs());
 

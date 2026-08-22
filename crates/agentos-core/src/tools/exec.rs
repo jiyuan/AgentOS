@@ -19,7 +19,7 @@
 //!
 //! # How the child is reaped
 //!
-//! `kill_on_drop(true)`, and nothing else. Both ways a child can outlive its
+//! `kill_on_drop(true)` for the direct child. Both ways one can outlive its
 //! usefulness end in the same place: the deadline drops the future that owns
 //! the `Child`, and D1's cancellation drops the whole call. Tokio signals the
 //! child on that drop and its orphan reaper collects it, so there is no path
@@ -27,12 +27,22 @@
 //! an explicit `kill().await` somewhere in [`run`]. `a_killed_child_leaves_no_survivor`
 //! checks the pid is actually gone rather than trusting the mechanism.
 //!
-//! It reaps the *direct child only*. A child that forks before it is killed
-//! leaves a grandchild reparented to init and still running — see the ignored
-//! `a_killed_child_leaves_no_grandchild`, which is red on purpose until M4 in
-//! `docs/AUDIT_REMEDIATION_PLAN.md` terminates the process group. Read the
-//! deadline as a bound on the process this module started, not on everything
-//! that process went on to start.
+//! Since M4 / `PROC-001` it reaps the *process group*, not only the direct
+//! child. Every child is spawned into a new group of its own, and a deadline
+//! or a cancellation signals the group — so a shell that forks before it is
+//! killed no longer leaves a grandchild reparented to init and still running.
+//! `a_killed_child_leaves_no_grandchild` is the test that says so; it was red
+//! on purpose until this landed. The group is signalled only on those two
+//! paths: a command that *finishes* may have started something on purpose,
+//! and killing it afterwards would make `sh -c 'daemon &'` mean something
+//! different here than everywhere else.
+//!
+//! # The child does not inherit the runtime's environment
+//!
+//! `env_clear`, then an allowlist ([`crate::tools::child_env`]). Before this
+//! every subprocess the model could reach — including the isolation worker —
+//! saw every provider and channel credential the gateway holds, and could
+//! print them with `env`.
 //!
 //! # Capping is not the same as not reading
 //!
@@ -44,6 +54,7 @@
 //! test caught it.
 
 use crate::sandbox::Sandbox;
+use crate::tools::child_env;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -107,6 +118,12 @@ pub struct Exec<'a> {
     pub stdin: Option<&'a [u8]>,
     pub timeout: Duration,
     pub max_output_bytes: usize,
+    /// Variable names to pass through on top of the allowlist in
+    /// [`crate::tools::child_env`] (`[isolation].env_passthrough`).
+    ///
+    /// Names, not values: what a deployment declares is which of *its own*
+    /// variables a tool may see, never a value this code could invent.
+    pub extra_env: &'a [String],
 }
 
 /// One finished child process.
@@ -139,9 +156,18 @@ pub async fn run(exec: Exec<'_>) -> Result<ExecOutput, ExecError> {
         // Covers the dropped-future path — D1 cancellation — where no code of
         // ours runs to clean up.
         .kill_on_drop(true);
+    // M4 / `PROC-001`: the child starts from nothing and is given back only
+    // what it needs, so a credential the gateway holds is not one `env` away
+    // from the model.
+    command.env_clear();
+    command.envs(child_env::minimal(exec.extra_env));
     if let Some(cwd) = &exec.cwd {
         command.current_dir(cwd);
     }
+    // Its own process group, so the deadline below can end everything the
+    // command started rather than only the command.
+    #[cfg(unix)]
+    command.process_group(0);
     // Before the spawn, and fatal if it fails: a tool that asked to be
     // sandboxed must not run unsandboxed instead.
     exec.sandbox
@@ -155,6 +181,10 @@ pub async fn run(exec: Exec<'_>) -> Result<ExecOutput, ExecError> {
         program: program.clone(),
         source,
     })?;
+    // `process_group(0)` makes the child's pid its own pgid, so this is the
+    // handle to everything it goes on to start. Taken before `child` is moved
+    // into the future below, which is the last point it can be read.
+    let mut group = child.id().map(ProcessGroup::new);
 
     // Taken up front: `wait` needs the pipes closed or a child that fills one
     // never exits, and holding them past this point would deadlock the join
@@ -194,17 +224,81 @@ pub async fn run(exec: Exec<'_>) -> Result<ExecOutput, ExecError> {
     .await;
 
     match gathered {
-        Ok(Ok(output)) => Ok(output),
+        // The command finished on its own terms. Anything it deliberately
+        // left running is its business, so the group is not signalled.
+        Ok(Ok(output)) => {
+            if let Some(group) = group.as_mut() {
+                group.leave_running();
+            }
+            Ok(output)
+        }
         Ok(Err(source)) => Err(ExecError::Io { program, source }),
         Err(_elapsed) => {
             // `child` was moved into the future above, which the timeout has
-            // now dropped — `kill_on_drop` has already signalled it. Nothing
-            // is left to await here, so the reap is the runtime's, and the
-            // caller gets a deadline error rather than a hang.
+            // now dropped — `kill_on_drop` has already signalled the direct
+            // child. This signals the rest of its group, which is where a
+            // forked grandchild lives.
+            if let Some(group) = group.as_mut() {
+                group.terminate();
+            }
             Err(ExecError::TimedOut {
                 program,
                 timeout_ms,
             })
+        }
+    }
+}
+
+/// A spawned child's process group, and the ability to end it.
+///
+/// Exists as a type rather than a call so the cancellation path is covered
+/// too: D1 drops the whole `run` future, and no code of ours runs at the end
+/// of the function — but `Drop` does. `kill_on_drop` handles the direct child
+/// on that path and nothing below it, which is exactly the gap
+/// `a_killed_child_leaves_no_grandchild` was written against.
+struct ProcessGroup {
+    pgid: u32,
+    /// Cleared once the command has finished on its own terms, so a normal
+    /// exit does not sweep up whatever the command started on purpose.
+    signal_on_drop: bool,
+}
+
+impl ProcessGroup {
+    fn new(pgid: u32) -> Self {
+        Self {
+            pgid,
+            signal_on_drop: true,
+        }
+    }
+
+    /// The command exited by itself. Leave its descendants alone.
+    fn leave_running(&mut self) {
+        self.signal_on_drop = false;
+    }
+
+    /// End every process in the group, now.
+    ///
+    /// `SIGKILL` rather than `SIGTERM`: this runs only after a deadline has
+    /// already expired or a run has been cancelled, so the process has had
+    /// whatever time it was going to get. A graceful signal here would mean a
+    /// second deadline to enforce, for a case where the caller has already
+    /// stopped waiting.
+    fn terminate(&mut self) {
+        self.signal_on_drop = false;
+        #[cfg(unix)]
+        // SAFETY: `kill` with a negative pid signals a process group and
+        // touches no memory. A pgid that no longer exists returns `ESRCH`,
+        // which is ignored.
+        unsafe {
+            libc::kill(-(self.pgid as i32), libc::SIGKILL);
+        }
+    }
+}
+
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        if self.signal_on_drop {
+            self.terminate();
         }
     }
 }
@@ -243,6 +337,48 @@ mod tests {
     static UNRESTRICTED: std::sync::LazyLock<Sandbox> =
         std::sync::LazyLock::new(Sandbox::unrestricted);
 
+    /// A per-test scratch path for a child to record a pid in.
+    ///
+    /// Hashed rather than interpolating the ids: a `ThreadId` renders with
+    /// parentheses, which the shell commands below would then choke on.
+    fn probe_path(label: &str) -> PathBuf {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(
+            &(std::process::id(), std::thread::current().id(), label),
+            &mut hasher,
+        );
+        std::env::temp_dir().join(format!(
+            "{label}-{:016x}",
+            std::hash::Hasher::finish(&hasher)
+        ))
+    }
+
+    /// Whether `pid` is still around after a couple of seconds of polling.
+    ///
+    /// Polled rather than slept once: a kill is asynchronous, so the only
+    /// thing worth asserting is that it happens promptly, not instantly. Kills
+    /// whatever survives, so one test's orphan is not the next one's.
+    async fn stays_alive(pid: &str) -> bool {
+        let mut alive = true;
+        for _ in 0..20 {
+            let probe = std::process::Command::new("kill")
+                .args(["-0", pid])
+                .output()
+                .expect("kill -0 runs");
+            if !probe.status.success() {
+                alive = false;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if alive {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", pid])
+                .output();
+        }
+        alive
+    }
+
     fn exec<'a>(program: &'a str, args: &'a [String]) -> Exec<'a> {
         Exec {
             program,
@@ -252,6 +388,7 @@ mod tests {
             timeout: Duration::from_secs(10),
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             sandbox: &UNRESTRICTED,
+            extra_env: &[],
         }
     }
 
@@ -381,17 +518,15 @@ mod tests {
     /// The case the test above sidesteps with `exec`.
     ///
     /// `kill_on_drop` signals the direct child and nothing else, so a shell
-    /// that forks before it is killed leaves a grandchild reparented to init
-    /// and still running past the deadline the caller asked for. That is the
-    /// orphan `a_killed_child_leaves_no_survivor`'s own comment names and then
-    /// avoids, which made "no orphan process" a claim no test checked.
+    /// that forks before it is killed used to leave a grandchild reparented to
+    /// init and still running past the deadline the caller asked for. That is
+    /// the orphan `a_killed_child_leaves_no_survivor`'s own comment names and
+    /// then avoids, which made "no orphan process" a claim no test checked.
     ///
-    /// Ignored because it is red on purpose: M4 in
-    /// `docs/AUDIT_REMEDIATION_PLAN.md` terminates the process group rather
-    /// than the direct child, and this is the test that will show it worked.
-    /// Run with `cargo test -p agentos-core -- --ignored a_killed_child_leaves_no_grandchild`.
+    /// Green since M4 / `PROC-001`: the child is spawned into its own process
+    /// group and the deadline signals the group, so the grandchild goes with
+    /// its parent.
     #[tokio::test]
-    #[ignore = "red until M4 terminates the process group; see AUDIT_REMEDIATION_PLAN.md"]
     async fn a_killed_child_leaves_no_grandchild() {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         std::hash::Hash::hash(
@@ -441,6 +576,88 @@ mod tests {
         assert!(
             !alive,
             "grandchild pid {pid} outlived the deadline its parent was killed for"
+        );
+    }
+
+    /// Two directions of the same rule, so "kill the group" does not quietly
+    /// become "kill anything the command started".
+    ///
+    /// A command that *finishes* may have started something deliberately —
+    /// `sh -c 'daemon &'` is a normal thing to run — and sweeping it up
+    /// afterwards would make this runtime's shell mean something different
+    /// from every other one. Only a deadline or a cancellation signals the
+    /// group.
+    #[tokio::test]
+    async fn a_command_that_finishes_leaves_its_deliberate_background_child_alone() {
+        let pid_file = probe_path("agentos-deliberate-child");
+        let _ = std::fs::remove_file(&pid_file);
+
+        // Redirected, because a background child that keeps the shell's
+        // stdout pipe open holds `run`'s reads open with it — the shell would
+        // exit and the call would still wait for the `sleep`, which is a
+        // different thing from what this test is about.
+        let args = vec![
+            "-c".to_owned(),
+            format!("sleep 5 >/dev/null 2>&1 & echo $! > {}", pid_file.display()),
+        ];
+        let mut spec = exec("sh", &args);
+        spec.timeout = Duration::from_secs(10);
+        let output = run(spec).await.expect("the shell finishes promptly");
+        assert!(output.success);
+
+        let pid = std::fs::read_to_string(&pid_file)
+            .expect("the shell recorded its background child's pid")
+            .trim()
+            .to_owned();
+        let _ = std::fs::remove_file(&pid_file);
+
+        // Immediately: the sleep has 5 seconds left, so anything that ended it
+        // was this module.
+        let probe = std::process::Command::new("kill")
+            .args(["-0", &pid])
+            .output()
+            .expect("kill -0 runs");
+        let alive = probe.status.success();
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid])
+            .output();
+        assert!(
+            alive,
+            "pid {pid} was started deliberately by a command that then exited cleanly, \
+             and must not have been swept up with it"
+        );
+    }
+
+    /// The cancellation path, which no code of ours runs at the end of: D1
+    /// drops the whole `run` future, and the process group is ended by the
+    /// guard's `Drop` rather than by a line in [`run`].
+    #[tokio::test]
+    async fn a_cancelled_call_takes_the_whole_group_with_it() {
+        let pid_file = probe_path("agentos-cancelled-group");
+        let _ = std::fs::remove_file(&pid_file);
+
+        let args = vec![
+            "-c".to_owned(),
+            format!("sleep 10 & echo $! > {}; sleep 10", pid_file.display()),
+        ];
+        let mut spec = exec("sh", &args);
+        // Far longer than the outer timeout: what ends this call must be the
+        // caller giving up on it, not its own deadline. Losing a `timeout`
+        // drops the future, which is exactly what `unless_cancelled` does to a
+        // tool call when a run is cancelled.
+        spec.timeout = Duration::from_secs(30);
+        let abandoned = tokio::time::timeout(Duration::from_millis(300), run(spec)).await;
+        assert!(abandoned.is_err(), "the call must not have finished");
+
+        let pid = std::fs::read_to_string(&pid_file)
+            .expect("the shell recorded its grandchild's pid")
+            .trim()
+            .to_owned();
+        let _ = std::fs::remove_file(&pid_file);
+
+        assert!(
+            !stays_alive(&pid).await,
+            "grandchild pid {pid} outlived the cancelled call that started it"
         );
     }
 

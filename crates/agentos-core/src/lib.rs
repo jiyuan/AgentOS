@@ -19,6 +19,7 @@ pub mod jobs;
 pub mod r#loop;
 pub mod memory;
 pub mod orchestrator;
+pub mod paths;
 pub mod prompt;
 pub mod runner;
 pub mod runtime;

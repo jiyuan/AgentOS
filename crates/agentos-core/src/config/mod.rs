@@ -271,6 +271,19 @@ impl Default for ChannelConfig {
 pub struct IsolationConfig {
     pub worker_path: Option<PathBuf>,
     pub worker_path_env: Option<String>,
+    /// Environment variable *names* a tool subprocess may see beyond the
+    /// built-in allowlist (M4 / `PROC-001`).
+    ///
+    /// Every child the runtime starts — the isolation worker, every `shell`
+    /// command — begins with a cleared environment and is given back only
+    /// `PATH`, `HOME`, `TMPDIR`, the locale, the proxy settings, and
+    /// `AGENTOS_HOME`. Before that, a child inherited every provider and
+    /// channel credential the gateway holds and could print them with `env`.
+    ///
+    /// Names, never values: this says which of the *deployment's own*
+    /// variables a tool is allowed to read. Adding a credential's name here
+    /// hands that credential to every command the model chooses to run.
+    pub env_passthrough: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]

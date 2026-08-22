@@ -113,7 +113,7 @@ fn builtin_specs() -> Result<Vec<agentos_interfaces::tool::ToolSpec>, String> {
     let limits = WorkspaceConfig::default().limits;
     let mut registry = ToolRegistry::new();
     for name in BUILTIN_TOOL_NAMES {
-        register_builtin_tool(&mut registry, name, &limits)?;
+        register_builtin_tool(&mut registry, name, &limits, &[])?;
     }
     Ok(registry.specs())
 }

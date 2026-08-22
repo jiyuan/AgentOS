@@ -1,11 +1,13 @@
-use super::common::{elapsed_ms, result_metadata, safe_workspace_path, workspace_root};
+use super::common::{elapsed_ms, result_metadata, workspace_root};
+use crate::paths::{DirEntry, RootDir};
 use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
 use agentos_proto::{ToolCall, ToolResult, ToolStatus};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, value::RawValue};
-use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -129,13 +131,18 @@ impl Tool for FileTool {
         let parsed: FileArgs = serde_json::from_str(args.get())
             .map_err(|err| ToolError::Failed(err.to_string().into()))?;
         let start = Instant::now();
-        let safe_path = safe_workspace_path(&workspace_root(), &parsed.path)
-            .map_err(|err| ToolError::Failed(Arc::from(err)))?;
+        // M4 / `FS-001`: containment is the kernel's, not a string check's.
+        // Every open below happens against a descriptor for a directory this
+        // root walked to with `O_NOFOLLOW`, so no symlink — planted before the
+        // call or swapped in during it — can move where the operation lands.
+        let root = RootDir::open(workspace_root())
+            .map_err(|err| ToolError::Failed(Arc::from(err.to_string())))?;
         match parsed.operation.as_str() {
             "read" => {
-                if safe_path.is_dir() {
+                if root.is_dir(&parsed.path) {
                     let listing = read_directory_listing(
-                        &safe_path,
+                        &root,
+                        &parsed.path,
                         parsed.include_metadata.unwrap_or(false),
                         parsed.modified_within_hours,
                         self.directory_list_entries,
@@ -152,8 +159,11 @@ impl Tool for FileTool {
                     .max_bytes
                     .unwrap_or(self.read_bytes)
                     .min(self.read_max_bytes);
+                let file = root
+                    .open_file(&parsed.path)
+                    .map_err(|err| ToolError::Failed(Arc::from(err.to_string())))?;
                 let (content, original_bytes, truncated) = read_file_slice(
-                    &safe_path,
+                    file,
                     max_bytes,
                     parsed.offset.unwrap_or(0),
                     parsed.tail.unwrap_or(false),
@@ -176,15 +186,14 @@ impl Tool for FileTool {
                 let content = parsed.content.unwrap_or_default();
                 // Models routinely request writes into directories that
                 // don't exist yet (e.g. `workspace/skills/rss-digest/SKILL.md`).
-                // Create the parent chain so they don't get ENOENT on first
-                // touch — they can always rm afterwards if it wasn't desired.
-                if let Some(parent) = safe_path.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        std::fs::create_dir_all(parent)
-                            .map_err(|err| ToolError::Failed(err.to_string().into()))?;
-                    }
-                }
-                std::fs::write(&safe_path, content.as_bytes())
+                // `create_file` creates the parent chain so they don't get
+                // ENOENT on first touch — through the same no-follow walk, so
+                // a link planted in the middle of a not-yet-existing path
+                // fails rather than deciding where the new file lands.
+                let mut file = root
+                    .create_file(&parsed.path)
+                    .map_err(|err| ToolError::Failed(Arc::from(err.to_string())))?;
+                file.write_all(content.as_bytes())
                     .map_err(|err| ToolError::Failed(err.to_string().into()))?;
                 let message = format!("wrote {} bytes", content.len());
                 Ok(ToolResult {
@@ -202,13 +211,11 @@ impl Tool for FileTool {
 }
 
 fn read_file_slice(
-    path: &Path,
+    mut file: File,
     max_bytes: usize,
     offset: u64,
     tail: bool,
 ) -> Result<(String, u64, bool), ToolError> {
-    let mut file =
-        std::fs::File::open(path).map_err(|err| ToolError::Failed(err.to_string().into()))?;
     let file_len = file
         .metadata()
         .map_err(|err| ToolError::Failed(err.to_string().into()))?
@@ -252,6 +259,7 @@ fn read_file_slice(
 }
 
 fn read_directory_listing(
+    root: &RootDir,
     path: &PathBuf,
     include_metadata: bool,
     modified_within_hours: Option<u64>,
@@ -259,45 +267,13 @@ fn read_directory_listing(
 ) -> Result<String, ToolError> {
     let modified_cutoff = modified_within_hours
         .map(|hours| SystemTime::now() - Duration::from_secs(hours.saturating_mul(60 * 60)));
-    let mut entries = std::fs::read_dir(path)
-        .map_err(|err| ToolError::Failed(err.to_string().into()))?
-        .map(|entry| {
-            let entry = entry.map_err(|err| ToolError::Failed(err.to_string().into()))?;
-            let file_type = entry
-                .file_type()
-                .map_err(|err| ToolError::Failed(err.to_string().into()))?;
-            let metadata = entry
-                .metadata()
-                .map_err(|err| ToolError::Failed(err.to_string().into()))?;
-            if let Some(cutoff) = modified_cutoff {
-                if file_type.is_file() {
-                    let modified = metadata
-                        .modified()
-                        .map_err(|err| ToolError::Failed(err.to_string().into()))?;
-                    if modified < cutoff {
-                        return Ok(None);
-                    }
-                }
-            }
-            let suffix = if file_type.is_dir() { "/" } else { "" };
-            let name = format!("{}{}", entry.file_name().to_string_lossy(), suffix);
-            if !include_metadata {
-                return Ok(Some(name));
-            }
-            let modified_secs = metadata
-                .modified()
-                .ok()
-                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-                .map(|duration| duration.as_secs())
-                .unwrap_or_default();
-            Ok(Some(format!(
-                "{name}\tmodified_unix={modified_secs}\tbytes={}",
-                metadata.len()
-            )))
-        })
-        .collect::<Result<Vec<_>, ToolError>>()?
+    let listed = root
+        .read_dir(path)
+        .map_err(|err| ToolError::Failed(Arc::from(err.to_string())))?;
+    let mut entries = listed
         .into_iter()
-        .flatten()
+        .filter(|entry| within_cutoff(entry, modified_cutoff))
+        .map(|entry| render_entry(&entry, include_metadata))
         .collect::<Vec<_>>();
     entries.sort();
     let truncated = entries.len() > limit;
@@ -312,44 +288,121 @@ fn read_directory_listing(
     Ok(listing)
 }
 
+/// Whether an entry survives a `modified_within_hours` filter.
+///
+/// Only files are filtered: a directory is a place to look next, and hiding
+/// one because it has not been touched recently would hide everything under
+/// it too. An entry whose modification time could not be read is kept —
+/// listing it without a timestamp says more than silently dropping it.
+fn within_cutoff(entry: &DirEntry, cutoff: Option<SystemTime>) -> bool {
+    let Some(cutoff) = cutoff else {
+        return true;
+    };
+    if entry.is_dir {
+        return true;
+    }
+    entry.modified.is_none_or(|modified| modified >= cutoff)
+}
+
+/// One listing line.
+///
+/// `/` marks a directory and `@` a symlink, as `ls -F` does. The `@` is not
+/// decoration: a link is listed because it is there, and refused if read —
+/// showing it without saying what it is would make the refusal look arbitrary.
+fn render_entry(entry: &DirEntry, include_metadata: bool) -> String {
+    let suffix = match (entry.is_dir, entry.is_symlink) {
+        (_, true) => "@",
+        (true, _) => "/",
+        _ => "",
+    };
+    let name = format!("{}{suffix}", entry.name);
+    if !include_metadata {
+        return name;
+    }
+    let modified_secs = entry
+        .modified
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    format!("{name}\tmodified_unix={modified_secs}\tbytes={}", entry.len)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn read_directory_listing_returns_sorted_entries_and_marks_dirs() {
+    /// A scratch tree plus a root opened on it, which is how every listing and
+    /// read below reaches the filesystem now.
+    fn fixture(label: &str) -> (PathBuf, RootDir) {
         let dir = std::env::temp_dir().join(format!(
-            "agentos-file-tool-listing-{}",
+            "agentos-file-tool-{label}-{}-{}",
+            std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+                .map(|since| since.as_nanos())
+                .unwrap_or(0)
         ));
-        std::fs::create_dir_all(dir.join("nested")).unwrap();
-        std::fs::write(dir.join("b.txt"), b"b").unwrap();
-        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        std::fs::create_dir_all(&dir).expect("fixture dir creates");
+        let root = RootDir::open(&dir).expect("root opens");
+        (dir, root)
+    }
 
-        let listing = read_directory_listing(&dir, false, None, DEFAULT_DIRECTORY_LIST_ENTRIES)
-            .expect("directory listing should succeed");
+    #[test]
+    fn read_directory_listing_returns_sorted_entries_and_marks_dirs() {
+        let (dir, root) = fixture("listing");
+        std::fs::create_dir_all(dir.join("here/nested")).unwrap();
+        std::fs::write(dir.join("here/b.txt"), b"b").unwrap();
+        std::fs::write(dir.join("here/a.txt"), b"a").unwrap();
+
+        let listing = read_directory_listing(
+            &root,
+            &PathBuf::from("here"),
+            false,
+            None,
+            DEFAULT_DIRECTORY_LIST_ENTRIES,
+        )
+        .expect("directory listing should succeed");
 
         assert_eq!(listing, "a.txt\nb.txt\nnested/");
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A symlink is listed, marked, and — as the containment tests show —
+    /// refused if read. Hiding it would make the refusal look arbitrary.
+    #[test]
+    fn a_symlink_is_listed_with_a_marker_rather_than_as_its_target() {
+        let (dir, root) = fixture("listing-link");
+        std::fs::create_dir_all(dir.join("here")).unwrap();
+        std::fs::write(dir.join("here/real.txt"), b"real").unwrap();
+        std::os::unix::fs::symlink("/etc", dir.join("here/elsewhere")).unwrap();
+
+        let listing = read_directory_listing(
+            &root,
+            &PathBuf::from("here"),
+            false,
+            None,
+            DEFAULT_DIRECTORY_LIST_ENTRIES,
+        )
+        .expect("listing succeeds");
+
+        assert_eq!(listing, "elsewhere@\nreal.txt");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn read_directory_listing_can_filter_recent_files_and_include_metadata() {
-        let dir = std::env::temp_dir().join(format!(
-            "agentos-file-tool-metadata-listing-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("recent.log"), b"recent").unwrap();
+        let (dir, root) = fixture("metadata-listing");
+        std::fs::create_dir_all(dir.join("here")).unwrap();
+        std::fs::write(dir.join("here/recent.log"), b"recent").unwrap();
 
-        let listing = read_directory_listing(&dir, true, Some(24), DEFAULT_DIRECTORY_LIST_ENTRIES)
-            .expect("metadata listing should succeed");
+        let listing = read_directory_listing(
+            &root,
+            &PathBuf::from("here"),
+            true,
+            Some(24),
+            DEFAULT_DIRECTORY_LIST_ENTRIES,
+        )
+        .expect("metadata listing should succeed");
 
         assert!(listing.contains("recent.log"));
         assert!(listing.contains("modified_unix="));
@@ -359,19 +412,15 @@ mod tests {
 
     #[test]
     fn read_file_slice_defaults_to_bounded_tail_or_range() {
-        let path = std::env::temp_dir().join(format!(
-            "agentos-file-tool-slice-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::write(&path, b"0123456789abcdef").unwrap();
+        let (dir, root) = fixture("slice");
+        std::fs::write(dir.join("data.bin"), b"0123456789abcdef").unwrap();
 
         let (head, file_bytes, truncated) =
-            read_file_slice(&path, 4, 0, false).expect("head read should succeed");
+            read_file_slice(root.open_file("data.bin").unwrap(), 4, 0, false)
+                .expect("head read should succeed");
         let (tail, _, tail_truncated) =
-            read_file_slice(&path, 4, 0, true).expect("tail read should succeed");
+            read_file_slice(root.open_file("data.bin").unwrap(), 4, 0, true)
+                .expect("tail read should succeed");
 
         assert_eq!(file_bytes, 16);
         assert!(truncated);
@@ -381,31 +430,29 @@ mod tests {
         assert!(tail.contains("cdef"));
         assert!(tail.starts_with("[file read truncated: omitted first 12 of 16 bytes]"));
 
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(dir);
     }
+
     /// The configured cap is what truncates, not the compiled-in default —
     /// otherwise `[limits].directory_list_entries` would be a key that reads
     /// back correctly and changes nothing.
     #[test]
     fn a_configured_listing_cap_is_what_truncates() {
-        let dir = std::env::temp_dir().join(format!(
-            "agentos-file-listing-cap-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("fixture dir creates");
+        let (dir, root) = fixture("listing-cap");
+        std::fs::create_dir_all(dir.join("here")).unwrap();
         for index in 0..5 {
-            std::fs::write(dir.join(format!("entry-{index}")), b"x").expect("entry writes");
+            std::fs::write(dir.join(format!("here/entry-{index}")), b"x").expect("entry writes");
         }
 
-        let listing = read_directory_listing(&dir, false, None, 2).expect("listing succeeds");
+        let listing = read_directory_listing(&root, &PathBuf::from("here"), false, None, 2)
+            .expect("listing succeeds");
         let lines: Vec<&str> = listing.lines().collect();
         // Two entries plus the truncation marker.
         assert_eq!(lines.len(), 3, "got: {listing}");
         assert_eq!(lines[2], "...");
 
-        let full = read_directory_listing(&dir, false, None, 10).expect("listing succeeds");
+        let full = read_directory_listing(&root, &PathBuf::from("here"), false, None, 10)
+            .expect("listing succeeds");
         assert_eq!(full.lines().count(), 5);
         let _ = std::fs::remove_dir_all(&dir);
     }

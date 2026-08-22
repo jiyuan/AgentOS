@@ -11,9 +11,10 @@
 //! milestone in its ignore reason. When that milestone lands, its PR deletes
 //! the `#[ignore]` and the test becomes the proof.
 //!
-//! The `AUTH-002`, `ID-001`, and `SBX-001` groups have been through that
-//! transition: those six run normally now, and are what a future change to
-//! `Policy::narrow`, to namespace encoding, or to registry dispatch is
+//! The `AUTH-002`, `ID-001`, `SBX-001`, `FS-001`, and `PROC-001` groups have
+//! been through that transition: those nine run normally now, and are what a
+//! future change to `Policy::narrow`, to namespace encoding, to registry
+//! dispatch, to filesystem containment, or to the child environment is
 //! measured against.
 //!
 //! Run them with:
@@ -250,15 +251,86 @@ async fn a_sandboxed_tool_does_not_run_in_process_without_an_executor() {
 }
 
 // ---------------------------------------------------------------------------
-// M4 / PROC-001 — the child inherits the whole process environment
-// `tools/exec.rs` never calls `env_clear`.
+// M4 / FS-001 — CLOSED. Containment is the kernel's, not a string check's.
+//
+// `safe_workspace_path` rejected `..` and absolute paths and then handed back
+// `root.join(requested)` for an ordinary `std::fs` call. A symlink inside the
+// workspace made a traversal-free relative path read and write outside it, and
+// the gap between the check and the open was a race anything with write access
+// to the tree could win.
+// ---------------------------------------------------------------------------
+
+/// The finding, in the shape an attacker would use it: no `..` anywhere, and
+/// the path still leaves the root.
+#[test]
+fn a_symlink_inside_the_root_does_not_make_an_outside_path_reachable() {
+    use agentos_core::paths::{ContainmentError, RootDir};
+
+    let inside = std::env::temp_dir().join(format!("agentos-fs001-in-{}", std::process::id()));
+    let outside = std::env::temp_dir().join(format!("agentos-fs001-out-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&inside);
+    let _ = std::fs::remove_dir_all(&outside);
+    std::fs::create_dir_all(&inside).expect("root creates");
+    std::fs::create_dir_all(&outside).expect("target creates");
+    std::fs::write(outside.join("secrets.env"), b"API_KEY=leaked").expect("target file");
+    std::os::unix::fs::symlink(&outside, inside.join("shared")).expect("symlink");
+
+    let root = RootDir::open(&inside).expect("root opens");
+    let error = root
+        .open_file("shared/secrets.env")
+        .expect_err("a link out of the root is not a path inside it");
+
+    assert!(
+        matches!(error, ContainmentError::Symlink { .. }),
+        "a symlinked component must be refused, not resolved: {error:?}"
+    );
+    // And the write half, which is the more damaging one.
+    assert!(root.create_file("shared/planted.txt").is_err());
+    assert!(!outside.join("planted.txt").exists());
+
+    let _ = std::fs::remove_dir_all(&inside);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+/// The other half of the finding: an identifier a model chose becomes one
+/// component of a path, and `Path::join` discards the root when handed an
+/// absolute one.
+#[test]
+fn an_identifier_that_is_a_path_cannot_become_a_directory() {
+    use agentos_core::task_workspace::{TaskWorkspace, TaskWorkspaceError};
+    use agentos_proto::TaskId;
+
+    let root = std::env::temp_dir().join(format!("agentos-fs001-task-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("root creates");
+    let workspace = TaskWorkspace::new(&root);
+
+    for id in ["/tmp/agentos-fs001-escape", "../escape", ".."] {
+        let error = workspace
+            .init_task(&TaskId::new(id))
+            .expect_err("a path is not a task id");
+        assert!(
+            matches!(error, TaskWorkspaceError::UnusableName(_)),
+            "{id:?}: {error:?}"
+        );
+    }
+    assert!(!std::path::Path::new("/tmp/agentos-fs001-escape").exists());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// M4 / PROC-001 — CLOSED. The child no longer inherits the whole process
+// environment.
+//
+// `tools/exec.rs` never called `env_clear`. It now clears and re-adds an
+// allowlist (`tools/child_env.rs`).
 // ---------------------------------------------------------------------------
 
 /// Every provider and channel credential the gateway holds is in its
-/// environment, and every shell command the model runs can read all of them.
+/// environment, and every shell command the model runs could read all of them.
 /// This is the credential-egress half of the M1 exposure.
 #[tokio::test]
-#[ignore = "red until M4 / PROC-001 passes a minimal allowlisted environment"]
 async fn a_child_process_does_not_inherit_the_parents_secrets() {
     // SAFETY-adjacent: single-threaded within this test, and the value is a
     // canary rather than a real credential.
@@ -274,6 +346,7 @@ async fn a_child_process_does_not_inherit_the_parents_secrets() {
         stdin: None,
         timeout: Duration::from_secs(10),
         max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+        extra_env: &[],
     })
     .await
     .expect("sh runs");
@@ -286,6 +359,10 @@ async fn a_child_process_does_not_inherit_the_parents_secrets() {
         "the child inherited a parent credential; a tool the model drives can read \
          every provider and channel key the runtime holds"
     );
+    // The control: clearing the environment is only useful if the child still
+    // has one. A `PATH`-less child cannot find `sh`'s own helpers and would
+    // fail in ways that look like this test passing.
+    assert!(env.contains("PATH="), "got: {env}");
 }
 
 // ---------------------------------------------------------------------------

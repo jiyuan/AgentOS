@@ -73,6 +73,7 @@ Every key `agent.toml` accepts, derived from the config structs. Edit the doc co
 | `isolation` | `IsolationConfig` | (table) | Where the subprocess worker that runs sandboxed tools is found. |
 | `isolation.worker_path` | `Option<PathBuf>` | (unset) | *(undocumented — see `config/undocumented.txt`)* |
 | `isolation.worker_path_env` | `Option<String>` | (unset) | *(undocumented — see `config/undocumented.txt`)* |
+| `isolation.env_passthrough` | `Vec<String>` | (empty) | Environment variable *names* a tool subprocess may see beyond the built-in allowlist (M4 / `PROC-001`).  Every child the runtime starts — the isolation worker, every `shell` command — begins with a cleared environment and is given back only `PATH`, `HOME`, `TMPDIR`, the locale, the proxy settings, and `AGENTOS_HOME`. Before that, a child inherited every provider and channel credential the gateway holds and could print them with `env`.  Names, never values: this says which of the *deployment's own* variables a tool is allowed to read. Adding a credential's name here hands that credential to every command the model chooses to run. |
 | `subagents` | `Vec<SubAgentConfig>` | (none) | Sub-agents this agent may delegate to. Each carries its own tools and inherits the parent's rules for them, so a sub-agent can never decide a call more permissively than its parent — arguments included. Listing a tool selects it; it does not elevate it. See `subagents.delegation_grants` for the declared exception. |
 | `subagents.name` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
 | `subagents.id` | `Arc<str>` | — | *(undocumented — see `config/undocumented.txt`)* |
@@ -168,5 +169,5 @@ Every key `agent.toml` accepts, derived from the config structs. Edit the doc co
 | `spill.root` | `PathBuf` | `spill` | Where artifacts are written. Relative paths resolve against the workspace root; an absolute path is taken as given, for a deployment that wants spill on a different volume from the session database. |
 | `spill.retention_days` | `u64` | `0` | Days an artifact is kept, or `0` to keep everything.  `0` is a choice rather than a disabled feature — see the module docs. |
 
-102 of 160 keys have no description yet. They are listed in `crates/agentos-core/src/config/undocumented.txt`; writing the doc comment on the field is what removes a line from it.
+102 of 161 keys have no description yet. They are listed in `crates/agentos-core/src/config/undocumented.txt`; writing the doc comment on the field is what removes a line from it.
 <!-- END GENERATED: config -->

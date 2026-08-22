@@ -270,7 +270,9 @@ impl AgentRuntime {
         let mut tools =
             build_parent_tools(&workspace_config, memory_manager.clone(), jobs.clone())?;
         if let Some(path) = isolation_worker_path(&workspace_config) {
-            tools = tools.with_subprocess_isolation(path);
+            tools = tools
+                .with_subprocess_isolation(path)
+                .with_env_passthrough(workspace_config.isolation.env_passthrough.iter().cloned());
         }
         let mcp_specs = register_configured_mcp(&mut tools, &workspace_config).await?;
         refuse_unenforceable_isolation(&tools).await?;
@@ -643,7 +645,12 @@ pub fn build_subagents(
         let mut tools = ToolRegistry::new();
         for tool in &subagent.tools {
             if tool.as_ref() != "memory" {
-                register_builtin_tool(&mut tools, tool, &config.limits)?;
+                register_builtin_tool(
+                    &mut tools,
+                    tool,
+                    &config.limits,
+                    &config.isolation.env_passthrough,
+                )?;
             }
         }
         if subagent_memory_tool_enabled(subagent) {

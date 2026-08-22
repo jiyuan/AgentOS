@@ -1,3 +1,4 @@
+use crate::paths::{path_segment, PathSegmentError};
 use agentos_interfaces::orchestrator::{MemoryFragment, OrchestratorTemplate};
 use agentos_proto::TaskId;
 use serde::{Deserialize, Serialize};
@@ -37,6 +38,16 @@ pub enum TaskWorkspaceError {
     },
     #[error("immutable task config already exists at {path}")]
     ImmutableConfig { path: PathBuf },
+    /// An identifier that becomes one component of a path is not usable as
+    /// one (M4 / `FS-001`).
+    ///
+    /// Task ids, sub-agent names and orchestrator template names are chosen by
+    /// a model's plan or by an envelope, and were joined onto the task root
+    /// unvalidated. `Path::join` replaces the whole left-hand side when its
+    /// argument is absolute, so a name of `/etc/cron.d` never landed beneath
+    /// the task directory at all.
+    #[error(transparent)]
+    UnusableName(#[from] PathSegmentError),
 }
 
 /// Bound on the in-flight queue between `append_session_event` and the
@@ -123,19 +134,22 @@ impl TaskWorkspace {
         &self.root
     }
 
-    pub fn task_dir(&self, task_id: &TaskId) -> PathBuf {
-        if matches!(task_id.as_str(), "main" | "min") {
-            return self
-                .root
-                .parent()
-                .unwrap_or_else(|| self.root())
-                .join(task_id.as_str());
+    /// Where a task's files live, once its id has been shown to be a name.
+    ///
+    /// Fallible since M4 / `FS-001`: this is the join every other path in this
+    /// module is built from, so validating here covers `state.toml`,
+    /// `task.toml`, and the `subagents`, `suborchestrators` and `sessions`
+    /// subtrees in one place.
+    pub fn task_dir(&self, task_id: &TaskId) -> Result<PathBuf, TaskWorkspaceError> {
+        let name = path_segment("task id", task_id.as_str())?;
+        if matches!(name, "main" | "min") {
+            return Ok(self.root.parent().unwrap_or_else(|| self.root()).join(name));
         }
-        self.root.join(task_id.as_str())
+        Ok(self.root.join(name))
     }
 
     pub fn init_task(&self, task_id: &TaskId) -> Result<(), TaskWorkspaceError> {
-        let dir = self.task_dir(task_id);
+        let dir = self.task_dir(task_id)?;
         create_dir_all(&dir)?;
         create_dir_all(&dir.join("subagents"))?;
         create_dir_all(&dir.join("suborchestrators"))?;
@@ -164,7 +178,7 @@ impl TaskWorkspace {
     }
 
     pub fn load_state(&self, task_id: &TaskId) -> Result<Option<TaskState>, TaskWorkspaceError> {
-        let path = self.task_dir(task_id).join("state.toml");
+        let path = self.task_dir(task_id)?.join("state.toml");
         match fs::read_to_string(&path) {
             Ok(input) => toml::from_str(&input)
                 .map(Some)
@@ -179,7 +193,7 @@ impl TaskWorkspace {
         task_id: &TaskId,
         state: &TaskState,
     ) -> Result<(), TaskWorkspaceError> {
-        write_toml(&self.task_dir(task_id).join("state.toml"), state)
+        write_toml(&self.task_dir(task_id)?.join("state.toml"), state)
     }
 
     pub fn create_subagent_config(
@@ -188,7 +202,10 @@ impl TaskWorkspace {
         name: &str,
         config: &SubAgentWorkspaceConfig,
     ) -> Result<(), TaskWorkspaceError> {
-        let dir = self.task_dir(task_id).join("subagents").join(name);
+        let dir = self
+            .task_dir(task_id)?
+            .join("subagents")
+            .join(path_segment("sub-agent name", name)?);
         create_dir_all(&dir)?;
         let path = dir.join("config.toml");
         if path.exists() {
@@ -203,9 +220,12 @@ impl TaskWorkspace {
         template: &OrchestratorTemplate,
     ) -> Result<(), TaskWorkspaceError> {
         let dir = self
-            .task_dir(task_id)
+            .task_dir(task_id)?
             .join("suborchestrators")
-            .join(template.name.as_ref());
+            .join(path_segment(
+                "orchestrator template name",
+                template.name.as_ref(),
+            )?);
         create_dir_all(&dir)?;
         write_toml(&dir.join("graph.toml"), template)
     }
@@ -216,10 +236,13 @@ impl TaskWorkspace {
         session_id: &str,
         event: &Value,
     ) -> Result<(), TaskWorkspaceError> {
+        // Validated before the extension is appended, so a `session_id` of
+        // `../../x` cannot become a legitimate-looking `x.jsonl` somewhere
+        // else.
         let path = self
-            .task_dir(task_id)
+            .task_dir(task_id)?
             .join("sessions")
-            .join(format!("{session_id}.jsonl"));
+            .join(format!("{}.jsonl", path_segment("session id", session_id)?));
         let encoded = serde_json::to_string(event).map_err(|source| TaskWorkspaceError::Json {
             path: path.clone(),
             source,
@@ -380,10 +403,99 @@ mod tests {
 
         let path = workspace
             .task_dir(&task_id)
+            .expect("alpha is a name")
             .join("sessions")
             .join("session-1.jsonl");
         let lines = read_lines(&path);
         assert_eq!(lines, vec![r#"{"k":1}"#, r#"{"k":2}"#]);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // M4 / FS-001 — identifiers that become path components are names.
+    // -----------------------------------------------------------------------
+
+    /// The join that made this necessary: `Path::join` with an absolute
+    /// argument discards the left-hand side entirely, so an unvalidated task
+    /// id of `/tmp/elsewhere` did not land beneath the task root at all.
+    #[test]
+    fn a_task_id_that_is_a_path_is_refused_rather_than_joined() {
+        let root = temp_root();
+        let workspace = TaskWorkspace::new(&root);
+
+        for id in ["/tmp/elsewhere", "../escape", "..", "a/b", ""] {
+            let error = workspace
+                .task_dir(&TaskId::new(id))
+                .expect_err("a path is not a task id");
+            assert!(
+                matches!(error, TaskWorkspaceError::UnusableName(_)),
+                "{id:?}: {error:?}"
+            );
+            assert!(
+                workspace.init_task(&TaskId::new(id)).is_err(),
+                "{id:?} must not create a directory"
+            );
+        }
+
+        assert!(!root.join("..").join("escape").exists());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Sub-agent names and orchestrator template names come from a model's
+    /// plan, which is the least trustworthy source of a filename in the
+    /// system.
+    #[test]
+    fn a_model_chosen_name_cannot_walk_out_of_its_task_directory() {
+        let root = temp_root();
+        let workspace = TaskWorkspace::new(&root);
+        let task_id = TaskId::new("alpha");
+        workspace.init_task(&task_id).expect("alpha initialises");
+
+        let config = SubAgentWorkspaceConfig {
+            role: Arc::from("researcher"),
+            instructions: Arc::from("look things up"),
+            resources: Vec::new(),
+        };
+        let error = workspace
+            .create_subagent_config(&task_id, "../../evil", &config)
+            .expect_err("a traversal is not a sub-agent name");
+        assert!(
+            matches!(error, TaskWorkspaceError::UnusableName(_)),
+            "{error:?}"
+        );
+
+        let template = OrchestratorTemplate {
+            name: Arc::from("/etc/cron.d/agentos"),
+            stages: Vec::new(),
+        };
+        let error = workspace
+            .write_suborchestrator_graph(&task_id, &template)
+            .expect_err("an absolute path is not a template name");
+        assert!(
+            matches!(error, TaskWorkspaceError::UnusableName(_)),
+            "{error:?}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Validated before `.jsonl` is appended, so a traversal cannot arrive
+    /// wearing a legitimate-looking extension.
+    #[test]
+    fn a_session_id_is_checked_before_its_extension_is_added() {
+        let root = temp_root();
+        let workspace = TaskWorkspace::new(&root);
+        let task_id = TaskId::new("alpha");
+        workspace.init_task(&task_id).expect("alpha initialises");
+
+        let error = workspace
+            .append_session_event(&task_id, "../../../escape", &json!({"k": 1}))
+            .expect_err("a traversal is not a session id");
+        assert!(
+            matches!(error, TaskWorkspaceError::UnusableName(_)),
+            "{error:?}"
+        );
+
         fs::remove_dir_all(&root).ok();
     }
 

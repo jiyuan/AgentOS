@@ -32,6 +32,10 @@ pub struct StaticMcpClient {
 pub struct StdioMcpClient {
     timeout: Duration,
     servers: Mutex<BTreeMap<Arc<str>, ManagedStdioServer>>,
+    /// `[isolation].env_passthrough`: names an MCP server may read from the
+    /// deployment's environment on top of the neutral allowlist
+    /// (M4 / `PROC-001`).
+    env_passthrough: Vec<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -79,6 +83,7 @@ impl Default for StdioMcpClient {
         Self {
             timeout: Duration::from_secs(10),
             servers: Mutex::new(BTreeMap::new()),
+            env_passthrough: Vec::new(),
         }
     }
 }
@@ -91,8 +96,15 @@ impl StdioMcpClient {
     pub fn with_timeout(timeout: Duration) -> Self {
         Self {
             timeout,
-            servers: Mutex::new(BTreeMap::new()),
+            ..Self::default()
         }
+    }
+
+    /// Names this client's servers may read from the deployment's
+    /// environment, on top of the neutral allowlist (M4 / `PROC-001`).
+    pub fn with_env_passthrough(mut self, names: impl IntoIterator<Item = String>) -> Self {
+        self.env_passthrough = names.into_iter().collect();
+        self
     }
 }
 
@@ -251,7 +263,7 @@ impl StdioMcpClient {
         if let Some(managed) = servers.get(&server.endpoint) {
             return Ok(managed.clone());
         }
-        let managed = spawn_managed_stdio_server(&server.endpoint)?;
+        let managed = spawn_managed_stdio_server(&server.endpoint, &self.env_passthrough)?;
         servers.insert(Arc::clone(&server.endpoint), managed.clone());
         Ok(managed)
     }
@@ -271,9 +283,21 @@ impl StdioMcpClient {
 /// returns as soon as the child is forked, so it cannot occupy a thread. The
 /// alternative, rebuilding the whole persistent worker on `tokio::process`, is
 /// a change with its own risk and no benefit to the exit condition.
-fn spawn_managed_stdio_server(endpoint: &str) -> Result<ManagedStdioServer, McpError> {
+fn spawn_managed_stdio_server(
+    endpoint: &str,
+    env_passthrough: &[String],
+) -> Result<ManagedStdioServer, McpError> {
     let program = stdio_program(endpoint)?;
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    // M4 / `PROC-001`, the same rule as every other child: an MCP server is
+    // third-party code the deployment chose to run, which makes inheriting the
+    // gateway's provider and channel credentials strictly worse here than for
+    // a shell command the model wrote. It gets the neutral allowlist and
+    // nothing else; `[isolation].env_passthrough` is how a server that needs
+    // its own variable is given it.
+    command.env_clear();
+    command.envs(crate::tools::child_env::minimal(env_passthrough));
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

@@ -102,6 +102,7 @@ async fn write_attempt(sandbox: &Sandbox, target: &Path) -> bool {
         timeout: Duration::from_secs(10),
         max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
         sandbox,
+        extra_env: &[],
     })
     .await
     .expect("sh runs");
@@ -175,6 +176,7 @@ async fn a_read_only_child_can_still_read() {
         timeout: Duration::from_secs(10),
         max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
         sandbox: &sandbox,
+        extra_env: &[],
     })
     .await
     .expect("sh runs");
@@ -237,6 +239,7 @@ async fn a_grandchild_inherits_the_sandbox() {
         timeout: Duration::from_secs(10),
         max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
         sandbox: &sandbox,
+        extra_env: &[],
     })
     .await
     .expect("sh runs");
@@ -265,6 +268,7 @@ async fn dev_null_stays_writable() {
         timeout: Duration::from_secs(10),
         max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
         sandbox: &sandbox,
+        extra_env: &[],
     })
     .await
     .expect("sh runs");
@@ -336,6 +340,7 @@ async fn the_isolation_worker_runs_under_its_sandbox() {
         Duration::from_secs(10),
         &sandbox,
         DEFAULT_MAX_OUTPUT_BYTES,
+        &[],
     )
     .await
     .expect("the worker answers");
@@ -376,6 +381,7 @@ async fn an_unbuildable_sandbox_fails_the_call() {
         timeout: Duration::from_secs(10),
         max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
         sandbox: &sandbox,
+        extra_env: &[],
     })
     .await
     .expect_err("a workspace that does not exist cannot be granted");

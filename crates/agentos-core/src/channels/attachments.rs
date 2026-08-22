@@ -9,6 +9,7 @@
 //! `from_env()` derives the root from `AGENTOS_HOME` joined with
 //! `workspace/attachments`, matching the layout the runtime sets up.
 
+use crate::paths::path_segment;
 use agentos_interfaces::ChannelError;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -81,22 +82,50 @@ fn sanitize_segment(input: &str) -> Arc<str> {
     Arc::from(agentos_proto::encode_component(input))
 }
 
+/// Bytes of a sender-supplied filename that survive into the stored name.
+///
+/// Generous for a real filename, short enough to leave room beneath a
+/// `NAME_MAX` of 255 for anything a caller appends.
+const MAX_FILENAME_BYTES: usize = 200;
+
+/// Make a sender-supplied filename usable as the last component of a path.
+///
+/// Unlike [`sanitize_segment`] this does not have to be injective — two
+/// attachments with the same name in the same message are the sender's
+/// problem, and they already land in a directory keyed by conversation and
+/// message. It only has to be *one name*, so the result is checked with
+/// [`path_segment`] rather than assumed (M4 / `FS-001`); anything that still
+/// is not a name becomes `attachment.bin`.
 fn sanitize_filename(input: &str) -> Arc<str> {
     let cleaned: String = input
         .chars()
         .map(|c| match c {
-            '/' | '\\' | '\0' => '_',
+            '/' | '\\' | ':' | '\0' => '_',
             c if c.is_control() => '_',
             c => c,
         })
+        .take_while_within(MAX_FILENAME_BYTES)
         .collect();
     let trimmed = cleaned.trim_matches(|c: char| c == '.' || c.is_whitespace());
-    if trimmed.is_empty() {
-        Arc::from("attachment.bin")
-    } else {
-        Arc::from(trimmed)
+    match path_segment("attachment filename", trimmed) {
+        Ok(name) => Arc::from(name),
+        Err(_) => Arc::from("attachment.bin"),
     }
 }
+
+/// `take` counts characters; a filename budget is in bytes, and a multi-byte
+/// character must not be split across the boundary.
+trait TakeWithinBytes: Iterator<Item = char> + Sized {
+    fn take_while_within(self, max_bytes: usize) -> impl Iterator<Item = char> {
+        let mut used = 0;
+        self.take_while(move |character| {
+            used += character.len_utf8();
+            used <= max_bytes
+        })
+    }
+}
+
+impl<I: Iterator<Item = char>> TakeWithinBytes for I {}
 
 #[cfg(test)]
 mod tests {
@@ -124,6 +153,25 @@ mod tests {
         assert!(!evil.contains('/') && !evil.contains('\\'));
         assert!(evil.contains("evil.exe"));
         assert_eq!(sanitize_filename("").as_ref(), "attachment.bin");
+        // M4 / `FS-001`: the result is checked as a single component rather
+        // than assumed to be one, so anything that survives the mapping and
+        // still is not a name falls back rather than being written.
+        assert_eq!(sanitize_filename("..").as_ref(), "attachment.bin");
+        assert_eq!(sanitize_filename("   ").as_ref(), "attachment.bin");
+        assert_eq!(
+            sanitize_filename("report:2026.pdf").as_ref(),
+            "report_2026.pdf"
+        );
+        let overlong = sanitize_filename(&"x".repeat(1_000));
+        assert!(
+            overlong.len() <= MAX_FILENAME_BYTES,
+            "a name the filesystem would refuse is bounded here instead: {} bytes",
+            overlong.len()
+        );
+        // Truncation must not split a character in half.
+        let multibyte = sanitize_filename(&"é".repeat(1_000));
+        assert!(multibyte.len() <= MAX_FILENAME_BYTES);
+        assert!(multibyte.chars().all(|character| character == 'é'));
         // Every traversal-ish segment still encodes to something inert, and
         // to something *different* from every other such segment.
         for segment in ["...", "..", ".", "", "/", "\\"] {

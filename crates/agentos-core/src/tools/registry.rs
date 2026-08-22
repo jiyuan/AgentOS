@@ -93,6 +93,9 @@ pub struct ToolRegistry {
     /// Bytes captured from an isolated tool's subprocess before the rest is
     /// read and discarded (roadmap item X3, `[limits].tool_output_bytes`).
     max_output_bytes: usize,
+    /// `[isolation].env_passthrough`: names the deployment allows the isolated
+    /// executor to read on top of the built-in allowlist (M4 / `PROC-001`).
+    env_passthrough: Vec<String>,
 }
 
 impl Default for ToolRegistry {
@@ -106,6 +109,7 @@ impl Default for ToolRegistry {
             jobs: None,
             promotable: BTreeSet::new(),
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            env_passthrough: Vec::new(),
         }
     }
 }
@@ -169,6 +173,13 @@ impl ToolRegistry {
 
     pub fn with_subprocess_isolation(mut self, runner: impl Into<PathBuf>) -> Self {
         self.isolation_runner = Some(runner.into());
+        self
+    }
+
+    /// Names the isolated executor may read from the deployment's environment,
+    /// on top of the built-in allowlist (M4 / `PROC-001`).
+    pub fn with_env_passthrough(mut self, names: impl IntoIterator<Item = String>) -> Self {
+        self.env_passthrough = names.into_iter().collect();
         self
     }
 
@@ -326,7 +337,7 @@ impl ToolRegistry {
         runner: &Path,
     ) -> Result<&ExecutorCapabilities, Arc<str>> {
         self.executor
-            .get_or_init(|| isolation::probe(runner))
+            .get_or_init(|| isolation::probe(runner, &self.env_passthrough))
             .await
             .as_ref()
             .map_err(Arc::clone)
@@ -342,15 +353,22 @@ impl ToolRegistry {
         deadline: Duration,
     ) -> Result<ToolResult, ToolRegistryError> {
         let sandbox = Sandbox::new(spec.sandbox, workspace_root());
-        call_isolated_subprocess(runner, call, deadline, &sandbox, self.max_output_bytes)
-            .await
-            .map_err(|error| match error {
-                IsolatedCallError::Tool(error) => ToolRegistryError::Tool(error),
-                IsolatedCallError::Executor(reason) => ToolRegistryError::SandboxExecutionFailed {
-                    tool: Arc::clone(&spec.name),
-                    reason,
-                },
-            })
+        call_isolated_subprocess(
+            runner,
+            call,
+            deadline,
+            &sandbox,
+            self.max_output_bytes,
+            &self.env_passthrough,
+        )
+        .await
+        .map_err(|error| match error {
+            IsolatedCallError::Tool(error) => ToolRegistryError::Tool(error),
+            IsolatedCallError::Executor(reason) => ToolRegistryError::SandboxExecutionFailed {
+                tool: Arc::clone(&spec.name),
+                reason,
+            },
+        })
     }
 
     /// Run a promotable tool as a background job, waiting out its deadline
@@ -552,6 +570,7 @@ pub async fn call_isolated_subprocess(
     timeout: Duration,
     sandbox: &Sandbox,
     max_output_bytes: usize,
+    extra_env: &[String],
 ) -> Result<ToolResult, IsolatedCallError> {
     let request = serde_json::to_vec(&IsolatedToolRequest { call })
         .map_err(|err| IsolatedCallError::Executor(Arc::from(err.to_string())))?;
@@ -564,6 +583,7 @@ pub async fn call_isolated_subprocess(
         timeout,
         max_output_bytes,
         sandbox,
+        extra_env,
     })
     .await
     .map_err(|err| IsolatedCallError::Executor(Arc::from(err.to_string())))?;

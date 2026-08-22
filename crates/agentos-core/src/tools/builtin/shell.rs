@@ -1,4 +1,5 @@
 use super::common::{elapsed_ms, result_metadata, safe_workspace_path, workspace_root};
+use crate::paths::RootDir;
 use crate::sandbox::Sandbox;
 use crate::tools::{Exec, ExecError, DEFAULT_MAX_OUTPUT_BYTES};
 use agentos_interfaces::tool::{Isolation, SandboxMode, Tool, ToolError, ToolSpec};
@@ -27,19 +28,31 @@ const SHELL_SANDBOX: SandboxMode = SandboxMode::WorkspaceWrite;
 /// time.
 pub struct ShellTool {
     max_output_bytes: usize,
+    /// `[isolation].env_passthrough`: names the deployment allows a command to
+    /// read on top of the built-in allowlist (M4 / `PROC-001`).
+    env_passthrough: Vec<String>,
 }
 
 impl Default for ShellTool {
     fn default() -> Self {
         Self {
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            env_passthrough: Vec::new(),
         }
     }
 }
 
 impl ShellTool {
     pub fn with_output_limit(max_output_bytes: usize) -> Self {
-        Self { max_output_bytes }
+        Self {
+            max_output_bytes,
+            ..Self::default()
+        }
+    }
+
+    pub fn with_env_passthrough(mut self, names: impl IntoIterator<Item = String>) -> Self {
+        self.env_passthrough = names.into_iter().collect();
+        self
     }
 }
 
@@ -98,10 +111,28 @@ impl Tool for ShellTool {
             .map_err(|err| ToolError::Failed(err.to_string().into()))?;
         let start = Instant::now();
         let cwd = match parsed.cwd {
-            Some(cwd) => Some(
-                safe_workspace_path(&workspace_root(), &cwd)
-                    .map_err(|err| ToolError::Failed(Arc::from(err)))?,
-            ),
+            Some(cwd) => {
+                let root = workspace_root();
+                // Two checks, because they answer different questions.
+                // `safe_workspace_path` builds the path to hand to
+                // `current_dir`; `RootDir::is_dir` proves that path is a real
+                // directory the no-follow walk can reach, so a symlinked
+                // `cwd` cannot start the command somewhere else (M4 /
+                // `FS-001`). The kernel sandbox, not this, is what bounds
+                // where the command may then write.
+                let resolved = safe_workspace_path(&root, &cwd)
+                    .map_err(|err| ToolError::Failed(Arc::from(err)))?;
+                let contained = RootDir::open(&root)
+                    .map(|root| root.is_dir(&cwd))
+                    .unwrap_or(false);
+                if !contained {
+                    return Err(ToolError::Failed(Arc::from(format!(
+                        "cwd {} is not a directory beneath the workspace root",
+                        cwd.display()
+                    ))));
+                }
+                Some(resolved)
+            }
             None => None,
         };
 
@@ -119,6 +150,7 @@ impl Tool for ShellTool {
             // because a shell command is run directly rather than through the
             // isolation worker when no worker is configured.
             sandbox: &Sandbox::new(SHELL_SANDBOX, workspace_root()),
+            extra_env: &self.env_passthrough,
         })
         .await;
 

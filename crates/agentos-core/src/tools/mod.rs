@@ -1,4 +1,5 @@
 mod builtin;
+pub mod child_env;
 pub mod exec;
 pub mod isolation;
 mod mcp;

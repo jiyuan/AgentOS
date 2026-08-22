@@ -160,7 +160,7 @@ impl Incompatible {
 /// whether a sandbox is available at all, so requiring one first would be
 /// circular. It reads no input, writes one JSON document, and is bounded by
 /// [`PROBE_TIMEOUT`] and [`PROBE_MAX_OUTPUT_BYTES`].
-pub async fn probe(runner: &Path) -> Result<ExecutorCapabilities, Arc<str>> {
+pub async fn probe(runner: &Path, extra_env: &[String]) -> Result<ExecutorCapabilities, Arc<str>> {
     let program = runner.to_string_lossy().into_owned();
     let args = vec![CAPABILITIES_FLAG.to_owned()];
     let unrestricted = Sandbox::unrestricted();
@@ -172,6 +172,7 @@ pub async fn probe(runner: &Path) -> Result<ExecutorCapabilities, Arc<str>> {
         timeout: PROBE_TIMEOUT,
         max_output_bytes: PROBE_MAX_OUTPUT_BYTES,
         sandbox: &unrestricted,
+        extra_env,
     })
     .await
     .map_err(|err| Arc::from(err.to_string()))?;
@@ -262,7 +263,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_executor_that_is_not_there_fails_the_handshake_rather_than_hanging() {
-        let error = probe(Path::new("/nonexistent/agentos-tool-worker"))
+        let error = probe(Path::new("/nonexistent/agentos-tool-worker"), &[])
             .await
             .expect_err("a missing executor cannot describe itself");
         assert!(error.contains("agentos-tool-worker"), "{error}");
@@ -272,7 +273,7 @@ mod tests {
     /// that is absent, and says so rather than being parsed hopefully.
     #[tokio::test]
     async fn an_executor_that_answers_with_nonsense_is_refused() {
-        let error = probe(Path::new("/bin/echo"))
+        let error = probe(Path::new("/bin/echo"), &[])
             .await
             .expect_err("echo does not speak the handshake");
         assert!(error.contains("unreadable handshake"), "{error}");

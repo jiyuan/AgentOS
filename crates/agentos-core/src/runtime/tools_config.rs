@@ -26,7 +26,12 @@ pub(super) fn build_parent_tools(
             "job_status" => tools.register(JobStatusTool::new(jobs.clone())),
             "job_output" => tools.register(JobOutputTool::new(jobs.clone())),
             "job_kill" => tools.register(JobKillTool::new(jobs.clone())),
-            _ => register_builtin_tool(&mut tools, tool, &config.limits)?,
+            _ => register_builtin_tool(
+                &mut tools,
+                tool,
+                &config.limits,
+                &config.isolation.env_passthrough,
+            )?,
         }
     }
     Ok(tools
@@ -292,9 +297,13 @@ pub fn register_builtin_tool(
     tools: &mut ToolRegistry,
     name: &str,
     limits: &LimitsConfig,
+    env_passthrough: &[String],
 ) -> Result<(), String> {
     match name {
-        "shell" => tools.register(ShellTool::with_output_limit(limits.tool_output_bytes)),
+        "shell" => tools.register(
+            ShellTool::with_output_limit(limits.tool_output_bytes)
+                .with_env_passthrough(env_passthrough.iter().cloned()),
+        ),
         "http" => tools.register(HttpTool),
         "file" => tools.register(FileTool::with_limits(
             limits.directory_list_entries,
@@ -916,11 +925,11 @@ mod tests {
         let limits = LimitsConfig::default();
         for name in BUILTIN_TOOL_NAMES {
             let mut registry = ToolRegistry::new();
-            register_builtin_tool(&mut registry, name, &limits)
+            register_builtin_tool(&mut registry, name, &limits, &[])
                 .unwrap_or_else(|err| panic!("{name} should register: {err}"));
             assert_eq!(registry.specs().len(), 1, "{name} registered nothing");
         }
         let mut registry = ToolRegistry::new();
-        assert!(register_builtin_tool(&mut registry, "not_a_tool", &limits).is_err());
+        assert!(register_builtin_tool(&mut registry, "not_a_tool", &limits, &[]).is_err());
     }
 }

@@ -46,6 +46,15 @@ pub(crate) fn skills_dir() -> PathBuf {
 /// absolute path for I/O). This is intentionally stricter than
 /// `Path::canonicalize`, which requires the target to exist and would fail
 /// for "write to a new file."
+///
+/// **This is not the containment boundary.** It answers for the *string*: no
+/// `..`, no root prefix. It cannot see a symlink, and it cannot see anything
+/// that changes between this call and the caller's `open`. Since M4 /
+/// `FS-001` the enforcement is [`crate::paths::RootDir`], which walks to the
+/// target with `openat(O_NOFOLLOW)` and operates on the resulting descriptor.
+/// What remains here is *classification* — deciding which tree a requested
+/// path belongs to, as the skill-bundle guardrail does — and building a path
+/// to hand to an API that takes one.
 pub(crate) fn safe_workspace_path(root: &Path, requested: &Path) -> Result<PathBuf, String> {
     if requested.as_os_str().is_empty() {
         return Err("empty path".to_owned());

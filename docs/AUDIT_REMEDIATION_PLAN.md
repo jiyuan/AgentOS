@@ -921,8 +921,8 @@ a slice moves off `not started` only when the named artifact exists in the tree.
 | `AUTH-001` | M3 | Remote sender authentication and approval binding | ID-001 | **done** — `AdmissionPolicy` (both channels fail closed), `ApprovalBinding` |
 | `AUTH-002` | M3 | Exact policy lattice and explicit delegation grants | ADR-001, TEST-001 | **done** — witness-based `narrow`, `[[subagents.delegation_grants]]` |
 | `SBX-001` | M4 | Fail-closed registry and executor capability protocol | ADR-001 | **done** — `Dispatch` enum, `Isolation::{RequiresExecutor,SelfHardened}`, `--capabilities` handshake, startup refusal |
-| `FS-001` | M4 | Validated path segments and no-follow containment | TEST-001 | not started |
-| `PROC-001` | M4 | Minimal tool environment and process-group termination | SBX-001 | not started |
+| `FS-001` | M4 | Validated path segments and no-follow containment | TEST-001 | **done** — `paths::segment`, `paths::RootDir` (`openat(O_NOFOLLOW)` walk), symlink-race test with a lexical control |
+| `PROC-001` | M4 | Minimal tool environment and process-group termination | SBX-001 | **done** — `tools::child_env` allowlist for every child incl. MCP servers, `[isolation].env_passthrough`, process-group kill on deadline and cancellation |
 | `NET-001` | M4 | Egress policy and bounded HTTP | TEST-001 | not started |
 | `ING-001` | M4 | Attachment and frame limits | ID-001 | not started |
 | `REQ-001` | M5 | Unified provider-call gateway, request kinds, compaction usage accounting | ADR-001 | not started |

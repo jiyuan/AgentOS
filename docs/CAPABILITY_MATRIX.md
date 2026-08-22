@@ -60,7 +60,7 @@ something that no longer exists — the two-way ratchet
 | Capability | Status | Platforms | Required config | Limitations | Test level |
 |---|---|---|---|---|---|
 | `tool:shell` | Stable | all | `[resources.tools]`, `[guardrails] shell_allowlist` | Sandboxed to `workspace_write`; the deployment's allowlist is the whole boundary on which programs run | unit, integration |
-| `tool:file` | Stable | all | `[resources.tools]` | `full_access`: an in-process tool the kernel sandbox cannot bound. Lexical containment only — no no-follow or symlink-race protection (M4) | unit, integration |
+| `tool:file` | Stable | all | `[resources.tools]` | `full_access`: an in-process tool the kernel sandbox cannot bound. Contained by `paths::RootDir` instead — every open is an `openat(O_NOFOLLOW)` walk from a workspace-root descriptor, so symlinks are refused rather than followed | unit, integration |
 | `tool:http` | **Preview** | all | `[resources.tools]` | No egress policy: loopback, RFC1918, link-local, and cloud metadata addresses are all reachable, redirects are not revalidated, responses are not bounded (M4) | unit |
 | `tool:skill_validate` | Stable | all | `[resources.tools]` | — | unit |
 | `tool:cron_create` | Stable | all | `[resources.tools]`, gateway running | Writes a TOML file the scheduler replays; the prompt it stores is executed later with no further approval | unit, integration |
@@ -82,8 +82,8 @@ something that no longer exists — the two-way ratchet
 | Seatbelt sandbox | Stable | macOS | tool declares a `SandboxMode` | Bounds filesystem **writes** only; reads and network are unrestricted, as on Linux | unit, integration, CI |
 | Registry enforcement of `SandboxMode` | Stable | all | — | A declared mode is carried by an isolated executor or by the tool's own `Isolation::SelfHardened` child; anything else is refused at startup and at every call | unit, integration |
 | Isolation worker subprocess | Stable | Linux, macOS | `[isolation]` | Carries `shell` only; the `--capabilities` handshake reports that, so an unsupported tool is refused before dispatch rather than after a non-zero exit | unit, integration |
-| Minimal subprocess environment | **Deferred** | — | — | Not implemented: `tools/exec.rs` never calls `env_clear`, so provider and channel credentials are inherited by every child (M4) | none |
-| Process-group termination | **Deferred** | — | — | Not implemented: `kill_on_drop` signals the direct child only (M4) | integration (red, `#[ignore]`) |
+| Minimal subprocess environment | Stable | all | `[isolation].env_passthrough` | Every child starts from `env_clear` and an allowlist. Proxy variables are kept, so a proxy URL carrying userinfo credentials still reaches tools | unit, integration |
+| Process-group termination | Stable | Unix | — | The group is signalled on deadline and cancellation only; a command that exits cleanly leaves its deliberate background children running | unit |
 | Network egress policy | **Deferred** | — | — | Not implemented; no SSRF protection anywhere (M4) | none |
 
 ## Memory

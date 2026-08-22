@@ -53,7 +53,10 @@ pub async fn register_configured_mcp(
                     .timeout_ms
                     .map(Duration::from_millis)
                     .unwrap_or_else(|| config.limits.tool_timeout());
-                Arc::new(StdioMcpClient::with_timeout(timeout))
+                Arc::new(
+                    StdioMcpClient::with_timeout(timeout)
+                        .with_env_passthrough(config.isolation.env_passthrough.iter().cloned()),
+                )
             } else if config
                 .mcp_tools
                 .iter()

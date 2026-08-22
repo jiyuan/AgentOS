@@ -34,7 +34,7 @@ fn call(name: &str) -> ToolCall {
 
 #[tokio::test]
 async fn the_worker_describes_itself_when_asked() {
-    let capabilities = probe(Path::new(WORKER))
+    let capabilities = probe(Path::new(WORKER), &[])
         .await
         .expect("the shipped worker speaks the handshake");
 
@@ -55,7 +55,7 @@ async fn the_worker_describes_itself_when_asked() {
 /// along.
 #[tokio::test]
 async fn the_worker_reports_the_enforcement_its_machine_actually_has() {
-    let capabilities = probe(Path::new(WORKER)).await.expect("handshake");
+    let capabilities = probe(Path::new(WORKER), &[]).await.expect("handshake");
 
     match availability() {
         Availability::Enforced(mechanism) => {
@@ -92,6 +92,7 @@ async fn an_unsupported_tool_is_an_executor_failure_not_a_tool_failure() {
         Duration::from_secs(10),
         &sandbox,
         64 * 1024,
+        &[],
     )
     .await
     .expect_err("the worker has no scrape_page");
@@ -122,6 +123,7 @@ async fn a_tool_that_runs_and_fails_stays_a_tool_failure() {
         Duration::from_secs(10),
         &sandbox,
         64 * 1024,
+        &[],
     )
     .await
     .expect_err("shell rejects arguments it cannot parse");
