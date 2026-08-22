@@ -92,6 +92,39 @@ pub struct ToolSpec {
     pub timeout_ms: Option<u64>,
 }
 
+/// How a tool's declared [`SandboxMode`] is actually enforced.
+///
+/// [`SandboxMode`] says *what* the restriction is. This says *who applies it*,
+/// and the two are not the same question: a mode is only real if some process
+/// boundary carries it. Before this existed the runtime assumed the registry
+/// would always be that boundary, and when no isolated executor was configured
+/// it ran the tool in-process with the mode silently discarded — the tool
+/// claimed `read_only` and had full access. See
+/// `docs/adr/0002-FAIL_CLOSED_ISOLATION.md`.
+///
+/// The default is [`Isolation::RequiresExecutor`] so that an implementation
+/// which has not thought about the question fails closed rather than open.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Isolation {
+    /// The runtime must run this tool inside a compatible isolated executor.
+    /// Where none exists, the call fails before the tool's body is reached.
+    ///
+    /// Correct for every tool that does its work in-process, and for every
+    /// tool the runtime did not write — an MCP tool cannot vouch for its own
+    /// containment.
+    #[default]
+    RequiresExecutor,
+    /// The tool spawns its own child process and applies the sandbox to it
+    /// before the spawn, treating a failure to do so as fatal for the call.
+    ///
+    /// A claim about the implementation, not a waiver: `ShellTool` builds a
+    /// [`SandboxMode`]-matching sandbox and hands it to the exec helper, where
+    /// hardening runs before the child exists and an error aborts the call.
+    /// A tool that returns this without doing that has lied about the kernel,
+    /// which is the one thing the mode is supposed to prevent.
+    SelfHardened,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ToolMetadata {
     pub duration_ms: u64,
@@ -104,6 +137,17 @@ pub struct ToolMetadata {
 pub trait Tool: Send + Sync {
     /// Return the static schema and safety metadata for this tool.
     fn spec(&self) -> ToolSpec;
+
+    /// Who enforces the [`SandboxMode`] this tool declares.
+    ///
+    /// Only consulted when the declared mode is not
+    /// [`SandboxMode::FullAccess`]; an unsandboxed tool has nothing to
+    /// enforce. Override it only if the implementation genuinely hardens its
+    /// own child process — the default refuses to run without an executor,
+    /// which is the safe answer for anything else.
+    fn isolation(&self) -> Isolation {
+        Isolation::RequiresExecutor
+    }
 
     /// Execute a tool call after guardrails and approval pass.
     ///

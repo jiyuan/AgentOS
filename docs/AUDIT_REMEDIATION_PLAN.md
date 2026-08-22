@@ -920,7 +920,7 @@ a slice moves off `not started` only when the named artifact exists in the tree.
 | `ID-002` | M3 | Versioned persistence migration and collision report | ID-001 | **done** — `schema_version`, `agentos-gateway migrate`, plan/report/apply; verified on the reference 142 MB database |
 | `AUTH-001` | M3 | Remote sender authentication and approval binding | ID-001 | **done** — `AdmissionPolicy` (both channels fail closed), `ApprovalBinding` |
 | `AUTH-002` | M3 | Exact policy lattice and explicit delegation grants | ADR-001, TEST-001 | **done** — witness-based `narrow`, `[[subagents.delegation_grants]]` |
-| `SBX-001` | M4 | Fail-closed registry and executor capability protocol | ADR-001 | not started |
+| `SBX-001` | M4 | Fail-closed registry and executor capability protocol | ADR-001 | **done** — `Dispatch` enum, `Isolation::{RequiresExecutor,SelfHardened}`, `--capabilities` handshake, startup refusal |
 | `FS-001` | M4 | Validated path segments and no-follow containment | TEST-001 | not started |
 | `PROC-001` | M4 | Minimal tool environment and process-group termination | SBX-001 | not started |
 | `NET-001` | M4 | Egress policy and bounded HTTP | TEST-001 | not started |

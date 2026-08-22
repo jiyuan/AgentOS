@@ -1,7 +1,7 @@
 use super::common::{elapsed_ms, result_metadata, safe_workspace_path, workspace_root};
 use crate::sandbox::Sandbox;
 use crate::tools::{Exec, ExecError, DEFAULT_MAX_OUTPUT_BYTES};
-use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
+use agentos_interfaces::tool::{Isolation, SandboxMode, Tool, ToolError, ToolSpec};
 use agentos_proto::{ToolCall, ToolResult, ToolStatus};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -80,6 +80,17 @@ impl Tool for ShellTool {
             // suits an HTTP call. `[limits].tool_timeout_overrides` still wins.
             timeout_ms: Some(SHELL_TIMEOUT_MS),
         }
+    }
+
+    /// This tool applies [`SHELL_SANDBOX`] to its own child, so it is one of
+    /// the two ways the declared mode can be real (M4 / `SBX-001`, ADR-0002).
+    ///
+    /// The claim is checked by construction below: `exec::run` hardens the
+    /// command *before* the spawn and returns `ExecError::Sandbox` if it
+    /// cannot, which this tool turns into an error rather than a result. There
+    /// is no arrangement of arguments that reaches an unsandboxed child.
+    fn isolation(&self) -> Isolation {
+        Isolation::SelfHardened
     }
 
     async fn call(&self, call: &ToolCall, args: &RawValue) -> Result<ToolResult, ToolError> {

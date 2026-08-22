@@ -434,6 +434,18 @@ AgentOS uses four independent safety rings:
    rather than running unsandboxed, and `agentos-gateway config` prints which
    mechanism (if any) this machine enforces with.
 
+   Two things can carry the mode, and a tool says which. The registry runs the
+   tool inside an isolated executor, whose `--capabilities` handshake reports
+   the tools it can execute and the modes its machine can enforce — asked, not
+   assumed, because the executor is a separate binary that may be older or on a
+   different kernel. Or the tool spawns and hardens its own child, declared as
+   `Isolation::SelfHardened`; `shell` is the only shipped instance. A tool that
+   declares a mode and offers neither is refused when the runtime starts and
+   again on every call, with a typed error naming which of the three
+   conditions applies: no executor, an incompatible one, or an isolated run
+   that failed. See
+   [`docs/adr/0002-FAIL_CLOSED_ISOLATION.md`](adr/0002-FAIL_CLOSED_ISOLATION.md).
+
 ### Checked invariants
 
 Three relationships the rings depend on are asserted in debug builds

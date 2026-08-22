@@ -25,12 +25,14 @@ use agentos_interfaces::orchestrator::{
 use agentos_llm::{EnvLlm, Llm, LlmModelController, LlmModelTier};
 use agentos_proto::AgentId;
 use async_trait::async_trait;
-use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+mod isolation;
+pub use isolation::isolation_worker_path;
+use isolation::refuse_unenforceable_isolation;
 mod mcp_config;
 pub use mcp_config::register_configured_mcp;
 mod tools_config;
@@ -271,6 +273,7 @@ impl AgentRuntime {
             tools = tools.with_subprocess_isolation(path);
         }
         let mcp_specs = register_configured_mcp(&mut tools, &workspace_config).await?;
+        refuse_unenforceable_isolation(&tools).await?;
         let model_controller = LlmModelController::new();
         // Pin `AGENTOS_HOME` to the absolute resolved workspace root so every
         // downstream caller of `agentos_interfaces::agentos_home(None)` (tool
@@ -737,20 +740,6 @@ pub fn build_subagents(
         registry.register(definition);
     }
     Ok(Some(registry))
-}
-
-pub fn isolation_worker_path(config: &WorkspaceConfig) -> Option<PathBuf> {
-    env::var_os("AGENTOS_TOOL_WORKER_PATH")
-        .map(PathBuf::from)
-        .or_else(|| {
-            config
-                .isolation
-                .worker_path_env
-                .as_deref()
-                .and_then(env::var_os)
-                .map(PathBuf::from)
-        })
-        .or_else(|| config.isolation.worker_path.clone())
 }
 
 fn subagent_orchestrator(

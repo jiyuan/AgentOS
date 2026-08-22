@@ -80,8 +80,8 @@ something that no longer exists — the two-way ratchet
 |---|---|---|---|---|---|
 | Landlock sandbox | Stable | Linux 5.13+ with the LSM enabled | tool declares a `SandboxMode` | Bounds filesystem **writes** only; reads and network are unrestricted | unit, integration |
 | Seatbelt sandbox | Stable | macOS | tool declares a `SandboxMode` | Bounds filesystem **writes** only; reads and network are unrestricted, as on Linux | unit, integration, CI |
-| Registry enforcement of `SandboxMode` | **Preview** | all | — | `if let Some(runner)` with no `else`: with no compatible executor, control falls through to the in-process body and the declared mode is discarded (M4) | none |
-| Isolation worker subprocess | **Preview** | Linux, macOS | `[isolation]` | 43 lines; rejects every tool but `shell`, with no handshake that would let the registry discover that first (M4) | integration |
+| Registry enforcement of `SandboxMode` | Stable | all | — | A declared mode is carried by an isolated executor or by the tool's own `Isolation::SelfHardened` child; anything else is refused at startup and at every call | unit, integration |
+| Isolation worker subprocess | Stable | Linux, macOS | `[isolation]` | Carries `shell` only; the `--capabilities` handshake reports that, so an unsupported tool is refused before dispatch rather than after a non-zero exit | unit, integration |
 | Minimal subprocess environment | **Deferred** | — | — | Not implemented: `tools/exec.rs` never calls `env_clear`, so provider and channel credentials are inherited by every child (M4) | none |
 | Process-group termination | **Deferred** | — | — | Not implemented: `kill_on_drop` signals the direct child only (M4) | integration (red, `#[ignore]`) |
 | Network egress policy | **Deferred** | — | — | Not implemented; no SSRF protection anywhere (M4) | none |

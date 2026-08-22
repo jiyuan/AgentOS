@@ -11,9 +11,10 @@
 //! milestone in its ignore reason. When that milestone lands, its PR deletes
 //! the `#[ignore]` and the test becomes the proof.
 //!
-//! The `AUTH-002` and `ID-001` groups have been through that transition: those
-//! five run normally now, and are what a future change to `Policy::narrow` or
-//! to namespace encoding is measured against.
+//! The `AUTH-002`, `ID-001`, and `SBX-001` groups have been through that
+//! transition: those six run normally now, and are what a future change to
+//! `Policy::narrow`, to namespace encoding, or to registry dispatch is
+//! measured against.
 //!
 //! Run them with:
 //!
@@ -182,8 +183,12 @@ fn two_domains_that_differ_only_by_a_slash_get_different_namespaces() {
 }
 
 // ---------------------------------------------------------------------------
-// M4 / SBX-001 — the registry falls through to the in-process body
-// ADR-0002. `if let Some(runner)` in `registry.rs` has no `else`.
+// M4 / SBX-001 — CLOSED. The registry no longer falls through to the
+// in-process body.
+//
+// ADR-0002. `if let Some(runner)` in `registry.rs` had no `else`, so a
+// declared mode was discarded whenever no executor was configured. Dispatch is
+// now a two-variant enum and the missing-executor arm is a typed error.
 // ---------------------------------------------------------------------------
 
 /// A tool that declares a mode and records whether its body ran.
@@ -215,9 +220,10 @@ impl Tool for SandboxedProbe {
 }
 
 /// The invariant `AGENTS.md` states: "Where no backend exists, a sandboxed tool
-/// fails rather than running unsandboxed." Today the registry silently runs it.
+/// fails rather than running unsandboxed." The probe declares `read_only` and
+/// does not harden anything itself, so with no executor configured it must not
+/// run at all.
 #[tokio::test]
-#[ignore = "red until M4 / SBX-001 makes the registry fail closed; see docs/adr/0002-FAIL_CLOSED_ISOLATION.md"]
 async fn a_sandboxed_tool_does_not_run_in_process_without_an_executor() {
     let ran = Arc::new(AtomicBool::new(false));
     let mut registry = ToolRegistry::new();

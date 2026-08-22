@@ -4,17 +4,19 @@ use crate::memory::conversation_id_from_context;
 use crate::sandbox::Sandbox;
 use crate::tools::builtin::workspace_root;
 use crate::tools::exec::{Exec, DEFAULT_MAX_OUTPUT_BYTES};
+use crate::tools::isolation::{self, ExecutorCapabilities};
 use agentos_interfaces::mcp::{McpClient, McpError, McpServer};
 use agentos_interfaces::orchestrator::RunContext;
-use agentos_interfaces::tool::{Tool, ToolError, ToolSpec};
+use agentos_interfaces::tool::{Isolation, Tool, ToolError, ToolSpec};
 use agentos_proto::ConversationId;
 use agentos_proto::{ToolCall, ToolResult, ToolStatus};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::OnceCell;
 use tokio::time::timeout;
 use tracing::warn;
 
@@ -22,6 +24,35 @@ use tracing::warn;
 pub enum ToolRegistryError {
     #[error("unknown tool: {0}")]
     UnknownTool(Arc<str>),
+    /// The tool declared a sandbox mode and this deployment configured no
+    /// isolated executor to enforce it (M4 / `SBX-001`, ADR-0002).
+    ///
+    /// Never a failed `ToolResult`: the model cannot replan its way around a
+    /// missing binary, and letting it try would mean asking again with the
+    /// same containment gap. `loop/tool_call.rs` bubbles this up as a run
+    /// error for that reason.
+    #[error(
+        "the `{tool}` tool declares sandbox mode `{mode}`, but no isolated executor is \
+         configured to enforce it; set `[isolation].worker_path` or \
+         AGENTOS_TOOL_WORKER_PATH, or declare `full_access`"
+    )]
+    NoIsolatedExecutor { tool: Arc<str>, mode: &'static str },
+    /// An isolated executor is configured but cannot take this call — wrong
+    /// handshake, no implementation for the tool, or no enforceable sandbox on
+    /// its machine. Distinct from [`Self::NoIsolatedExecutor`] because the fix
+    /// is different: this deployment has an executor and picked the wrong one.
+    #[error("the `{tool}` tool needs sandbox mode `{mode}`, but the isolated executor {reason}")]
+    IncompatibleExecutor {
+        tool: Arc<str>,
+        mode: &'static str,
+        reason: String,
+    },
+    /// The executor was compatible and the isolated run itself failed — the
+    /// worker could not be started, refused the request, or died before
+    /// answering. The tool's own errors do not come through here; they arrive
+    /// as [`Self::Tool`] and stay recoverable.
+    #[error("the `{tool}` tool could not be run under isolation: {reason}")]
+    SandboxExecutionFailed { tool: Arc<str>, reason: Arc<str> },
     #[error(transparent)]
     Tool(#[from] ToolError),
     #[error(transparent)]
@@ -34,9 +65,27 @@ pub enum ToolRegistryError {
 /// `[limits].tool_timeout_ms` overrides it.
 pub const DEFAULT_TOOL_TIMEOUT_MS: u64 = 60_000;
 
+/// Where a call runs, once the sandbox question has been settled.
+///
+/// A two-variant enum rather than an `Option<&Path>` so the in-process arm is
+/// something the code says out loud. The bug this replaces was an absent
+/// branch; a named variant is harder to omit again.
+enum Dispatch<'a> {
+    InProcess,
+    Isolated { runner: &'a Path },
+}
+
 pub struct ToolRegistry {
     tools: BTreeMap<Arc<str>, Arc<dyn Tool>>,
     isolation_runner: Option<PathBuf>,
+    /// What [`Self::isolation_runner`] said it can do, asked at most once.
+    ///
+    /// Lazy rather than probed at construction: the handshake spawns a
+    /// process, and a deployment whose tools are all `full_access` should
+    /// never pay for one. `OnceCell` rather than a lock because the answer
+    /// cannot change for the life of the registry — the runner path is fixed
+    /// at construction.
+    executor: OnceCell<Result<ExecutorCapabilities, Arc<str>>>,
     default_timeout: Duration,
     timeout_overrides: BTreeMap<Arc<str>, Duration>,
     jobs: Option<Arc<JobRegistry>>,
@@ -51,6 +100,7 @@ impl Default for ToolRegistry {
         Self {
             tools: BTreeMap::new(),
             isolation_runner: None,
+            executor: OnceCell::new(),
             default_timeout: Duration::from_millis(DEFAULT_TOOL_TIMEOUT_MS),
             timeout_overrides: BTreeMap::new(),
             jobs: None,
@@ -154,18 +204,8 @@ impl ToolRegistry {
             .ok_or_else(|| ToolRegistryError::UnknownTool(Arc::clone(&call.name)))?;
         let spec = tool.spec();
         let deadline = self.deadline(&spec);
-        if spec.sandbox.is_sandboxed() {
-            if let Some(runner) = &self.isolation_runner {
-                let sandbox = Sandbox::new(spec.sandbox, workspace_root());
-                return Ok(call_isolated_subprocess(
-                    runner,
-                    call,
-                    deadline,
-                    &sandbox,
-                    self.max_output_bytes,
-                )
-                .await?);
-            }
+        if let Dispatch::Isolated { runner } = self.dispatch(tool, &spec).await? {
+            return self.call_isolated(runner, call, &spec, deadline).await;
         }
         match timeout(deadline, tool.call(call, &call.args)).await {
             Ok(result) => Ok(result?),
@@ -184,18 +224,8 @@ impl ToolRegistry {
             .ok_or_else(|| ToolRegistryError::UnknownTool(Arc::clone(&call.name)))?;
         let spec = tool.spec();
         let deadline = self.deadline(&spec);
-        if spec.sandbox.is_sandboxed() {
-            if let Some(runner) = &self.isolation_runner {
-                let sandbox = Sandbox::new(spec.sandbox, workspace_root());
-                return Ok(call_isolated_subprocess(
-                    runner,
-                    call,
-                    deadline,
-                    &sandbox,
-                    self.max_output_bytes,
-                )
-                .await?);
-            }
+        if let Dispatch::Isolated { runner } = self.dispatch(tool, &spec).await? {
+            return self.call_isolated(runner, call, &spec, deadline).await;
         }
         if let Some(promoted) = self.call_promotable(tool, call, ctx, deadline).await {
             return promoted;
@@ -204,6 +234,123 @@ impl ToolRegistry {
             Ok(result) => Ok(result?),
             Err(_elapsed) => Ok(timed_out_result(call, deadline)),
         }
+    }
+
+    /// Every registered tool whose declared sandbox mode this registry cannot
+    /// enforce, as lines an operator can act on.
+    ///
+    /// The registration half of ADR-0002's "checked at registration where it
+    /// can be, at invocation always". Startup is where a containment gap is
+    /// cheapest to fix and least likely to be read as a model failure — the
+    /// alternative is a run that dies mid-conversation on the first sandboxed
+    /// call, which is correct but arrives at the worst possible moment.
+    ///
+    /// Empty is the answer for the shipped configuration: every built-in but
+    /// `shell` declares `full_access`, and `shell` hardens its own child.
+    pub async fn isolation_problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        for tool in self.tools.values() {
+            let spec = tool.spec();
+            if let Err(error) = self.dispatch(tool, &spec).await {
+                problems.push(error.to_string());
+            }
+        }
+        problems
+    }
+
+    /// Where this call runs — decided before the tool's body is reachable.
+    ///
+    /// The M4 / `SBX-001` rule, from ADR-0002: a declared [`agentos_interfaces::tool::SandboxMode`] other
+    /// than `full_access` is a **precondition, not a preference**. This used to
+    /// be an `if let Some(runner)` with no `else`, so a deployment with no
+    /// isolated executor ran the tool in-process with its declared mode
+    /// silently discarded — a tool that asked for `read_only` got everything.
+    ///
+    /// A [`Isolation::SelfHardened`] tool is the one case that still runs
+    /// in-process without an executor, and it is not a fallthrough: that tool
+    /// builds the matching [`Sandbox`] itself and hands it to
+    /// [`crate::tools::exec::run`], where hardening happens before the child
+    /// exists and a failure aborts the call. The mode is enforced either way;
+    /// only the process that enforces it differs.
+    async fn dispatch<'a>(
+        &'a self,
+        tool: &Arc<dyn Tool>,
+        spec: &ToolSpec,
+    ) -> Result<Dispatch<'a>, ToolRegistryError> {
+        if !spec.sandbox.is_sandboxed() {
+            return Ok(Dispatch::InProcess);
+        }
+        let self_hardened = matches!(tool.isolation(), Isolation::SelfHardened);
+        let Some(runner) = self.isolation_runner.as_deref() else {
+            if self_hardened {
+                return Ok(Dispatch::InProcess);
+            }
+            return Err(ToolRegistryError::NoIsolatedExecutor {
+                tool: Arc::clone(&spec.name),
+                mode: spec.sandbox.as_str(),
+            });
+        };
+        let incompatible = match self.executor_capabilities(runner).await {
+            Ok(capabilities) => match capabilities.can_run(&spec.name, spec.sandbox) {
+                Ok(()) => return Ok(Dispatch::Isolated { runner }),
+                Err(incompatible) => incompatible.describe(),
+            },
+            Err(reason) => format!("could not be asked what it supports: {reason}"),
+        };
+        if self_hardened {
+            // Not silence: an operator who configured an executor and got a
+            // useless one should be told, even though the call is still safe.
+            warn!(
+                tool = spec.name.as_ref(),
+                runner = %runner.display(),
+                reason = incompatible.as_str(),
+                "running a self-hardening tool in-process instead of the isolated executor"
+            );
+            return Ok(Dispatch::InProcess);
+        }
+        Err(ToolRegistryError::IncompatibleExecutor {
+            tool: Arc::clone(&spec.name),
+            mode: spec.sandbox.as_str(),
+            reason: incompatible,
+        })
+    }
+
+    /// The configured executor's handshake, asked once and reused.
+    ///
+    /// A failed handshake is cached alongside a successful one. Re-probing per
+    /// call would spawn a process for every sandboxed tool call on a
+    /// deployment whose executor is simply missing, which is the case most
+    /// likely to be making a lot of them.
+    async fn executor_capabilities(
+        &self,
+        runner: &Path,
+    ) -> Result<&ExecutorCapabilities, Arc<str>> {
+        self.executor
+            .get_or_init(|| isolation::probe(runner))
+            .await
+            .as_ref()
+            .map_err(Arc::clone)
+    }
+
+    /// Run one call in the isolated executor, keeping the tool's own failures
+    /// recoverable and the executor's own failures typed.
+    async fn call_isolated(
+        &self,
+        runner: &Path,
+        call: &ToolCall,
+        spec: &ToolSpec,
+        deadline: Duration,
+    ) -> Result<ToolResult, ToolRegistryError> {
+        let sandbox = Sandbox::new(spec.sandbox, workspace_root());
+        call_isolated_subprocess(runner, call, deadline, &sandbox, self.max_output_bytes)
+            .await
+            .map_err(|error| match error {
+                IsolatedCallError::Tool(error) => ToolRegistryError::Tool(error),
+                IsolatedCallError::Executor(reason) => ToolRegistryError::SandboxExecutionFailed {
+                    tool: Arc::clone(&spec.name),
+                    reason,
+                },
+            })
     }
 
     /// Run a promotable tool as a background job, waiting out its deadline
@@ -374,6 +521,25 @@ struct IsolatedToolRequest<'a> {
     call: &'a ToolCall,
 }
 
+/// Why an isolated call did not produce a result.
+///
+/// The split is the point (M4 / `SBX-001`). A tool that fails inside the
+/// worker is the model's problem and stays recoverable; a worker that cannot
+/// run the tool at all is the deployment's problem and aborts the run. Before
+/// this, both arrived as `ToolError::Failed` with a line of stderr, so a
+/// containment failure was indistinguishable from a bad file path.
+#[derive(Debug, Error)]
+pub enum IsolatedCallError {
+    /// The worker ran the tool and the tool returned an error.
+    #[error(transparent)]
+    Tool(#[from] ToolError),
+    /// The worker could not run the tool: it would not start, refused the
+    /// request, could not apply the sandbox, or answered with something
+    /// unreadable.
+    #[error("{0}")]
+    Executor(Arc<str>),
+}
+
 /// Run one tool call inside the isolation worker.
 ///
 /// Async since roadmap D2: this used to block a Tokio worker thread on
@@ -386,9 +552,9 @@ pub async fn call_isolated_subprocess(
     timeout: Duration,
     sandbox: &Sandbox,
     max_output_bytes: usize,
-) -> Result<ToolResult, ToolError> {
+) -> Result<ToolResult, IsolatedCallError> {
     let request = serde_json::to_vec(&IsolatedToolRequest { call })
-        .map_err(|err| ToolError::Failed(err.to_string().into()))?;
+        .map_err(|err| IsolatedCallError::Executor(Arc::from(err.to_string())))?;
     let program = runner.to_string_lossy().into_owned();
     let output = crate::tools::exec::run(Exec {
         program: &program,
@@ -400,20 +566,32 @@ pub async fn call_isolated_subprocess(
         sandbox,
     })
     .await
-    .map_err(|err| ToolError::Failed(err.to_string().into()))?;
+    .map_err(|err| IsolatedCallError::Executor(Arc::from(err.to_string())))?;
 
     if !output.success {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let message = stderr.trim();
-        return Err(ToolError::Failed(Arc::from(if message.is_empty() {
-            "isolated worker failed".to_owned()
+        let detail = Arc::from(if message.is_empty() {
+            "the isolated worker failed without saying why".to_owned()
         } else {
             message.to_owned()
-        })));
+        });
+        // The worker's exit code carries which half of the boundary failed:
+        // `EXIT_TOOL_FAILED` for the tool's own error, `EXIT_WORKER_FAILED`
+        // for anything the worker itself could not do. An unexpected code —
+        // including a signal, which leaves no code at all — is the worker's,
+        // because a tool error never gets to choose one.
+        return Err(match output.status {
+            Some(isolation::EXIT_TOOL_FAILED) => ToolError::Failed(detail).into(),
+            _ => IsolatedCallError::Executor(detail),
+        });
     }
 
-    let mut result: ToolResult = serde_json::from_slice(&output.stdout)
-        .map_err(|err| ToolError::Failed(err.to_string().into()))?;
+    let mut result: ToolResult = serde_json::from_slice(&output.stdout).map_err(|err| {
+        IsolatedCallError::Executor(Arc::from(format!(
+            "the isolated worker answered with something unreadable: {err}"
+        )))
+    })?;
     result.metadata.insert(
         Arc::from("isolation"),
         Value::String("subprocess".to_owned()),
@@ -439,6 +617,7 @@ mod tests {
     use agentos_proto::ToolCallId;
     use async_trait::async_trait;
     use serde_json::{json, value::RawValue};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// A tool that never returns, so only a deadline can end a call to it.
     struct NeverReturns {
@@ -541,5 +720,146 @@ mod tests {
             registry.deadline(&spec),
             Duration::from_millis(DEFAULT_TOOL_TIMEOUT_MS)
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // M4 / SBX-001 — dispatch decides before the body is reachable.
+    // -----------------------------------------------------------------------
+
+    /// A tool that declares a mode, records whether its body ran, and can be
+    /// told which enforcement claim to make.
+    struct Declares {
+        mode: SandboxMode,
+        isolation: Isolation,
+        ran: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Tool for Declares {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: Arc::from("declares"),
+                description: Arc::from("declares a mode"),
+                input_schema: json!({"type": "object"}),
+                sandbox: self.mode,
+                timeout_ms: None,
+            }
+        }
+
+        fn isolation(&self) -> Isolation {
+            self.isolation
+        }
+
+        async fn call(&self, call: &ToolCall, _args: &RawValue) -> Result<ToolResult, ToolError> {
+            self.ran.store(true, Ordering::SeqCst);
+            Ok(ToolResult {
+                call_id: call.id.clone(),
+                status: ToolStatus::Succeeded,
+                content: Arc::from("ran"),
+                metadata: BTreeMap::new(),
+            })
+        }
+    }
+
+    fn declares_call() -> ToolCall {
+        ToolCall {
+            id: ToolCallId::new("call-1"),
+            name: Arc::from("declares"),
+            args: RawValue::from_string("{}".to_owned()).expect("static args are valid JSON"),
+        }
+    }
+
+    fn registry_with(mode: SandboxMode, isolation: Isolation) -> (ToolRegistry, Arc<AtomicBool>) {
+        let ran = Arc::new(AtomicBool::new(false));
+        let mut registry = ToolRegistry::new();
+        registry.register(Declares {
+            mode,
+            isolation,
+            ran: Arc::clone(&ran),
+        });
+        (registry, ran)
+    }
+
+    #[tokio::test]
+    async fn a_tool_needing_an_executor_is_refused_when_none_is_configured() {
+        let (registry, ran) = registry_with(SandboxMode::ReadOnly, Isolation::RequiresExecutor);
+
+        let error = registry
+            .call(&declares_call())
+            .await
+            .expect_err("no executor means no call");
+
+        assert!(
+            matches!(error, ToolRegistryError::NoIsolatedExecutor { mode, .. } if mode == "read_only"),
+            "{error:?}"
+        );
+        assert!(!ran.load(Ordering::SeqCst), "the body must not have run");
+    }
+
+    /// The same refusal, stated once at startup instead of once per call.
+    #[tokio::test]
+    async fn the_same_gap_is_reported_before_anything_is_called() {
+        let (registry, _) = registry_with(SandboxMode::WorkspaceWrite, Isolation::RequiresExecutor);
+        let problems = registry.isolation_problems().await;
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("workspace_write"), "{problems:?}");
+    }
+
+    /// The exception, and the reason it is not a fallthrough: this tool applies
+    /// the sandbox to its own child, so the mode is enforced with or without an
+    /// executor. `ShellTool` is the shipped instance.
+    #[tokio::test]
+    async fn a_self_hardening_tool_still_runs_without_an_executor() {
+        let (registry, ran) = registry_with(SandboxMode::WorkspaceWrite, Isolation::SelfHardened);
+
+        let result = registry.call(&declares_call()).await.expect("runs");
+
+        assert_eq!(result.status, ToolStatus::Succeeded);
+        assert!(ran.load(Ordering::SeqCst));
+        assert!(registry.isolation_problems().await.is_empty());
+    }
+
+    /// `full_access` is not a sandbox, so there is nothing for an executor to
+    /// enforce and nothing to refuse.
+    #[tokio::test]
+    async fn an_unsandboxed_tool_is_unaffected_by_any_of_this() {
+        let (registry, ran) = registry_with(SandboxMode::FullAccess, Isolation::RequiresExecutor);
+
+        let result = registry.call(&declares_call()).await.expect("runs");
+
+        assert_eq!(result.status, ToolStatus::Succeeded);
+        assert!(ran.load(Ordering::SeqCst));
+    }
+
+    /// A configured executor that cannot answer the handshake is a different
+    /// error from no executor at all, because it wants a different fix.
+    #[tokio::test]
+    async fn an_executor_that_cannot_be_asked_is_reported_as_incompatible() {
+        let (registry, ran) = registry_with(SandboxMode::ReadOnly, Isolation::RequiresExecutor);
+        let registry = registry.with_subprocess_isolation("/nonexistent/agentos-tool-worker");
+
+        let error = registry
+            .call(&declares_call())
+            .await
+            .expect_err("an unusable executor is not a usable one");
+
+        assert!(
+            matches!(error, ToolRegistryError::IncompatibleExecutor { .. }),
+            "{error:?}"
+        );
+        assert!(!ran.load(Ordering::SeqCst));
+    }
+
+    /// Whereas a self-hardening tool degrades to its own enforcement rather
+    /// than failing, and says so in the log.
+    #[tokio::test]
+    async fn a_self_hardening_tool_falls_back_to_its_own_enforcement() {
+        let (registry, ran) = registry_with(SandboxMode::WorkspaceWrite, Isolation::SelfHardened);
+        let registry = registry.with_subprocess_isolation("/nonexistent/agentos-tool-worker");
+
+        let result = registry.call(&declares_call()).await.expect("runs");
+
+        assert_eq!(result.status, ToolStatus::Succeeded);
+        assert!(ran.load(Ordering::SeqCst));
     }
 }
