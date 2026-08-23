@@ -31,10 +31,10 @@
 //! owner, and inventing one would be a way across the fence.
 
 use crate::jobs::{JobError, JobId, JobRegistry, JobSnapshot};
-use crate::memory::conversation_id_from_context;
+use crate::memory::{conversation_id_from_context, conversation_principal_from_context};
 use agentos_interfaces::orchestrator::RunContext;
 use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
-use agentos_proto::{ConversationId, ToolCall, ToolResult, ToolStatus};
+use agentos_proto::{Principal, ToolCall, ToolResult, ToolStatus};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, value::RawValue, Value};
@@ -120,17 +120,17 @@ impl Tool for JobStatusTool {
         args: &RawValue,
         ctx: &RunContext<'_>,
     ) -> Result<ToolResult, ToolError> {
-        let (conversation_id, parsed) = owner_and_args(ctx, args)?;
+        let (conversation, parsed) = owner_and_args(ctx, args)?;
         match parsed.job_id {
             Some(id) => {
                 let id = JobId::parse(&id);
-                match self.jobs.status(&conversation_id, &id) {
+                match self.jobs.status(&conversation, &id) {
                     Ok(snapshot) => Ok(ok(call, render(&snapshot), snapshot_metadata(&snapshot))),
                     Err(error) => Ok(failed(call, &error)),
                 }
             }
             None => {
-                let jobs = self.jobs.list(&conversation_id);
+                let jobs = self.jobs.list(&conversation);
                 let content = if jobs.is_empty() {
                     "No background jobs in this conversation.".to_owned()
                 } else {
@@ -176,13 +176,13 @@ impl Tool for JobOutputTool {
         args: &RawValue,
         ctx: &RunContext<'_>,
     ) -> Result<ToolResult, ToolError> {
-        let (conversation_id, parsed) = owner_and_args(ctx, args)?;
+        let (conversation, parsed) = owner_and_args(ctx, args)?;
         let Some(id) = parsed.job_id else {
             return Ok(failed_text(call, "job_output needs a job_id"));
         };
         let id = JobId::parse(&id);
         let offset = parsed.offset.unwrap_or(0);
-        match self.jobs.output(&conversation_id, &id, offset) {
+        match self.jobs.output(&conversation, &id, offset) {
             Ok(output) => {
                 let mut metadata = BTreeMap::new();
                 metadata.insert(Arc::from("offset"), Value::from(offset));
@@ -227,12 +227,12 @@ impl Tool for JobKillTool {
         args: &RawValue,
         ctx: &RunContext<'_>,
     ) -> Result<ToolResult, ToolError> {
-        let (conversation_id, parsed) = owner_and_args(ctx, args)?;
+        let (conversation, parsed) = owner_and_args(ctx, args)?;
         let Some(id) = parsed.job_id else {
             return Ok(failed_text(call, "job_kill needs a job_id"));
         };
         let id = JobId::parse(&id);
-        match self.jobs.kill(&conversation_id, &id) {
+        match self.jobs.kill(&conversation, &id) {
             Ok(()) => Ok(ok(call, format!("Stopped job `{id}`."), BTreeMap::new())),
             Err(error) => Ok(failed(call, &error)),
         }
@@ -241,15 +241,18 @@ impl Tool for JobKillTool {
 
 /// Resolve the calling conversation and parse the arguments, refusing a call
 /// that has no owner.
-fn owner_and_args(
-    ctx: &RunContext<'_>,
-    args: &RawValue,
-) -> Result<(ConversationId, JobRef), ToolError> {
-    let conversation_id =
-        conversation_id_from_context(ctx).ok_or_else(|| ToolError::Failed(Arc::from(NO_OWNER)))?;
+fn owner_and_args(ctx: &RunContext<'_>, args: &RawValue) -> Result<(Principal, JobRef), ToolError> {
+    // The presence check stays on the bare id: a context that names no
+    // conversation has no owner, and `conversation_principal_from_context`
+    // would substitute the run id rather than say so. Once there *is* an
+    // owner, it is a principal, because that is what the registry fences on
+    // (M3 deliverable 2).
+    if conversation_id_from_context(ctx).is_none() {
+        return Err(ToolError::Failed(Arc::from(NO_OWNER)));
+    }
     let parsed: JobRef = serde_json::from_str(args.get())
         .map_err(|err| ToolError::Failed(err.to_string().into()))?;
-    Ok((conversation_id, parsed))
+    Ok((conversation_principal_from_context(ctx), parsed))
 }
 
 fn render(snapshot: &JobSnapshot) -> String {

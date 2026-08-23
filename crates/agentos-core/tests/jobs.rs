@@ -15,8 +15,8 @@ use agentos_core::tools::{JobKillTool, JobOutputTool, JobStatusTool, ToolRegistr
 use agentos_interfaces::orchestrator::{Orchestrator, OrchestratorError, Plan, RunContext};
 use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
 use agentos_proto::{
-    ChannelId, ConversationId, Envelope, Message, MessageRole, RunId, ToolCall, ToolCallId,
-    ToolResult, ToolStatus,
+    AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole, Principal, RunId, ToolCall,
+    ToolCallId, ToolResult, ToolStatus,
 };
 use async_trait::async_trait;
 use serde_json::{json, value::RawValue, Value};
@@ -27,22 +27,38 @@ use std::time::Duration;
 
 const SLOW_TOOL: &str = "slow";
 
-/// An envelope in a named conversation. The job registry fences by conversation
-/// id, and it reads that id from the input item's metadata, so these tests need
-/// to control it rather than take the shared default.
+/// The channel these envelopes arrive on. Named because the job registry
+/// fences by *principal* now (M3 deliverable 2), so a test that wants to look
+/// a job up has to name the same channel the run did.
+const CHANNEL: &str = "jobs-channel";
+
+/// An envelope in a named conversation. The job registry fences by principal,
+/// and it reads the parts from the input item's metadata, so these tests need
+/// to control them rather than take the shared default.
 fn envelope_in(conversation: &str, text: &str) -> Envelope {
     let mut metadata = BTreeMap::new();
     metadata.insert(
         Arc::from("conversation_id"),
         Value::String(conversation.to_owned()),
     );
+    metadata.insert(Arc::from("channel_id"), Value::String(CHANNEL.to_owned()));
     Envelope {
-        channel_id: ChannelId::new("jobs-channel"),
+        channel_id: ChannelId::new(CHANNEL),
         conversation_id: ConversationId::new(conversation),
         sender: Arc::from("user"),
         message: Message::text(MessageRole::User, text),
         metadata,
     }
+}
+
+/// The principal a run in `conversation` fences its jobs by. `golden-agent` is
+/// what `support::runner_deps` runs as.
+fn owner(conversation: &str) -> Principal {
+    Principal::conversation(
+        AgentId::new("golden-agent"),
+        ChannelId::new(CHANNEL),
+        ConversationId::new(conversation),
+    )
 }
 
 /// Calls the slow tool once, then reports what came back.
@@ -157,7 +173,7 @@ async fn a_tool_past_its_deadline_becomes_a_job_that_keeps_running() {
     );
 
     // The run is over and the job is still going: that is the whole item.
-    let conversation = ConversationId::new("conv-a");
+    let conversation = owner("conv-a");
     let running = jobs.list(&conversation);
     assert_eq!(running.len(), 1);
     assert_eq!(running[0].state, JobState::Running);
@@ -239,10 +255,10 @@ async fn one_conversations_job_is_invisible_to_another() {
     .await
     .expect("promotion is not a failure");
 
-    let owner = ConversationId::new("conv-a");
-    let intruder = ConversationId::new("conv-b");
+    let owner_principal = owner("conv-a");
+    let intruder = owner("conv-b");
     let job = jobs
-        .list(&owner)
+        .list(&owner_principal)
         .first()
         .expect("conv-a owns a job")
         .clone();
@@ -253,7 +269,7 @@ async fn one_conversations_job_is_invisible_to_another() {
     assert!(jobs.output(&intruder, &job.id, 0).is_err());
     assert!(jobs.kill(&intruder, &job.id).is_err());
     assert!(jobs.list(&intruder).is_empty());
-    assert!(jobs.status(&owner, &job.id).is_ok());
+    assert!(jobs.status(&owner_principal, &job.id).is_ok());
 }
 
 /// A conversation that runs out of job slots keeps working: the call runs
@@ -293,7 +309,7 @@ async fn a_conversation_out_of_job_slots_degrades_to_the_deadline() {
         "expected D2's deadline result, got: {}",
         output.message.content
     );
-    assert_eq!(jobs.list(&ConversationId::new("conv-a")).len(), 1);
+    assert_eq!(jobs.list(&owner("conv-a")).len(), 1);
 }
 
 fn runner_deps_for<'a>(

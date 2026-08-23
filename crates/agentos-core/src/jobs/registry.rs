@@ -1,6 +1,6 @@
 //! The registry itself: what a job is, and the bounds it runs under.
 
-use agentos_proto::ConversationId;
+use agentos_proto::Principal;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -96,7 +96,15 @@ pub struct JobSpec {
     pub kind: Arc<str>,
     /// Human- and model-facing description of what this job is doing.
     pub label: Arc<str>,
-    pub conversation_id: ConversationId,
+    /// The conversation this job belongs to.
+    ///
+    /// A `Principal` rather than a bare `ConversationId` (M3 deliverable 2):
+    /// the fence below is a *security* boundary — it decides whose job a
+    /// `job_output` call may read — and `telegram:42` and `feishu:42` were the
+    /// same key. Conversation-wide, with no sender: a job started in a group
+    /// chat belongs to the conversation, and a participant who did not start
+    /// it can still ask how it is going.
+    pub conversation: Principal,
     /// Bytes of output retained. `None` takes the registry's default.
     pub output_limit_bytes: Option<usize>,
 }
@@ -201,6 +209,14 @@ impl Job {
     }
 }
 
+/// Whether `job` belongs to `conversation`.
+///
+/// Compared by conversation name, so the sender on either side is irrelevant:
+/// a job belongs to the conversation, not to whoever happened to start it.
+fn owned_by(job: &Job, conversation: &Principal) -> bool {
+    job.spec.conversation.conversation_name() == conversation.conversation_name()
+}
+
 /// Background work, fenced by conversation.
 pub struct JobRegistry {
     jobs: Mutex<BTreeMap<JobId, Job>>,
@@ -260,7 +276,8 @@ impl JobRegistry {
             let running = jobs
                 .values()
                 .filter(|job| {
-                    job.spec.conversation_id == spec.conversation_id
+                    job.spec.conversation.conversation_name()
+                        == spec.conversation.conversation_name()
                         && job.state == JobState::Running
                 })
                 .count();
@@ -291,7 +308,7 @@ impl JobRegistry {
         info!(
             job_id = id.as_str(),
             kind = spec.kind.as_ref(),
-            conversation_id = spec.conversation_id.as_str(),
+            conversation = %spec.conversation.conversation_name(),
             "job started"
         );
 
@@ -313,22 +330,18 @@ impl JobRegistry {
         Ok(id)
     }
 
-    /// Snapshot of one job, if it belongs to `conversation_id`.
-    pub fn status(
-        &self,
-        conversation_id: &ConversationId,
-        id: &JobId,
-    ) -> Result<JobSnapshot, JobError> {
+    /// Snapshot of one job, if it belongs to `conversation`.
+    pub fn status(&self, conversation: &Principal, id: &JobId) -> Result<JobSnapshot, JobError> {
         let jobs = self.lock();
-        let job = Self::owned(&jobs, conversation_id, id)?;
+        let job = Self::owned(&jobs, conversation, id)?;
         Ok(job.snapshot(id))
     }
 
     /// Every job this conversation owns, oldest first.
-    pub fn list(&self, conversation_id: &ConversationId) -> Vec<JobSnapshot> {
+    pub fn list(&self, conversation: &Principal) -> Vec<JobSnapshot> {
         self.lock()
             .iter()
-            .filter(|(_, job)| job.spec.conversation_id == *conversation_id)
+            .filter(|(_, job)| owned_by(job, conversation))
             .map(|(id, job)| job.snapshot(id))
             .collect()
     }
@@ -339,12 +352,12 @@ impl JobRegistry {
     /// how much it has seen, and asks for the rest.
     pub fn output(
         &self,
-        conversation_id: &ConversationId,
+        conversation: &Principal,
         id: &JobId,
         offset: usize,
     ) -> Result<String, JobError> {
         let jobs = self.lock();
-        let job = Self::owned(&jobs, conversation_id, id)?;
+        let job = Self::owned(&jobs, conversation, id)?;
         let output = job
             .output
             .lock()
@@ -361,11 +374,11 @@ impl JobRegistry {
 
     /// Cancel a job. Idempotent on an already-finished one, which reports
     /// [`JobError::AlreadyFinished`] rather than pretending it killed anything.
-    pub fn kill(&self, conversation_id: &ConversationId, id: &JobId) -> Result<(), JobError> {
+    pub fn kill(&self, conversation: &Principal, id: &JobId) -> Result<(), JobError> {
         let mut jobs = self.lock();
         let job = jobs
             .get_mut(id)
-            .filter(|job| job.spec.conversation_id == *conversation_id)
+            .filter(|job| owned_by(job, conversation))
             .ok_or_else(|| JobError::Unknown(id.clone()))?;
         if job.state.is_terminal() {
             return Err(JobError::AlreadyFinished(id.clone()));
@@ -385,17 +398,17 @@ impl JobRegistry {
     /// checked, so a job that finishes in the gap is not missed.
     pub async fn wait_for(
         &self,
-        conversation_id: &ConversationId,
+        conversation: &Principal,
         id: &JobId,
         timeout: std::time::Duration,
     ) -> Result<Option<JobSnapshot>, JobError> {
         let (finished, settled) = {
             let jobs = self.lock();
-            let job = Self::owned(&jobs, conversation_id, id)?;
+            let job = Self::owned(&jobs, conversation, id)?;
             (Arc::clone(&job.finished), job.state.is_terminal())
         };
         if settled {
-            return self.status(conversation_id, id).map(Some);
+            return self.status(conversation, id).map(Some);
         }
 
         let notified = finished.notified();
@@ -405,14 +418,14 @@ impl JobRegistry {
         // between.
         notified.as_mut().enable();
         if self
-            .status(conversation_id, id)
+            .status(conversation, id)
             .is_ok_and(|snapshot| snapshot.state.is_terminal())
         {
-            return self.status(conversation_id, id).map(Some);
+            return self.status(conversation, id).map(Some);
         }
 
         match tokio::time::timeout(timeout, notified).await {
-            Ok(()) => self.status(conversation_id, id).map(Some),
+            Ok(()) => self.status(conversation, id).map(Some),
             Err(_elapsed) => Ok(None),
         }
     }
@@ -422,11 +435,11 @@ impl JobRegistry {
     /// Called when a conversation ends. Nothing calls it yet — the runtime has
     /// no notion of a conversation ending until G1 introduces the actor that
     /// owns one — so this is the seam G1 plugs into, tested but not yet wired.
-    pub fn dispose_conversation(&self, conversation_id: &ConversationId) -> usize {
+    pub fn dispose_conversation(&self, conversation: &Principal) -> usize {
         let mut jobs = self.lock();
         let doomed: Vec<JobId> = jobs
             .iter()
-            .filter(|(_, job)| job.spec.conversation_id == *conversation_id)
+            .filter(|(_, job)| owned_by(job, conversation))
             .map(|(id, _)| id.clone())
             .collect();
         for id in &doomed {
@@ -436,7 +449,7 @@ impl JobRegistry {
         }
         if !doomed.is_empty() {
             info!(
-                conversation_id = conversation_id.as_str(),
+                conversation = %conversation.conversation_name(),
                 jobs = doomed.len(),
                 "conversation disposed; jobs cancelled"
             );
@@ -522,11 +535,13 @@ impl JobRegistry {
 
     fn owned<'a>(
         jobs: &'a BTreeMap<JobId, Job>,
-        conversation_id: &ConversationId,
+        conversation: &Principal,
         id: &JobId,
     ) -> Result<&'a Job, JobError> {
         jobs.get(id)
-            .filter(|job| job.spec.conversation_id == *conversation_id)
+            .filter(|job| owned_by(job, conversation))
+            // Deliberately the same error as "no such job". A caller asking
+            // about someone else's job learns nothing about whether it exists.
             .ok_or_else(|| JobError::Unknown(id.clone()))
     }
 
@@ -544,11 +559,22 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    /// One agent, one channel: these tests are about the fence between
+    /// conversations, and `conversation_of` builds the same principals the
+    /// runtime would.
+    fn conversation_of(conversation: &str) -> Principal {
+        Principal::conversation(
+            agentos_proto::AgentId::new("main"),
+            agentos_proto::ChannelId::new("telegram"),
+            agentos_proto::ConversationId::new(conversation),
+        )
+    }
+
     fn spec(conversation: &str, label: &str) -> JobSpec {
         JobSpec {
             kind: Arc::from("test"),
             label: Arc::from(label),
-            conversation_id: ConversationId::new(conversation),
+            conversation: conversation_of(conversation),
             output_limit_bytes: None,
         }
     }
@@ -570,7 +596,7 @@ mod tests {
         // The whole point of the item: `start` returns immediately and the work
         // keeps running.
         let registry = Arc::new(JobRegistry::default());
-        let conversation = ConversationId::new("conv-a");
+        let conversation = conversation_of("conv-a");
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
 
         let id = registry
@@ -616,7 +642,7 @@ mod tests {
     #[tokio::test]
     async fn reading_from_an_offset_returns_only_what_is_new() {
         let registry = Arc::new(JobRegistry::default());
-        let conversation = ConversationId::new("conv-a");
+        let conversation = conversation_of("conv-a");
         let id = registry
             .start(spec("conv-a", "chatty"), |sink, _cancel| async move {
                 sink.append("first\n");
@@ -654,7 +680,7 @@ mod tests {
             })
             .expect("room");
 
-        let intruder = ConversationId::new("conv-b");
+        let intruder = conversation_of("conv-b");
         assert!(matches!(
             registry.status(&intruder, &id),
             Err(JobError::Unknown(_))
@@ -670,7 +696,7 @@ mod tests {
         assert!(registry.list(&intruder).is_empty());
 
         // And the owner still sees it, so the fence is the reason, not a bug.
-        let owner = ConversationId::new("conv-a");
+        let owner = conversation_of("conv-a");
         assert!(registry.status(&owner, &id).is_ok());
         assert_eq!(registry.list(&owner).len(), 1);
     }
@@ -678,7 +704,7 @@ mod tests {
     #[tokio::test]
     async fn killing_a_job_stops_it_and_is_not_repeatable() {
         let registry = Arc::new(JobRegistry::default());
-        let conversation = ConversationId::new("conv-a");
+        let conversation = conversation_of("conv-a");
         let id = registry
             .start(spec("conv-a", "endless"), |_sink, cancel| async move {
                 cancel.cancelled().await;
@@ -711,8 +737,8 @@ mod tests {
         // The G1 seam. Nothing calls this yet, so its contract is only
         // guaranteed by this test.
         let registry = Arc::new(JobRegistry::default());
-        let doomed = ConversationId::new("conv-a");
-        let survivor = ConversationId::new("conv-b");
+        let doomed = conversation_of("conv-a");
+        let survivor = conversation_of("conv-b");
         // A drop guard rather than a flag set after `cancelled()`: cancelling
         // *drops* the work future, so code after an await point in it never
         // runs. Observing the drop is what proves the work actually stopped.
@@ -772,7 +798,7 @@ mod tests {
         // "never happened", and a producer with side effects needs to know
         // which it gets.
         let registry = Arc::new(JobRegistry::default());
-        let conversation = ConversationId::new("conv-a");
+        let conversation = conversation_of("conv-a");
         let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let id = registry
@@ -822,7 +848,7 @@ mod tests {
     #[tokio::test]
     async fn a_finished_job_frees_its_slot() {
         let registry = Arc::new(JobRegistry::new(1, DEFAULT_JOB_OUTPUT_BYTES));
-        let conversation = ConversationId::new("conv-a");
+        let conversation = conversation_of("conv-a");
         let id = registry
             .start(spec("conv-a", "quick"), |_sink, _cancel| async move {
                 Ok(Arc::from("done"))
@@ -845,7 +871,7 @@ mod tests {
     #[tokio::test]
     async fn output_past_the_cap_is_discarded_and_flagged() {
         let registry = Arc::new(JobRegistry::default());
-        let conversation = ConversationId::new("conv-a");
+        let conversation = conversation_of("conv-a");
         let mut spec = spec("conv-a", "loud");
         spec.output_limit_bytes = Some(8);
         let id = registry
@@ -874,7 +900,7 @@ mod tests {
     #[tokio::test]
     async fn a_failing_job_records_why() {
         let registry = Arc::new(JobRegistry::default());
-        let conversation = ConversationId::new("conv-a");
+        let conversation = conversation_of("conv-a");
         let id = registry
             .start(spec("conv-a", "doomed"), |_sink, _cancel| async move {
                 Err(Arc::from("the command exited 1"))

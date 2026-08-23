@@ -24,6 +24,42 @@ pub struct SqliteStore {
     path: Option<PathBuf>,
 }
 
+/// The session tables, applied only to a database that is not still in the
+/// pre-principal shape. See `init_schema`.
+const SESSION_SCHEMA: &str = r#"
+-- `conversation_key` is `Principal::conversation_name`, not the
+-- transport's conversation id: Telegram's chat 42, Feishu's chat
+-- 42, and a second agent on this database used to share one
+-- transcript (M3 deliverable 2).
+CREATE TABLE IF NOT EXISTS session_items (
+    row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_key TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    item_json TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(conversation_key, ordinal)
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_items_conversation_ordinal
+    ON session_items(conversation_key, ordinal);
+
+-- Two columns, on purpose. `conversation_key` says which
+-- transcript, `principal` says whose view of it — so a purge
+-- removes a whole conversation with one equality and `/clear`
+-- touches one participant. A single column plus a prefix match
+-- over an encoded name is the version of this that goes wrong.
+CREATE TABLE IF NOT EXISTS session_epochs (
+    row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_key TEXT NOT NULL,
+    principal TEXT NOT NULL,
+    epoch_ordinal INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_epochs_principal
+    ON session_epochs(conversation_key, principal, epoch_ordinal);
+"#;
+
 impl SqliteStore {
     /// Open the database at `path` with [`DEFAULT_MAX_CONNECTIONS`].
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MemoryError> {
@@ -114,30 +150,23 @@ impl SqliteStore {
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
-            CREATE TABLE IF NOT EXISTS session_items (
-                row_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                conversation_id TEXT NOT NULL,
-                ordinal INTEGER NOT NULL,
-                item_json TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(conversation_id, ordinal)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_session_items_conversation_ordinal
-                ON session_items(conversation_id, ordinal);
-
-            CREATE TABLE IF NOT EXISTS session_epochs (
-                row_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                conversation_id TEXT NOT NULL,
-                epoch_ordinal INTEGER NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_session_epochs_conversation
-                ON session_epochs(conversation_id, epoch_ordinal);
             "#,
         )
         .map_err(memory_sqlite_error)?;
+
+        // The session tables, unless this database still has them in the
+        // pre-principal shape. Creating an index over `conversation_key`
+        // against a table that has `conversation_id` fails, and failing here
+        // would mean a legacy database could not be *opened* — including by
+        // the migration that fixes it. Left alone instead; the runtime refuses
+        // to serve until `agentos-gateway migrate` has run
+        // (M3 deliverable 2).
+        if super::migrate_sessions::schema_of_connection(&conn)?
+            != super::migrate_sessions::SessionSchema::Legacy
+        {
+            conn.execute_batch(SESSION_SCHEMA)
+                .map_err(memory_sqlite_error)?;
+        }
 
         ensure_memory_record_columns(&conn)?;
         conn.execute_batch(

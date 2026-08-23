@@ -245,6 +245,17 @@ impl SafetyEvent {
         self
     }
 
+    /// Attach who this was about.
+    ///
+    /// Normally set by [`SafetyJournal::for_run`](super::SafetyJournal::for_run),
+    /// which stamps every event a run emits. This is for the events with no
+    /// run behind them — an operator purge is the case that needed it
+    /// (M3 deliverable 2).
+    pub fn with_principal(mut self, principal: Principal) -> Self {
+        self.principal = Some(principal);
+        self
+    }
+
     pub fn with_digest(mut self, digest: ArgumentDigest) -> Self {
         self.argument_digest = Some(digest);
         self

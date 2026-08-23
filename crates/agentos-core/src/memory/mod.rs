@@ -12,6 +12,7 @@ mod hybrid;
 mod in_memory;
 mod lease;
 pub mod migrate;
+pub mod migrate_sessions;
 mod pool;
 mod qdrant;
 mod query;
@@ -25,7 +26,8 @@ mod sqlite_vec;
 use accounting::{managed_metadata, MemoryAccessLogEntry, MemoryAccounting, MemoryOperation};
 use authorize::{authorize_scope, hydration_scopes, unauthorized};
 pub use context::{
-    channel_id_from_context, conversation_id_from_context, memory_caller_from_context,
+    channel_id_from_context, conversation_id_from_context, conversation_principal_from_context,
+    memory_caller_from_context,
 };
 use hybrid::reciprocal_rank_fusion;
 pub use hybrid::{SemanticIndex, SemanticSearchHit};

@@ -37,7 +37,8 @@ use agentos_interfaces::session::Transcript;
 use agentos_interfaces::tool::ToolSpec;
 use agentos_llm::{Llm, LlmError};
 use agentos_proto::{
-    AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole, ToolCall, ToolCallId,
+    AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole, Principal, ToolCall,
+    ToolCallId,
 };
 use async_trait::async_trait;
 use serde_json::{json, value::RawValue, Value};
@@ -167,6 +168,26 @@ pub const CHANNEL: &str = "golden-channel";
 /// a test can be built against the same identity the envelope will have.
 pub const SENDER: &str = "user";
 pub const CONVERSATION: &str = "golden-conversation";
+
+/// The principal a golden run keys its session on (M3 deliverable 2).
+///
+/// `golden-agent` is what [`runner_deps`] runs as, `CHANNEL` is what
+/// [`user_envelope`] arrives on. A test that reads the transcript back has to
+/// name the same three, which is the point of having one helper for it.
+pub fn golden_principal() -> Principal {
+    Principal::conversation(
+        AgentId::new("golden-agent"),
+        ChannelId::new(CHANNEL),
+        ConversationId::new(CONVERSATION),
+    )
+}
+
+/// The same conversation as seen by the participant who speaks in it, which is
+/// what a run actually loads with — the sender decides which `/clear` epoch
+/// applies.
+pub fn golden_participant() -> Principal {
+    golden_principal().with_sender(SENDER)
+}
 
 pub fn user_envelope(text: &str) -> Envelope {
     Envelope {

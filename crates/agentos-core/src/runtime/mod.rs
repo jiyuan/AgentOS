@@ -5,8 +5,8 @@ use crate::guardrails::{
 };
 use crate::jobs::JobRegistry;
 use crate::memory::{
-    InMemoryMemory, MemoryManager, QdrantSemanticIndex, SemanticIndex, SqliteStore,
-    SqliteVecSemanticIndex,
+    migrate_sessions, InMemoryMemory, MemoryManager, QdrantSemanticIndex, SemanticIndex,
+    SqliteStore, SqliteVecSemanticIndex,
 };
 use crate::orchestrator::{
     EchoOrchestrator, MaxOrchestrator, MemoryHydrationSettings, MinOrchestrator,
@@ -264,6 +264,24 @@ impl AgentRuntime {
             )
             .map_err(|err| format!("failed to open session store: {err}"))?,
         );
+        // A session log still keyed by bare conversation ids would read as
+        // *empty* under principal keys — every conversation silently starting
+        // over. Refused at startup instead, naming the one command that fixes
+        // it (M3 deliverable 2).
+        if migrate_sessions::session_schema(&session)
+            .map_err(|err| format!("failed to inspect the session schema: {err}"))?
+            == migrate_sessions::SessionSchema::Legacy
+        {
+            return Err(format!(
+                "the session log in {} is still keyed by conversation id; conversations would \
+                 read as empty. Run `agentos-gateway migrate --channel NAME --apply --backup \
+                 PATH` first (M3 deliverable 2)",
+                session.database_path().map_or_else(
+                    || "this database".to_owned(),
+                    |path| path.display().to_string()
+                )
+            ));
+        }
         let memory_manager =
             build_memory_manager(&workspace_config, session.clone(), semantic_factory)?;
         // One registry for the whole runtime, keyed by conversation. Jobs

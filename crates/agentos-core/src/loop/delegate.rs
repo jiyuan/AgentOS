@@ -5,7 +5,7 @@ use super::{LoopDeps, RunError};
 use crate::audit::{SafetyEvent, SafetyEventKind, SafetyOutcome};
 use crate::runner::ResumeDecision;
 use crate::subagents::{
-    child_input_envelope, child_run_id, parent_conversation_id, ParentSeed, SubAgentError,
+    child_input_envelope, child_run_id, parent_principal, ParentSeed, SubAgentError,
     SubAgentPausedRun, SubAgentRun, SubAgentRunOutput,
 };
 use crate::trace;
@@ -91,7 +91,7 @@ pub(super) async fn execute_delegate(
     // ask itself reaches the child as its input message. Whether any of it is
     // used is the sub-agent definition's call.
     let seed = ParentSeed {
-        conversation_id: parent_conversation_id(state),
+        principal: parent_principal(state),
         boundary: state.transcript.items.len(),
     };
     let invocation = match subagents

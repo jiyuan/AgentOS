@@ -15,8 +15,8 @@ use agentos_interfaces::orchestrator::{Orchestrator, OrchestratorError, Plan, Ru
 use agentos_interfaces::session::Session;
 use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
 use agentos_proto::{
-    ChannelId, ConversationId, Envelope, Message, MessageRole, RunId, ToolCall, ToolCallId,
-    ToolResult, ToolStatus,
+    AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole, Principal, RunId, ToolCall,
+    ToolCallId, ToolResult, ToolStatus,
 };
 use async_trait::async_trait;
 use serde_json::{json, value::RawValue, Value};
@@ -25,6 +25,17 @@ use std::sync::{Arc, Mutex};
 
 const RECORDER: &str = "recorder";
 const CONVERSATION: &str = "batch-conv";
+
+/// The principal a run on [`envelope`] keys its session on: `golden-agent`
+/// from `support::runner_deps`, and this test's own channel and conversation.
+fn principal() -> Principal {
+    Principal::conversation(
+        AgentId::new("golden-agent"),
+        ChannelId::new("batches"),
+        ConversationId::new(CONVERSATION),
+    )
+    .with_sender("user")
+}
 
 fn envelope(text: &str) -> Envelope {
     Envelope {
@@ -177,10 +188,7 @@ async fn a_batch_is_written_back_as_paired_turns() {
         .await
         .expect("a batch runs cleanly");
 
-    let transcript = session
-        .load(&ConversationId::new(CONVERSATION))
-        .await
-        .expect("session loads");
+    let transcript = session.load(&principal()).await.expect("session loads");
     let shape: Vec<(String, usize)> = transcript
         .items
         .iter()

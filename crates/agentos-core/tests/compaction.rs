@@ -21,13 +21,13 @@ use agentos_interfaces::orchestrator::RunContext;
 use agentos_interfaces::session::Session;
 use agentos_interfaces::tool::ToolSpec;
 use agentos_llm::{Llm, LlmError};
-use agentos_proto::{ConversationId, Message, MessageRole, RunId};
+use agentos_proto::{Message, MessageRole, RunId};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use support::{assistant, runner_deps, user_envelope, ScriptedLlm, CONVERSATION};
+use support::{assistant, runner_deps, user_envelope, ScriptedLlm};
 
 /// The window every scenario here is measured against. Small enough that a few
 /// dozen ordinary turns reach it.
@@ -240,7 +240,7 @@ async fn a_long_conversation_stays_within_the_window_and_keeps_its_log() {
     // Append-only: the log still holds every user turn and every reply, plus
     // the checkpoints. Nothing was rewritten or dropped.
     let transcript = session
-        .load(&ConversationId::new(CONVERSATION))
+        .load(&support::golden_participant())
         .await
         .expect("session loads");
     let originals = transcript
@@ -345,7 +345,7 @@ async fn a_failing_summarizer_leaves_the_run_uncompacted_rather_than_broken() {
 
     // No checkpoint was written, and the conversation is intact.
     let transcript = session
-        .load(&ConversationId::new(CONVERSATION))
+        .load(&support::golden_participant())
         .await
         .expect("session loads");
     assert!(!transcript.items.iter().any(is_checkpoint));
@@ -497,7 +497,7 @@ async fn a_disabled_deployment_writes_no_checkpoints() {
 
     assert_eq!(summarizer.calls(), 0);
     let transcript = session
-        .load(&ConversationId::new(CONVERSATION))
+        .load(&support::golden_participant())
         .await
         .expect("session loads");
     assert!(!transcript.items.iter().any(is_checkpoint));

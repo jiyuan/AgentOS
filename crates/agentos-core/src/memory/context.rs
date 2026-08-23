@@ -10,7 +10,7 @@
 
 use super::{MemoryCaller, SharedDomainGrants};
 use agentos_interfaces::orchestrator::RunContext;
-use agentos_proto::{ChannelId, ConversationId};
+use agentos_proto::{ChannelId, ConversationId, Principal};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -123,6 +123,25 @@ pub fn channel_id_from_context(ctx: &RunContext<'_>) -> ChannelId {
         .get("channel_id")
         .and_then(Value::as_str)
         .map_or_else(|| ChannelId::new("unknown-channel"), ChannelId::new)
+}
+
+/// The conversation-wide principal this run is speaking in.
+///
+/// The same three components `memory_caller_from_context` keys memory on, in
+/// the shape everything else in the runtime keys on — so a background job, a
+/// memory record and a session transcript from one turn all agree about which
+/// conversation they belong to (M3 deliverable 2).
+///
+/// No sender: this names the conversation, not the participant. Something that
+/// needs the participant adds it with
+/// [`Principal::with_sender`](agentos_proto::Principal::with_sender).
+pub fn conversation_principal_from_context(ctx: &RunContext<'_>) -> Principal {
+    Principal::conversation(
+        ctx.system.active_agent.clone(),
+        channel_id_from_context(ctx),
+        conversation_id_from_context(ctx)
+            .unwrap_or_else(|| ConversationId::new(ctx.state.run_id.as_str())),
+    )
 }
 
 fn caller_metadata_from_context<'a>(ctx: &'a RunContext<'_>) -> &'a BTreeMap<Arc<str>, Value> {

@@ -12,7 +12,7 @@
 
 use super::sqlite::{session_json_error, session_sqlite_error, SqliteStore};
 use agentos_interfaces::session::{Item, Session, SessionError, Transcript};
-use agentos_proto::ConversationId;
+use agentos_proto::Principal;
 use async_trait::async_trait;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::sync::Arc;
@@ -32,15 +32,16 @@ impl SqliteStore {
     /// The epoch table is itself append-only: a second `/clear` adds a row
     /// rather than moving one, so the sequence of clears is as readable as the
     /// items between them. Irreversible removal is [`Self::purge_session`].
-    pub fn clear_session(&self, conv_id: &ConversationId) -> Result<usize, SessionError> {
+    pub fn clear_session(&self, principal: &Principal) -> Result<usize, SessionError> {
+        let conversation = principal.conversation_name();
         let mut conn = self.session_conn()?;
         let tx = conn.transaction().map_err(session_sqlite_error)?;
-        let epoch = current_epoch(&tx, conv_id)?;
+        let epoch = current_epoch(&tx, principal)?;
         let next: i64 = tx
             .query_row(
                 "SELECT COALESCE(MAX(ordinal) + 1, 0) FROM session_items \
-                 WHERE conversation_id = ?1",
-                params![conv_id.as_str()],
+                 WHERE conversation_key = ?1",
+                params![conversation],
                 |row| row.get(0),
             )
             .map_err(session_sqlite_error)?;
@@ -48,8 +49,9 @@ impl SqliteStore {
         // second `/clear` on an already-cleared conversation reports as zero.
         let hidden = usize::try_from(next.saturating_sub(epoch)).unwrap_or(0);
         tx.execute(
-            "INSERT INTO session_epochs (conversation_id, epoch_ordinal) VALUES (?1, ?2)",
-            params![conv_id.as_str(), next],
+            "INSERT INTO session_epochs (conversation_key, principal, epoch_ordinal) \
+             VALUES (?1, ?2, ?3)",
+            params![conversation, principal.storage_name(), next],
         )
         .map_err(session_sqlite_error)?;
         tx.commit().map_err(session_sqlite_error)?;
@@ -63,16 +65,18 @@ impl SqliteStore {
     /// "deleted" distinguishable to anything other than the storage layer:
     /// an operator exporting a conversation, and the tests that check `/clear`
     /// hides rather than removes.
-    pub fn session_log(&self, conv_id: &ConversationId) -> Result<Vec<Item>, SessionError> {
+    pub fn session_log(&self, principal: &Principal) -> Result<Vec<Item>, SessionError> {
         let conn = self.session_conn()?;
         let mut stmt = conn
             .prepare(
                 "SELECT item_json FROM session_items \
-                 WHERE conversation_id = ?1 ORDER BY ordinal ASC",
+                 WHERE conversation_key = ?1 ORDER BY ordinal ASC",
             )
             .map_err(session_sqlite_error)?;
         let rows = stmt
-            .query_map(params![conv_id.as_str()], |row| row.get::<_, String>(0))
+            .query_map(params![principal.conversation_name()], |row| {
+                row.get::<_, String>(0)
+            })
             .map_err(session_sqlite_error)?;
         let mut items = Vec::new();
         for row in rows {
@@ -103,13 +107,13 @@ impl SqliteStore {
     pub fn idle_conversations(
         &self,
         before_unix: u64,
-    ) -> Result<Vec<(ConversationId, usize)>, SessionError> {
+    ) -> Result<Vec<(Principal, usize)>, SessionError> {
         let conn = self.session_conn()?;
         let mut stmt = conn
             .prepare(
-                "SELECT conversation_id, COUNT(*), MAX(created_at) AS newest \
+                "SELECT conversation_key, COUNT(*), MAX(created_at) AS newest \
                    FROM session_items \
-                  GROUP BY conversation_id \
+                  GROUP BY conversation_key \
                  HAVING newest < datetime(?1, 'unixepoch') \
                   ORDER BY newest ASC",
             )
@@ -117,13 +121,26 @@ impl SqliteStore {
         let rows = stmt
             .query_map(params![before_unix as i64], |row| {
                 Ok((
-                    ConversationId::new(row.get::<_, String>(0)?.as_str()),
+                    row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?.max(0) as usize,
                 ))
             })
             .map_err(session_sqlite_error)?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(session_sqlite_error)
+        let mut idle = Vec::new();
+        for row in rows {
+            let (key, count) = row.map_err(session_sqlite_error)?;
+            // A key that does not decode is a row this build did not write —
+            // a legacy conversation, or one from a newer encoding. Reported
+            // rather than skipped, because a purge survey that quietly omits
+            // rows understates what is on disk.
+            let principal = Principal::from_storage_name(&key).ok_or_else(|| {
+                SessionError::Backend(Arc::from(format!(
+                    "session key '{key}' is not a principal name; run `agentos-gateway migrate`"
+                )))
+            })?;
+            idle.push((principal, count));
+        }
+        Ok(idle)
     }
 
     /// Irreversibly remove a conversation's items and its epoch markers.
@@ -133,18 +150,23 @@ impl SqliteStore {
     /// method with a separate name, so nothing reaches it by the casual path,
     /// and callers are expected to confirm explicitly and record a safety
     /// event ([ADR-0006](../../../../docs/adr/0006-CLEAR_EPOCH.md)).
-    pub fn purge_session(&self, conv_id: &ConversationId) -> Result<usize, SessionError> {
+    pub fn purge_session(&self, principal: &Principal) -> Result<usize, SessionError> {
+        let conversation = principal.conversation_name();
         let mut conn = self.session_conn()?;
         let tx = conn.transaction().map_err(session_sqlite_error)?;
         let removed = tx
             .execute(
-                "DELETE FROM session_items WHERE conversation_id = ?1",
-                params![conv_id.as_str()],
+                "DELETE FROM session_items WHERE conversation_key = ?1",
+                params![conversation],
             )
             .map_err(session_sqlite_error)?;
+        // Every participant's epoch, not just this principal's: the
+        // conversation is being destroyed, and a marker left behind would
+        // hide the first items of whatever is written under the same key
+        // next.
         tx.execute(
-            "DELETE FROM session_epochs WHERE conversation_id = ?1",
-            params![conv_id.as_str()],
+            "DELETE FROM session_epochs WHERE conversation_key = ?1",
+            params![conversation],
         )
         .map_err(session_sqlite_error)?;
         tx.commit().map_err(session_sqlite_error)?;
@@ -159,10 +181,32 @@ impl SqliteStore {
 /// the two queries that read the table, rather than at the call sites — a
 /// query that forgets it is a correctness bug that surfaces as resurrected
 /// history.
-fn current_epoch(conn: &Connection, conv_id: &ConversationId) -> Result<i64, SessionError> {
+/// Where this participant's visible history starts.
+///
+/// **Two levels, and the maximum of them.** A `/clear` from a participant is
+/// written against their full principal and hides history for them alone —
+/// which is what stops one member of a group conversation clearing another's
+/// view ([ADR-0006](../../../../docs/adr/0006-CLEAR_EPOCH.md)). A `/clear`
+/// with no sender is written against the conversation itself and hides
+/// history for everyone in it; the TUI's single participant writes one, and so
+/// does the migration that carries a pre-principal epoch forward, because that
+/// is exactly what a per-conversation epoch used to mean.
+///
+/// Taking the maximum rather than the participant's alone is what makes those
+/// two compose: a conversation-wide clear cannot be escaped by having spoken
+/// before it, and a participant who clears again afterwards still moves only
+/// their own line.
+fn current_epoch(conn: &Connection, principal: &Principal) -> Result<i64, SessionError> {
     conn.query_row(
-        "SELECT COALESCE(MAX(epoch_ordinal), 0) FROM session_epochs WHERE conversation_id = ?1",
-        params![conv_id.as_str()],
+        "SELECT COALESCE(MAX(epoch_ordinal), 0) FROM session_epochs \
+         WHERE conversation_key = ?1 AND principal IN (?2, ?3)",
+        params![
+            principal.conversation_name(),
+            principal.storage_name(),
+            // The conversation-wide marker. Equal to the one above when the
+            // caller has no sender, which `IN` handles without a special case.
+            principal.conversation_name(),
+        ],
         |row| row.get(0),
     )
     .map_err(session_sqlite_error)
@@ -170,19 +214,19 @@ fn current_epoch(conn: &Connection, conv_id: &ConversationId) -> Result<i64, Ses
 
 #[async_trait]
 impl Session for SqliteStore {
-    async fn load(&self, conv_id: &ConversationId) -> Result<Transcript, SessionError> {
+    async fn load(&self, principal: &Principal) -> Result<Transcript, SessionError> {
         let conn = self.session_conn()?;
-        let epoch = current_epoch(&conn, conv_id)?;
+        let epoch = current_epoch(&conn, principal)?;
         let mut stmt = conn
             .prepare(
                 "SELECT item_json \
                  FROM session_items \
-                 WHERE conversation_id = ?1 AND ordinal >= ?2 \
+                 WHERE conversation_key = ?1 AND ordinal >= ?2 \
                  ORDER BY ordinal ASC",
             )
             .map_err(session_sqlite_error)?;
         let rows = stmt
-            .query_map(params![conv_id.as_str(), epoch], |row| {
+            .query_map(params![principal.conversation_name(), epoch], |row| {
                 row.get::<_, String>(0)
             })
             .map_err(session_sqlite_error)?;
@@ -197,17 +241,19 @@ impl Session for SqliteStore {
         Ok(transcript)
     }
 
-    async fn append(&self, conv_id: &ConversationId, items: Vec<Item>) -> Result<(), SessionError> {
+    async fn append(&self, principal: &Principal, items: Vec<Item>) -> Result<(), SessionError> {
         if items.is_empty() {
             return Ok(());
         }
+        let conversation = principal.conversation_name();
 
         let mut conn = self.session_conn()?;
         let tx = conn.transaction().map_err(session_sqlite_error)?;
         let next_ordinal = tx
             .query_row(
-                "SELECT COALESCE(MAX(ordinal) + 1, 0) FROM session_items WHERE conversation_id = ?1",
-                params![conv_id.as_str()],
+                "SELECT COALESCE(MAX(ordinal) + 1, 0) FROM session_items \
+                 WHERE conversation_key = ?1",
+                params![conversation],
                 |row| row.get::<_, i64>(0),
             )
             .optional()
@@ -220,8 +266,9 @@ impl Session for SqliteStore {
             })?;
             let item_json = serde_json::to_string(&item).map_err(session_json_error)?;
             tx.execute(
-                "INSERT INTO session_items (conversation_id, ordinal, item_json) VALUES (?1, ?2, ?3)",
-                params![conv_id.as_str(), next_ordinal + offset, item_json],
+                "INSERT INTO session_items (conversation_key, ordinal, item_json) \
+                 VALUES (?1, ?2, ?3)",
+                params![conversation, next_ordinal + offset, item_json],
             )
             .map_err(session_sqlite_error)?;
         }
@@ -241,14 +288,14 @@ impl Session for SqliteStore {
     /// look and the write.
     async fn fork(
         &self,
-        source: &ConversationId,
+        source: &Principal,
         boundary: usize,
-        child_id: &ConversationId,
+        child: &Principal,
     ) -> Result<usize, SessionError> {
-        if source == child_id {
+        let (source_key, child_key) = (source.conversation_name(), child.conversation_name());
+        if source_key == child_key {
             return Err(SessionError::Backend(Arc::from(format!(
-                "cannot fork conversation '{}' onto itself",
-                source.as_str()
+                "cannot fork conversation '{source_key}' onto itself"
             ))));
         }
         let boundary = i64::try_from(boundary).unwrap_or(i64::MAX);
@@ -257,16 +304,15 @@ impl Session for SqliteStore {
         let tx = conn.transaction().map_err(session_sqlite_error)?;
         let existing: i64 = tx
             .query_row(
-                "SELECT COUNT(*) FROM session_items WHERE conversation_id = ?1",
-                params![child_id.as_str()],
+                "SELECT COUNT(*) FROM session_items WHERE conversation_key = ?1",
+                params![child_key],
                 |row| row.get(0),
             )
             .map_err(session_sqlite_error)?;
         if existing > 0 {
             return Err(SessionError::Backend(Arc::from(format!(
-                "fork target '{}' already holds {existing} items; seeding it would interleave \
-                 two histories",
-                child_id.as_str()
+                "fork target '{child_key}' already holds {existing} items; seeding it would \
+                 interleave two histories"
             ))));
         }
 
@@ -277,16 +323,11 @@ impl Session for SqliteStore {
         let epoch = current_epoch(&tx, source)?;
         let seeded = tx
             .execute(
-                "INSERT INTO session_items (conversation_id, ordinal, item_json) \
+                "INSERT INTO session_items (conversation_key, ordinal, item_json) \
                  SELECT ?1, ordinal, item_json FROM session_items \
-                 WHERE conversation_id = ?2 AND ordinal >= ?3 AND ordinal < ?4 \
+                 WHERE conversation_key = ?2 AND ordinal >= ?3 AND ordinal < ?4 \
                  ORDER BY ordinal ASC",
-                params![
-                    child_id.as_str(),
-                    source.as_str(),
-                    epoch,
-                    epoch.saturating_add(boundary)
-                ],
+                params![child_key, source_key, epoch, epoch.saturating_add(boundary)],
             )
             .map_err(session_sqlite_error)?;
         tx.commit().map_err(session_sqlite_error)?;

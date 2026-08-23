@@ -17,8 +17,8 @@ use agentos_interfaces::orchestrator::{Orchestrator, OrchestratorError, Plan, Ru
 use agentos_interfaces::session::Session;
 use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
 use agentos_proto::{
-    ChannelId, ConversationId, Envelope, Message, MessageRole, RunId, ToolCall, ToolCallId,
-    ToolResult, ToolStatus,
+    AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole, Principal, RunId, ToolCall,
+    ToolCallId, ToolResult, ToolStatus,
 };
 use async_trait::async_trait;
 use serde_json::{json, value::RawValue, Value};
@@ -132,6 +132,18 @@ impl Orchestrator for Scripted {
     }
 }
 
+/// The principal a run on [`envelope`] keys its session on. `golden-agent` is
+/// what `support::runner_deps` runs as; this test's own channel and
+/// conversation are otherwise unrelated to the golden ones.
+fn principal() -> Principal {
+    Principal::conversation(
+        AgentId::new("golden-agent"),
+        ChannelId::new("spill"),
+        ConversationId::new(CONVERSATION),
+    )
+    .with_sender("user")
+}
+
 fn envelope() -> Envelope {
     Envelope {
         channel_id: ChannelId::new("spill"),
@@ -170,10 +182,7 @@ async fn run_with(
         .expect("the run finishes");
     assert!(matches!(outcome, RunOutcome::Finished { .. }));
 
-    let transcript = session
-        .load(&ConversationId::new(CONVERSATION))
-        .await
-        .expect("the session loads");
+    let transcript = session.load(&principal()).await.expect("the session loads");
     let locator = transcript
         .items
         .iter()

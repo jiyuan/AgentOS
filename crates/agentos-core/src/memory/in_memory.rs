@@ -1,7 +1,7 @@
 use super::{record_matches_query, MemoryError};
 use agentos_interfaces::memory::{Memory, Query, Record, Selector};
 use agentos_interfaces::session::{Item, Session, SessionError, Transcript};
-use agentos_proto::{ConversationId, Namespace, RecordId};
+use agentos_proto::{Namespace, Principal, RecordId};
 use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -60,28 +60,37 @@ impl Memory for InMemoryMemory {
     }
 }
 
+/// Keyed by [`Principal::conversation_name`], like every other session store:
+/// one transcript per conversation, shared by its participants.
+///
+/// No epochs, so `/clear` is not modelled here. A run against this store sees
+/// the whole log — which is right for the one-shot and test uses it exists
+/// for, and is why the epoch tests use the SQLite store.
 #[derive(Default)]
 pub struct InMemorySession {
-    transcripts: Mutex<BTreeMap<ConversationId, Transcript>>,
+    transcripts: Mutex<BTreeMap<String, Transcript>>,
 }
 
 #[async_trait]
 impl Session for InMemorySession {
-    async fn load(&self, conv_id: &ConversationId) -> Result<Transcript, SessionError> {
+    async fn load(&self, principal: &Principal) -> Result<Transcript, SessionError> {
         let transcripts = self
             .transcripts
             .lock()
             .map_err(|_| SessionError::Backend(Arc::from("in-memory session lock poisoned")))?;
-        Ok(transcripts.get(conv_id).cloned().unwrap_or_default())
+        Ok(transcripts
+            .get(&principal.conversation_name())
+            .cloned()
+            .unwrap_or_default())
     }
 
-    async fn append(&self, conv_id: &ConversationId, items: Vec<Item>) -> Result<(), SessionError> {
+    async fn append(&self, principal: &Principal, items: Vec<Item>) -> Result<(), SessionError> {
         let mut transcripts = self
             .transcripts
             .lock()
             .map_err(|_| SessionError::Backend(Arc::from("in-memory session lock poisoned")))?;
         transcripts
-            .entry(conv_id.clone())
+            .entry(principal.conversation_name())
             .or_default()
             .items
             .extend(items);

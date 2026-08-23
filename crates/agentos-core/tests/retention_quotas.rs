@@ -20,7 +20,8 @@ use agentos_core::retention::{cutoff_from_date, RetentionSweep, RetentionTargets
 use agentos_core::spill::{SpillSource, SpillStore};
 use agentos_interfaces::session::{Item, Session};
 use agentos_proto::{
-    ChannelId, ConversationId, Envelope, Message, MessageRole, RunId, ToolCallId, INGRESS_ID_KEY,
+    AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole, Principal, RunId,
+    ToolCallId, INGRESS_ID_KEY,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -28,6 +29,16 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 const DAY: u64 = 24 * 60 * 60;
+
+/// The principal a conversation is keyed by here. One agent and one channel
+/// throughout: these tests are about retention, not about identity.
+fn principal(conversation: &str) -> Principal {
+    Principal::conversation(
+        AgentId::new("retention-agent"),
+        ChannelId::new("telegram"),
+        ConversationId::new(conversation),
+    )
+}
 
 fn item(text: &str) -> Item {
     Item {
@@ -175,13 +186,13 @@ async fn every_configured_ceiling_removes_what_it_names() {
     backdate(&stale_artifact, 40 * DAY);
 
     let jobs = Arc::new(JobRegistry::default());
-    let conversation = ConversationId::new("conv-1");
+    let conversation = principal("conv-1");
     let id = jobs
         .start(
             JobSpec {
                 kind: Arc::from("tool"),
                 label: Arc::from("finished work"),
-                conversation_id: conversation.clone(),
+                conversation: conversation.clone(),
                 output_limit_bytes: None,
             },
             |_sink, _cancel| async move { Ok(Arc::from("done")) },
@@ -267,7 +278,7 @@ async fn the_record_survives_the_most_aggressive_sweep() {
     let store =
         Arc::new(SqliteStore::open(deployment.path("agentos.sqlite")).expect("the store opens"));
 
-    let conversation = ConversationId::new("conv-keep");
+    let conversation = principal("conv-keep");
     Session::append(
         store.as_ref(),
         &conversation,
@@ -491,14 +502,14 @@ async fn idle_conversations_are_surveyed_without_being_touched() {
     let store = SqliteStore::open(deployment.path("agentos.sqlite")).expect("the store opens");
 
     for name in ["stale-1", "stale-2", "live"] {
-        Session::append(&store, &ConversationId::new(name), vec![item(name)])
+        Session::append(&store, &principal(name), vec![item(name)])
             .await
             .expect("the session appends");
     }
     backdate_rows(
         &deployment.path("agentos.sqlite"),
         "UPDATE session_items SET created_at = datetime(created_at, '-400 days') \
-         WHERE conversation_id LIKE 'stale-%'",
+         WHERE conversation_key LIKE '%.stale-%'",
     );
 
     let cutoff = cutoff_from_date("2026-01-01").expect("a date parses");
@@ -506,14 +517,14 @@ async fn idle_conversations_are_surveyed_without_being_touched() {
     assert_eq!(idle.len(), 2, "only the backdated conversations are idle");
     assert!(idle
         .iter()
-        .all(|(conversation, _)| conversation.as_str().starts_with("stale-")));
+        .all(|(principal, _)| principal.conversation.as_str().starts_with("stale-")));
 
     // The survey is read-only. Everything is still there until an operator
     // names a count back.
     for name in ["stale-1", "stale-2", "live"] {
         assert_eq!(
             store
-                .session_log(&ConversationId::new(name))
+                .session_log(&principal(name))
                 .expect("the log reads")
                 .len(),
             1,
@@ -522,9 +533,7 @@ async fn idle_conversations_are_surveyed_without_being_touched() {
     }
 
     // And the purge, once authorized, removes the conversation whole.
-    let removed = store
-        .purge_session(&ConversationId::new("stale-1"))
-        .expect("purged");
+    let removed = store.purge_session(&principal("stale-1")).expect("purged");
     assert_eq!(removed, 1);
     assert_eq!(store.idle_conversations(cutoff).expect("surveyed").len(), 1);
 }

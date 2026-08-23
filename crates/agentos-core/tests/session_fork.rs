@@ -16,7 +16,20 @@ use agentos_core::memory::{InMemorySession, SqliteStore};
 use agentos_core::prompt;
 use agentos_core::spill::{SpillLocator, SpillSource, SpillStore, SPILL_LOCATOR_KEY};
 use agentos_interfaces::session::{Item, Session, Transcript};
-use agentos_proto::{ConversationId, Message, MessageRole, RunId, ToolCallId};
+use agentos_proto::{
+    AgentId, ChannelId, ConversationId, Message, MessageRole, Principal, RunId, ToolCallId,
+};
+
+/// A conversation as a principal. Forking is keyed on the conversation name,
+/// so the agent and channel are fixed here and only the conversation varies —
+/// which is also what makes `a_fork_onto_itself_is_refused` still meaningful.
+fn conversation(name: &str) -> Principal {
+    Principal::conversation(
+        AgentId::new("fork-agent"),
+        ChannelId::new("telegram"),
+        ConversationId::new(name),
+    )
+}
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -73,8 +86,8 @@ fn projection_of(items: &[Item]) -> Vec<Arc<str>> {
         .collect()
 }
 
-async fn seeded_parent(session: &dyn Session, items: Vec<Item>) -> ConversationId {
-    let parent = ConversationId::new("chat:parent");
+async fn seeded_parent(session: &dyn Session, items: Vec<Item>) -> Principal {
+    let parent = conversation("chat:parent");
     session
         .append(&parent, items)
         .await
@@ -88,7 +101,7 @@ async fn a_forked_child_projects_the_parents_prefix() {
     let session = InMemorySession::default();
     let items = transcript_with_a_checkpoint();
     let parent = seeded_parent(&session, items.clone()).await;
-    let child = ConversationId::new("chat:child");
+    let child = conversation("chat:child");
 
     let seeded = session
         .fork(&parent, 6, &child)
@@ -125,7 +138,7 @@ async fn a_checkpoints_shadow_still_names_the_right_items_in_the_child() {
     let session = InMemorySession::default();
     let items = transcript_with_a_checkpoint();
     let parent = seeded_parent(&session, items.clone()).await;
-    let child = ConversationId::new("chat:child");
+    let child = conversation("chat:child");
     session.fork(&parent, 7, &child).await.expect("seeded");
 
     let forked = session.load(&child).await.expect("the child loads");
@@ -154,7 +167,7 @@ async fn a_boundary_past_the_end_seeds_what_exists_and_says_how_much() {
     // not persisted yet.
     let session = InMemorySession::default();
     let parent = seeded_parent(&session, vec![item(MessageRole::User, "only")]).await;
-    let child = ConversationId::new("chat:child");
+    let child = conversation("chat:child");
 
     let seeded = session
         .fork(&parent, 99, &child)
@@ -168,7 +181,7 @@ async fn a_boundary_past_the_end_seeds_what_exists_and_says_how_much() {
 async fn a_zero_boundary_branches_an_empty_conversation() {
     let session = InMemorySession::default();
     let parent = seeded_parent(&session, transcript_with_a_checkpoint()).await;
-    let child = ConversationId::new("chat:child");
+    let child = conversation("chat:child");
 
     assert_eq!(session.fork(&parent, 0, &child).await.expect("ok"), 0);
     assert!(session.load(&child).await.expect("loads").items.is_empty());
@@ -181,7 +194,7 @@ async fn forking_onto_a_conversation_with_history_is_refused() {
     // reason a sub-agent can be seeded exactly once.
     let session = InMemorySession::default();
     let parent = seeded_parent(&session, transcript_with_a_checkpoint()).await;
-    let child = ConversationId::new("chat:child");
+    let child = conversation("chat:child");
     session.fork(&parent, 4, &child).await.expect("first seed");
 
     let error = session
@@ -219,8 +232,8 @@ async fn the_sqlite_override_agrees_with_the_default_implementation() {
     let items = transcript_with_a_checkpoint();
     let generic = InMemorySession::default();
     let sqlite = SqliteStore::open_in_memory().expect("an in-memory store opens");
-    let parent = ConversationId::new("chat:parent");
-    let child = ConversationId::new("chat:child");
+    let parent = conversation("chat:parent");
+    let child = conversation("chat:child");
 
     for store in [&generic as &dyn Session, &sqlite as &dyn Session] {
         store
@@ -249,7 +262,7 @@ async fn the_sqlite_override_agrees_with_the_default_implementation() {
 async fn a_forked_child_can_be_appended_to() {
     let sqlite = SqliteStore::open_in_memory().expect("opens");
     let parent = seeded_parent(&sqlite, transcript_with_a_checkpoint()).await;
-    let child = ConversationId::new("chat:child");
+    let child = conversation("chat:child");
     sqlite.fork(&parent, 5, &child).await.expect("seeded");
 
     sqlite
@@ -304,7 +317,7 @@ async fn spill_locators_in_a_seeded_prefix_resolve_from_the_child() {
         ],
     )
     .await;
-    let child = ConversationId::new("chat:child");
+    let child = conversation("chat:child");
     session.fork(&parent, 2, &child).await.expect("seeded");
 
     let forked = session.load(&child).await.expect("loads");
@@ -352,7 +365,7 @@ use agentos_core::subagents::{SubAgentDefinition, SubAgentRegistry};
 use agentos_interfaces::orchestrator::{
     Orchestrator, OrchestratorError, Plan, RunContext, SubAgentSpec,
 };
-use agentos_proto::{AgentId, ChannelId, Envelope};
+use agentos_proto::Envelope;
 use async_trait::async_trait;
 
 const PARENT_CONVERSATION: &str = "chat:seeding";
@@ -408,9 +421,31 @@ fn delegating_policy() -> Policy {
     }
 }
 
+/// The parent's session key: agent `parent`, channel `test-channel`. Same
+/// three components `parent_principal` reads back out of the run.
+fn seeding_parent() -> Principal {
+    Principal::conversation(
+        AgentId::new("parent"),
+        ChannelId::new("test-channel"),
+        ConversationId::new(PARENT_CONVERSATION),
+    )
+}
+
+/// The child's, which is the one that matters: the sub-agent runs as `child`
+/// on its own `subagent:child` channel, so the fork has to land under exactly
+/// that key or the seed goes somewhere the sub-agent never loads from — and
+/// nothing would say so, because an unseeded sub-agent just starts empty.
+fn seeding_child() -> Principal {
+    Principal::conversation(
+        AgentId::new("child"),
+        ChannelId::new("subagent:child"),
+        ConversationId::new(format!("{PARENT_CONVERSATION}:child")),
+    )
+}
+
 async fn delegate_with_seeding(seed_from_parent: bool) -> (Arc<InMemorySession>, Arc<str>) {
     let session = Arc::new(InMemorySession::default());
-    let parent_conversation = ConversationId::new(PARENT_CONVERSATION);
+    let parent_conversation = seeding_parent();
     session
         .append(
             &parent_conversation,
@@ -465,7 +500,7 @@ async fn delegate_with_seeding(seed_from_parent: bool) -> (Arc<InMemorySession>,
     let outcome = run_envelope(
         Envelope {
             channel_id: ChannelId::new("test-channel"),
-            conversation_id: parent_conversation,
+            conversation_id: parent_conversation.conversation.clone(),
             sender: Arc::from("user"),
             message: Message::text(MessageRole::User, "ask the child"),
             metadata: BTreeMap::new(),
@@ -488,7 +523,7 @@ async fn a_seeded_subagent_starts_from_the_parents_conversation() {
     let (session, _) = delegate_with_seeding(true).await;
 
     // `child_input_envelope` derives this from the parent's conversation id.
-    let child_conversation = ConversationId::new(format!("{PARENT_CONVERSATION}:child"));
+    let child_conversation = seeding_child();
     let child = session
         .load(&child_conversation)
         .await
@@ -511,7 +546,7 @@ async fn an_unseeded_subagent_starts_from_nothing_but_its_own_input() {
     // The default, and the behaviour every sub-agent had before X6.
     let (session, reply) = delegate_with_seeding(false).await;
 
-    let child_conversation = ConversationId::new(format!("{PARENT_CONVERSATION}:child"));
+    let child_conversation = seeding_child();
     let child = session
         .load(&child_conversation)
         .await
@@ -539,7 +574,7 @@ async fn a_seeded_subagent_is_seeded_once_not_on_every_turn() {
     // history already there. Re-seeding would duplicate the parent's log into
     // the child on every turn of a long conversation.
     let (session, _) = delegate_with_seeding(true).await;
-    let child_conversation = ConversationId::new(format!("{PARENT_CONVERSATION}:child"));
+    let child_conversation = seeding_child();
     let after_first = session
         .load(&child_conversation)
         .await
@@ -548,11 +583,7 @@ async fn a_seeded_subagent_is_seeded_once_not_on_every_turn() {
         .len();
 
     let seeded_again = session
-        .fork(
-            &ConversationId::new(PARENT_CONVERSATION),
-            99,
-            &child_conversation,
-        )
+        .fork(&seeding_parent(), 99, &child_conversation)
         .await;
     assert!(
         seeded_again.is_err(),

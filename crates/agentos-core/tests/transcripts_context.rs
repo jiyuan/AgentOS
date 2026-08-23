@@ -103,7 +103,7 @@ async fn golden_memory_hydration() {
     .expect("a hydrated run finishes");
 
     let transcript = session
-        .load(&ConversationId::new(CONVERSATION))
+        .load(&support::golden_participant())
         .await
         .expect("session loads");
     scenario_golden("memory_hydration", &llm, &transcript, &outcome);
@@ -189,7 +189,7 @@ async fn golden_tool_result_spilled() {
     .expect("an oversized tool result finishes the run");
 
     let transcript = session
-        .load(&ConversationId::new(CONVERSATION))
+        .load(&support::golden_participant())
         .await
         .expect("session loads");
 
@@ -285,7 +285,7 @@ async fn elision_reaches_the_model_but_not_the_log() {
     // The log is untouched. Elision is a view over it, recomputed each turn,
     // so a later compaction could still show these bytes in full.
     let transcript = session
-        .load(&ConversationId::new(CONVERSATION))
+        .load(&support::golden_participant())
         .await
         .expect("session loads");
     let logged = transcript

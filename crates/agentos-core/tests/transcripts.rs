@@ -63,7 +63,7 @@ async fn golden_plain_reply() {
     .expect("a plain reply run finishes");
 
     let transcript = session
-        .load(&ConversationId::new(CONVERSATION))
+        .load(&support::golden_participant())
         .await
         .expect("session loads");
     scenario_golden("plain_reply", &llm, &transcript, &outcome);
@@ -102,7 +102,7 @@ async fn golden_skill_prelude() {
     .expect("a run with a populated catalog finishes");
 
     let transcript = session
-        .load(&ConversationId::new(CONVERSATION))
+        .load(&support::golden_participant())
         .await
         .expect("session loads");
     scenario_golden("skill_prelude", &llm, &transcript, &outcome);
@@ -133,7 +133,7 @@ async fn golden_tool_call_allowed() {
     .expect("an allowed tool call finishes");
 
     let transcript = session
-        .load(&ConversationId::new(CONVERSATION))
+        .load(&support::golden_participant())
         .await
         .expect("session loads");
     scenario_golden("tool_call_allowed", &llm, &transcript, &outcome);
@@ -173,7 +173,7 @@ async fn golden_tool_call_batch() {
     .expect("a batch runs cleanly");
 
     let transcript = session
-        .load(&ConversationId::new(CONVERSATION))
+        .load(&support::golden_participant())
         .await
         .expect("session loads");
     support::assert_golden("tool_call_batch", &scenario(&llm, &transcript, &outcome));
@@ -266,7 +266,7 @@ async fn golden_approval_pause_and_resume() {
     .expect("an approved run resumes");
 
     let transcript = session
-        .load(&ConversationId::new(CONVERSATION))
+        .load(&support::golden_participant())
         .await
         .expect("session loads");
     support::assert_golden(
@@ -347,7 +347,7 @@ async fn golden_subagent_delegation() {
     .expect("delegation finishes");
 
     let transcript = session
-        .load(&ConversationId::new(CONVERSATION))
+        .load(&support::golden_participant())
         .await
         .expect("session loads");
     support::assert_golden(
@@ -371,7 +371,7 @@ async fn golden_cron_ephemeral_scope() {
     // — the guarantee `SESSION_SCOPE_EPHEMERAL` exists to provide (commit
     // 7b52e7d). The golden pins both halves.
     let session = InMemorySession::default();
-    let conversation = ConversationId::new(CONVERSATION);
+    let conversation = support::golden_participant();
     session
         .append(
             &conversation,
@@ -401,7 +401,7 @@ async fn golden_cron_ephemeral_scope() {
     );
     let envelope = Envelope {
         channel_id: ChannelId::new(CHANNEL),
-        conversation_id: conversation.clone(),
+        conversation_id: conversation.conversation.clone(),
         sender: Arc::from("cron:digest"),
         message: Message::text(MessageRole::User, "Run the scheduled digest."),
         metadata,
@@ -426,7 +426,7 @@ async fn golden_compaction_checkpoint() {
     // first two turns hides them from the model without anything having been
     // deleted — the shape compaction (C3) will write.
     let session = InMemorySession::default();
-    let conversation = ConversationId::new(CONVERSATION);
+    let conversation = support::golden_participant();
     session
         .append(
             &conversation,

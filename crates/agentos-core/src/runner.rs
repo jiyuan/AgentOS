@@ -218,10 +218,20 @@ pub async fn run_envelope(
         .get(SESSION_SCOPE_KEY)
         .and_then(Value::as_str)
         == Some(SESSION_SCOPE_EPHEMERAL);
+    // The principal this turn speaks as (M3 deliverable 2). The sender is
+    // carried because `Session::load` applies *this participant's* `/clear`
+    // epoch; the items it returns belong to the conversation, which is why
+    // `append` below can be given the same value and ignore the sender.
+    let principal = Principal::conversation(
+        deps.active_agent.clone(),
+        input.channel_id.clone(),
+        input.conversation_id.clone(),
+    )
+    .with_sender(Arc::clone(&input.sender));
     let mut transcript = if ephemeral_session {
         Transcript::default()
     } else {
-        deps.session.load(&input.conversation_id).await?
+        deps.session.load(&principal).await?
     };
     let persisted_len = transcript.items.len();
     let mut input_metadata = input.metadata.clone();
@@ -314,9 +324,7 @@ pub async fn run_envelope(
             RunLoopState::Paused(state) => {
                 if !ephemeral_session {
                     let append_items = state.transcript.items[persisted_len..].to_vec();
-                    deps.session
-                        .append(&input.conversation_id, append_items)
-                        .await?;
+                    deps.session.append(&principal, append_items).await?;
                 }
                 persist_task_session_items(
                     task_session.as_ref(),
@@ -704,7 +712,15 @@ async fn finish(
     });
     if !ephemeral_session {
         let append_items = state.transcript.items[persisted_len..].to_vec();
-        deps.session.append(&conversation_id, append_items).await?;
+        // No sender: appending is conversation-keyed, and `finish` is also
+        // reached from a resume, where the participant who answered the
+        // approval is not necessarily the one who spoke.
+        let principal = Principal::conversation(
+            deps.active_agent.clone(),
+            channel_id.clone(),
+            conversation_id.clone(),
+        );
+        deps.session.append(&principal, append_items).await?;
     }
     persist_task_session_items(
         active_task_session(&state, deps).as_ref(),
@@ -1193,9 +1209,15 @@ mod tests {
         // context limit and every cron on it failed permanently.
         let session = InMemorySession::default();
         let conversation = ConversationId::new("chat-1");
+        // The principal the run below will key on: same agent, same channel.
+        let principal = Principal::conversation(
+            AgentId::new("parent"),
+            ChannelId::new("telegram"),
+            conversation.clone(),
+        );
         session
             .append(
-                &conversation,
+                &principal,
                 vec![Item {
                     message: Message::text(MessageRole::User, "prior chat history"),
                     metadata: BTreeMap::new(),
@@ -1254,7 +1276,7 @@ mod tests {
         // ...output still delivers to the original conversation...
         assert_eq!(output.conversation_id, conversation);
         // ...and nothing was written back to the shared session.
-        let transcript = session.load(&conversation).await.unwrap();
+        let transcript = session.load(&principal).await.unwrap();
         assert_eq!(transcript.items.len(), 1, "ephemeral run polluted session");
 
         // Contrast: the default scope still loads and persists history.
@@ -1273,7 +1295,7 @@ mod tests {
             RunOutcome::Paused(_) => panic!("expected finished run"),
         };
         assert_eq!(output.message.content.as_ref(), "saw 2 items");
-        let transcript = session.load(&conversation).await.unwrap();
+        let transcript = session.load(&principal).await.unwrap();
         assert_eq!(transcript.items.len(), 3, "seed + input + reply expected");
     }
 

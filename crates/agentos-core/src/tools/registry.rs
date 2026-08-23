@@ -1,6 +1,6 @@
 use super::McpTool;
 use crate::jobs::{JobId, JobRegistry, JobSnapshot, JobSpec, JobState};
-use crate::memory::conversation_id_from_context;
+use crate::memory::{conversation_id_from_context, conversation_principal_from_context};
 use crate::sandbox::Sandbox;
 use crate::tools::builtin::workspace_root;
 use crate::tools::exec::{Exec, DEFAULT_MAX_OUTPUT_BYTES};
@@ -8,8 +8,7 @@ use crate::tools::isolation::{self, ExecutorCapabilities};
 use agentos_interfaces::mcp::{McpClient, McpError, McpServer};
 use agentos_interfaces::orchestrator::RunContext;
 use agentos_interfaces::tool::{Isolation, Tool, ToolError, ToolSpec};
-use agentos_proto::ConversationId;
-use agentos_proto::{ToolCall, ToolResult, ToolStatus};
+use agentos_proto::{Principal, ToolCall, ToolResult, ToolStatus};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -398,7 +397,8 @@ impl ToolRegistry {
         // A job belongs to a conversation, and there is no safe default owner:
         // guessing one would put a job somewhere another conversation might
         // reach it. Without an owner, this call is simply not promotable.
-        let conversation_id = conversation_id_from_context(ctx)?;
+        conversation_id_from_context(ctx)?;
+        let conversation = conversation_principal_from_context(ctx);
 
         // Deliberately `Tool::call`, not `call_with_context`: the job outlives
         // the borrow the context is built from. `[jobs].promotable` is an
@@ -409,7 +409,7 @@ impl ToolRegistry {
         let spec = JobSpec {
             kind: Arc::from("tool"),
             label: Arc::clone(&call.name),
-            conversation_id: conversation_id.clone(),
+            conversation: conversation.clone(),
             output_limit_bytes: None,
         };
         let id = match jobs.start(spec, move |sink, _cancel| async move {
@@ -435,11 +435,11 @@ impl ToolRegistry {
             }
         };
 
-        match jobs.wait_for(&conversation_id, &id, deadline).await {
+        match jobs.wait_for(&conversation, &id, deadline).await {
             Ok(Some(snapshot)) => Some(Ok(finished_job_result(
                 call,
                 jobs,
-                &conversation_id,
+                &conversation,
                 &snapshot,
             ))),
             Ok(None) => Some(Ok(promoted_result(call, &id, deadline))),
@@ -479,11 +479,11 @@ fn promoted_result(call: &ToolCall, id: &JobId, deadline: Duration) -> ToolResul
 fn finished_job_result(
     call: &ToolCall,
     jobs: &JobRegistry,
-    conversation_id: &ConversationId,
+    conversation: &Principal,
     snapshot: &JobSnapshot,
 ) -> ToolResult {
     let content = jobs
-        .output(conversation_id, &snapshot.id, 0)
+        .output(conversation, &snapshot.id, 0)
         .unwrap_or_default();
     let mut metadata = BTreeMap::new();
     if snapshot.output_truncated {
