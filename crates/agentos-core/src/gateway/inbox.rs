@@ -42,8 +42,15 @@ pub enum Admitted {
     NextStep,
     /// Handed to the in-flight run, displacing the oldest un-claimed steer.
     NextStepDisplacing,
-    /// Refused: the turn queue is full. The caller must tell the user — a
-    /// silently dropped message is indistinguishable from an ignored one.
+    /// Refused: the turn queue is full.
+    ///
+    /// The caller *should* tell the user — a silently dropped message is
+    /// indistinguishable from an ignored one — and today it does not. The
+    /// shard loop logs `inbox full; message refused` and drops it, because the
+    /// loop that admits has no egress to answer on. See
+    /// `docs/OBSERVABILITY.md`, which names this as the open gap rather than
+    /// leaving this comment describing behaviour the tree does not have
+    /// (M9 / `CI-002`).
     Full,
 }
 

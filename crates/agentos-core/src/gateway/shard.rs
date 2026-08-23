@@ -256,8 +256,23 @@ pub async fn run_shard<H: TurnHandler>(
                     let inbox = conversations
                         .entry(conversation.clone())
                         .or_insert_with(|| Inbox::bounded(config.inbox_capacity));
-                    if inbox.admit(envelope) == Admitted::NextTurn {
-                        ready.push(conversation);
+                    match inbox.admit(envelope) {
+                        Admitted::NextTurn => ready.push(conversation),
+                        Admitted::NextStep | Admitted::NextStepDisplacing => {}
+                        // The refusal was decided in `Inbox::admit` and then
+                        // discarded here, so a conversation that outran its
+                        // `[gateway] inbox_capacity` lost the message with no
+                        // trace anywhere — the one thing `Admitted::Full`'s own
+                        // documentation says must not happen. Saturation is now
+                        // at least *observable*; telling the sender needs an
+                        // egress this loop does not have, and is recorded as
+                        // the remaining gap in `docs/OBSERVABILITY.md`
+                        // (M9 / `CI-002`).
+                        Admitted::Full => tracing::warn!(
+                            conversation_id = conversation.as_str(),
+                            inbox_capacity = config.inbox_capacity,
+                            "inbox full; message refused"
+                        ),
                     }
                 }
                 Some(Dispatch::Stop(conversation, answer)) => {

@@ -162,7 +162,14 @@ proptest! {
     // files do not resolve inside integration tests; the printed seed and
     // minimal counterexample are sufficient to reproduce a failure.
     #![proptest_config({
-        let mut config = ProptestConfig::with_cases(1000);
+        // 1000 per run, or whatever `PROPTEST_CASES` says. `with_cases` would
+        // otherwise pin it and quietly ignore the variable, which is what the
+        // nightly deep-property job needs to turn up (M9 / `CI-002`).
+        let cases = std::env::var("PROPTEST_CASES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1000);
+        let mut config = ProptestConfig::with_cases(cases);
         config.failure_persistence = Some(Box::new(
             proptest::test_runner::FileFailurePersistence::Off,
         ));

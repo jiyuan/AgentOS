@@ -1419,10 +1419,24 @@ fn runtime_paths(config: &ServiceConfig) -> RuntimePaths {
 fn migrate(config: &ServiceConfig) -> Result<(), String> {
     let flags: Vec<String> = env::args().skip(2).collect();
     let has = |name: &str| flags.iter().any(|flag| flag == name);
+    // Both `--channel=NAME` and `--channel NAME`. This read only the first,
+    // which was survivable while `parse_config` rejected the second outright —
+    // it failed loudly. Once `parse_config` learned to accept the separated
+    // form for `purge`, the separated form here started being *silently
+    // ignored*, and `migrate --channel telegram` failed claiming no channel
+    // was given. One lookup shape for every subcommand, so the two cannot
+    // disagree again (M9 / `CI-002`).
     let value = |name: &str| {
-        flags
-            .iter()
-            .find_map(|flag| flag.strip_prefix(&format!("{name}=")).map(str::to_owned))
+        let mut args = flags.iter();
+        while let Some(flag) = args.next() {
+            if let Some(inline) = flag.strip_prefix(&format!("{name}=")) {
+                return Some(inline.to_owned());
+            }
+            if flag == name {
+                return args.next().cloned();
+            }
+        }
+        None
     };
 
     let db_path = session_path(config);

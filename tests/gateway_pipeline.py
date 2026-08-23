@@ -53,6 +53,18 @@ DEFAULT_TASKS_PATH = TESTS_DIR / "test_tasks.json"
 GATEWAY_LOG = REPO / "tests" / "_artifacts" / "agentos-gateway.log"
 GATEWAY_STDIO = REPO / "tests" / "_artifacts" / "agentos-gateway.stdio.log"
 GATEWAY_PID = REPO / "tests" / "_artifacts" / "agentos-gateway.pid"
+# A session database of the cycle's own, replaced on every run.
+#
+# Two reasons, and the second is why the fix is a fresh file rather than a
+# fixed one. First, without this the pipeline writes into
+# `workspace/agentos.sqlite` — the developer's live database. Second, M8 /
+# `GW-001` made the Telegram channel persist its `getUpdates` offset as an
+# ingress cursor, and the mock restarts its update ids at 1 every cycle. A
+# gateway resuming from the previous cycle's offset therefore skipped the first
+# few tasks of the next one, which is correct behaviour against a real
+# transport (ids are globally increasing) and wrong against a mock that rewinds
+# (M9 / `CI-002`).
+GATEWAY_DB = REPO / "tests" / "_artifacts" / "agentos-pipeline.sqlite"
 ARTIFACTS_DIR = REPO / "tests" / "_artifacts"
 
 DEFAULT_TASKS = [
@@ -819,22 +831,32 @@ def _build_gateway_env(
     telegram: TelegramMock, feishu: FeishuMock
 ) -> dict[str, str]:
     env = os.environ.copy()
-    # Note: AGENTOS_TELEGRAM_CHAT_ID is intentionally blanked so the gateway
-    # accepts inbound messages from any chat_id. That lets each task use a
-    # unique chat_id and get a fresh conversation/session. It is set to ""
-    # (not just popped) because AGENTOS_NO_ENV_OVERRIDE=1 below would
-    # otherwise let the on-disk .env re-introduce a real chat-id allowlist,
-    # which would make the gateway silently drop every test message.
+    # Every task uses a unique chat_id so it gets a fresh conversation, which
+    # means the gateway has to accept chats it was not told about in advance.
+    #
+    # Blanking AGENTOS_TELEGRAM_CHAT_ID used to be how that was asked for, and
+    # M3 / `AUTH-001` reversed it: an empty allowlist now admits *nothing*,
+    # because "unset means open" is how a deployment that forgot the variable
+    # ended up exposed to anyone who could find the bot. The pipeline was
+    # invoked by nothing, so it went on asking the old way and every task
+    # timed out at 90 seconds against a channel loop that had already failed
+    # to start (M9 / `CI-002`). ALLOW_ALL is the explicit form of the same
+    # request. It is set (not just popped) because AGENTOS_NO_ENV_OVERRIDE=1
+    # below would otherwise let the on-disk .env re-introduce a real
+    # allowlist, which would make the gateway silently drop every test
+    # message.
     env.pop("AGENTOS_TELEGRAM_CHAT_ID", None)
     env.update(
         {
             "AGENTOS_TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
             "AGENTOS_TELEGRAM_CHAT_ID": "",
+            "AGENTOS_TELEGRAM_ALLOW_ALL": "1",
             "AGENTOS_TELEGRAM_API_BASE": telegram.base_url(),
             "AGENTOS_TELEGRAM_FILE_BASE": telegram.base_url(),
             "AGENTOS_FEISHU_APP_ID": FEISHU_APP_ID,
             "AGENTOS_FEISHU_APP_SECRET": FEISHU_APP_SECRET,
             "AGENTOS_FEISHU_ALLOWED_ID": FEISHU_SENDER_OPEN_ID,
+            "AGENTOS_FEISHU_ALLOW_ALL": "1",
             "AGENTOS_FEISHU_RECEIVE_ID_TYPE": "chat_id",
             "AGENTOS_FEISHU_API_BASE": feishu.base_url(),
             "AGENTOS_ENABLED_CHANNELS": "telegram,feishu",
@@ -878,6 +900,8 @@ def _start_gateway(
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     GATEWAY_LOG.touch(exist_ok=True)
     GATEWAY_PID.unlink(missing_ok=True)
+    for suffix in ("", "-wal", "-shm"):
+        Path(f"{GATEWAY_DB}{suffix}").unlink(missing_ok=True)
     # Pre-populate the pid file so the gateway accepts ownership immediately.
     GATEWAY_PID.write_text(f"0 {env['AGENTOS_GATEWAY_OWNER_TOKEN']}\n", encoding="utf-8")
     cmd = [
@@ -887,6 +911,8 @@ def _start_gateway(
         str(GATEWAY_PID),
         "--log-path",
         str(GATEWAY_LOG),
+        "--session-db-path",
+        str(GATEWAY_DB),
     ]
     log(f"starting gateway: {' '.join(cmd)}")
     # Redirect the gateway's stdout/stderr (eprintln! channel diagnostics,

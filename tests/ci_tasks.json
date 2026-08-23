@@ -1,0 +1,10 @@
+{
+  "_doc": "The subset tests/gateway_pipeline.py runs on every push (M9 / `CI-002`). One task per behaviour that reaches a different part of the gateway, kept small enough that the whole cycle fits in a minute on both channels. tests/test_tasks.json is the full fifty, for the nightly soak.",
+  "tasks": [
+    { "id": "ci-smoke-ack", "prompt": "Reply with the single word READY.", "category": "smoke" },
+    { "id": "ci-unicode", "prompt": "自動化の利点を一文で答えてください。", "category": "smoke" },
+    { "id": "ci-blank", "prompt": "\n\n\n", "category": "edge-case" },
+    { "id": "ci-slash-help", "prompt": "/help", "category": "slash-command" },
+    { "id": "ci-slash-unknown", "prompt": "/teleport --to mars", "category": "slash-command" }
+  ]
+}
