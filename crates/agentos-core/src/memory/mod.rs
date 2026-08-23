@@ -30,7 +30,7 @@ pub use context::{
 use hybrid::reciprocal_rank_fusion;
 pub use hybrid::{SemanticIndex, SemanticSearchHit};
 pub use in_memory::{InMemoryMemory, InMemorySession};
-pub use lease::{lease_holder_id, Lease, DEFAULT_LEASE_TTL, REFLECTION_LEASE};
+pub use lease::{lease_holder_id, Lease, DEFAULT_LEASE_TTL, REFLECTION_LEASE, RETENTION_LEASE};
 pub use pool::{DEFAULT_MAX_CONNECTIONS, MAX_MAX_CONNECTIONS};
 pub use qdrant::{QdrantSemanticConfig, QdrantSemanticIndex};
 use query::{estimate_fragment_tokens, selector_matches_record};

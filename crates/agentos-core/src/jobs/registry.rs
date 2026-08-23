@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -20,6 +21,13 @@ pub const DEFAULT_MAX_CONCURRENT_JOBS: usize = 4;
 
 /// Output one job retains before it starts discarding.
 pub const DEFAULT_JOB_OUTPUT_BYTES: usize = 256 * 1024;
+
+/// How long a finished job stays answerable before the registry forgets it.
+///
+/// An hour: long enough that a user who walked away from a build comes back to
+/// a result rather than to "no such job", short enough that a gateway running
+/// for months is not still holding this morning's output (M7 / `QUOTA-001`).
+pub const DEFAULT_COMPLETED_JOB_SECS: u64 = 3600;
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -167,6 +175,12 @@ struct Job {
     /// on it for the tool's deadline, so a call that finishes in time is
     /// indistinguishable from one that never involved a job at all.
     finished: Arc<Notify>,
+    /// When the job reached a terminal state, for [`JobRegistry::reap_completed`].
+    ///
+    /// A monotonic instant rather than a wall clock: the reap is "an hour after
+    /// it finished", which a clock stepped backwards over NTP would otherwise
+    /// turn into "never" (M7 / `QUOTA-001`).
+    finished_at: Option<Instant>,
 }
 
 impl Job {
@@ -268,6 +282,7 @@ impl JobRegistry {
                     output: Arc::clone(&output),
                     cancel: cancel.clone(),
                     finished: Arc::new(Notify::new()),
+                    finished_at: None,
                 },
             );
             id
@@ -455,7 +470,54 @@ impl JobRegistry {
                 job.detail = Some(Arc::from("cancelled"));
             }
         }
+        job.finished_at = Some(Instant::now());
         job.finished.notify_waiters();
+    }
+
+    /// Forget every job that reached a terminal state more than `max_age` ago,
+    /// returning how many were removed.
+    ///
+    /// The bound `max_concurrent` never was. It counts *running* jobs, so a
+    /// finished one costs nothing against it and stays in the map with its
+    /// retained output — up to `[jobs].output_limit_bytes` each — until its
+    /// conversation is cleared. A gateway is not cleared, so before this the
+    /// registry was a slow leak proportional to how much work the agent had
+    /// ever done (M7 / `QUOTA-001`).
+    ///
+    /// Only terminal jobs, and only by their own completion time: a running
+    /// job is never reaped at any age, because how long work takes is the
+    /// tool's business and `[limits].tool_timeout_ms` is what bounds it.
+    pub fn reap_completed(&self, max_age: Duration) -> usize {
+        let mut jobs = self.lock();
+        let now = Instant::now();
+        let doomed: Vec<JobId> = jobs
+            .iter()
+            .filter(|(_, job)| {
+                job.finished_at
+                    .is_some_and(|at| now.saturating_duration_since(at) >= max_age)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &doomed {
+            jobs.remove(id);
+        }
+        if !doomed.is_empty() {
+            info!(jobs = doomed.len(), "finished jobs reaped");
+        }
+        doomed.len()
+    }
+
+    /// How many jobs the registry is holding, terminal ones included.
+    ///
+    /// Exposed for the retention sweep's report and for tests that need to
+    /// assert the reap actually shrank something.
+    pub fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    /// Whether the registry is holding nothing at all.
+    pub fn is_empty(&self) -> bool {
+        self.lock().is_empty()
     }
 
     fn owned<'a>(

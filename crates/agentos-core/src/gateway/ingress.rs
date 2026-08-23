@@ -48,7 +48,7 @@ use crate::memory::SqliteStore;
 use agentos_proto::{ChannelId, ConversationId, Envelope};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -303,6 +303,36 @@ impl IngressLedger {
         .optional()
         .map_err(backend)
         .map(|cursor| cursor.map(|cursor| Arc::from(cursor.as_str())))
+    }
+
+    /// Drop settled rows older than `max_age`, returning how many went.
+    ///
+    /// Across every channel, not one: the ledger is one table and a sweep that
+    /// had to be told which channels exist would quietly stop pruning a
+    /// channel the deployment turned off.
+    ///
+    /// **Settled rows only, at any age.** An unsettled row is the record that
+    /// a message was accepted and never finished — the whole reason the ledger
+    /// is durable — and deleting one would turn the crash it documents into a
+    /// message that was never received. What bounds those is that there are
+    /// only ever as many as there were in-flight turns when the process died.
+    ///
+    /// Safe against redelivery because settlement is what the transport is
+    /// waiting on: a row is settled only once the sender heard back, and no
+    /// transport this runtime speaks redelivers an event it was acknowledged
+    /// for weeks earlier. `[retention].ingress_days` is the margin.
+    pub fn prune_settled(&self, max_age: Duration) -> Result<usize, IngressError> {
+        let conn = self
+            .store
+            .ingress_conn()
+            .map_err(|err| IngressError::Backend(Arc::from(err.to_string())))?;
+        let cutoff = unix_now().saturating_sub(max_age.as_secs());
+        conn.execute(
+            "DELETE FROM ingress_events \
+             WHERE settlement IS NOT NULL AND settled_at IS NOT NULL AND settled_at < ?1",
+            params![cutoff as i64],
+        )
+        .map_err(backend)
     }
 
     /// Record where the channel has read up to. Call this only after the

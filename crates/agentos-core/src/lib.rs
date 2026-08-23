@@ -23,6 +23,7 @@ pub mod memory;
 pub mod orchestrator;
 pub mod paths;
 pub mod prompt;
+pub mod retention;
 pub mod runner;
 pub mod runtime;
 pub mod sandbox;

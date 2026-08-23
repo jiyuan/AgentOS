@@ -33,5 +33,5 @@ mod registry;
 
 pub use registry::{
     JobError, JobId, JobRegistry, JobSink, JobSnapshot, JobSpec, JobState,
-    DEFAULT_JOB_OUTPUT_BYTES, DEFAULT_MAX_CONCURRENT_JOBS,
+    DEFAULT_COMPLETED_JOB_SECS, DEFAULT_JOB_OUTPUT_BYTES, DEFAULT_MAX_CONCURRENT_JOBS,
 };

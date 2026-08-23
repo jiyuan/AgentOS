@@ -82,6 +82,50 @@ impl SqliteStore {
         Ok(items)
     }
 
+    /// Conversations whose newest session item is older than `before_unix`,
+    /// with how many items each holds, oldest first.
+    ///
+    /// A *survey*, not a sweep. Nothing here deletes: the session log is
+    /// append-only without qualification and the one path that removes from it
+    /// is [`Self::purge_session`], reached by an operator naming what they are
+    /// destroying ([ADR-0006](../../../../docs/adr/0006-CLEAR_EPOCH.md)). This
+    /// exists so `agentos-gateway purge --idle-days` can show them the list
+    /// first, which is the only way an answer to "is this safe to delete" can
+    /// be a considered one (M7 / `QUOTA-001`).
+    ///
+    /// Newest item rather than oldest: a conversation that started a year ago
+    /// and was used this morning is not idle.
+    /// `before` is Unix seconds. The cutoff is rendered by SQLite's own
+    /// `datetime(?, 'unixepoch')` rather than formatted here, because
+    /// `created_at` is written by `CURRENT_TIMESTAMP` and the two have to be
+    /// the same shape for `<` to mean what it looks like — an RFC 3339 literal
+    /// compares wrong against `YYYY-MM-DD HH:MM:SS` on the `T` alone.
+    pub fn idle_conversations(
+        &self,
+        before_unix: u64,
+    ) -> Result<Vec<(ConversationId, usize)>, SessionError> {
+        let conn = self.session_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT conversation_id, COUNT(*), MAX(created_at) AS newest \
+                   FROM session_items \
+                  GROUP BY conversation_id \
+                 HAVING newest < datetime(?1, 'unixepoch') \
+                  ORDER BY newest ASC",
+            )
+            .map_err(session_sqlite_error)?;
+        let rows = stmt
+            .query_map(params![before_unix as i64], |row| {
+                Ok((
+                    ConversationId::new(row.get::<_, String>(0)?.as_str()),
+                    row.get::<_, i64>(1)?.max(0) as usize,
+                ))
+            })
+            .map_err(session_sqlite_error)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(session_sqlite_error)
+    }
+
     /// Irreversibly remove a conversation's items and its epoch markers.
     ///
     /// The legitimate requirement `/clear` does not serve: somebody asking to

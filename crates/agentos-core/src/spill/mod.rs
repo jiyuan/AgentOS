@@ -60,7 +60,6 @@ use agentos_proto::{RunId, ToolCallId};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -269,59 +268,6 @@ impl SpillStore {
     pub fn open(&self, locator: &SpillLocator) -> Result<std::fs::File, ContainmentError> {
         RootDir::open(&self.root)?.open_file(Path::new(locator.run()).join(locator.artifact()))
     }
-
-    /// Delete run directories whose newest artifact is older than `max_age`.
-    ///
-    /// Returns how many were removed. Best effort throughout: a directory that
-    /// cannot be read or removed is skipped rather than failing the sweep, and
-    /// the sweep is maintenance — a run that cannot clean up must not be a run
-    /// that fails.
-    ///
-    /// Whole run directories, never individual files: a run's artifacts are
-    /// referenced together by the transcript that produced them, so removing
-    /// half of one leaves a conversation with locators that resolve and
-    /// locators that do not, which is worse than removing all of it.
-    pub async fn sweep_older_than(&self, max_age: Duration) -> usize {
-        let Ok(mut entries) = tokio::fs::read_dir(&self.root).await else {
-            // No root yet means nothing has spilled, which is not a failure.
-            return 0;
-        };
-        let cutoff = SystemTime::now() - max_age;
-        let mut removed = 0;
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            if !entry.file_type().await.is_ok_and(|kind| kind.is_dir()) {
-                continue;
-            }
-            if newest_write(&path)
-                .await
-                .is_some_and(|newest| newest >= cutoff)
-            {
-                continue;
-            }
-            if tokio::fs::remove_dir_all(&path).await.is_ok() {
-                removed += 1;
-            }
-        }
-        removed
-    }
-}
-
-/// When anything in `dir` was last written, or `None` when it is empty or
-/// unreadable.
-///
-/// The *newest* artifact rather than the directory's own mtime: a run that
-/// spilled twice, hours apart, is as recent as its last write, and directory
-/// mtimes are not consistent across filesystems.
-async fn newest_write(dir: &Path) -> Option<SystemTime> {
-    let mut entries = tokio::fs::read_dir(dir).await.ok()?;
-    let mut newest = None;
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        if let Ok(modified) = entry.metadata().await.and_then(|meta| meta.modified()) {
-            newest = Some(newest.map_or(modified, |seen: SystemTime| seen.max(modified)));
-        }
-    }
-    newest
 }
 
 /// The cap `safe_segment` applies and [`SpillLocator::parse`] enforces. Well
@@ -550,72 +496,5 @@ mod tests {
             .join(saved.locator.run())
             .join(saved.locator.artifact())
             .exists());
-    }
-    /// Retention removes a whole run's artifacts, not some of them: a
-    /// conversation with half its locators resolving is worse than one with
-    /// none of them.
-    #[tokio::test]
-    async fn a_sweep_removes_expired_runs_and_keeps_fresh_ones() {
-        let root = temp_root("sweep");
-        let _ = std::fs::remove_dir_all(&root);
-        let store = SpillStore::new(&root);
-
-        for run in ["stale", "fresh"] {
-            store
-                .save_text(
-                    &SpillSource {
-                        run_id: &RunId::new(run),
-                        call_id: &ToolCallId::new("call-1"),
-                        tool_name: "shell",
-                    },
-                    "output",
-                )
-                .await
-                .expect("the artifact writes");
-        }
-        // Age one run past the window by moving its file's mtime back. The
-        // sweep reads the newest write in each directory, so this is the same
-        // state a week-old run would leave.
-        let stale = root.join("stale");
-        let stale_file = std::fs::read_dir(&stale)
-            .expect("the stale run has a directory")
-            .next()
-            .expect("and an artifact in it")
-            .expect("readable")
-            .path();
-        let old = SystemTime::now() - Duration::from_secs(30 * 24 * 60 * 60);
-        filetime_set(&stale_file, old);
-
-        let removed = store
-            .sweep_older_than(Duration::from_secs(24 * 60 * 60))
-            .await;
-        assert_eq!(removed, 1);
-        assert!(!stale.exists(), "an expired run is removed whole");
-        assert!(root.join("fresh").exists(), "a fresh run is kept");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// Nothing to sweep is not a failure: a runtime that has never spilled has
-    /// no root, and maintenance must not report an error for that.
-    #[tokio::test]
-    async fn sweeping_a_store_that_never_wrote_is_a_no_op() {
-        let root = temp_root("sweep-empty");
-        let _ = std::fs::remove_dir_all(&root);
-        let store = SpillStore::new(&root);
-        assert_eq!(store.sweep_older_than(Duration::from_secs(60)).await, 0);
-    }
-
-    /// Set a file's mtime without pulling in a crate for it.
-    ///
-    /// `File::set_modified` rather than `touch -d @<epoch>`: the `-d @seconds`
-    /// form is a GNU extension, so the previous version of this helper failed
-    /// on macOS and every BSD — on a platform AgentOS supports (M2 / `CI-001`).
-    fn filetime_set(path: &Path, when: SystemTime) {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(path)
-            .expect("the spill artifact is open-able for writing")
-            .set_modified(when)
-            .expect("the filesystem supports setting mtime");
     }
 }

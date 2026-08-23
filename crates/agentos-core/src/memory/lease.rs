@@ -39,9 +39,18 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// The reflection and retention sweep. One name because they are one job: the
-/// retention budgets are applied by the reflection pass.
+/// The memory reflection pass, which also applies `[memory.retention]`. One
+/// name because those two are one job: the budgets are applied by the sweep.
 pub const REFLECTION_LEASE: &str = "memory.reflection";
+
+/// The store retention sweep — traces, attachments, spill, the gateway log,
+/// the ingress ledger, and finished jobs (M7 / `QUOTA-001`).
+///
+/// A second name rather than a second use of [`REFLECTION_LEASE`], because the
+/// two jobs are not the same job and must not gate each other. Reflection is
+/// off by default and needs an LLM; retention is on, needs nothing, and has to
+/// keep running on a deployment that never enabled reflection.
+pub const RETENTION_LEASE: &str = "gateway.retention";
 
 /// How long a lease lasts without renewal.
 ///

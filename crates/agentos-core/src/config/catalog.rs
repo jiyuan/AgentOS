@@ -47,6 +47,7 @@ const SOURCES: &[&str] = &[
     include_str!("memory.rs"),
     include_str!("orchestrator.rs"),
     include_str!("policy.rs"),
+    include_str!("retention.rs"),
     include_str!("spill.rs"),
     include_str!("subagents.rs"),
 ];

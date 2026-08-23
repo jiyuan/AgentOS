@@ -62,6 +62,16 @@ pub enum SafetyEventKind {
     /// ([ADR-0006](../../../../docs/adr/0006-CLEAR_EPOCH.md)). `/clear` is not
     /// this: it writes an epoch marker and removes nothing.
     SessionPurged,
+    /// An operator irreversibly deleted rows from the audit stores themselves.
+    ///
+    /// [ADR-0005](../../../../docs/adr/0005-SAFETY_EVENTS.md) accepts that
+    /// `safety_events` and `memory_access_log` grow monotonically and asks that
+    /// what bounds them be "an explicit, authorized operation rather than a
+    /// background cleanup". This is the record of one such operation, written
+    /// *after* the delete and therefore into the store it just shortened: the
+    /// first row of the new history says how the old one ended
+    /// (M7 / `QUOTA-001`).
+    AuditPurged,
 }
 
 impl SafetyEventKind {
@@ -80,6 +90,7 @@ impl SafetyEventKind {
             Self::DelegationGrantUsed => "delegation_grant_used",
             Self::TerminalError => "terminal_error",
             Self::SessionPurged => "session_purged",
+            Self::AuditPurged => "audit_purged",
         }
     }
 }

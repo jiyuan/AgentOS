@@ -147,6 +147,7 @@ fn parse_kind(name: &str) -> SafetyEventKind {
         "delegation_grant_used" => SafetyEventKind::DelegationGrantUsed,
         "terminal_error" => SafetyEventKind::TerminalError,
         "session_purged" => SafetyEventKind::SessionPurged,
+        "audit_purged" => SafetyEventKind::AuditPurged,
         _ => SafetyEventKind::TerminalError,
     }
 }

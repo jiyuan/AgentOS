@@ -23,6 +23,12 @@ pub const DEFAULT_SPILL_RELPATH: &str = "spill";
 /// it, turning a recoverable result back into the destroyed one C2 replaced.
 const MIN_RETENTION_DAYS: u64 = 1;
 
+/// Smallest byte quota the spill store may be given.
+///
+/// A quota below one artifact's worth would evict the run currently spilling,
+/// which turns the recoverable result C2 built back into the destroyed one.
+const MIN_STORE_BYTES: u64 = 1024 * 1024;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SpillConfig {
@@ -34,6 +40,13 @@ pub struct SpillConfig {
     ///
     /// `0` is a choice rather than a disabled feature — see the module docs.
     pub retention_days: u64,
+    /// Bytes all spill artifacts may occupy together, or `0` for no ceiling.
+    ///
+    /// Applied after `retention_days`, oldest run first, until the total fits
+    /// (M7 / `QUOTA-001`). An age ceiling on its own bounds nothing: one busy
+    /// afternoon of a tool that reads large files can outweigh a quiet month,
+    /// and it is the afternoon that fills the disk.
+    pub max_bytes: u64,
 }
 
 impl Default for SpillConfig {
@@ -41,6 +54,7 @@ impl Default for SpillConfig {
         Self {
             root: PathBuf::from(DEFAULT_SPILL_RELPATH),
             retention_days: 0,
+            max_bytes: 0,
         }
     }
 }
@@ -55,9 +69,14 @@ impl SpillConfig {
         }
     }
 
-    /// Seconds an artifact is kept, or `None` when nothing is swept.
+    /// Seconds an artifact is kept, or `None` when nothing is swept by age.
     pub fn retention_secs(&self) -> Option<u64> {
         (self.retention_days > 0).then(|| self.retention_days * 24 * 60 * 60)
+    }
+
+    /// The byte ceiling, or `None` when the store may grow without one.
+    pub fn max_bytes(&self) -> Option<u64> {
+        (self.max_bytes > 0).then_some(self.max_bytes)
     }
 }
 
@@ -88,6 +107,13 @@ pub fn validate_spill(config: &SpillConfig) -> Result<(), String> {
             config.retention_days
         ));
     }
+    if config.max_bytes > 0 && config.max_bytes < MIN_STORE_BYTES {
+        return Err(format!(
+            "spill.max_bytes must be at least {MIN_STORE_BYTES} (or 0 for no ceiling), got {}; \
+             below that the quota evicts the run that is spilling",
+            config.max_bytes
+        ));
+    }
     Ok(())
 }
 
@@ -103,6 +129,7 @@ mod tests {
         assert!(validate_spill(&config).is_ok());
         assert_eq!(config.root_in(Path::new("/ws")), PathBuf::from("/ws/spill"));
         assert_eq!(config.retention_secs(), None);
+        assert_eq!(config.max_bytes(), None);
     }
 
     #[test]
@@ -138,6 +165,19 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(config.retention_secs(), Some(7 * 24 * 60 * 60));
+    }
+
+    /// A quota small enough to evict the artifact being written is a broken
+    /// deployment, not a tight one.
+    #[test]
+    fn an_unusably_small_quota_is_rejected() {
+        let config = SpillConfig {
+            max_bytes: 2048,
+            ..Default::default()
+        };
+        assert!(validate_spill(&config)
+            .expect_err("2 KiB must be rejected")
+            .contains("spill.max_bytes"));
     }
 
     #[test]

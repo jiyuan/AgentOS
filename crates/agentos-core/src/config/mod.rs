@@ -21,6 +21,7 @@ mod memory;
 mod normalize;
 mod orchestrator;
 mod policy;
+mod retention;
 mod spill;
 mod subagents;
 
@@ -38,6 +39,9 @@ pub use orchestrator::{RoutingConfig, RoutingRuleConfig, StageConfig, TemplateCo
 pub use policy::{
     default_shell_profiles, GuardrailsConfig, PolicyConfig, ShellProfileConfig,
     DEFAULT_SHELL_ALLOWLIST,
+};
+pub use retention::{
+    RetentionConfig, DEFAULT_GATEWAY_LOG_BYTES, DEFAULT_GATEWAY_LOG_KEEP, DEFAULT_INGRESS_DAYS,
 };
 pub use spill::{SpillConfig, DEFAULT_SPILL_RELPATH};
 pub use subagents::{DelegationGrantConfig, SubAgentConfig};
@@ -95,6 +99,9 @@ pub struct WorkspaceConfig {
     pub approval: ApprovalConfig,
     /// Where oversized tool output is written, and how long it is kept.
     pub spill: SpillConfig,
+    /// How long the stores nothing else bounds are kept: traces, attachments,
+    /// the gateway log, and the ingress ledger.
+    pub retention: RetentionConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -327,6 +334,7 @@ impl WorkspaceConfig {
         gateway::validate_gateway(&config.gateway).map_err(std::io::Error::other)?;
         approval::validate_approval(&config.approval).map_err(std::io::Error::other)?;
         spill::validate_spill(&config.spill).map_err(std::io::Error::other)?;
+        retention::validate_retention(&config.retention).map_err(std::io::Error::other)?;
         config
             .validate_guardrails()
             .map_err(std::io::Error::other)?;

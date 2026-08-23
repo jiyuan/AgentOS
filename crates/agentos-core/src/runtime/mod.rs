@@ -203,23 +203,15 @@ impl AgentRuntime {
         &self.jobs
     }
 
-    /// Delete spill artifacts past `[spill].retention_days`, returning how
-    /// many run directories were removed (roadmap item X3).
+    /// This runtime's spill store, when one is configured.
     ///
-    /// A no-op when retention is `0` — "keep everything" — or when no spill
-    /// store is configured. Called from the gateway's idle phase, beside cron
-    /// and reflection, because sweeping a directory is maintenance and has no
-    /// business competing with a run.
-    pub async fn sweep_spill(&self) -> usize {
-        let Some(retention) = self.workspace_config.spill.retention_secs() else {
-            return 0;
-        };
-        let Some(spill) = self.spill.as_ref() else {
-            return 0;
-        };
-        spill
-            .sweep_older_than(std::time::Duration::from_secs(retention))
-            .await
+    /// Exposed so the retention sweep can apply `[spill].retention_days` and
+    /// `[spill].max_bytes` to it (M7 / `QUOTA-001`). Reading and writing
+    /// artifacts goes through [`Self::content_limits`] instead — a call site
+    /// that reached for the store directly would be bypassing the inline
+    /// threshold that decides whether anything spills at all.
+    pub fn spill(&self) -> Option<&SpillStore> {
+        self.spill.as_deref()
     }
 
     /// This runtime's root cancellation token (roadmap item D1).
