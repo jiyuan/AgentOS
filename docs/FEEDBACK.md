@@ -567,3 +567,13 @@
 - **Actual Behavior**: `audit-skill` read append-only JSONL/log artifacts directly, including a 10 MB gateway log, and the next DeepSeek request exceeded the model context limit with 2,940,746 message tokens.
 - **Root Cause**: The file tool had no read range/tail controls or default output bound, and the audit skill documented unbounded reads for large operational artifacts.
 - **Suggested Fix**: Add bounded file reads with `max_bytes`, `offset`, and `tail`, cap tool-result transcript content defensively, and require audit-skill to read recent log/JSONL tails instead of full files.
+
+## [2026-08-23 20:47] TOOL [RESOLVED]
+
+- **Agent**: /root
+- **Task**: Inspect the R0 roadmap and its implementation targets.
+- **Guideline Violated**: GUIDELINES > Efficiency
+- **Expected Behavior**: Repository inspection commands should be quoted safely and complete on the first invocation.
+- **Actual Behavior**: An unescaped backtick inside a double-quoted shell command caused zsh to reject the command before inspection began.
+- **Root Cause**: A Markdown-heading search pattern containing a backtick was embedded in a double-quoted command string.
+- **Suggested Fix**: Use single-quoted ripgrep patterns when searching Markdown syntax; the corrected invocation did so and completed successfully.

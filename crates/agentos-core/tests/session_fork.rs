@@ -16,6 +16,7 @@ use agentos_core::memory::{InMemorySession, SqliteStore};
 use agentos_core::prompt;
 use agentos_core::spill::{SpillLocator, SpillSource, SpillStore, SPILL_LOCATOR_KEY};
 use agentos_interfaces::session::{Item, Session, Transcript};
+use agentos_interfaces::RunState;
 use agentos_proto::{
     AgentId, ChannelId, ConversationId, Message, MessageRole, Principal, RunId, ToolCallId,
 };
@@ -361,7 +362,7 @@ async fn spill_locators_in_a_seeded_prefix_resolve_from_the_child() {
 
 use agentos_core::approve::{Policy, PolicyAction, PolicyRule, PolicyVerb};
 use agentos_core::runner::{run_envelope, RunnerDeps};
-use agentos_core::subagents::{SubAgentDefinition, SubAgentRegistry};
+use agentos_core::subagents::{child_input_envelope, SubAgentDefinition, SubAgentRegistry};
 use agentos_interfaces::orchestrator::{
     Orchestrator, OrchestratorError, Plan, RunContext, SubAgentSpec,
 };
@@ -436,10 +437,32 @@ fn seeding_parent() -> Principal {
 /// that key or the seed goes somewhere the sub-agent never loads from — and
 /// nothing would say so, because an unseeded sub-agent just starts empty.
 fn seeding_child() -> Principal {
+    let mut parent = RunState::new(RunId::new("seeding-run"), AgentId::new("parent"));
+    parent.transcript.items.push(Item {
+        message: Message::text(MessageRole::User, "ask the child"),
+        metadata: BTreeMap::from([
+            (
+                Arc::from("channel_id"),
+                Value::String("test-channel".to_owned()),
+            ),
+            (
+                Arc::from("conversation_id"),
+                Value::String(PARENT_CONVERSATION.to_owned()),
+            ),
+        ]),
+    });
+    let envelope = child_input_envelope(
+        &SubAgentSpec {
+            agent_id: AgentId::new("child"),
+            policy_id: Arc::from("child-policy"),
+            metadata: BTreeMap::new(),
+        },
+        &parent,
+    );
     Principal::conversation(
         AgentId::new("child"),
-        ChannelId::new("subagent:child"),
-        ConversationId::new(format!("{PARENT_CONVERSATION}:child")),
+        envelope.channel_id,
+        envelope.conversation_id,
     )
 }
 

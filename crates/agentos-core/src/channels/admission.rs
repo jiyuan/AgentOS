@@ -130,7 +130,7 @@ impl AdmissionPolicy {
     ) -> Result<(), Refusal> {
         // Checked before anything else, including `allow_all`: an event nobody
         // can be held responsible for is refused on every path.
-        if !attribution.is_some_and(|value| !value.trim().is_empty()) {
+        if attribution.is_none_or(|value| value.trim().is_empty()) {
             return Err(Refusal::Unattributed);
         }
         if self.allow_all {

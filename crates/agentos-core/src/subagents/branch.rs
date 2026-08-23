@@ -11,10 +11,19 @@
 use super::{ParentSeed, SubAgentSpec, SESSION_SCOPE_EPHEMERAL, SESSION_SCOPE_KEY};
 use agentos_interfaces::session::Session;
 use agentos_proto::{
-    AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole, Principal, RunId,
+    base64url, AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole, Principal, RunId,
 };
 use serde_json::Value;
 use std::sync::Arc;
+
+/// Version of the child-conversation source tuple encoded below.
+///
+/// This is separate from `PRINCIPAL_VERSION`: a principal and a delegation
+/// branch are different stored identities and may evolve independently. The
+/// rendered prefix makes the version visible in session keys and migration
+/// reports instead of leaving a future reader to infer it.
+const CHILD_CONVERSATION_VERSION: u8 = 1;
+const CHILD_CONVERSATION_DOMAIN: &[u8] = b"agentos.child-conversation";
 
 /// Branch a sub-agent's conversation from its parent's, once (roadmap X6).
 ///
@@ -142,39 +151,74 @@ pub fn child_input_envelope(
         Value::String(parent_state.run_id.as_str().to_owned()),
     );
 
-    // Stable conversation id: derived from the parent's *user-conversation*
-    // id (read off the most recent transcript item's metadata, where the
-    // runner stamps it on every inbound). Sticking to parent_run_id here
-    // would mint a new sub-agent conversation every turn and the persistent
-    // session would never accumulate history.
-    let parent_conversation_id = parent_conversation_id(parent_state);
-
-    let conversation_suffix = prompt
-        .filter(|prompt| !prompt.trim().is_empty())
-        .map(|prompt| format!(":{}", prompt_fingerprint(prompt)))
-        .unwrap_or_default();
-
     Envelope {
         channel_id: ChannelId::new(format!("subagent:{}", spec.agent_id.as_str())),
-        conversation_id: ConversationId::new(format!(
-            "{}:{}{}",
-            parent_conversation_id.as_str(),
-            spec.agent_id.as_str(),
-            conversation_suffix
-        )),
+        conversation_id: child_conversation_id(spec, parent_state),
         sender: Arc::from(parent_state.active_agent.as_str()),
         message,
         metadata,
     }
 }
 
-fn prompt_fingerprint(prompt: &str) -> String {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in prompt.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+/// Derive the persistent conversation a delegated task owns (`ID-003`).
+///
+/// The old key was `parent_conversation:child_agent:FNV(prompt)`. It omitted
+/// the parent agent, parent channel, and child policy, and the non-cryptographic
+/// fixed-width prompt hash could collide. This encoding commits injectively to
+/// the complete senderless parent principal, the registered child definition
+/// `(agent_id, policy_id)`, and one stable task discriminator. Components are
+/// length-prefixed bytes and the complete tuple is rendered as unpadded
+/// base64url, so component contents cannot impersonate boundaries.
+fn child_conversation_id(
+    spec: &SubAgentSpec,
+    parent_state: &agentos_interfaces::RunState,
+) -> ConversationId {
+    let parent = parent_principal(parent_state).without_sender();
+    let mut source = Vec::new();
+    push_child_component(&mut source, CHILD_CONVERSATION_DOMAIN);
+    source.push(CHILD_CONVERSATION_VERSION);
+    push_child_component(&mut source, &parent.canonical_bytes());
+    push_child_component(&mut source, spec.agent_id.as_str().as_bytes());
+    push_child_component(&mut source, spec.policy_id.as_bytes());
+
+    // Prefer an explicit task id when a caller has one. Ordinary direct and
+    // routed delegation carries only `prompt`, where the complete prompt is
+    // the stable discriminator. Keeping the bytes rather than a short hash is
+    // what makes this encoding injective rather than merely unlikely to
+    // collide. Blank prompts retain the old "default task" behavior.
+    let task_id = spec
+        .metadata
+        .get("task_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty());
+    let prompt = spec
+        .metadata
+        .get("prompt")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty());
+    match (task_id, prompt) {
+        (Some(task_id), _) => {
+            source.push(1);
+            push_child_component(&mut source, task_id.as_bytes());
+        }
+        (None, Some(prompt)) => {
+            source.push(2);
+            push_child_component(&mut source, prompt.as_bytes());
+        }
+        (None, None) => source.push(0),
     }
-    format!("{hash:016x}")
+
+    ConversationId::new(format!(
+        "child.v{CHILD_CONVERSATION_VERSION}.{}",
+        base64url(&source)
+    ))
+}
+
+fn push_child_component(into: &mut Vec<u8>, component: &[u8]) {
+    let length = u64::try_from(component.len())
+        .expect("a Rust slice length always fits in the u64 delegation encoding");
+    into.extend_from_slice(&length.to_be_bytes());
+    into.extend_from_slice(component);
 }
 
 pub fn child_run_id(spec: &SubAgentSpec, parent_state: &agentos_interfaces::RunState) -> RunId {
@@ -210,12 +254,25 @@ mod tests {
     }
 
     fn parent_state_with_user_message() -> RunState {
-        parent_state_with_run_and_conv("parent-run", "tg-12345")
+        parent_state_with_identity("parent-run", "parent-agent", "telegram", "tg-12345")
     }
 
     fn parent_state_with_run_and_conv(run_id: &str, conv_id: &str) -> RunState {
-        let mut state = RunState::new(ProtoRunId::new(run_id), AgentId::new("parent-agent"));
+        parent_state_with_identity(run_id, "parent-agent", "telegram", conv_id)
+    }
+
+    fn parent_state_with_identity(
+        run_id: &str,
+        agent_id: &str,
+        channel_id: &str,
+        conv_id: &str,
+    ) -> RunState {
+        let mut state = RunState::new(ProtoRunId::new(run_id), AgentId::new(agent_id));
         let mut metadata = BTreeMap::new();
+        metadata.insert(
+            Arc::from("channel_id"),
+            Value::String(channel_id.to_owned()),
+        );
         metadata.insert(
             Arc::from("conversation_id"),
             Value::String(conv_id.to_owned()),
@@ -275,14 +332,15 @@ mod tests {
     }
 
     #[test]
-    fn child_envelope_uses_parent_conversation_id() {
+    fn child_envelope_uses_a_versioned_encoded_identity() {
         let parent = parent_state_with_user_message();
         let spec = spec_with_prompt("hi");
         let envelope = child_input_envelope(&spec, &parent);
-        assert_eq!(
-            envelope.conversation_id.as_str(),
-            "tg-12345:worker:08ba5f07b55ec3da"
+        assert!(
+            envelope.conversation_id.as_str().starts_with("child.v1."),
+            "the stored id must say which child-source encoding it uses"
         );
+        assert!(!envelope.conversation_id.as_str().contains("tg-12345"));
     }
 
     #[test]
@@ -305,6 +363,71 @@ mod tests {
     }
 
     #[test]
+    fn identical_parent_conversation_ids_on_two_channels_are_isolated() {
+        let telegram =
+            parent_state_with_identity("parent-run-1", "parent-agent", "telegram", "shared-id");
+        let feishu =
+            parent_state_with_identity("parent-run-2", "parent-agent", "feishu", "shared-id");
+        let spec = spec_with_prompt("same task");
+
+        assert_ne!(
+            child_input_envelope(&spec, &telegram).conversation_id,
+            child_input_envelope(&spec, &feishu).conversation_id,
+        );
+    }
+
+    #[test]
+    fn identical_channel_conversations_under_two_parent_agents_are_isolated() {
+        let first = parent_state_with_identity("run-1", "agent-a", "telegram", "shared-id");
+        let second = parent_state_with_identity("run-2", "agent-b", "telegram", "shared-id");
+        let spec = spec_with_prompt("same task");
+
+        assert_ne!(
+            child_input_envelope(&spec, &first).conversation_id,
+            child_input_envelope(&spec, &second).conversation_id,
+        );
+    }
+
+    #[test]
+    fn two_policies_for_one_child_agent_are_isolated() {
+        let parent = parent_state_with_user_message();
+        let first = spec_with_prompt("same task");
+        let mut second = first.clone();
+        second.policy_id = Arc::from("restricted");
+
+        assert_ne!(
+            child_input_envelope(&first, &parent).conversation_id,
+            child_input_envelope(&second, &parent).conversation_id,
+        );
+    }
+
+    #[test]
+    fn an_explicit_task_id_is_stable_and_separates_tasks() {
+        let parent = parent_state_with_user_message();
+        let mut first = spec_with_prompt("wording may change");
+        first
+            .metadata
+            .insert(Arc::from("task_id"), Value::String("task-1".to_owned()));
+        let mut same_task = spec_with_prompt("different wording");
+        same_task
+            .metadata
+            .insert(Arc::from("task_id"), Value::String("task-1".to_owned()));
+        let mut other_task = first.clone();
+        other_task
+            .metadata
+            .insert(Arc::from("task_id"), Value::String("task-2".to_owned()));
+
+        assert_eq!(
+            child_input_envelope(&first, &parent).conversation_id,
+            child_input_envelope(&same_task, &parent).conversation_id,
+        );
+        assert_ne!(
+            child_input_envelope(&first, &parent).conversation_id,
+            child_input_envelope(&other_task, &parent).conversation_id,
+        );
+    }
+
+    #[test]
     fn child_envelope_falls_back_when_parent_metadata_missing() {
         // No conversation_id in the parent's transcript metadata — fall back
         // to the old run-id-derived form so embedded callers without a runner
@@ -316,9 +439,11 @@ mod tests {
         });
         let spec = spec_with_prompt("hi");
         let envelope = child_input_envelope(&spec, &parent);
+        assert!(envelope.conversation_id.as_str().starts_with("child.v1."));
         assert_eq!(
-            envelope.conversation_id.as_str(),
-            "parent-run:worker:08ba5f07b55ec3da"
+            parent_principal(&parent).conversation.as_str(),
+            "parent-run",
+            "embedded callers still fall back to the run id as the parent conversation"
         );
     }
 }
