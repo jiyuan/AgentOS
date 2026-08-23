@@ -138,9 +138,9 @@ parsing, streaming assembly, and retry behavior.
 | `builtin.min` (LLM fallback) | Stable | all | `[agent] orchestrator` | — | integration, golden |
 | LLM routing classifier | Stable | all | `[routing]` | Records a `routing` header carrying its two own sections and none of the turn's. Its isolation from prompt assembly is a prompt-injection defence, now enforced by `invariants::request_derives_from_state` rather than by convention ([ADR-0004](adr/0004-REQUEST_KINDS.md)) | unit, integration |
 | Sub-agents | Stable | all | `[[subagents]]` | See *Sub-agent policy narrowing* | integration |
-| Workspace skills | Stable | all | `[skills]` | Loaded from workspace content, which is data the agent can modify | unit, integration |
-| Deterministic skill planners | Stable | all | `[skills]` | — | unit |
-| Lifecycle hooks | Stable | all | `[hooks]` | — | unit |
+| Workspace skills | Stable | all | `[resources.skills]` | Loaded from workspace content, which is data the agent can modify | unit, integration |
+| Deterministic skill planners | Stable | all | `[resources.skills]` | — | unit |
+| Lifecycle hooks | **Deferred** | all | — | `Hooks` is a bounded channel on `RunnerDeps` that `record_trace_event` writes to. Every entrypoint passes `None`, and there is no config key that would attach one, so nothing an operator can do makes a hook fire. It is a seam for an embedder using `agentos-core` as a library, not a capability of the shipped runtime | unit |
 | Strict config schema | Stable | all | — | Every section rejects an unknown key at load time, so a typo is an error rather than a silent default. Two keys are accepted-but-deprecated and warn: `agent.memory` (use `[memory].backend`) and `[resources.llm]` (use `[resources].priority`) | unit, integration |
 | Configured agent identity | Stable | all | `[agent] id` | Stamped on every trace, episode, memory record, and safety event, and part of the principal keying them. Changing it on an existing deployment orphans memory written under the old id — there is no rename path | unit, integration |
 | Persisted crons | Stable | all | gateway running | The scheduler replays a stored prompt with no further approval | integration |
@@ -166,3 +166,11 @@ parsing, streaming assembly, and retry behavior.
 | Generated catalogs | Stable | all | — | — | integration |
 | Import-boundary check | Stable | all | — | Self-testing (`--self-test`) | script, integration |
 | Module-size check | Stable | all | — | Two allowlisted files exceed the 800-LOC budget | script |
+| One required CI check | Stable | Linux, macOS | — | Every job feeds a single `ci` job, so protection needs one entry and a later job is required automatically. Enabling protection on `main` is a repository setting and cannot be committed | workflow |
+| Dependency policy | Stable | all | — | Advisories, licences, duplicate versions and allowed sources over the four supported targets. Suppressions carry an `# expires:` date and `check-dependencies.sh` fails on an expired one. Needs `cargo-deny` | script (`check-dependencies.sh`), CI |
+| Upgrade, restart and rollback rehearsal | Stable | Linux, macOS | — | Exercises the transitions an existing deployment performs, including starting the current binary on a database restored from a pre-migration backup | script (`rehearse-upgrade.sh`), CI |
+| Channel pipeline rehearsal | Stable | Linux, macOS | — | Mock Telegram and Feishu on loopback with `builtin.echo` as the provider. Five tasks per push, the full fifty nightly. It exercises the adapters and the gateway, not a real transport's behaviour | script (`check-gateway-pipeline.sh`), CI |
+| Loop-overhead budget | Stable | all | — | Nightly. Gates on the 2 ms ceiling read out of `BENCHMARKS.md`, not on the recorded per-bench figures — those are one machine's, and a shared runner would fail on scheduling | script (`check-loop-budget.sh`), CI |
+| Miri over the wire types | **Preview** | Linux | — | Nightly, `agentos-proto` only. The other crates open files, spawn processes and run a multi-threaded tokio runtime, none of which Miri supports, so it would report unsupported operations rather than defects | CI |
+| Fuzzing | **Deferred** | — | — | Not present. The inputs worth fuzzing — the MCP framer, Feishu's fragment reassembler, the config parser — are each driven by a property or interop test against a peer that imports nothing from this repository, and a fuzz target with no corpus is a slow random test. It should follow a real crash | none |
+| Operational signals | **Preview** | all | — | `safety_events` covers sandbox denial, approval failure and delivery lag well; queue saturation is a log line only, and contention, retention backlog and child-process counts have no signal. Dashboards are a deployment's own. See [`OBSERVABILITY.md`](OBSERVABILITY.md) | integration (events), none (the four gaps) |

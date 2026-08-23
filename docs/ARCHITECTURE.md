@@ -572,6 +572,16 @@ conversations, `--audit --before DATE` for `safety_events` and
 types the printed count back, and each writes a safety event — the audit purge
 writing its own record into the store it just shortened.
 
+### 9.2 What a running deployment emits
+
+Three sources: `safety_events` for every authorization decision, the gateway
+log for operator-facing events, and `tracing` for everything else.
+[`OBSERVABILITY.md`](OBSERVABILITY.md) maps each alertable condition to its
+signal and names the four that have none — a refused message does not reach its
+sender, database contention has no counter, retention reports what it removed
+rather than what remains, and nothing counts child processes. Dashboards are a
+deployment's own; what this project owes is that the signal exists.
+
 ## 10. Safety Architecture
 
 AgentOS uses nine independent safety rings:

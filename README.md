@@ -93,6 +93,8 @@ loop model, memory architecture, and extension boundary.
 - [Architecture Design Document](docs/ARCHITECTURE.md)
 - [Skills Guide](docs/SKILLS.md)
 - [Config catalog](docs/CONFIG_CATALOG.md) and [tool catalog](docs/TOOL_CATALOG.md) — generated from the code
+- [Capability matrix](docs/CAPABILITY_MATRIX.md) — every capability with a status, its limitations, and its test level
+- [Observability](docs/OBSERVABILITY.md) — what a running deployment emits, and the gaps
 - [Release Notes](docs/RELEASE_NOTES.md)
 
 ## Release artifacts

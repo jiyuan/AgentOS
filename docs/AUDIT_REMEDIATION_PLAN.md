@@ -1025,29 +1025,99 @@ Primary files: `crates/agentos-cli/src/bin/agentos-gateway/`,
 
 Priority: P0 release gate
 Size: M — mostly workflow configuration
-Status: **not started**
+Status: **done** — all six deliverables, as `CI-002`. Sized as "mostly workflow
+configuration", which turned out to be wrong in the useful direction: wiring up
+the checks found four defects that no existing test could reach. They are named
+under the deliverables.
 Dependencies: M2, M6, M7, and either M8 or explicit Preview classification
 
-Current state: `.github/workflows/ci.yml` has four jobs, all `ubuntu-latest`. No
-`--locked` on any cargo command. No action is pinned by SHA, and
-`dtolnay/rust-toolchain@stable` is a moving branch. `semver-checks` is suppressed
-twice over — `continue-on-error: true` **and** a trailing `|| echo`.
-`tests/gateway_pipeline.py` is invoked by nothing. Neither release script is
+Current state (before this milestone): `.github/workflows/ci.yml` had four jobs,
+all `ubuntu-latest`. No `--locked` on any cargo command. No action pinned by
+SHA, and `dtolnay/rust-toolchain@stable` is a moving branch. `semver-checks`
+suppressed twice over — `continue-on-error: true` **and** a trailing `|| echo`.
+`tests/gateway_pipeline.py` invoked by nothing. Neither release script
 exercised.
 
 Deliverables:
 
-1. Pin CI actions by commit SHA and use `--locked` for every Cargo command.
-2. Require Linux and macOS jobs with real sandbox enforcement, where a skip on a
-   supported target is a failure.
-3. Run source startup, packaged install/start/stop, gateway pipeline, schema
-   migration, and rollback rehearsals.
-4. Make public-interface semver checks blocking for release branches, and remove
-   the double suppression.
-5. Add dependency advisory, license, duplicate-dependency, and allowed-source
-   policy with time-limited exceptions.
-6. Add scheduled fuzz/property, fault-injection, Miri where practical, soak, and
-   performance-regression jobs.
+1. **Done.** Every action pinned by commit SHA with its tag in a trailing
+   comment, `dtolnay/rust-toolchain@stable` included — that one was a *branch*,
+   so the toolchain a build used was whatever the branch said the moment it
+   ran, which is not something a failed build can be reproduced against. Every
+   Cargo command takes `--locked`.
+2. **Done.** `test`, `rehearsals`, `bench-smoke` and `release-smoke` all run on
+   `ubuntu-latest` and `macos-latest`. The sandbox assertion was already
+   `enforced_or_fail!` from `CI-001`; what M9 adds is that a single `ci` job
+   `needs:` every other one, so branch protection names one check and a job
+   added later is required automatically. The failure mode that avoids is a new
+   job nobody adds to the protection rule, which then blocks nothing.
+3. **Done**, and this is where the defects were.
+   `scripts/rehearse-upgrade.sh` starts the gateway, stops it, restarts it on
+   its own state, plants a pre-`ID-001` namespace, plans the migration, applies
+   it with a backup, restores the backup, and starts the current binary on the
+   rolled-back data — because "there is a backup" and "restoring the backup
+   leaves a working deployment" are different claims and only the second is
+   what an operator needs. `scripts/check-gateway-pipeline.sh` runs
+   `tests/gateway_pipeline.py` against mock Telegram and Feishu transports.
+   `check-release-archive.sh` gained a packaged `gateway-start` /
+   `gateway-status` / `gateway-stop`.
+
+   Three defects, none reachable from a unit test:
+
+   - **`agentos-gateway migrate --channel telegram` silently ignored the
+     channel.** `parse_config` rejects unknown flags, and it learned the
+     separated form for `purge` in `QUOTA-001` while `migrate` still read only
+     `--channel=NAME`. Before that it failed loudly; after, it was accepted and
+     dropped. Both subcommands now use one lookup.
+   - **The pipeline asked for an open Telegram channel the pre-`AUTH-001`
+     way**, by blanking `AGENTOS_TELEGRAM_CHAT_ID`, which M3 reversed to mean
+     "admit nothing". Every task had been timing out for months against a
+     channel loop that failed to start. Nothing noticed because nothing ran it.
+   - **A two-channel gateway on a database that does not exist yet lost a
+     channel to "database is locked".** `PRAGMA journal_mode = WAL` needs an
+     exclusive lock and SQLite returns `SQLITE_BUSY` for it *without* consulting
+     the busy handler, so M8's `busy_timeout` did not cover the one statement
+     that needed it. It only contends on a *fresh* file, which is why every
+     test opened one that already existed. Fixed in `memory/pool.rs`, pinned by
+     `tests/persistence_concurrency.rs`.
+4. **Done.** `continue-on-error` and the trailing `|| echo` are gone;
+   `agentos-interfaces` and `agentos-proto` are both checked and both block.
+   The escape hatch is the one `cargo-semver-checks` already understands — a
+   breaking change passes once the crate version is bumped to match it — so no
+   exception mechanism was needed. Not scoped to release branches: there is one
+   branch, and "blocking later" is how it stayed advisory for a year.
+5. **Done.** `deny.toml` plus `scripts/check-dependencies.sh`, covering
+   advisories, licences, duplicate versions and allowed sources, with the graph
+   restricted to the four supported targets. Exceptions carry an
+   `# expires: YYYY-MM-DD` comment and the script fails on an expired one — an
+   exception without an expiry is a policy change made quietly, which is the
+   failure `config/undocumented.txt` exists to prevent, applied to
+   dependencies. Its first run found two advisories in transitive dependencies
+   (`RUSTSEC-2026-0204`, `RUSTSEC-2026-0258`, both fixed by a lockfile bump)
+   and one in this tree: every workspace crate declared
+   `license = "MIT license"`, which is not a valid SPDX expression, so every
+   crate here read as *unlicensed* to any tool that looks.
+6. **Done.** `.github/workflows/nightly.yml`: the narrowing property search at
+   100k cases instead of 1k, twenty repeated rounds of the crash-injection and
+   concurrency suites on both platforms, Miri on `agentos-proto`, the full
+   fifty-task pipeline soak, and the loop-overhead budget.
+
+   Two honest scopings. **Miri runs on `agentos-proto` only** — it is serde
+   types plus hand-written base64url and component encoding, which is where
+   undefined behaviour would hide and what Miri can actually see; the other
+   crates open files, spawn processes and run a multi-threaded tokio runtime,
+   none of which it supports. **Fuzzing is deliberately absent**: the inputs
+   worth fuzzing here — the MCP framer, Feishu's fragment reassembler, the
+   config parser — are each already driven by a property or interop test
+   against a peer that imports nothing from this repository, and a fuzz target
+   with no corpus is a slow random test. It should follow a real crash rather
+   than precede one.
+
+   `scripts/check-loop-budget.sh` is the performance gate, and what it gates
+   matters: the 2 ms ceiling `BENCHMARKS.md` has promised since the beginning,
+   read out of that document so the two cannot disagree — not the recorded
+   per-bench microsecond figures, which are one machine's and would fail on a
+   shared runner's scheduling rather than on code.
 
 *Deferred until there is a real distribution need:* SBOM, provenance, signed
 artifacts, and staged cohort rollout. These are disproportionate for the current
@@ -1055,13 +1125,38 @@ consumer set and can be added when the project ships to third parties.
 
 Acceptance criteria:
 
-- Required checks cannot be bypassed by an ordinary merge.
+- Required checks cannot be bypassed by an ordinary merge. **Met in the tree,
+  and one step remains outside it.** Every job feeds a single `ci` job, so
+  protection needs one entry and a later job is required without anyone
+  remembering. Turning branch protection *on* for `main` is a repository
+  setting, not a file; it cannot be committed and has to be done in the
+  GitHub UI.
 - The artifact, catalogs, capability matrix, and release notes describe the same
-  feature surface.
+  feature surface. **Met** — `scripts/check-release-surface.sh`. Its first run
+  found the capability matrix requiring `[skills]` and `[hooks]`, neither of
+  which is a config section: skills are `[resources.skills]`, and hooks have no
+  configuration at all, because every entrypoint passes `None`. Lifecycle hooks
+  are reclassified from Stable to Deferred as a result — it is a library seam,
+  not a capability of the shipped runtime. The release notes were also five
+  milestones out of date; v0.7.0 now names every completed slice, and the check
+  fails when one is missing.
 - Upgrade, restart, rollback, and legacy-data migration have been rehearsed on
-  representative data.
+  representative data. **Met** — `scripts/rehearse-upgrade.sh`, 25 assertions,
+  on both platforms in CI.
 - Dashboards and alerts cover queue saturation, sandbox denial, approval failure,
   DB contention, retention backlog, process leaks, and delivery lag.
+  **Partly met, and the rest is deliberately not this repository's.** Which
+  metrics system a deployment runs and what it pages on are its decisions; what
+  this project owes is that the *signal* exists and is machine-readable, since
+  nobody can alert on a condition the runtime never mentions.
+  [`docs/OBSERVABILITY.md`](OBSERVABILITY.md) is the inventory: three of the
+  seven are well served by `safety_events`, one was added here (queue
+  saturation was decided in `Inbox::admit` and then *discarded* at the call
+  site, so an overflowing conversation dropped the message with no trace
+  anywhere), and four gaps are named rather than described as intentions — a
+  refused message still does not reach its sender, contention has no counter,
+  retention reports flow rather than stock, and nothing counts child
+  processes.
 
 ## 9. Cheap wins
 
@@ -1111,7 +1206,7 @@ a slice moves off `not started` only when the named artifact exists in the tree.
 | `SPILL-001` | M7 | Opaque spill locator and scoped retrieval | FS-001 | **done** — `spill:<run>/<artifact>`, `spill_read` tool authorized by the transcript, contained by `RootDir` |
 | `GW-001` | M8 | Durable ingress, WAL, maintenance leadership, atomic state files, shutdown | ID-002 | **done** — WAL + busy timeout behind a bounded pool, `memory.reflection` lease, `ingress_events`/`ingress_cursors` ledger, `paths::write_private_atomic` for every replaced state file, `flock`ed control file and a `SIGTERM` drain bounded by `[gateway] shutdown_grace_secs` |
 | `MCP-001` | M8 | Standard lifecycle, request-id correlation, bounds, interoperability, server isolation | SBX-001 | **done** — JSON-RPC 2.0 pinned to MCP `2025-06-18`, `initialize` + capability negotiation, `nextCursor` pagination, content blocks, id correlation, `notifications/cancelled`, named bounds on frames/pending/stderr/pages/tools/restarts, the server child sandboxed by `[[mcp_servers]] sandbox`, and an interop suite against a fixture that imports nothing from this repository |
-| `CI-002` | M9 | Required platform, artifact, gateway, migration, and semver gates | prior slices | not started |
+| `CI-002` | M9 | Required platform, artifact, gateway, migration, dependency and semver gates | prior slices | **done** — one required `ci` job over both platforms, actions pinned by SHA, `--locked` throughout, blocking semver, `deny.toml` with expiring exceptions, upgrade/rollback and channel-pipeline rehearsals, a nightly workflow, and `docs/OBSERVABILITY.md` |
 
 Each implementation PR should include the failing test, implementation, focused
 verification, documentation, and capability-matrix update in the same change.

@@ -71,12 +71,37 @@ cargo bench -p agentos-core                               # Loop overhead benchm
 bash scripts/check-import-boundaries.sh                    # Core must not depend on workspace/extensions.
 bash scripts/check-module-size.sh                         # 800-LOC ceiling (cfg(test) excluded).
 bash scripts/check-catalogs.sh                            # docs/*-catalog.md still match the code.
-bash scripts/check-release-archive.sh                     # Clean-room: package, install, run one offline turn.
+bash scripts/check-release-surface.sh                     # Catalogs, matrix and release notes agree.
+bash scripts/check-dependencies.sh                        # Advisories, licences, duplicates; exceptions expire.
+bash scripts/check-release-archive.sh                     # Clean-room: package, install, start/stop, one offline turn.
+bash scripts/rehearse-upgrade.sh                          # Restart, migration, rollback on a real database.
+bash scripts/check-gateway-pipeline.sh                    # Both channels end to end against mock transports.
 cargo semver-checks check-release -p agentos-interfaces --baseline-rev HEAD
 ```
 
-The interface crates are unpublished, so `semver-checks` needs `--baseline-rev`;
-without it the crates.io baseline lookup fails. CI runs every command above.
+The last four need a built binary or an installed toolchain and are the slow
+half; the first block is what to run while working. `check-dependencies.sh`
+needs `cargo install cargo-deny --locked`.
+
+Nightly rather than per-push (`.github/workflows/nightly.yml`), runnable by
+hand before a release:
+
+```sh
+PROPTEST_CASES=100000 cargo test -p agentos-core --test policy_narrow_props --release
+cargo +nightly miri test -p agentos-proto                  # Wire types only; see the workflow for why.
+bash scripts/check-gateway-pipeline.sh --tasks tests/test_tasks.json --timeout 90
+bash scripts/check-loop-budget.sh                         # Every loop bench against BENCHMARKS.md's 2 ms.
+```
+
+The interface crates are unpublished (`publish = false` in the workspace
+manifest), so `semver-checks` needs `--baseline-rev`; without it the crates.io
+baseline lookup fails. It is a *blocking* check: the way to land a breaking
+change to `agentos-interfaces` or `agentos-proto` is to bump the crate version
+to match, which is what it is asking for.
+
+CI runs every command above, on Linux and macOS, and a single `ci` job depends
+on all of them — so branch protection names one check and a job added later is
+required without anyone remembering to add it.
 
 Run the most targeted test first. For example, if you changed `crates/agentos-core/loop/`, run `cargo test -p agentos-core` before running the full workspace suite.
 
@@ -162,3 +187,5 @@ These rules are load-bearing. Violating any of them breaks the extension model o
 | `docs/CAPABILITY_MATRIX.md` | Every capability with a Stable / Preview / Deferred status, its platforms, required config, security limitations, and test level. Ratcheted by `tests/capability_matrix.rs`: a new tool or provider without a row fails the build. |
 | `docs/TRANSFER_ROADMAP.md` | Most recent work, with per-item rationale and status. |
 | `docs/CONFIG_CATALOG.md`, `docs/TOOL_CATALOG.md` | Generated from the code by `agentos-gateway catalog`. Edit the doc comment on the field, not the table. |
+| `docs/OBSERVABILITY.md` | What a running deployment emits per alertable condition, and the four gaps that are named rather than described as intentions. |
+| `deny.toml` | Dependency policy: advisories, licences, duplicates, sources. Every suppression carries an `# expires:` date. |
