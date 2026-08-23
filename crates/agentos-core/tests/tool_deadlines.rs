@@ -62,6 +62,7 @@ impl Tool for HangTool {
             name: Arc::from(HANG_TOOL),
             description: Arc::from("Never returns."),
             input_schema: json!({"type": "object"}),
+            safety: Default::default(),
             sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }
@@ -155,6 +156,7 @@ async fn a_prompt_tool_is_unaffected_by_the_deadline() {
                 name: Arc::from(HANG_TOOL),
                 description: Arc::from("Returns at once."),
                 input_schema: json!({"type": "object"}),
+                safety: Default::default(),
                 sandbox: SandboxMode::FullAccess,
                 timeout_ms: None,
             }

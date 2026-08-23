@@ -34,7 +34,9 @@
 
 use crate::spill::{SpillLocator, SpillStore, SPILL_LOCATOR_KEY};
 use agentos_interfaces::orchestrator::RunContext;
-use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
+use agentos_interfaces::tool::{
+    SandboxMode, Tool, ToolError, ToolPersistenceScope, ToolSafety, ToolSideEffect, ToolSpec,
+};
 use agentos_proto::{ToolCall, ToolResult, ToolStatus};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -133,6 +135,7 @@ impl Tool for SpillReadTool {
             // walked to itself. There is no child to sandbox, and declaring a
             // mode with nothing to enforce it would be a claim the kernel is
             // not making (M4 / `SBX-001`).
+            safety: ToolSafety::new(ToolSideEffect::ReadOnly, ToolPersistenceScope::Conversation),
             sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }

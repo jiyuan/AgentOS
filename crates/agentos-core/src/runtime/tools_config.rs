@@ -61,18 +61,37 @@ pub(super) fn build_parent_tools(
         .with_jobs(jobs, config.jobs.promotable.iter().cloned()))
 }
 
-pub fn phase5_policy(config: &WorkspaceConfig, mcp_specs: &[ToolSpec]) -> Policy {
+pub fn phase5_policy(config: &WorkspaceConfig, tool_specs: &[ToolSpec]) -> Result<Policy, String> {
     let mut policy = Policy::default();
     policy.default_decision = policy_default_decision(&config.policy.default);
+    if policy.default_decision == PolicyVerb::Allow {
+        if let Some(spec) = tool_specs
+            .iter()
+            .find(|spec| spec.safety.rejects_blanket_allow())
+        {
+            return Err(blanket_allow_error("policy.default", spec));
+        }
+    }
+
+    let specs = tool_specs
+        .iter()
+        .map(|spec| (spec.name.as_ref(), spec))
+        .collect::<BTreeMap<_, _>>();
     let allowlist = &config.policy.allowlist;
     for tool in &config.resources.tools.enabled {
+        let spec = specs.get(tool.as_ref()).ok_or_else(|| {
+            format!(
+                "cannot construct policy for enabled tool '{}': its ToolSpec is not registered",
+                tool
+            )
+        })?;
         // `memory` is never allowlist-able; `WorkspaceConfig::validate`
         // rejects a config that tries, so this is the second half of one rule
         // rather than a silent precedence decision.
         if tool.as_ref() == "memory" {
             add_memory_policy(&mut policy, &config.memory.policy);
         } else if is_allowlisted(allowlist, tool) {
-            allowlist_tool(&mut policy, Arc::clone(tool));
+            allowlist_tool(&mut policy, spec)?;
         } else {
             add_builtin_tool_policy(&mut policy, tool);
         }
@@ -93,26 +112,53 @@ pub fn phase5_policy(config: &WorkspaceConfig, mcp_specs: &[ToolSpec]) -> Policy
             arg_equals: BTreeMap::new(),
         });
     }
-    for spec in mcp_specs {
-        allow_tool_once(&mut policy, Arc::clone(&spec.name));
+    // Specs outside `[resources.tools]` are enabled MCP tools. Older MCP
+    // servers cannot declare this metadata and therefore deserialize to
+    // `unspecified`; that is an approval prompt, never implicit authority.
+    for spec in tool_specs.iter().filter(|spec| {
+        !config
+            .resources
+            .tools
+            .enabled
+            .iter()
+            .any(|tool| tool == &spec.name)
+    }) {
+        if is_allowlisted(allowlist, &spec.name) {
+            allowlist_tool(&mut policy, spec)?;
+        } else if spec.safety.rejects_blanket_allow() {
+            ask_tool_once(
+                &mut policy,
+                Arc::clone(&spec.name),
+                None,
+                "tool safety metadata requires user approval",
+            );
+        } else {
+            allow_tool_once(&mut policy, Arc::clone(&spec.name));
+        }
     }
-    policy
+    Ok(policy)
 }
 
 fn is_allowlisted(allowlist: &[Arc<str>], tool: &Arc<str>) -> bool {
     allowlist.iter().any(|entry| entry == tool)
 }
 
-// Bypass any `AskUser` gating for a tool the operator has explicitly
-// allowlisted. `memory` never reaches here: it is decided by `[memory.policy]`
-// and a config that allowlists it fails to load (M7 / `MEM-001`).
-fn allowlist_tool(policy: &mut Policy, tool: Arc<str>) {
+// Bypass any `AskUser` gating for a read-only or conversation-local transient
+// tool the operator explicitly allowlisted. Persistent and cross-conversation
+// mutations require a scoped approval path; a coarse name is not one.
+// `memory` never reaches here: it is decided by `[memory.policy]` and a config
+// that allowlists it fails to load (M7 / `MEM-001`).
+fn allowlist_tool(policy: &mut Policy, spec: &ToolSpec) -> Result<(), String> {
+    if spec.safety.rejects_blanket_allow() {
+        return Err(blanket_allow_error("policy.allowlist", spec));
+    }
+    let tool = Arc::clone(&spec.name);
     if policy.rules.iter().any(|rule| {
         rule.action == PolicyAction::Tool(Arc::clone(&tool))
             && rule.decision == PolicyVerb::Allow
             && rule.arg_equals.is_empty()
     }) {
-        return;
+        return Ok(());
     }
     policy.rules.push(PolicyRule {
         action: PolicyAction::Tool(tool),
@@ -120,6 +166,17 @@ fn allowlist_tool(policy: &mut Policy, tool: Arc<str>) {
         reason: None,
         arg_equals: BTreeMap::new(),
     });
+    Ok(())
+}
+
+fn blanket_allow_error(source: &str, spec: &ToolSpec) -> String {
+    format!(
+        "{source} cannot blanket-allow tool '{}': side_effect={} and persistence_scope={}; \
+         remove the blanket Allow and require user approval or a principal-bound exact grant",
+        spec.name,
+        spec.safety.side_effect.as_str(),
+        spec.safety.persistence_scope.as_str(),
+    )
 }
 
 fn policy_default_decision(input: &str) -> PolicyVerb {
@@ -488,6 +545,7 @@ mod tests {
     use crate::config::DelegationGrantConfig;
     use crate::memory::InMemoryMemory;
     use agentos_interfaces::orchestrator::Plan;
+    use agentos_interfaces::tool::{SandboxMode, ToolPersistenceScope, ToolSafety, ToolSideEffect};
     use agentos_proto::{ToolCall, ToolCallId};
     use serde_json::{json, value::RawValue};
 
@@ -505,6 +563,54 @@ mod tests {
         config
     }
 
+    fn policy_spec(name: &str) -> ToolSpec {
+        let safety = match name {
+            "shell" | "file" => ToolSafety::new(
+                ToolSideEffect::PersistentMutation,
+                ToolPersistenceScope::Workspace,
+            ),
+            "cron_create" | "cron_remove" | "memory" => ToolSafety::new(
+                ToolSideEffect::PersistentMutation,
+                ToolPersistenceScope::CrossConversation,
+            ),
+            "cron_list" => ToolSafety::new(
+                ToolSideEffect::ReadOnly,
+                ToolPersistenceScope::CrossConversation,
+            ),
+            "job_status" | "job_output" | "spill_read" => {
+                ToolSafety::new(ToolSideEffect::ReadOnly, ToolPersistenceScope::Conversation)
+            }
+            "job_kill" => ToolSafety::new(
+                ToolSideEffect::TransientMutation,
+                ToolPersistenceScope::Conversation,
+            ),
+            "skill_validate" => {
+                ToolSafety::new(ToolSideEffect::ReadOnly, ToolPersistenceScope::Workspace)
+            }
+            "http" => ToolSafety::new(ToolSideEffect::ReadOnly, ToolPersistenceScope::None),
+            _ => ToolSafety::default(),
+        };
+        ToolSpec {
+            name: Arc::from(name),
+            description: Arc::from("policy test tool"),
+            input_schema: json!({ "type": "object" }),
+            safety,
+            sandbox: SandboxMode::FullAccess,
+            timeout_ms: None,
+        }
+    }
+
+    fn policy_for_config(config: &WorkspaceConfig) -> Policy {
+        let specs = config
+            .resources
+            .tools
+            .enabled
+            .iter()
+            .map(|name| policy_spec(name))
+            .collect::<Vec<_>>();
+        super::phase5_policy(config, &specs).expect("test policy builds")
+    }
+
     #[test]
     fn parent_policy_does_not_inherit_subagent_tool_permissions() {
         let mut config = config_with_parent_tools(&["file"]);
@@ -513,7 +619,7 @@ mod tests {
             ..SubAgentConfig::default()
         });
 
-        let policy = phase5_policy(&config, &[]);
+        let policy = policy_for_config(&config);
         let decision = policy.decide(&tool_plan("http", json!({ "url": "https://example.com" })));
 
         assert!(matches!(decision, PolicyDecision::Deny { .. }));
@@ -527,7 +633,7 @@ mod tests {
             ..SubAgentConfig::default()
         });
 
-        let policy = phase5_policy(&config, &[]);
+        let policy = policy_for_config(&config);
         assert_eq!(
             policy.decide(&tool_plan(
                 "file",
@@ -547,7 +653,7 @@ mod tests {
     #[test]
     fn a_subagent_inherits_the_parents_rules_for_the_tools_it_lists() {
         let config = config_with_parent_tools(&["file"]);
-        let parent = phase5_policy(&config, &[]);
+        let parent = policy_for_config(&config);
         let child_config = SubAgentConfig {
             tools: vec![Arc::from("file")],
             ..SubAgentConfig::default()
@@ -582,7 +688,7 @@ mod tests {
     #[test]
     fn listing_a_tool_does_not_elevate_what_the_parent_gated() {
         let config = config_with_parent_tools(&["file", "shell"]);
-        let parent = phase5_policy(&config, &[]);
+        let parent = policy_for_config(&config);
         let child_config = SubAgentConfig {
             tools: vec![Arc::from("file"), Arc::from("shell")],
             ..SubAgentConfig::default()
@@ -616,7 +722,7 @@ mod tests {
     #[test]
     fn a_delegation_grant_elevates_exactly_what_it_names() {
         let config = config_with_parent_tools(&["file", "shell"]);
-        let parent = phase5_policy(&config, &[]);
+        let parent = policy_for_config(&config);
         let child_config = SubAgentConfig {
             tools: vec![Arc::from("file"), Arc::from("shell")],
             delegation_grants: vec![DelegationGrantConfig {
@@ -711,7 +817,7 @@ mod tests {
     #[test]
     fn an_expired_grant_does_not_elevate() {
         let config = config_with_parent_tools(&["shell"]);
-        let parent = phase5_policy(&config, &[]);
+        let parent = policy_for_config(&config);
         let child_config = SubAgentConfig {
             tools: vec![Arc::from("shell")],
             delegation_grants: vec![DelegationGrantConfig {
@@ -738,7 +844,7 @@ mod tests {
     #[test]
     fn a_subagent_cannot_reach_a_tool_the_parent_never_grants() {
         let config = config_with_parent_tools(&["http"]);
-        let parent = phase5_policy(&config, &[]);
+        let parent = policy_for_config(&config);
         let child_config = SubAgentConfig {
             tools: vec![Arc::from("shell")],
             ..SubAgentConfig::default()
@@ -758,7 +864,7 @@ mod tests {
     #[test]
     fn a_grant_cannot_reach_past_an_explicit_parent_deny() {
         let config = config_with_parent_tools(&["shell"]);
-        let mut parent = phase5_policy(&config, &[]);
+        let mut parent = policy_for_config(&config);
         parent.rules.insert(
             0,
             PolicyRule {
@@ -790,14 +896,13 @@ mod tests {
     /// not elevate.
     #[test]
     fn a_subagent_tool_list_selects_rather_than_elevates() {
-        let mut config = config_with_parent_tools(&["shell", "cron_create", "cron_remove"]);
-        config.policy.allowlist = vec![Arc::from("cron_create"), Arc::from("cron_remove")];
-        let parent = phase5_policy(&config, &[]);
+        let config = config_with_parent_tools(&["shell", "cron_list", "job_status"]);
+        let parent = policy_for_config(&config);
         let child_config = SubAgentConfig {
             tools: vec![
                 Arc::from("shell"),
-                Arc::from("cron_create"),
-                Arc::from("cron_remove"),
+                Arc::from("cron_list"),
+                Arc::from("job_status"),
             ],
             ..SubAgentConfig::default()
         };
@@ -809,14 +914,11 @@ mod tests {
             PolicyDecision::AskUser { .. }
         ));
         assert_eq!(
-            child.decide(&tool_plan(
-                "cron_create",
-                json!({ "id": "daily", "channel_id": "telegram", "conversation_id": "1", "prompt": "hi", "interval_minutes": 60 })
-            )),
+            child.decide(&tool_plan("cron_list", json!({}))),
             PolicyDecision::Allow
         );
         assert_eq!(
-            child.decide(&tool_plan("cron_remove", json!({ "id": "daily" }))),
+            child.decide(&tool_plan("job_status", json!({}))),
             PolicyDecision::Allow
         );
     }
@@ -827,7 +929,7 @@ mod tests {
     #[test]
     fn subagent_memory_operations_are_selected_then_inherited() {
         let config = config_with_parent_tools(&["memory"]);
-        let parent = phase5_policy(&config, &[]);
+        let parent = policy_for_config(&config);
         let child_config = SubAgentConfig {
             tools: vec![Arc::from("memory")],
             memory_tools: vec![Arc::from("read"), Arc::from("write")],
@@ -870,43 +972,61 @@ mod tests {
     }
 
     #[test]
-    fn allowlisted_tool_bypasses_ask_user() {
+    fn a_blanket_allow_for_persistent_tools_is_rejected() {
         let mut config = config_with_parent_tools(&["shell", "file"]);
         config.policy.allowlist = vec![Arc::from("shell"), Arc::from("file")];
+        let specs = [policy_spec("shell"), policy_spec("file")];
 
-        let policy = phase5_policy(&config, &[]);
-
-        assert_eq!(
-            policy.decide(&tool_plan("shell", json!({ "command": "ls" }))),
-            PolicyDecision::Allow
-        );
-        assert_eq!(
-            policy.decide(&tool_plan(
-                "file",
-                json!({ "operation": "write", "path": "x", "content": "y" })
-            )),
-            PolicyDecision::Allow
-        );
+        let error = super::phase5_policy(&config, &specs)
+            .expect_err("persistent mutations cannot be blanket-allowed");
+        assert!(error.contains("policy.allowlist"), "{error}");
+        assert!(error.contains("persistent_mutation"), "{error}");
     }
 
     #[test]
-    fn non_allowlisted_tool_still_asks_user() {
-        let mut config = config_with_parent_tools(&["shell", "file"]);
-        config.policy.allowlist = vec![Arc::from("file")];
+    fn a_new_risky_tool_cannot_gain_blanket_authority() {
+        let mut config = config_with_parent_tools(&["future_mutator"]);
+        config.policy.allowlist = vec![Arc::from("future_mutator")];
+        let mut spec = policy_spec("future_mutator");
+        spec.safety = ToolSafety::new(
+            ToolSideEffect::PersistentMutation,
+            ToolPersistenceScope::CrossConversation,
+        );
 
-        let policy = phase5_policy(&config, &[]);
+        let error = super::phase5_policy(&config, &[spec])
+            .expect_err("new persistent tools must be covered by the metadata ratchet");
+        assert!(error.contains("future_mutator"), "{error}");
+        assert!(error.contains("policy.allowlist"), "{error}");
+    }
+
+    #[test]
+    fn omitted_safety_metadata_fails_closed_for_an_mcp_tool() {
+        let config = config_with_parent_tools(&[]);
+        let policy = super::phase5_policy(&config, &[policy_spec("legacy_mcp")])
+            .expect("unspecified metadata prompts instead of rejecting policy construction");
+
+        assert!(matches!(
+            policy.decide(&tool_plan("legacy_mcp", json!({}))),
+            PolicyDecision::AskUser { .. }
+        ));
+    }
+
+    #[test]
+    fn a_non_allowlisted_persistent_tool_still_asks_user() {
+        let config = config_with_parent_tools(&["shell", "file"]);
+        let policy = policy_for_config(&config);
 
         assert!(matches!(
             policy.decide(&tool_plan("shell", json!({ "command": "ls" }))),
             PolicyDecision::AskUser { .. }
         ));
-        assert_eq!(
+        assert!(matches!(
             policy.decide(&tool_plan(
                 "file",
                 json!({ "operation": "write", "path": "x", "content": "y" })
             )),
-            PolicyDecision::Allow
-        );
+            PolicyDecision::AskUser { .. }
+        ));
     }
 
     #[test]
@@ -914,7 +1034,7 @@ mod tests {
         let mut config = config_with_parent_tools(&[]);
         config.policy.default = Arc::from("ask_user");
 
-        let policy = phase5_policy(&config, &[]);
+        let policy = policy_for_config(&config);
         let decision = policy.decide(&tool_plan("unknown_tool", json!({})));
 
         assert!(matches!(decision, PolicyDecision::AskUser { .. }));
@@ -925,7 +1045,7 @@ mod tests {
         let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let config = WorkspaceConfig::load(&repo_root.join("workspace/agent.toml"))
             .expect("workspace config loads");
-        let parent = phase5_policy(&config, &[]);
+        let parent = policy_for_config(&config);
 
         for subagent in &config.subagents {
             let child = subagent_policy(subagent, &parent).expect("subagent policy builds");

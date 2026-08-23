@@ -130,6 +130,7 @@ impl Tool for EchoTool {
             name: Arc::from(TOOL_NAME),
             description: Arc::from("narrowing test tool"),
             input_schema: serde_json::json!({"type": "object"}),
+            safety: Default::default(),
             sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }

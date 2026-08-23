@@ -1,6 +1,9 @@
 [package]
 name = "agentos-interfaces"
-version.workspace = true
+# `ToolSpec` gained authorization metadata in CFG-002. This is a source-level
+# breaking change for downstream struct literals, so the interface crate moves
+# to the next pre-1.0 compatibility line even though the runtime stays v0.7.
+version = "0.8.0"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true

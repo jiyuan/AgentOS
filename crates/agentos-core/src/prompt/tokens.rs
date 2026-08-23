@@ -183,6 +183,7 @@ mod tests {
                 "required": ["text"],
                 "properties": { "text": { "type": "string" } }
             }),
+            safety: Default::default(),
             sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }];

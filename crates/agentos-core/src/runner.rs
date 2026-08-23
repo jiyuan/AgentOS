@@ -1444,6 +1444,7 @@ mod tests {
                 name: Arc::from("mock"),
                 description: Arc::from("mock approval tool"),
                 input_schema: json!({"type": "object"}),
+                safety: Default::default(),
                 sandbox: SandboxMode::FullAccess,
                 timeout_ms: None,
             }

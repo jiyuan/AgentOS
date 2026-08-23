@@ -7,9 +7,15 @@
 
 use agentos_core::config::catalog;
 use agentos_core::config::WorkspaceConfig;
-use agentos_core::runtime::{register_builtin_tool, BUILTIN_TOOL_NAMES};
-use agentos_core::tools::ToolRegistry;
+use agentos_core::jobs::JobRegistry;
+use agentos_core::memory::{InMemoryMemory, MemoryManager};
+use agentos_core::runtime::{register_builtin_tool, BUILTIN_TOOL_NAMES, RUNTIME_TOOL_NAMES};
+use agentos_core::spill::SpillStore;
+use agentos_core::tools::{
+    JobKillTool, JobOutputTool, JobStatusTool, MemoryTool, SpillReadTool, ToolRegistry,
+};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 fn repo_file(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -50,6 +56,15 @@ fn the_tool_catalog_matches_the_registered_specs() {
     for name in BUILTIN_TOOL_NAMES {
         register_builtin_tool(&mut registry, name, &limits, &[]).expect("a built-in registers");
     }
+    let memory = Arc::new(MemoryManager::new(Arc::new(InMemoryMemory::default())));
+    let jobs = Arc::new(JobRegistry::default());
+    registry.register(MemoryTool::with_manager(memory));
+    registry.register(JobStatusTool::new(jobs.clone()));
+    registry.register(JobOutputTool::new(jobs.clone()));
+    registry.register(JobKillTool::new(jobs));
+    registry.register(SpillReadTool::new(Arc::new(SpillStore::new(
+        PathBuf::from("catalog-spec-only"),
+    ))));
     let body = catalog::tool_markdown(&registry.specs());
 
     let path = repo_file("docs/TOOL_CATALOG.md");
@@ -74,7 +89,7 @@ fn the_tool_catalog_matches_the_registered_specs() {
 fn every_built_in_tool_has_a_row() {
     let catalog = std::fs::read_to_string(repo_file("docs/TOOL_CATALOG.md"))
         .expect("the tool catalog exists");
-    for name in BUILTIN_TOOL_NAMES {
+    for name in BUILTIN_TOOL_NAMES.iter().chain(RUNTIME_TOOL_NAMES) {
         assert!(
             catalog.contains(&format!("| `{name}` |")),
             "'{name}' has no row in the tool catalog; {REGENERATE}"

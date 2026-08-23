@@ -85,6 +85,7 @@ impl Tool for EchoTool {
             name: Arc::from(TOOL),
             description: Arc::from("does nothing of consequence"),
             input_schema: serde_json::json!({"type": "object"}),
+            safety: Default::default(),
             sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }

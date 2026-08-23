@@ -19,7 +19,7 @@ default = "deny"
 # deliberately absent, which leaves them on their built-in rules — `file` read
 # allowed and `file` write asked, `memory` read allowed and write/forget asked
 # (`[memory.policy]`), and every `shell` call asked.
-allowlist = ["cron_create", "cron_remove", "job_status", "job_output", "job_kill"]
+allowlist = ["job_status", "job_output", "job_kill"]
 
 # Programs the shell tool guardrail accepts in a call's `command` field.
 # These eight are read-only inspection commands (the built-in default).

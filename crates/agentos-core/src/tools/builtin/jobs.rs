@@ -33,7 +33,9 @@
 use crate::jobs::{JobError, JobId, JobRegistry, JobSnapshot};
 use crate::memory::{conversation_id_from_context, conversation_principal_from_context};
 use agentos_interfaces::orchestrator::RunContext;
-use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
+use agentos_interfaces::tool::{
+    SandboxMode, Tool, ToolError, ToolPersistenceScope, ToolSafety, ToolSideEffect, ToolSpec,
+};
 use agentos_proto::{Principal, ToolCall, ToolResult, ToolStatus};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -105,6 +107,7 @@ impl Tool for JobStatusTool {
                     "job_id": { "type": "string" }
                 }
             }),
+            safety: ToolSafety::new(ToolSideEffect::ReadOnly, ToolPersistenceScope::Conversation),
             sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }
@@ -161,6 +164,7 @@ impl Tool for JobOutputTool {
                     "offset": { "type": "integer", "minimum": 0 }
                 }
             }),
+            safety: ToolSafety::new(ToolSideEffect::ReadOnly, ToolPersistenceScope::Conversation),
             sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }
@@ -212,6 +216,10 @@ impl Tool for JobKillTool {
                     "job_id": { "type": "string" }
                 }
             }),
+            safety: ToolSafety::new(
+                ToolSideEffect::TransientMutation,
+                ToolPersistenceScope::Conversation,
+            ),
             sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }

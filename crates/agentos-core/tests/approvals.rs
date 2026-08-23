@@ -86,6 +86,7 @@ impl Tool for GatedTool {
             name: Arc::from(GATED_TOOL),
             description: Arc::from("Does something worth asking about."),
             input_schema: json!({"type": "object"}),
+            safety: Default::default(),
             sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }

@@ -2,7 +2,10 @@ use super::common::{elapsed_ms, result_metadata, safe_workspace_path, workspace_
 use crate::paths::RootDir;
 use crate::sandbox::Sandbox;
 use crate::tools::{Exec, ExecError, DEFAULT_MAX_OUTPUT_BYTES};
-use agentos_interfaces::tool::{Isolation, SandboxMode, Tool, ToolError, ToolSpec};
+use agentos_interfaces::tool::{
+    Isolation, SandboxMode, Tool, ToolError, ToolPersistenceScope, ToolSafety, ToolSideEffect,
+    ToolSpec,
+};
 use agentos_proto::{ToolCall, ToolResult, ToolStatus};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -86,6 +89,10 @@ impl Tool for ShellTool {
                     "cwd": { "type": "string" }
                 }
             }),
+            safety: ToolSafety::new(
+                ToolSideEffect::PersistentMutation,
+                ToolPersistenceScope::Workspace,
+            ),
             sandbox: SHELL_SANDBOX,
             // A shell command is the one built-in that legitimately runs for
             // minutes — a build, a test suite. It declares its own deadline so

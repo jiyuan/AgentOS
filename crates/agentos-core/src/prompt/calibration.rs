@@ -114,6 +114,7 @@ fn shell_spec() -> ToolSpec {
                 "timeout_ms": { "type": "integer", "description": "Deadline in milliseconds." }
             }
         }),
+        safety: Default::default(),
         sandbox: SandboxMode::WorkspaceWrite,
         timeout_ms: Some(30_000),
     }
@@ -136,6 +137,7 @@ fn file_spec() -> ToolSpec {
                 "content": { "type": "string", "description": "Body, for write and append." }
             }
         }),
+        safety: Default::default(),
         sandbox: SandboxMode::WorkspaceWrite,
         timeout_ms: Some(10_000),
     }

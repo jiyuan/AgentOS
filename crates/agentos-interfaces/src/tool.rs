@@ -62,11 +62,114 @@ impl SandboxMode {
     }
 }
 
+/// Whether invoking a tool can change state outside the current call.
+///
+/// This is authorization metadata, not a promise about filesystem isolation.
+/// A tool that only reads files may still need a sandbox; a tool that mutates
+/// a database in-process may declare [`SandboxMode::FullAccess`] while still
+/// carrying [`ToolSideEffect::PersistentMutation`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSideEffect {
+    /// The tool did not declare its behavior. Policy treats this as unsafe for
+    /// blanket authorization so an older or third-party specification cannot
+    /// gain authority merely by omitting new metadata.
+    #[default]
+    Unspecified,
+    /// Reads or computes without changing external state.
+    ReadOnly,
+    /// Changes process-lifetime state that does not survive a restart.
+    TransientMutation,
+    /// Changes state that survives the call or process.
+    PersistentMutation,
+}
+
+impl ToolSideEffect {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unspecified => "unspecified",
+            Self::ReadOnly => "read_only",
+            Self::TransientMutation => "transient_mutation",
+            Self::PersistentMutation => "persistent_mutation",
+        }
+    }
+
+    pub fn is_mutation(self) -> bool {
+        matches!(self, Self::TransientMutation | Self::PersistentMutation)
+    }
+}
+
+/// The widest durable or shared state an invocation can address.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolPersistenceScope {
+    /// The tool did not declare its scope. Like an unspecified side effect,
+    /// this fails closed for blanket authorization.
+    #[default]
+    Unspecified,
+    /// No durable or shared state is addressed.
+    None,
+    /// State is fenced to the initiating conversation.
+    Conversation,
+    /// State belongs to the agent workspace and can affect later runs.
+    Workspace,
+    /// One call can address state owned by another conversation.
+    CrossConversation,
+}
+
+impl ToolPersistenceScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unspecified => "unspecified",
+            Self::None => "none",
+            Self::Conversation => "conversation",
+            Self::Workspace => "workspace",
+            Self::CrossConversation => "cross_conversation",
+        }
+    }
+}
+
+/// Authorization-relevant behavior declared by a tool.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolSafety {
+    #[serde(default)]
+    pub side_effect: ToolSideEffect,
+    #[serde(default)]
+    pub persistence_scope: ToolPersistenceScope,
+}
+
+impl ToolSafety {
+    pub const fn new(side_effect: ToolSideEffect, persistence_scope: ToolPersistenceScope) -> Self {
+        Self {
+            side_effect,
+            persistence_scope,
+        }
+    }
+
+    /// Whether a blanket `Allow` would cover a persistent or
+    /// cross-conversation mutation, or metadata too incomplete to prove it
+    /// would not.
+    pub fn rejects_blanket_allow(self) -> bool {
+        matches!(
+            self.side_effect,
+            ToolSideEffect::Unspecified | ToolSideEffect::PersistentMutation
+        ) || matches!(self.persistence_scope, ToolPersistenceScope::Unspecified)
+            || (self.side_effect.is_mutation()
+                && self.persistence_scope == ToolPersistenceScope::CrossConversation)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolSpec {
     pub name: Arc<str>,
     pub description: Arc<str>,
     pub input_schema: Value,
+    /// Side effects and persistence scope used by policy construction. An
+    /// omitted declaration deserializes to `unspecified`, which prevents
+    /// blanket authorization rather than granting it.
+    #[serde(default)]
+    pub safety: ToolSafety,
     /// What this tool is allowed to do to the filesystem, and therefore how it
     /// is executed (roadmap item X2).
     ///
@@ -166,5 +269,50 @@ pub trait Tool: Send + Sync {
         _ctx: &RunContext<'_>,
     ) -> Result<ToolResult, ToolError> {
         self.call(call, args).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn omitted_safety_metadata_deserializes_fail_closed() {
+        let spec: ToolSpec = serde_json::from_value(serde_json::json!({
+            "name": "legacy",
+            "description": "legacy spec",
+            "input_schema": { "type": "object" },
+            "sandbox": "full_access"
+        }))
+        .expect("legacy tool specs remain readable");
+
+        assert_eq!(spec.safety, ToolSafety::default());
+        assert!(spec.safety.rejects_blanket_allow());
+    }
+
+    #[test]
+    fn read_only_cross_conversation_inspection_is_not_a_mutation() {
+        let safety = ToolSafety::new(
+            ToolSideEffect::ReadOnly,
+            ToolPersistenceScope::CrossConversation,
+        );
+
+        assert!(!safety.rejects_blanket_allow());
+    }
+
+    #[test]
+    fn persistent_and_cross_conversation_mutations_reject_blanket_allow() {
+        for safety in [
+            ToolSafety::new(
+                ToolSideEffect::PersistentMutation,
+                ToolPersistenceScope::Workspace,
+            ),
+            ToolSafety::new(
+                ToolSideEffect::TransientMutation,
+                ToolPersistenceScope::CrossConversation,
+            ),
+        ] {
+            assert!(safety.rejects_blanket_allow());
+        }
     }
 }

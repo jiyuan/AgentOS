@@ -103,6 +103,7 @@ impl Tool for Recorder {
             name: Arc::from(RECORDER),
             description: Arc::from("Records that it ran."),
             input_schema: json!({"type": "object"}),
+            safety: Default::default(),
             sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }

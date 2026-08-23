@@ -31,6 +31,7 @@ impl Tool for EchoTool {
                 "required": ["text"],
                 "properties": { "text": { "type": "string" } }
             }),
+            safety: Default::default(),
             sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }
@@ -74,6 +75,7 @@ impl Tool for BulkTool {
                 "required": ["lines"],
                 "properties": { "lines": { "type": "integer" } }
             }),
+            safety: Default::default(),
             sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }

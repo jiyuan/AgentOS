@@ -477,6 +477,7 @@ impl MockTool {
                 name: Arc::clone(&name),
                 description: Arc::from("mock tool"),
                 input_schema: serde_json::json!({"type": "object"}),
+                safety: Default::default(),
                 sandbox: SandboxMode::FullAccess,
                 timeout_ms: None,
             },
@@ -718,6 +719,7 @@ mod tests {
             name: Arc::from("ping"),
             description: Arc::from("returns pong"),
             input_schema: serde_json::json!({}),
+            safety: Default::default(),
             sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }]);

@@ -46,6 +46,7 @@ impl Tool for BulkTool {
             name: Arc::from(BULK),
             description: Arc::from("emits a lot"),
             input_schema: json!({"type": "object"}),
+            safety: Default::default(),
             sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }

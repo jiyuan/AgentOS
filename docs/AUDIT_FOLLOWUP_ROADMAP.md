@@ -795,48 +795,55 @@ claim, not yet a claim that Rust binaries or archives are bit-for-bit reproducib
 
 ## Audit finding coverage
 
-| ID | Finding | Priority | Corrective slice | Acceptance evidence | Status |
-|---|---|---:|---|---|---|
-| `AF-001` | Child session namespace omits parent channel/agent/policy | P0 | `ID-003` | Cross-channel, cross-agent, cross-policy fork/memory isolation | Open |
-| `AF-002` | Feishu ACK precedes durable ingress | P0 | `GW-002` | ACK-order crash fixture | Open |
-| `AF-003` | Telegram checkpoint advances without recoverable replay | P0 | `GW-002` | Cursor/restart/replay fixture | Open |
-| `AF-004` | Ingress ledger error logs and continues | P0 | `GW-002` | SQLite failpoint proves no ACK or execution | Open |
-| `AF-005` | ACKed rows can strand until restart; `/stop` bypasses admission | P0 | `GW-002` | Live dispatcher, saturation, and `/stop` ordering | Open |
-| `AF-006` | Legacy unsettled rows lack replay payload behind an advanced cursor | P0 | `GW-002` | Pre-roadmap migration quarantine fixture | Open |
-| `AF-007` | Steering/requeue loses envelope metadata and ingress ID | P1 | `GW-003` | Multi-sender steering/displacement | Open |
-| `AF-008` | Remote paused approvals exist only in memory | P1 | `STATE-002` | Pause/restart/policy-change/resolve matrix | Open |
-| `AF-009` | Authorization commitment omits plan fields; plan is swappable | P1 | `AUTH-005` | Per-field mutation and compile-fail tests | Open |
-| `AF-010` | Public resume path accepts bare interruption/decision identifiers | P1 | `AUTH-003` | Opaque actor-bound witness negative tests | Open |
-| `AF-011` | Approval ticket initialization can collide and lacks one prompt ID | P1 | `AUTH-003` | Deterministic synchronized initialization test | Open |
-| `AF-012` | Interruption resolution can select an old non-pending entry | P1 | `AUTH-003` | Exact pending-instance lifecycle | Open |
-| `AF-013` | Bare administrator sender IDs can cross channel namespaces | P1 | `AUTH-003` | Telegram/Feishu selector and migration test | Open |
-| `AF-014` | Delegation grants are not actor-bound or mandatorily expiring | P1 | `AUTH-004` | Actor/channel/agent/expiry/non-transitive matrix | Open |
-| `AF-015` | Approval resolution audit omits the resolver | P1 | `AUTH-003` | Requested/resolved actor correlation | Open |
-| `AF-016` | Best-effort journal writes can leave required safety evidence absent | P1 | `AUD-002` | Approval/grant/denial/refusal append failpoints | Open |
-| `AF-017` | Failed/retried provider calls lose attempt manifests | P1 | `REQ-002` | Failure/retry/compaction/cancellation goldens | Open |
-| `AF-018` | Task/attachment writes and skill traversal bypass rooted I/O | P1 | `FS-002`, `FS-003` | Symlink/race/main-min/outside-canary matrix | Open |
-| `AF-019` | Task/session modes rely on umask; fsync errors are ignored | P2 | `FS-002`, `FS-003` | Mode and injected-fsync tests | Open |
-| `AF-020` | Native macOS workspace-write/setup semantics are wrong | P1 | `SBX-002` | Enforcing Seatbelt tests on macOS | Open |
-| `AF-021` | Sandboxed MCP tools cannot register/invoke correctly | P1 | `MCP-002` | Full-runtime sandboxed MCP call | Open |
-| `AF-022` | MCP cancellation leaks pending slots/notification | P1 | `MCP-003` | Observed cancellation storm beyond limit | Open |
-| `AF-023` | MCP group shutdown, stderr, and restart accounting are incomplete | P1 | `MCP-004` | Descendant/flood/failed-open/active-drain tests | Open |
-| `AF-024` | MCP tool-page count sizes allocation before the cumulative cap | P1 | `MCP-004` | Oversized compact `tools/list` page | Open |
-| `AF-025` | Gateway lock is visible before shutdown handling is ready | P1 | `CTRL-002` | Process-level startup/SIGTERM barrier | Open |
-| `AF-026` | Channel receive can block shutdown indefinitely | P1 | `CTRL-002`, `PROC-002` | Forever-blocked receiver | Open |
-| `AF-027` | Numeric PID holder lookup can signal a replacement process | P1 | `CTRL-002` | Barrier-controlled PID-reuse regression | Open |
-| `AF-028` | Channels construct independent runtime authorities | P1 | `GW-005` | Two-channel shared-authority test | Open |
-| `AF-029` | Maintenance depends on shard-0 idle time | P1 | `MAINT-002` | Saturated-shard deterministic-clock test | Open |
-| `AF-030` | Failed/ambiguous egress is settled as handled or blindly retried | P1 | `GW-004` | Delivery/action crash-state matrix | Open |
-| `AF-031` | Shipped cron mutations are blanket-allowed | P1 | `CFG-002` | Metadata-driven mutation policy ratchet | Open |
-| `AF-032` | Reinstall deletes operator configuration and extensions | P1 | `REL-003` | Modify-and-reinstall preservation | Open |
-| `AF-033` | Purge commits before best-effort audit marker/count recheck | P1 | `AUD-003` | Transaction count-race/failpoint rollback | Open |
-| `AF-034` | Feishu single-part and other protocol bodies allocate before caps | P1 | `ING-002` | Oversize/malformed input matrix | Open |
-| `AF-035` | Terminal fallback bypasses output policy | P1 | `OUT-001` | Deny-all terminal-path matrix | Open |
-| `AF-036` | Provider-call checker is grep-bypassable | P2 | `REQ-002`, `CI-003` | Compile-time or AST negative fixture | Open |
-| `AF-037` | Release/catalog/source builds are unlocked; tool versions float | P2 | `REL-004` | Static gate and clean input-manifest test | Open |
-| `AF-038` | IPv6 site-local egress remains allowed | P2 | `NET-002` | Literal/DNS-resolved policy tests | Open |
-| `AF-039` | Telegram child bypasses common env/group/output controls | P2 | `PROC-002`, `ING-002` | Secret/descendant/response-cap tests | Open |
-| `AF-040` | Current all-target Clippy gate fails | P1 | `BASE-001` | Required command green on both platforms | Open |
+`Regression artifact` is the exact test or executable gate that must exist before
+the row can move to `Complete`. `Execution` separates portable evidence from
+claims that are meaningful only on native Linux or macOS runners; a managed-host
+failure is recorded as environment-induced and never substitutes for a native
+platform result. `scripts/check-audit-regressions.sh` enforces the schema, stable
+ID sequence, and complete-row artifact resolution.
+
+| ID | Finding | Priority | Corrective slice | Acceptance evidence | Regression artifact | Execution | Status |
+|---|---|---:|---|---|---|---|---|
+| `AF-001` | Child session namespace omits parent channel/agent/policy | P0 | `ID-003` | Cross-channel, cross-agent, cross-policy fork/memory isolation | `crates/agentos-core/tests/subagent_identity.rs::colliding_legacy_sources_do_not_share_transcript_or_memory` | `portable` | Open |
+| `AF-002` | Feishu ACK precedes durable ingress | P0 | `GW-002` | ACK-order crash fixture | `crates/agentos-core/tests/gateway_ingress_crash.rs::feishu_ack_follows_durable_ingress_commit` | `native-linux+macos` | Open |
+| `AF-003` | Telegram checkpoint advances without recoverable replay | P0 | `GW-002` | Cursor/restart/replay fixture | `crates/agentos-core/tests/gateway_ingress_crash.rs::telegram_cursor_never_advances_past_unrecoverable_input` | `native-linux+macos` | Open |
+| `AF-004` | Ingress ledger error logs and continues | P0 | `GW-002` | SQLite failpoint proves no ACK or execution | `crates/agentos-core/tests/gateway_ingress_crash.rs::ledger_failure_prevents_ack_and_execution` | `portable` | Open |
+| `AF-005` | ACKed rows can strand until restart; `/stop` bypasses admission | P0 | `GW-002` | Live dispatcher, saturation, and `/stop` ordering | `crates/agentos-core/tests/gateway_ingress_crash.rs::live_dispatcher_drains_acked_rows_and_stop_obeys_admission` | `native-linux+macos` | Open |
+| `AF-006` | Legacy unsettled rows lack replay payload behind an advanced cursor | P0 | `GW-002` | Pre-roadmap migration quarantine fixture | `crates/agentos-core/tests/gateway_ingress_crash.rs::legacy_unsettled_rows_are_quarantined_before_cursor_advance` | `portable` | Open |
+| `AF-007` | Steering/requeue loses envelope metadata and ingress ID | P1 | `GW-003` | Multi-sender steering/displacement | `crates/agentos-core/tests/gateway_steering.rs::displaced_envelope_preserves_principal_and_ingress_id` | `portable` | Open |
+| `AF-008` | Remote paused approvals exist only in memory | P1 | `STATE-002` | Pause/restart/policy-change/resolve matrix | `crates/agentos-core/tests/approval_recovery.rs::paused_approval_survives_restart_and_policy_change` | `native-linux+macos` | Open |
+| `AF-009` | Authorization commitment omits plan fields; plan is swappable | P1 | `AUTH-005` | Per-field mutation and compile-fail tests | `crates/agentos-core/tests/authorization_commitment.rs::mutating_any_plan_field_invalidates_authorization` | `portable` | Open |
+| `AF-010` | Public resume path accepts bare interruption/decision identifiers | P1 | `AUTH-003` | Opaque actor-bound witness negative tests | `crates/agentos-core/tests/approval_witness.rs::resume_rejects_bare_or_wrong_actor_witness` | `portable` | Open |
+| `AF-011` | Approval ticket initialization can collide and lacks one prompt ID | P1 | `AUTH-003` | Deterministic synchronized initialization test | `crates/agentos-core/tests/approval_witness.rs::synchronized_prompts_receive_distinct_ids` | `portable` | Open |
+| `AF-012` | Interruption resolution can select an old non-pending entry | P1 | `AUTH-003` | Exact pending-instance lifecycle | `crates/agentos-core/tests/approval_witness.rs::resolution_selects_only_the_exact_pending_instance` | `portable` | Open |
+| `AF-013` | Bare administrator sender IDs can cross channel namespaces | P1 | `AUTH-003` | Telegram/Feishu selector and migration test | `crates/agentos-core/tests/channel_admin_identity.rs::same_sender_id_on_two_channels_is_not_one_administrator` | `portable` | Open |
+| `AF-014` | Delegation grants are not actor-bound or mandatorily expiring | P1 | `AUTH-004` | Actor/channel/agent/expiry/non-transitive matrix | `crates/agentos-core/tests/delegation_grants.rs::grant_is_actor_bound_expiring_and_non_transitive` | `portable` | Open |
+| `AF-015` | Approval resolution audit omits the resolver | P1 | `AUTH-003` | Requested/resolved actor correlation | `crates/agentos-core/tests/safety_events.rs::approval_resolution_records_requester_and_resolver` | `portable` | Open |
+| `AF-016` | Best-effort journal writes can leave required safety evidence absent | P1 | `AUD-002` | Approval/grant/denial/refusal append failpoints | `crates/agentos-core/tests/audit_failpoints.rs::required_safety_event_failure_aborts_the_action` | `portable` | Open |
+| `AF-017` | Failed/retried provider calls lose attempt manifests | P1 | `REQ-002` | Failure/retry/compaction/cancellation goldens | `crates/agentos-core/tests/request_attempts.rs::every_failed_retried_or_cancelled_attempt_is_durable` | `portable` | Open |
+| `AF-018` | Task/attachment writes and skill traversal bypass rooted I/O | P1 | `FS-002`, `FS-003` | Symlink/race/main-min/outside-canary matrix | `crates/agentos-core/tests/rooted_io.rs::all_model_selected_paths_refuse_symlink_escape_and_swap` | `native-linux+macos` | Open |
+| `AF-019` | Task/session modes rely on umask; fsync errors are ignored | P2 | `FS-002`, `FS-003` | Mode and injected-fsync tests | `crates/agentos-core/tests/state_durability.rs::fsync_failure_aborts_state_commit` | `native-linux+macos` | Open |
+| `AF-020` | Native macOS workspace-write/setup semantics are wrong | P1 | `SBX-002` | Enforcing Seatbelt tests on macOS | `crates/agentos-core/tests/sandbox.rs::a_workspace_write_child_writes_inside_and_not_outside`, `crates/agentos-core/tests/sandbox.rs::an_unbuildable_sandbox_fails_the_call` | `native-macos` | Open |
+| `AF-021` | Sandboxed MCP tools cannot register/invoke correctly | P1 | `MCP-002` | Full-runtime sandboxed MCP call | `crates/agentos-core/tests/mcp_runtime.rs::sandboxed_mcp_tool_registers_and_runs_through_runtime` | `native-linux+macos` | Open |
+| `AF-022` | MCP cancellation leaks pending slots/notification | P1 | `MCP-003` | Observed cancellation storm beyond limit | `crates/agentos-core/tests/mcp_interop.rs::cancellation_storm_releases_slots_and_notifies_server` | `native-linux+macos` | Open |
+| `AF-023` | MCP group shutdown, stderr, and restart accounting are incomplete | P1 | `MCP-004` | Descendant/flood/failed-open/active-drain tests | `crates/agentos-core/tests/mcp_process_lifecycle.rs::shutdown_drains_active_calls_and_kills_the_process_group` | `native-linux+macos` | Open |
+| `AF-024` | MCP tool-page count sizes allocation before the cumulative cap | P1 | `MCP-004` | Oversized compact `tools/list` page | `crates/agentos-core/tests/mcp_interop.rs::oversized_compact_tool_page_is_refused_before_allocation` | `portable` | Open |
+| `AF-025` | Gateway lock is visible before shutdown handling is ready | P1 | `CTRL-002` | Process-level startup/SIGTERM barrier | `crates/agentos-cli/tests/gateway_lifecycle.rs::startup_lock_is_published_after_signal_handlers_are_ready` | `native-linux+macos` | Open |
+| `AF-026` | Channel receive can block shutdown indefinitely | P1 | `CTRL-002`, `PROC-002` | Forever-blocked receiver | `crates/agentos-core/tests/gateway_shutdown.rs::forever_blocked_channel_is_abandoned_at_shutdown_deadline` | `native-linux+macos` | Open |
+| `AF-027` | Numeric PID holder lookup can signal a replacement process | P1 | `CTRL-002` | Barrier-controlled PID-reuse regression | `crates/agentos-cli/tests/gateway_lifecycle.rs::stop_never_signals_a_reused_pid` | `native-linux+macos` | Open |
+| `AF-028` | Channels construct independent runtime authorities | P1 | `GW-005` | Two-channel shared-authority test | `crates/agentos-core/tests/runtime_authority.rs::two_channels_share_one_runtime_authority` | `native-linux+macos` | Open |
+| `AF-029` | Maintenance depends on shard-0 idle time | P1 | `MAINT-002` | Saturated-shard deterministic-clock test | `crates/agentos-core/tests/maintenance.rs::maintenance_runs_while_shard_zero_is_saturated` | `portable` | Open |
+| `AF-030` | Failed/ambiguous egress is settled as handled or blindly retried | P1 | `GW-004` | Delivery/action crash-state matrix | `crates/agentos-core/tests/delivery_crash.rs::ambiguous_delivery_is_neither_silently_settled_nor_blindly_retried` | `native-linux+macos` | Open |
+| `AF-031` | Shipped cron mutations are blanket-allowed | P1 | `CFG-002` | Metadata-driven mutation policy ratchet | `crates/agentos-core/tests/shipped_config_policy.rs::metadata_drives_the_blanket_allow_ratchet_for_every_shipped_tool` | `portable` | Open |
+| `AF-032` | Reinstall deletes operator configuration and extensions | P1 | `REL-003` | Modify-and-reinstall preservation | `scripts/check-install-preservation.sh` | `native-linux+macos` | Open |
+| `AF-033` | Purge commits before best-effort audit marker/count recheck | P1 | `AUD-003` | Transaction count-race/failpoint rollback | `crates/agentos-core/tests/audit_purge.rs::purge_count_race_or_marker_failure_rolls_back_everything` | `portable` | Open |
+| `AF-034` | Feishu single-part and other protocol bodies allocate before caps | P1 | `ING-002` | Oversize/malformed input matrix | `crates/agentos-core/tests/ingress_limits.rs::all_protocol_bodies_are_bounded_before_allocation` | `portable` | Open |
+| `AF-035` | Terminal fallback bypasses output policy | P1 | `OUT-001` | Deny-all terminal-path matrix | `crates/agentos-core/tests/output_gate.rs::every_terminal_fallback_crosses_the_output_policy` | `portable` | Open |
+| `AF-036` | Provider-call checker is grep-bypassable | P2 | `REQ-002`, `CI-003` | Compile-time or AST negative fixture | `tests/test_provider_call_checker.py::test_syntactic_bypasses_are_rejected` | `portable` | Open |
+| `AF-037` | Release/catalog/source builds are unlocked; tool versions float | P2 | `REL-004` | Static gate and clean input-manifest test | `scripts/check-release-locking.sh` | `native-linux+macos` | Open |
+| `AF-038` | IPv6 site-local egress remains allowed | P2 | `NET-002` | Literal/DNS-resolved policy tests | `crates/agentos-core/tests/egress.rs::ipv6_site_local_is_refused_by_literal_and_resolution` | `portable` | Open |
+| `AF-039` | Telegram child bypasses common env/group/output controls | P2 | `PROC-002`, `ING-002` | Secret/descendant/response-cap tests | `crates/agentos-core/tests/subprocess_boundaries.rs::telegram_child_has_minimal_env_group_kill_and_output_cap` | `native-linux+macos` | Open |
+| `AF-040` | Current all-target Clippy gate fails | P1 | `BASE-001` | Required command green on both platforms | `scripts/check-baseline-gates.sh` | `native-linux+macos` | Open |
 
 ## Final release gate
 

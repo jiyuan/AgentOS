@@ -36,6 +36,7 @@ pub async fn register_configured_mcp(
                 name: Arc::clone(&tool.name),
                 description: Arc::clone(&tool.description),
                 input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+                safety: Default::default(),
                 sandbox: tool.sandbox,
                 timeout_ms: None,
             },

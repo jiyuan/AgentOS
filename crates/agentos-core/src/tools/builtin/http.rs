@@ -1,6 +1,8 @@
 use super::common::{elapsed_ms, result_metadata};
 use crate::egress::{fetch_bounded, tool_client, DEFAULT_MAX_RESPONSE_BYTES};
-use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
+use agentos_interfaces::tool::{
+    SandboxMode, Tool, ToolError, ToolPersistenceScope, ToolSafety, ToolSideEffect, ToolSpec,
+};
 use agentos_proto::{ToolCall, ToolResult, ToolStatus};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -57,6 +59,7 @@ impl Tool for HttpTool {
                     "method": { "type": "string", "enum": ["GET"] }
                 }
             }),
+            safety: ToolSafety::new(ToolSideEffect::ReadOnly, ToolPersistenceScope::None),
             sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }

@@ -659,6 +659,7 @@ mod tests {
             name: Arc::from("file"),
             description: Arc::from("read or write"),
             input_schema: json!({"type":"object","properties":{}}),
+            safety: Default::default(),
             sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         };

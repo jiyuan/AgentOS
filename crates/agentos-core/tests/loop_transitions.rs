@@ -88,6 +88,7 @@ impl Tool for NoopTool {
             name: Arc::from(TOOL),
             description: Arc::from("transition table fixture"),
             input_schema: serde_json::json!({"type": "object"}),
+            safety: Default::default(),
             sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }

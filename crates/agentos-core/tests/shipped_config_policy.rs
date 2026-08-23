@@ -13,9 +13,16 @@
 use agentos_core::approve::{PolicyDecision, PolicyVerb};
 use agentos_core::config::WorkspaceConfig;
 use agentos_core::guardrails::ShellCommandAllowlist;
-use agentos_core::runtime::phase5_policy;
+use agentos_core::jobs::JobRegistry;
+use agentos_core::memory::{InMemoryMemory, MemoryManager};
+use agentos_core::runtime::{phase5_policy, register_builtin_tool};
+use agentos_core::spill::SpillStore;
+use agentos_core::tools::{
+    JobKillTool, JobOutputTool, JobStatusTool, MemoryTool, SpillReadTool, ToolRegistry,
+};
 use agentos_interfaces::guardrail::{GuardrailOutcome, ToolGuardrail};
 use agentos_interfaces::orchestrator::{Plan, RunContext};
+use agentos_interfaces::tool::{ToolSideEffect, ToolSpec};
 use agentos_interfaces::RunState;
 use agentos_proto::{AgentId, RunId, ToolCall, ToolCallId};
 use serde_json::{json, value::RawValue};
@@ -25,6 +32,36 @@ use std::sync::Arc;
 fn shipped_config() -> WorkspaceConfig {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../workspace/agent.toml");
     WorkspaceConfig::load(&path).expect("the shipped workspace config must load")
+}
+
+fn shipped_specs(config: &WorkspaceConfig) -> Vec<ToolSpec> {
+    let mut registry = ToolRegistry::new();
+    let memory = Arc::new(MemoryManager::new(Arc::new(InMemoryMemory::default())));
+    let jobs = Arc::new(JobRegistry::default());
+    for name in &config.resources.tools.enabled {
+        match name.as_ref() {
+            "memory" => registry.register(MemoryTool::with_manager(memory.clone())),
+            "job_status" => registry.register(JobStatusTool::new(jobs.clone())),
+            "job_output" => registry.register(JobOutputTool::new(jobs.clone())),
+            "job_kill" => registry.register(JobKillTool::new(jobs.clone())),
+            "spill_read" => registry.register(SpillReadTool::new(Arc::new(SpillStore::new(
+                std::env::temp_dir().join("agentos-shipped-policy-spec-only"),
+            )))),
+            other => register_builtin_tool(
+                &mut registry,
+                other,
+                &config.limits,
+                &config.isolation.env_passthrough,
+            )
+            .expect("every shipped built-in tool registers"),
+        }
+    }
+    registry.specs()
+}
+
+fn shipped_policy() -> agentos_core::approve::Policy {
+    let config = shipped_config();
+    phase5_policy(&config, &shipped_specs(&config)).expect("the shipped policy builds")
 }
 
 fn call(name: &str, args: serde_json::Value) -> ToolCall {
@@ -144,7 +181,7 @@ async fn an_unprofiled_program_is_still_refused_by_name() {
 #[test]
 fn file_write_asks_and_read_allows() {
     let config = shipped_config();
-    let policy = phase5_policy(&config, &[]);
+    let policy = phase5_policy(&config, &shipped_specs(&config)).expect("policy builds");
 
     assert_eq!(
         policy.decide(&Plan::CallTool(call(
@@ -173,7 +210,7 @@ fn an_unknown_file_operation_is_denied_rather_than_allowed() {
     // falls to the default rather than through a blanket tool allow.
     let config = shipped_config();
     assert_eq!(config.policy.default.as_ref(), "deny");
-    let policy = phase5_policy(&config, &[]);
+    let policy = phase5_policy(&config, &shipped_specs(&config)).expect("policy builds");
 
     let decision = policy.decide(&Plan::CallTool(call(
         "file",
@@ -188,7 +225,7 @@ fn an_unknown_file_operation_is_denied_rather_than_allowed() {
 #[test]
 fn shell_and_memory_mutations_reach_the_user() {
     let config = shipped_config();
-    let policy = phase5_policy(&config, &[]);
+    let policy = phase5_policy(&config, &shipped_specs(&config)).expect("policy builds");
 
     let shell = policy.decide(&Plan::CallTool(call(
         "shell",
@@ -223,22 +260,82 @@ fn shell_and_memory_mutations_reach_the_user() {
     );
 }
 
+/// AF-031: shipped risky mutations must never acquire an unconstrained Allow.
 #[test]
-fn the_shipped_policy_carries_no_blanket_rule_for_a_gated_tool() {
-    // The structural version of the assertions above: whatever rules exist,
-    // none of the three tools may carry an unconstrained `Allow`. This is what
-    // catches a future edit that re-adds one under a different spelling.
-    let policy = phase5_policy(&shipped_config(), &[]);
-    for rule in &policy.rules {
-        let agentos_core::approve::PolicyAction::Tool(tool) = &rule.action else {
-            continue;
-        };
-        if !matches!(tool.as_ref(), "shell" | "file" | "memory") {
+fn metadata_drives_the_blanket_allow_ratchet_for_every_shipped_tool() {
+    let config = shipped_config();
+    let specs = shipped_specs(&config);
+    let policy = phase5_policy(&config, &specs).expect("the shipped policy builds");
+
+    for spec in &specs {
+        assert_ne!(
+            spec.safety.side_effect,
+            ToolSideEffect::Unspecified,
+            "'{}' must declare side-effect metadata",
+            spec.name
+        );
+        if !spec.safety.rejects_blanket_allow() {
             continue;
         }
         assert!(
-            !(rule.decision == PolicyVerb::Allow && rule.arg_equals.is_empty()),
-            "'{tool}' must not carry an unconstrained Allow rule: {rule:?}"
+            policy.rules.iter().all(|rule| {
+                rule.action != agentos_core::approve::PolicyAction::Tool(Arc::clone(&spec.name))
+                    || rule.decision != PolicyVerb::Allow
+                    || !rule.arg_equals.is_empty()
+            }),
+            "'{}' must not carry an unconstrained Allow rule",
+            spec.name
         );
     }
+}
+
+#[test]
+fn cron_mutations_ask_while_cron_and_job_inspection_remain_noninteractive() {
+    let config = shipped_config();
+    assert!(!config
+        .policy
+        .allowlist
+        .iter()
+        .any(|name| matches!(name.as_ref(), "cron_create" | "cron_remove")));
+    let policy = shipped_policy();
+
+    let create = policy.decide(&Plan::CallTool(call(
+        "cron_create",
+        json!({
+            "id": "daily-report",
+            "channel_id": "telegram",
+            "conversation_id": "42",
+            "prompt": "prepare the daily report",
+            "expression": "0 9 * * *"
+        }),
+    )));
+    assert!(
+        matches!(create, PolicyDecision::AskUser { .. }),
+        "{create:?}"
+    );
+
+    let remove = policy.decide(&Plan::CallTool(call(
+        "cron_remove",
+        json!({ "id": "daily-report" }),
+    )));
+    assert!(
+        matches!(remove, PolicyDecision::AskUser { .. }),
+        "{remove:?}"
+    );
+
+    assert_eq!(
+        policy.decide(&Plan::CallTool(call("cron_list", json!({})))),
+        PolicyDecision::Allow
+    );
+    assert_eq!(
+        policy.decide(&Plan::CallTool(call("job_status", json!({})))),
+        PolicyDecision::Allow
+    );
+    assert_eq!(
+        policy.decide(&Plan::CallTool(call(
+            "job_output",
+            json!({ "job_id": "job-1", "offset": 0 })
+        ))),
+        PolicyDecision::Allow
+    );
 }

@@ -1,6 +1,8 @@
 use super::common::{elapsed_ms, result_metadata, workspace_root};
 use crate::paths::{DirEntry, RootDir};
-use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
+use agentos_interfaces::tool::{
+    SandboxMode, Tool, ToolError, ToolPersistenceScope, ToolSafety, ToolSideEffect, ToolSpec,
+};
 use agentos_proto::{ToolCall, ToolResult, ToolStatus};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -122,6 +124,10 @@ impl Tool for FileTool {
                     }
                 }
             }),
+            safety: ToolSafety::new(
+                ToolSideEffect::PersistentMutation,
+                ToolPersistenceScope::Workspace,
+            ),
             sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }

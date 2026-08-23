@@ -17,6 +17,9 @@ use agentos_core::memory::{
 use agentos_core::runtime::phase5_policy;
 use agentos_interfaces::memory::Query;
 use agentos_interfaces::orchestrator::Plan;
+use agentos_interfaces::tool::{
+    SandboxMode, ToolPersistenceScope, ToolSafety, ToolSideEffect, ToolSpec,
+};
 use agentos_proto::{AgentId, ChannelId, ConversationId, TaskId, ToolCall, ToolCallId};
 use serde_json::{json, value::RawValue};
 use std::sync::Arc;
@@ -28,6 +31,49 @@ fn memory_call(operation: &str) -> Plan {
         args: RawValue::from_string(json!({ "operation": operation }).to_string())
             .expect("valid JSON"),
     })
+}
+
+fn memory_policy(config: &WorkspaceConfig) -> Policy {
+    let specs = config
+        .resources
+        .tools
+        .enabled
+        .iter()
+        .map(|name| ToolSpec {
+            name: Arc::clone(name),
+            description: Arc::from("memory policy test tool"),
+            input_schema: json!({ "type": "object" }),
+            safety: match name.as_ref() {
+                "shell" | "file" => ToolSafety::new(
+                    ToolSideEffect::PersistentMutation,
+                    ToolPersistenceScope::Workspace,
+                ),
+                "cron_create" | "cron_remove" | "memory" => ToolSafety::new(
+                    ToolSideEffect::PersistentMutation,
+                    ToolPersistenceScope::CrossConversation,
+                ),
+                "cron_list" => ToolSafety::new(
+                    ToolSideEffect::ReadOnly,
+                    ToolPersistenceScope::CrossConversation,
+                ),
+                "job_status" | "job_output" | "spill_read" => {
+                    ToolSafety::new(ToolSideEffect::ReadOnly, ToolPersistenceScope::Conversation)
+                }
+                "job_kill" => ToolSafety::new(
+                    ToolSideEffect::TransientMutation,
+                    ToolPersistenceScope::Conversation,
+                ),
+                "skill_validate" => {
+                    ToolSafety::new(ToolSideEffect::ReadOnly, ToolPersistenceScope::Workspace)
+                }
+                "http" => ToolSafety::new(ToolSideEffect::ReadOnly, ToolPersistenceScope::None),
+                _ => ToolSafety::default(),
+            },
+            sandbox: SandboxMode::FullAccess,
+            timeout_ms: None,
+        })
+        .collect::<Vec<_>>();
+    phase5_policy(config, &specs).expect("memory policy builds")
 }
 
 /// Load a config from TOML text, the way a deployment's `agent.toml` is loaded.
@@ -52,7 +98,7 @@ fn the_memory_policy_section_decides_each_operation() {
         "{BASE}\n[memory.policy]\nreads = \"deny\"\nwrites = \"allow\"\nforgets = \"ask_user\"\n"
     ))
     .expect("the config loads");
-    let policy = phase5_policy(&config, &[]);
+    let policy = memory_policy(&config);
 
     // All three come from `[memory.policy]`. Before M7 these were hardcoded
     // allow-read / ask-write / ask-forget, and the keys were read nowhere.
@@ -338,7 +384,7 @@ fn the_shipped_config_still_loads() {
         .allowlist
         .iter()
         .any(|t| t.as_ref() == "memory"));
-    let policy: Policy = phase5_policy(&config, &[]);
+    let policy: Policy = memory_policy(&config);
     assert!(
         policy.rules.iter().any(|rule| {
             rule.decision == PolicyVerb::AskUser && rule.arg_equals.values().any(|v| v == "write")

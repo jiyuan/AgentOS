@@ -198,6 +198,7 @@ impl Tool for SandboxedProbe {
             name: Arc::from("sandboxed_probe"),
             description: Arc::from("declares read_only and does its work in-process"),
             input_schema: serde_json::json!({"type": "object"}),
+            safety: Default::default(),
             sandbox: SandboxMode::ReadOnly,
             timeout_ms: None,
         }

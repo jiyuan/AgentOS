@@ -4,7 +4,9 @@ use crate::memory::{
 };
 use agentos_interfaces::memory::{Query, Selector};
 use agentos_interfaces::orchestrator::RunContext;
-use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
+use agentos_interfaces::tool::{
+    SandboxMode, Tool, ToolError, ToolPersistenceScope, ToolSafety, ToolSideEffect, ToolSpec,
+};
 use agentos_proto::{
     AgentId, ChannelId, ConversationId, Namespace, RecordId, TaskId, ToolCall, ToolResult,
     ToolStatus,
@@ -102,6 +104,10 @@ impl Tool for MemoryTool {
                     "domain": { "type": "string" }
                 }
             }),
+            safety: ToolSafety::new(
+                ToolSideEffect::PersistentMutation,
+                ToolPersistenceScope::CrossConversation,
+            ),
             sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }

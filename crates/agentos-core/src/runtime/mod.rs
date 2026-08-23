@@ -342,7 +342,8 @@ impl AgentRuntime {
         .map_err(|err| format!("failed to load workspace skills: {err}"))?;
         // Before the sub-agents, because each sub-agent's policy is now derived
         // from this one rather than synthesised independently.
-        let policy = phase5_policy(&workspace_config, &mcp_specs);
+        let tool_specs = tools.specs();
+        let policy = phase5_policy(&workspace_config, &tool_specs)?;
         let subagents = build_subagents(
             &workspace_config,
             model_controller.clone(),
@@ -351,7 +352,7 @@ impl AgentRuntime {
             &policy,
         )?;
         let resource_index =
-            workspace_config.resource_index(&tools.specs(), &mcp_specs, &skill_catalog.metadata());
+            workspace_config.resource_index(&tool_specs, &mcp_specs, &skill_catalog.metadata());
         let routing_table = workspace_config.routing_table()?;
         let high_llm = Arc::new(EnvLlm::new(LlmModelTier::High, model_controller.clone())?);
         let summarizer = summarizer_for(
@@ -359,7 +360,7 @@ impl AgentRuntime {
             &high_llm,
             &model_controller,
         )?;
-        let max_orchestrator = MaxOrchestrator::with_tools(tools.specs())
+        let max_orchestrator = MaxOrchestrator::with_tools(tool_specs)
             .with_resource_index(resource_index)
             .with_routing_table(routing_table)
             .with_llm_routing(workspace_config.routing.llm_classifier)

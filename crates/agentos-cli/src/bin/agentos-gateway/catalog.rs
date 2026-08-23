@@ -10,9 +10,15 @@
 
 use agentos_core::config::catalog;
 use agentos_core::config::WorkspaceConfig;
+use agentos_core::jobs::JobRegistry;
+use agentos_core::memory::{InMemoryMemory, MemoryManager};
 use agentos_core::runtime::{register_builtin_tool, BUILTIN_TOOL_NAMES};
-use agentos_core::tools::ToolRegistry;
+use agentos_core::spill::SpillStore;
+use agentos_core::tools::{
+    JobKillTool, JobOutputTool, JobStatusTool, MemoryTool, SpillReadTool, ToolRegistry,
+};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Where the catalogs live, relative to the repository root.
 const CONFIG_CATALOG: &str = "docs/CONFIG_CATALOG.md";
@@ -57,7 +63,8 @@ pub(super) fn run(root: &Path, check: bool) -> Result<(), String> {
             catalog::TOOL_BEGIN_MARKER,
             catalog::TOOL_END_MARKER,
             "Tool catalog",
-            "Every built-in tool, derived from its `ToolSpec`. \
+            "Every built-in tool, derived from its `ToolSpec`. `Side effect` \
+             and `Persistence scope` drive blanket-authorization checks; \
              `Sandbox` is what the kernel enforces for the tool's child \
              processes; `Deadline` is the tool's own declaration, which a \
              deployment's `[limits]` can override.",
@@ -108,13 +115,23 @@ fn write_catalog(path: &Path, body: &str) -> Result<(), String> {
 ///
 /// Built from the default config rather than the deployment's, because the
 /// catalog documents what this *build* offers: a machine that has disabled a
-/// tool should not publish a catalog implying nobody else has it.
+/// tool should not publish a catalog implying nobody else has it. Runtime-owned
+/// tools receive inert in-memory handles because `spec()` does not use them.
 fn builtin_specs() -> Result<Vec<agentos_interfaces::tool::ToolSpec>, String> {
     let limits = WorkspaceConfig::default().limits;
     let mut registry = ToolRegistry::new();
     for name in BUILTIN_TOOL_NAMES {
         register_builtin_tool(&mut registry, name, &limits, &[])?;
     }
+    let memory = Arc::new(MemoryManager::new(Arc::new(InMemoryMemory::default())));
+    let jobs = Arc::new(JobRegistry::default());
+    registry.register(MemoryTool::with_manager(memory));
+    registry.register(JobStatusTool::new(jobs.clone()));
+    registry.register(JobOutputTool::new(jobs.clone()));
+    registry.register(JobKillTool::new(jobs));
+    registry.register(SpillReadTool::new(Arc::new(SpillStore::new(
+        PathBuf::from("catalog-spec-only"),
+    ))));
     Ok(registry.specs())
 }
 

@@ -102,6 +102,7 @@ impl Tool for NoopEchoTool {
             name: Arc::from(BENCH_TOOL_NAME),
             description: Arc::from("bench echo tool"),
             input_schema: serde_json::json!({"type": "object"}),
+            safety: Default::default(),
             sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }

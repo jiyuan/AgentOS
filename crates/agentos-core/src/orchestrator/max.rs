@@ -741,6 +741,7 @@ mod tests {
             name: Arc::from("file"),
             description: Arc::from("read and write files"),
             input_schema: json!({"type": "object"}),
+            safety: Default::default(),
             sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }])
@@ -803,6 +804,7 @@ mod tests {
             name: Arc::from("file"),
             description: Arc::from("read and write files"),
             input_schema: json!({"type": "object"}),
+            safety: Default::default(),
             sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }])
@@ -862,6 +864,7 @@ mod tests {
             name: Arc::from("file"),
             description: Arc::from("read and write files"),
             input_schema: json!({"type": "object"}),
+            safety: Default::default(),
             sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }])
@@ -917,6 +920,7 @@ mod tests {
             name: Arc::from("file"),
             description: Arc::from("read and write files"),
             input_schema: json!({"type": "object"}),
+            safety: Default::default(),
             sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }])
@@ -978,6 +982,7 @@ mod tests {
             name: Arc::from("file"),
             description: Arc::from("read and write files"),
             input_schema: json!({"type": "object"}),
+            safety: Default::default(),
             sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }])

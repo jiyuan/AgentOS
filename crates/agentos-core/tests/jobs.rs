@@ -95,6 +95,7 @@ impl Tool for SlowTool {
             name: Arc::from(SLOW_TOOL),
             description: Arc::from("Takes far longer than its deadline."),
             input_schema: json!({"type": "object"}),
+            safety: Default::default(),
             sandbox: SandboxMode::FullAccess,
             timeout_ms: None,
         }

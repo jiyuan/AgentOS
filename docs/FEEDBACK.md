@@ -577,3 +577,33 @@
 - **Actual Behavior**: An unescaped backtick inside a double-quoted shell command caused zsh to reject the command before inspection began.
 - **Root Cause**: A Markdown-heading search pattern containing a backtick was embedded in a double-quoted command string.
 - **Suggested Fix**: Use single-quoted ripgrep patterns when searching Markdown syntax; the corrected invocation did so and completed successfully.
+
+## [2026-08-23 21:47] TOOL [RESOLVED]
+
+- **Agent**: /root
+- **Task**: Add `ToolSpec` safety metadata across the Rust workspace for CFG-002.
+- **Guideline Violated**: GUIDELINES > Efficiency
+- **Expected Behavior**: A mechanical source rewrite should run deterministically in the repository's shell environment.
+- **Actual Behavior**: The first Perl rewrite failed before changing files because the inherited `C.UTF-8` locale was unavailable to the host Perl installation.
+- **Root Cause**: The command relied on an environment-specific locale instead of selecting a portable locale explicitly.
+- **Suggested Fix**: Run locale-sensitive mechanical rewrites with `LC_ALL=C LANG=C`; the corrected invocation completed, and workspace compilation verified every edited struct literal.
+
+## [2026-08-23 21:47] TOOL [RESOLVED]
+
+- **Agent**: /root
+- **Task**: Run the complete `agentos-core` test suite after CFG-002.
+- **Guideline Violated**: GUIDELINES > Correctness
+- **Expected Behavior**: Full-suite failures should distinguish product regressions from restrictions imposed by the managed execution host.
+- **Actual Behavior**: In the managed sandbox, seven egress tests could not bind loopback sockets; after escalation those passed, while two pre-existing macOS Seatbelt assertions failed because the managed host does not provide native sandbox semantics.
+- **Root Cause**: The two test groups require mutually different host capabilities that this managed execution environment cannot expose in one run.
+- **Suggested Fix**: Keep CFG-002's targeted and structural tests as the local gate, run loopback tests with network permission, and rely on native macOS CI for the Seatbelt enforcement matrix; the failures were kept separate from the passing CFG-002 results.
+
+## [2026-08-23 21:57] TOOL [RESOLVED]
+
+- **Agent**: /root
+- **Task**: Validate the TEST-002 GitHub Actions workflow edit locally.
+- **Guideline Violated**: GUIDELINES > Efficiency
+- **Expected Behavior**: The local YAML parser invocation should match the API supported by the host Ruby/Psych version.
+- **Actual Behavior**: The first parse attempt passed the newer `aliases:` keyword to the host's Ruby 2.6 Psych API and failed before reading the workflow.
+- **Root Cause**: The validation command assumed a newer Psych method signature than the macOS system Ruby provides.
+- **Suggested Fix**: Use `YAML.load_file(path)` for workflows without aliases on this host; the corrected command parsed `.github/workflows/ci.yml` successfully.

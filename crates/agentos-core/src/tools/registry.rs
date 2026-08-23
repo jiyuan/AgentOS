@@ -651,6 +651,7 @@ mod tests {
                 name: Arc::from("hang"),
                 description: Arc::from("Never returns."),
                 input_schema: json!({"type": "object"}),
+                safety: Default::default(),
                 sandbox: SandboxMode::FullAccess,
                 timeout_ms: self.declared_timeout_ms,
             }
@@ -761,6 +762,7 @@ mod tests {
                 name: Arc::from("declares"),
                 description: Arc::from("declares a mode"),
                 input_schema: json!({"type": "object"}),
+                safety: Default::default(),
                 sandbox: self.mode,
                 timeout_ms: None,
             }

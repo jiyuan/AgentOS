@@ -358,6 +358,11 @@ pub fn parse_tool_page(result: &Value, sandbox: SandboxMode) -> Result<ToolPage,
                 .get("inputSchema")
                 .cloned()
                 .unwrap_or_else(|| json!({ "type": "object", "properties": {} })),
+            // MCP tool annotations are optional hints and do not declare the
+            // persistence scope this policy needs. Fail closed until the
+            // deployment supplies trusted metadata rather than treating an
+            // omission by an older server as read-only authority.
+            safety: Default::default(),
             sandbox,
             timeout_ms: None,
         });
