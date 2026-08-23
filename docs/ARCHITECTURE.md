@@ -260,10 +260,11 @@ Effective config sections:
 | `[[routing.rules]]`, `[orchestrator_templates]` | routing table and sub-orchestrator templates. |
 | `[[subagents]]` | sub-agent declarations (also loaded from `subagents/*.toml`). |
 | `[limits]` | tool deadlines and per-tool overrides, inline tool-result cap, file/listing/output byte bounds. |
-| `[spill]` | oversized tool-output artifact root and retention. |
+| `[spill]` | oversized tool-output artifact root, age ceiling, and byte quota. |
 | `[compaction]` | whether, when, and with which model tier a run summarizes its own history. |
-| `[jobs]` | background job concurrency, output cap, and the promotable-tool allowlist. |
-| `[gateway]` | shard-thread count and per-conversation inbox capacity. |
+| `[jobs]` | background job concurrency, output cap, how long a finished job is kept, and the promotable-tool allowlist. |
+| `[gateway]` | shard-thread count, per-conversation inbox capacity, and the `SIGTERM` drain budget. |
+| `[retention]` | age ceilings and byte quotas for traces, attachments, the gateway log, and the ingress ledger. |
 | `[approval]` | approval prompt expiry. |
 | `[guardrails]` | shell allowlist and content-check settings. |
 | `[isolation]` | sandbox worker binary discovery. |
@@ -537,9 +538,39 @@ Roadmap D1–D3 and G1–G2. All of this sits around the loop, not inside it.
   handler — the router stops accepting, in-flight turns drain within
   `[gateway] shutdown_grace_secs`, and past that the gateway reports the shards
   that would not drain and every accepted-but-unsettled event rather than
-  hanging. Separately, reflection and retention run under a `memory.reflection`
-  lease so the one database gets one sweep, across every channel's shard set
-  and every process on the file.
+  hanging. Separately, memory reflection runs under a `memory.reflection` lease
+  and the store retention sweep under a `gateway.retention` lease, so the one
+  database and the one set of directories get one sweep each, across every
+  channel's shard set and every process on the file. Two leases rather than
+  one: reflection is off by default and needs an LLM, retention is on and
+  needs nothing, and gating the second on the first would silently disable it
+  almost everywhere.
+
+### 9.1 Retention
+
+Eight things this runtime writes grow with use, and they split on one question
+— is this store the *record*, or a by-product of work recorded elsewhere?
+
+Six are by-products, and `crates/agentos-core/src/retention/` sweeps them from
+the gateway's idle phase: run traces, inbound attachments, the gateway log,
+spill artifacts, settled ingress rows, and finished background jobs. Where the
+store is a directory this runtime owns outright, it takes an age ceiling *and*
+a byte quota, applied in that order — age is what the operator reasoned about,
+and applying the quota first would evict something they had said to keep. Age
+alone is not enough either: one busy afternoon of a tool that reads large files
+outweighs a quiet month, and it is the afternoon that fills the disk. The unit
+is whole: a whole trace file, a whole message's attachments, a whole spill run.
+Half of any of them is worse than none of it.
+
+Two are the record, and nothing deletes from them on a timer. The session log
+is append-only without qualification ([ADR-0006](adr/0006-CLEAR_EPOCH.md)), and
+[ADR-0005](adr/0005-SAFETY_EVENTS.md) asks the audit stores for "an explicit,
+authorized operation rather than a background cleanup". Both are served by
+`agentos-gateway purge`: `--sessions --before DATE` for whole idle
+conversations, `--audit --before DATE` for `safety_events` and
+`memory_access_log`. Each reports first and applies only when the operator
+types the printed count back, and each writes a safety event — the audit purge
+writing its own record into the store it just shortened.
 
 ## 10. Safety Architecture
 
@@ -1091,9 +1122,6 @@ Remaining architecture work:
 - An MCP transport other than stdio (HTTP with SSE), and the client-side
   capabilities — `roots`, `sampling`, `elicitation` — this build declines in
   `initialize` and therefore refuses when a server asks.
-- Retention and quotas across sessions, traces, attachments, gateway logs, and
-  jobs, plus an authorized purge for the two append-only audit stores
-  (`QUOTA-001`).
 - Decide when channel and memory reference implementations should move into
   separate extension crates.
 - Make real embeddings the persistent default by injecting an embedder into the

@@ -48,7 +48,17 @@ diagram wrong and the events unreadable.
 ## Consequences
 
 - The store grows monotonically and needs a retention story that is an
-  explicit, authorized operation rather than a background cleanup.
+  explicit, authorized operation rather than a background cleanup. **Settled
+  by M7 / `QUOTA-001`:** `agentos-gateway purge --audit --before YYYY-MM-DD`,
+  covering `safety_events` and `memory_access_log` together. It reports the
+  counts and changes nothing until `--apply --yes N` names the number it
+  printed, and the date is absolute rather than "N days ago" so the count an
+  operator was shown is the count the apply computes. The delete writes an
+  `audit_purged` event afterwards, into the store it just shortened — the
+  first row of the remaining history says how the preceding history ended,
+  which is this ADR's own rule applied to itself. Nothing else in the tree
+  deletes from either table, and the background retention sweep
+  (`crates/agentos-core/src/retention/`) deliberately does not touch them.
 - Redaction has to be decided per event type at the point of emission. A
   generic "log the arguments" helper is exactly what this ADR prohibits.
 - Some existing code paths that signal by deleting need a second field

@@ -741,7 +741,8 @@ Primary files: `crates/agentos-core/src/loop/`, `crates/agentos-core/src/runner.
 
 Priority: P1
 Size: M — mechanical, but `deny_unknown_fields` will break existing `agent.toml`s
-Status: **deliverables 1–9 done** (`CFG-001`, `MEM-001`, `SPILL-001` all closed); 10 open as `QUOTA-001`
+Status: **done** — all ten deliverables. `CFG-001`, `MEM-001`, `SPILL-001` and
+`QUOTA-001` all closed.
 Dependencies: M0; memory authorization depends on M3
 
 Current state, verified field by field:
@@ -837,22 +838,80 @@ Deliverables:
    authorized by the calling run's own transcript citing the locator. The
    `file` tool is no longer the retrieval path, which also fixes a spill root
    outside the workspace being unreadable.
-10. **Open, and it is a slice of its own** — `QUOTA-001` below. Two of the
-    seven have retention: spill (`[spill].retention_days`, swept from the
-    gateway's idle tick) and memory (M7 / `MEM-001`). The other five —
-    sessions, traces, attachments, gateway logs, jobs — grow without bound,
-    and the two append-only audit stores (`memory_access_log`,
-    `safety_events`) grow monotonically *by design*, so
-    [ADR-0005](adr/0005-SAFETY_EVENTS.md) asks for an explicitly authorized
-    purge rather than a background sweep. That is a different mechanism from
-    the other five, which is the main reason this is not one afternoon's work
-    bolted onto the end of `CFG-001`.
+10. **Done** — `QUOTA-001`, a slice of its own. Every growing store now has a
+    bound, and the two that must not have a *background* one have the other
+    mechanism instead.
+
+    The survey that opened the slice corrected two things it had assumed. Only
+    **one** of the seven had retention, not two: `[spill].retention_days` was
+    parsed, validated, catalogued, and reached `AgentRuntime::sweep_spill` —
+    which nothing ever called. It was the same class of defect as the inert
+    keys `CFG-001` closed, one layer further out, and it is why the sweep is
+    now driven from a private function in the gateway binary whose only
+    caller is the maintenance tick: unwiring it fails the build under
+    `-D warnings`, which a `pub` method on a library type never would.
+    And an eighth store had appeared since the audit — the ingress ledger
+    `GW-001` added in M8 — so it is bounded here too.
+
+    Six stores are swept from the gateway's idle phase, under a
+    `gateway.retention` lease of their own (separate from
+    `memory.reflection`, because reflection is off by default and needs an
+    LLM while retention is on and needs nothing, and gating one on the other
+    would silently disable retention almost everywhere): traces, attachments,
+    the gateway log, spill, settled ingress rows, and finished jobs. Each
+    file store takes an age ceiling **and** a byte quota, because age alone
+    bounds nothing — one busy afternoon outweighs a quiet month, and it is
+    the afternoon that fills the disk.
+
+    Two stores are never swept. The session log and the two audit stores are
+    the *record*, not a by-product, and both ADRs say so in as many words —
+    [ADR-0005](adr/0005-SAFETY_EVENTS.md) asks for "an explicit, authorized
+    operation rather than a background cleanup", and
+    [ADR-0006](adr/0006-CLEAR_EPOCH.md) makes the session log append-only
+    without qualification. `agentos-gateway purge` gained `--sessions
+    --before DATE` and `--audit --before DATE`: both report first, apply only
+    when the operator types the printed count back, and record a safety
+    event. The session mode removes whole idle conversations through the one
+    existing `purge_session` path rather than trimming items off live ones,
+    so there is still exactly one statement in the tree that deletes a
+    session item.
+
+    Three things found on the way, all fixed here:
+
+    - `agentos-gateway purge` could not be run at all. `parse_config` rejects
+      any flag it does not know, and `--conversation` and `--yes` were never
+      added to it, so the command has failed with `unknown option:
+      --conversation` for as long as it has existed. Every flag a subcommand
+      reads is now named there.
+    - The gateway log was created world-readable, unlike every other file
+      `GW-001` made private. It names conversations, senders, and error text,
+      and rotation creates more of these files rather than fewer.
+    - `[jobs].max_concurrent` counts only *running* jobs, so it never bounded
+      the registry: a finished job kept its snapshot and up to
+      `output_limit_bytes` of retained output until its conversation was
+      cleared, which a gateway never is.
+
+    New keys: `[retention]` (seven), `[spill].max_bytes`,
+    `[jobs].completed_retention_secs`. The two destructive defaults — traces
+    and attachments — are off, for the same reason `[spill].retention_days`
+    is: they are what a deployment reads to find out what the agent actually
+    did, and a runtime upgrade is not the moment to discover a month of them
+    has gone. The three harmless ones are on.
+
+    Verified by `tests/retention_quotas.rs`, whose load-bearing case runs the
+    sweep with every ceiling turned up as far as validation allows against a
+    populated session log and audit store and asserts nothing was touched —
+    shown to fail by giving the sweep a `DELETE FROM session_items`.
 
 Acceptance criteria:
 
 - A typo such as `max_reocrds` is a load-time error. **Met.**
-- Retention and quotas cover every growing store. **Not met** — see
-  deliverable 10 and `QUOTA-001`.
+- Retention and quotas cover every growing store. **Met** — see deliverable
+  10. Eight stores: six swept on a timer with an age ceiling and, where the
+  store is a directory this runtime owns, a byte quota as well; two — the
+  session log and the audit stores — bounded by an authorized `purge` instead,
+  because a timer that deleted from either is the thing ADR-0005 and ADR-0006
+  exist to forbid.
 - Every stable config key has a behavioral assertion, not only a parse test.
   **Partly met.** Every key now has a *description*, and the keys the audit
   named as inert have behavioural tests (`tests/config_authority.rs`,
@@ -881,7 +940,9 @@ Acceptance criteria:
 Primary files: `crates/agentos-core/src/config/`, `crates/agentos-core/src/runtime/`,
 `crates/agentos-core/src/memory/`, `crates/agentos-core/src/spill/mod.rs`,
 `crates/agentos-core/src/loop/items.rs`, `crates/agentos-core/src/prompt/prune.rs`,
-`crates/agentos-core/src/tools/builtin/file.rs`, generated catalogs.
+`crates/agentos-core/src/tools/builtin/file.rs`, `crates/agentos-core/src/retention/`,
+`crates/agentos-core/src/audit/purge.rs`,
+`crates/agentos-cli/src/bin/agentos-gateway/purge.rs`, generated catalogs.
 
 ### M8 — Harden gateway persistence and rebuild stdio MCP
 
@@ -891,8 +952,8 @@ Status: **done** — all nine deliverables. `GW-001` closed deliverables 1–5 a
 `MCP-001` closed 6–9. Two things that were in the "current state" below are
 deliberately *not* closed here and are recorded elsewhere rather than left
 implied: storage convergence across sessions, traces, attachments, gateway
-logs, and jobs is `QUOTA-001` (M7 deliverable 10), and an MCP transport other
-than stdio is a deferral in §13.
+logs, and jobs is `QUOTA-001` (M7 deliverable 10, since closed), and an MCP
+transport other than stdio is a deferral in §13.
 Dependencies: M3, M4
 
 This milestone absorbs the old "isolate the actual MCP server process" item: that
@@ -1046,7 +1107,7 @@ a slice moves off `not started` only when the named artifact exists in the tree.
 | `STATE-001` | M6 | Clear epochs, denial semantics, terminal output gate, `act()` policy re-assertion | AUD-001 | **done** — `session_epochs` + `agentos-gateway purge`, `RunError::StructuralDenial`, `loop/output.rs` gating every synthesized terminal reply, private `Authorization` on `ActCtx` + `tests/loop_transitions.rs`, `[channels] provisional_streaming = false` |
 | `CFG-001` | M7 | Unknown-key rejection and effective-config inventory | ADR-001 | **done** — `deny_unknown_fields` on all 32 structs, `agent.id` wired, two keys deprecated, `config/maturity.txt` inventory, catalog-derived `agentos-gateway config`, zero undocumented keys |
 | `MEM-001` | M7 | Effective memory policy, domains, shared writes, retention | ID-001, CFG-001, CFG-000 | **done** — `[memory.policy]` is the authority (allowlist conflict rejected at load), three-gate shared writes, `default_domain` reaches writes and hydration, count/age/byte retention |
-| `QUOTA-001` | M7 | Retention and quotas for sessions, traces, attachments, gateway logs, and jobs; an authorized purge for the two append-only audit stores | MEM-001, AUD-001 | not started |
+| `QUOTA-001` | M7 | Retention and quotas for traces, attachments, gateway logs, jobs, spill and the ingress ledger; an authorized purge for the session log and the two append-only audit stores | MEM-001, AUD-001 | done |
 | `SPILL-001` | M7 | Opaque spill locator and scoped retrieval | FS-001 | **done** — `spill:<run>/<artifact>`, `spill_read` tool authorized by the transcript, contained by `RootDir` |
 | `GW-001` | M8 | Durable ingress, WAL, maintenance leadership, atomic state files, shutdown | ID-002 | **done** — WAL + busy timeout behind a bounded pool, `memory.reflection` lease, `ingress_events`/`ingress_cursors` ledger, `paths::write_private_atomic` for every replaced state file, `flock`ed control file and a `SIGTERM` drain bounded by `[gateway] shutdown_grace_secs` |
 | `MCP-001` | M8 | Standard lifecycle, request-id correlation, bounds, interoperability, server isolation | SBX-001 | **done** — JSON-RPC 2.0 pinned to MCP `2025-06-18`, `initialize` + capability negotiation, `nextCursor` pagination, content blocks, id correlation, `notifications/cancelled`, named bounds on frames/pending/stderr/pages/tools/restarts, the server child sandboxed by `[[mcp_servers]] sandbox`, and an interop suite against a fixture that imports nothing from this repository |
@@ -1114,7 +1175,7 @@ them.
 | Safety events not durably reconstructible | P1 | M6 | Run loop/observability | Closed by `AUD-001` |
 | Append-only, transition, denial, cancellation, streaming contract gaps | P1 | M6 | Run loop/session | Closed by `STATE-001` |
 | Inert/conflicting config and memory policy | P1 | M7 | Config/memory | Closed by `CFG-001` and `MEM-001` |
-| Retention and default domain not wired | P1 | M7 | Memory | Closed by `MEM-001` for memory; sessions, traces, attachments, gateway logs, and jobs are still unbounded (`QUOTA-001`) |
+| Retention and default domain not wired | P1 | M7 | Memory | Closed by `MEM-001` for memory and by `QUOTA-001` for the rest |
 | Spill locator is an absolute host path | P1 | M7 | Prompt/tools | Closed by `SPILL-001` |
 | SQLite contention, no WAL, no ingress idempotency, non-atomic state files | P1 | M8 | Gateway/persistence | Closed by `GW-001` |
 | stdio MCP is not MCP; unbounded queues and frames; no tests | P1/P2 | M8 | Tool integrations | Closed by `MCP-001`. The transport stays Preview: only stdio exists, and this client declares no `roots`/`sampling`/`elicitation` capability |

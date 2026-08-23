@@ -43,7 +43,17 @@ group conversation cannot clear another's state.
 ## Consequences
 
 - Storage grows where it previously shrank. Bounded by the purge operation and
-  by retention policy, not by `/clear`.
+  by retention policy, not by `/clear`. **Settled by M7 / `QUOTA-001`:** there
+  is deliberately no background sweep over `session_items`. A timer that
+  trimmed old items off a live conversation would leave a history beginning
+  mid-sentence, with compaction summaries citing items that are gone — a
+  mutation of the log wearing retention's name. What bounds it instead is
+  `agentos-gateway purge --sessions --before YYYY-MM-DD`, which surveys whole
+  conversations that have been idle since that date, reports them, and applies
+  only when the operator types the count back. It removes each one through
+  `SqliteStore::purge_session`, so this ADR's "one deletion path, one safety
+  event" still holds exactly — a bulk `DELETE` would have been the second
+  path.
 - Every reader of `session_items` must respect the epoch. A query that forgets
   to is a correctness bug that shows up as resurrected history, so the epoch
   filter belongs in the projection layer, not at call sites.

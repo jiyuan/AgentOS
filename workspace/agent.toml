@@ -187,6 +187,11 @@ root = "spill"
 # window would race the run that wrote it, which is the destroyed-output
 # behaviour spill exists to replace.
 retention_days = 0
+# Bytes all artifacts may occupy together, or 0 for no ceiling. Applied after
+# retention_days, oldest run first. An age ceiling alone bounds nothing: one
+# afternoon of a tool reading large files outweighs a quiet month, and it is
+# the afternoon that fills the disk. Minimum 1 MiB when set.
+max_bytes = 0
 
 # Background work. A tool that outlives its deadline becomes a job instead of
 # being killed, and the model follows it with job_status / job_output / job_kill.
@@ -197,6 +202,11 @@ retention_days = 0
 max_concurrent = 4
 # Bytes of output a job retains before discarding the rest. Minimum 1024.
 output_limit_bytes = 262144
+# Seconds a finished job stays answerable by job_status / job_output before the
+# registry forgets it, or 0 to keep it until the conversation is cleared. This
+# is memory: max_concurrent counts only *running* jobs, so without this a
+# gateway holds every job it has ever run. Minimum 60 when set.
+completed_retention_secs = 3600
 # Tools that become a job rather than failing when they exceed their deadline.
 # An allowlist because a promoted call is re-issued without the run context: no
 # built-in tool but `memory` uses that context, but a third-party tool might,
@@ -220,6 +230,41 @@ shards = 0
 # is already in flight does not queue here at all — it is handed to the running
 # turn and claimed at its next planning step. Minimum 1.
 inbox_capacity = 32
+# Seconds SIGTERM waits for in-flight turns before exiting anyway. The router
+# stops accepting immediately; this bounds the drain. 0 means do not wait.
+# Maximum 600.
+shutdown_grace_secs = 30
+
+# Retention for the stores nothing else bounds. Swept from the gateway's idle
+# phase under its own lease, so two channels' shard sets do not walk the same
+# directory at once.
+#
+# Deliberately absent from this section: the session log and the two audit
+# stores (safety_events, memory_access_log). Those are the record rather than a
+# by-product, and nothing deletes from them on a timer — `agentos-gateway purge
+# --sessions --before DATE` and `--audit --before DATE` report first and apply
+# only when an operator types the count back. See ADR-0005 and ADR-0006.
+[retention]
+# Days a run's trace file is kept, and bytes all traces may occupy together.
+# 0 means no ceiling. Off by default: a trace is what you read to find out what
+# the agent actually did, and an upgrade is not the moment to discover a month
+# of them has gone. Minimum 1 day / 1 MiB when set.
+trace_days = 0
+trace_max_bytes = 0
+# The same, for inbound attachments. The unit is one message's directory, not
+# one file: a message that arrived with three images was answered by a turn
+# that saw all three.
+attachment_days = 0
+attachment_max_bytes = 0
+# Days a *settled* ingress ledger row is kept. Unsettled rows are never swept
+# at any age — they are the record of a message accepted and never finished.
+# On by default: no transport this runtime speaks redelivers an event it was
+# acknowledged for a month earlier.
+ingress_days = 30
+# Bytes the gateway log may reach before it rotates, and how many rotations are
+# kept beside the live file. 0 bytes means one growing file.
+gateway_log_max_bytes = 33554432
+gateway_log_keep = 3
 
 # Approvals. A prompt names itself with a short ticket, and only an answer
 # carrying that ticket decides it — /approve <ticket>, /deny <ticket>, or the

@@ -95,7 +95,7 @@ something that no longer exists — the two-way ratchet
 |---|---|---|---|---|---|
 | Three-layer scoped memory (session, working, long-term) | Stable | all | `[memory]` | Namespaces are keyed by `Principal` and encoded injectively ([ADR-0003](adr/0003-TYPED_PRINCIPAL.md)). Memory written before this is under the old keys and needs the `ID-002` migration | unit, integration |
 | SQLite reference backend | Stable | all | `[memory] backend = "sqlite"`, `[memory] max_connections` | WAL with a 5s busy timeout, behind a fixed-size connection pool. Still synchronous calls from async code: a pooled connection is never held across an `.await`, but a slow statement occupies the calling thread | unit, integration |
-| Single maintenance leader | Stable | all | — | Reflection and retention run under a `memory.reflection` lease in the database, so one sweep runs across every channel's shard set and every process on the file. The lease expires rather than locks, so a leader that wedges without dying can be overlapped after 5 minutes | unit, integration |
+| Single maintenance leader | Stable | all | — | Memory reflection runs under a `memory.reflection` lease and the store retention sweep under a `gateway.retention` lease, so each gets one sweep across every channel's shard set and every process on the file. A lease expires rather than locks, so a leader that wedges without dying can be overlapped after 5 minutes | unit, integration |
 | In-memory backend | Stable | all | `[memory] backend = "in_memory"` | Not durable; for tests and ephemeral runs | unit |
 | Passive retrieval into planning context | Stable | all | `[memory]` | — | integration |
 | Reflection | Stable | all | `[memory.reflection]`, `[memory.retention]` | Promotion runs per conversation; retention and the index rebuild run once per sweep, after it | integration |
@@ -155,6 +155,8 @@ parsing, streaming assembly, and retry behavior.
 | `stop` | Stable | Unix | — | Signals the holder of an `flock`ed control file, never a pid read out of a file: a stale record names nobody and is not signalled. Escalates to `SIGKILL` after 45s | unit, integration |
 | Graceful shutdown | Stable | Unix | `[gateway] shutdown_grace_secs` | `SIGTERM` stops the router accepting and drains in-flight turns within the grace period, then reports the shards that would not drain and every accepted-but-unsettled event | unit, integration |
 | Durable ingress ledger | Stable | all | — | `(channel_id, transport event id)` decides fresh / retry / suppress. A channel that publishes no `INGRESS_ID_KEY` is delivered and not recorded — the gateway cannot dedupe what it cannot recognise | unit, integration |
+| Store retention sweep | Stable | all | `[retention]`, `[spill]`, `[jobs] completed_retention_secs` | Traces, attachments, the gateway log, spill, settled ingress rows and finished jobs, from the idle phase every 15 minutes under a `gateway.retention` lease. Runs only while a channel is served: a gateway with no channels enabled rotates nothing. The trace and attachment ceilings are off by default | unit, integration |
+| Authorized purge (`purge --conversation` / `--sessions` / `--audit`) | Stable | all | — | The only deletion path for the session log and the two audit stores; no timer touches either ([ADR-0005](adr/0005-SAFETY_EVENTS.md), [ADR-0006](adr/0006-CLEAR_EPOCH.md)). The bulk modes report first and apply only against the printed count typed back. Gated on shell access to the host, not on `Approve` | unit, integration |
 
 ## Release and packaging
 
