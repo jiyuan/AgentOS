@@ -8,10 +8,10 @@
 
 use crate::memory::{Memory, MemoryError, Query, QueryType, Record, Selector};
 use crate::session::{Item, Session, SessionError, Transcript};
-use agentos_proto::{ConversationId, Namespace, RecordId};
+use agentos_proto::{Namespace, Principal, RecordId};
 use async_trait::async_trait;
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 // ---------------------------------------------------------------------------
 // Memory
@@ -143,9 +143,14 @@ impl Memory for MockMemory {
 // Session
 // ---------------------------------------------------------------------------
 
-/// In-memory [`Session`] mock backed by a `BTreeMap` of conversations.
+/// In-memory [`Session`] mock, keyed by [`Principal::conversation_name`].
+///
+/// Conversation-keyed, not principal-keyed, for the same reason a real store
+/// is: everyone in a conversation shares one transcript. The mock has no
+/// epochs, so it does not model `/clear` — a test about clearing needs the
+/// SQLite store, which is where the epoch lives.
 pub struct MockSession {
-    transcripts: Mutex<BTreeMap<ConversationId, Transcript>>,
+    transcripts: Mutex<BTreeMap<String, Transcript>>,
 }
 
 impl MockSession {
@@ -155,11 +160,13 @@ impl MockSession {
         }
     }
 
-    pub fn with_transcript(self, conv_id: impl Into<Arc<str>>, transcript: Transcript) -> Self {
+    /// Seed the transcript of a conversation, named by the principal that
+    /// speaks in it. The sender is dropped, as everywhere else.
+    pub fn with_transcript(self, principal: &Principal, transcript: Transcript) -> Self {
         self.transcripts
             .lock()
             .expect("MockSession transcripts lock not poisoned")
-            .insert(ConversationId::new(conv_id), transcript);
+            .insert(principal.conversation_name(), transcript);
         self
     }
 }
@@ -172,23 +179,23 @@ impl Default for MockSession {
 
 #[async_trait]
 impl Session for MockSession {
-    async fn load(&self, conv_id: &ConversationId) -> Result<Transcript, SessionError> {
+    async fn load(&self, principal: &Principal) -> Result<Transcript, SessionError> {
         Ok(self
             .transcripts
             .lock()
             .expect("MockSession transcripts lock not poisoned")
-            .get(conv_id)
+            .get(&principal.conversation_name())
             .cloned()
             .unwrap_or_default())
     }
 
-    async fn append(&self, conv_id: &ConversationId, items: Vec<Item>) -> Result<(), SessionError> {
+    async fn append(&self, principal: &Principal, items: Vec<Item>) -> Result<(), SessionError> {
         let mut transcripts = self
             .transcripts
             .lock()
             .expect("MockSession transcripts lock not poisoned");
         transcripts
-            .entry(conv_id.clone())
+            .entry(principal.conversation_name())
             .or_default()
             .items
             .extend(items);
@@ -199,7 +206,7 @@ impl Session for MockSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentos_proto::{Message, MessageRole};
+    use agentos_proto::{AgentId, ChannelId, ConversationId, Message, MessageRole};
 
     #[tokio::test]
     async fn mock_memory_round_trips_and_forgets() {
@@ -238,13 +245,21 @@ mod tests {
             .is_empty());
     }
 
+    fn principal(conversation: &str) -> Principal {
+        Principal::conversation(
+            AgentId::new("main"),
+            ChannelId::new("telegram"),
+            ConversationId::new(conversation),
+        )
+    }
+
     #[tokio::test]
     async fn mock_session_appends_and_loads() {
         let session = MockSession::new();
-        let conv = ConversationId::new("conv-1");
+        let alice = principal("conv-1").with_sender("alice");
         session
             .append(
-                &conv,
+                &alice,
                 vec![Item {
                     message: Message::text(MessageRole::User, "first"),
                     metadata: BTreeMap::new(),
@@ -252,7 +267,24 @@ mod tests {
             )
             .await
             .expect("append ok");
-        let transcript = session.load(&conv).await.expect("load ok");
-        assert_eq!(transcript.items.len(), 1);
+        assert_eq!(session.load(&alice).await.expect("load ok").items.len(), 1);
+
+        // The same conversation seen by a second participant: one transcript.
+        let bob = principal("conv-1").with_sender("bob");
+        assert_eq!(session.load(&bob).await.expect("load ok").items.len(), 1);
+
+        // The same conversation *number* on another channel: not the same
+        // transcript. This is the collision M3 deliverable 2 removed.
+        let elsewhere = Principal::conversation(
+            AgentId::new("main"),
+            ChannelId::new("feishu"),
+            ConversationId::new("conv-1"),
+        );
+        assert!(session
+            .load(&elsewhere)
+            .await
+            .expect("load ok")
+            .items
+            .is_empty());
     }
 }

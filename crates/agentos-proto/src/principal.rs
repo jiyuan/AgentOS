@@ -130,6 +130,25 @@ impl Principal {
         )
     }
 
+    /// The storage name of the conversation-wide principal this one belongs
+    /// to — [`Self::without_sender`] then [`Self::storage_name`], without the
+    /// clone.
+    ///
+    /// The two names exist because session state splits on exactly this line
+    /// (M3 deliverable 2). A conversation has *one* transcript, shared by
+    /// everyone in it, keyed by this. A `/clear` epoch belongs to the
+    /// participant who typed it, keyed by [`Self::storage_name`] — so one
+    /// member of a group chat clearing their view does not clear anybody
+    /// else's ([ADR-0006](../../../../docs/adr/0006-CLEAR_EPOCH.md)).
+    pub fn conversation_name(&self) -> String {
+        format!(
+            "v{PRINCIPAL_VERSION}.{}.{}.{}.n",
+            encode_component(self.agent.as_str()),
+            encode_component(self.channel.as_str()),
+            encode_component(self.conversation.as_str()),
+        )
+    }
+
     /// Recover a principal from [`Self::storage_name`].
     ///
     /// Round-tripping matters beyond convenience: maintenance paths read owner
@@ -252,6 +271,46 @@ pub fn base64url_decode(input: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    /// The two names differ only in the sender field, and the conversation
+    /// name is what every participant shares.
+    #[test]
+    fn a_conversation_name_drops_the_sender_and_matches_the_senderless_principal() {
+        let base = super::Principal::conversation(
+            super::AgentId::new("main"),
+            super::ChannelId::new("telegram"),
+            super::ConversationId::new("42"),
+        );
+        assert_eq!(base.conversation_name(), "v1.main.telegram.42.n");
+        assert_eq!(base.conversation_name(), base.storage_name());
+
+        let alice = base.clone().with_sender("alice");
+        let bob = base.clone().with_sender("bob");
+        assert_eq!(alice.conversation_name(), bob.conversation_name());
+        assert_ne!(alice.storage_name(), bob.storage_name());
+        assert_eq!(
+            alice.conversation_name(),
+            alice.clone().without_sender().storage_name()
+        );
+    }
+
+    /// A conversation id needing escaping must escape the same way in both,
+    /// or a cleared participant would key an epoch against a transcript that
+    /// is not theirs.
+    #[test]
+    fn an_escaped_component_encodes_alike_in_both_names() {
+        let awkward = super::Principal::conversation(
+            super::AgentId::new("main"),
+            super::ChannelId::new("feishu"),
+            super::ConversationId::new("oc.chat/1"),
+        )
+        .with_sender("ou_x");
+        assert_eq!(
+            awkward.conversation_name(),
+            awkward.clone().without_sender().storage_name()
+        );
+        assert!(awkward.conversation_name().ends_with(".n"));
+    }
+
     use super::*;
 
     fn principal(agent: &str, channel: &str, conversation: &str) -> Principal {

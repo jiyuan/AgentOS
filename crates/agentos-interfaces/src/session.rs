@@ -1,4 +1,4 @@
-use agentos_proto::{ConversationId, Message};
+use agentos_proto::{Message, Principal};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -24,20 +24,46 @@ pub struct Transcript {
     pub items: Vec<Item>,
 }
 
+/// The conversation transcript, keyed by [`Principal`].
+///
+/// # Why a principal and not a conversation id
+///
+/// A bare `ConversationId` is a number the *transport* chose. Telegram's chat
+/// `42`, Feishu's chat `42`, and a second agent sharing the same database all
+/// produced the same key, so they shared one transcript — the collision
+/// [ADR-0003](../../../../docs/adr/0003-TYPED_PRINCIPAL.md) removed from memory
+/// and episodes, still present here until M3 deliverable 2 finished the job.
+/// Changing this signature is the semver break that milestone was waiting on.
+///
+/// # The two names, and which one an implementation uses
+///
+/// [`Principal::conversation_name`] identifies the *transcript*: everyone in a
+/// group conversation shares it, so `load`, `append` and `fork` must key on it
+/// and must ignore the sender.
+///
+/// [`Principal::storage_name`] identifies the *participant*, and only the
+/// `/clear` epoch uses it — one member clearing their view must not clear
+/// anybody else's ([ADR-0006](../../../../docs/adr/0006-CLEAR_EPOCH.md)). So
+/// `load` reads one conversation's items and applies the calling participant's
+/// epoch, and two participants can legitimately see different prefixes of the
+/// same log.
 #[async_trait]
 pub trait Session: Send + Sync {
-    /// Load the transcript for a conversation before a run starts.
+    /// Load the transcript this participant can see, before a run starts.
     ///
-    /// Missing conversations should return an empty transcript rather than an
-    /// error.
-    async fn load(&self, conv_id: &ConversationId) -> Result<Transcript, SessionError>;
+    /// The items are the conversation's; the visible prefix is this
+    /// principal's. Missing conversations return an empty transcript rather
+    /// than an error.
+    async fn load(&self, principal: &Principal) -> Result<Transcript, SessionError>;
 
     /// Append items after a run progresses.
     ///
-    /// Implementations must preserve item ordering exactly as supplied.
-    async fn append(&self, conv_id: &ConversationId, items: Vec<Item>) -> Result<(), SessionError>;
+    /// Keyed by the conversation, so the sender on `principal` is irrelevant
+    /// here and two participants appending to one conversation write to one
+    /// log. Implementations must preserve item ordering exactly as supplied.
+    async fn append(&self, principal: &Principal, items: Vec<Item>) -> Result<(), SessionError>;
 
-    /// Seed `child_id` with the first `boundary` items of `source`, returning
+    /// Seed `child` with the first `boundary` items of `source`, returning
     /// how many were copied.
     ///
     /// Branching a conversation: the child starts from the parent's history up
@@ -63,7 +89,7 @@ pub trait Session: Send + Sync {
     ///   in memory, and the store legitimately holds less of it — the current
     ///   turn is not persisted until the run that produced it finishes. The
     ///   return value is what actually landed.
-    /// - `child_id` must be empty. Appending a prefix onto a conversation that
+    /// - `child` must be empty. Appending a prefix onto a conversation that
     ///   already has history interleaves two logs and invalidates every
     ///   checkpoint position in both, so implementations must refuse rather
     ///   than merge.
@@ -78,22 +104,21 @@ pub trait Session: Send + Sync {
     /// can copy a prefix without moving it through memory.
     async fn fork(
         &self,
-        source: &ConversationId,
+        source: &Principal,
         boundary: usize,
-        child_id: &ConversationId,
+        child: &Principal,
     ) -> Result<usize, SessionError> {
-        if source == child_id {
+        let (source_key, child_key) = (source.conversation_name(), child.conversation_name());
+        if source_key == child_key {
             return Err(SessionError::Backend(Arc::from(format!(
-                "cannot fork conversation '{}' onto itself",
-                source.as_str()
+                "cannot fork conversation '{source_key}' onto itself"
             ))));
         }
-        let existing = self.load(child_id).await?;
+        let existing = self.load(child).await?;
         if !existing.items.is_empty() {
             return Err(SessionError::Backend(Arc::from(format!(
-                "fork target '{}' already holds {} items; seeding it would interleave two \
-                 histories",
-                child_id.as_str(),
+                "fork target '{child_key}' already holds {} items; seeding it would interleave \
+                 two histories",
                 existing.items.len()
             ))));
         }
@@ -101,7 +126,7 @@ pub trait Session: Send + Sync {
         let mut transcript = self.load(source).await?;
         transcript.items.truncate(boundary);
         let seeded = transcript.items.len();
-        self.append(child_id, transcript.items).await?;
+        self.append(child, transcript.items).await?;
         Ok(seeded)
     }
 }
