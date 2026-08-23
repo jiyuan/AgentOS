@@ -7,6 +7,7 @@ use agentos_core::gateway::{
     DEFAULT_IDLE_INTERVAL,
 };
 use agentos_core::memory::migrate::{self, MigrationSettings};
+use agentos_core::memory::migrate_sessions;
 use agentos_core::memory::{
     lease_holder_id, MemoryManager, SqliteStore, DEFAULT_LEASE_TTL, REFLECTION_LEASE,
     RETENTION_LEASE,
@@ -234,6 +235,16 @@ struct ServiceConfig {
     log_path: PathBuf,
     agent_config_path: Option<PathBuf>,
     session_db_path: Option<PathBuf>,
+    /// The `.env` this invocation was told to read, forwarded to the `serve`
+    /// child.
+    ///
+    /// `start` forwarded `--config` and `--session-db-path` and not this, so a
+    /// deployment started with `--env-file /etc/agentos/prod.env` spawned a
+    /// service that read whatever `.env` happened to be in the working
+    /// directory instead — a different provider, different credentials,
+    /// different channels, and nothing saying so (M3 deliverable 2, found by
+    /// the upgrade rehearsal).
+    env_file: Option<PathBuf>,
 }
 
 impl ServiceConfig {
@@ -243,6 +254,7 @@ impl ServiceConfig {
             log_path: home.join(DEFAULT_LOG_RELPATH),
             agent_config_path: None,
             session_db_path: None,
+            env_file: None,
             home,
         }
     }
@@ -330,8 +342,10 @@ Subcommands:
              counts and record the result (roadmap C1). Spends real requests.
              `--check` re-scores today's estimator against the recorded counts
              offline, spending nothing; `--root=PATH` names the repository.
-  migrate    Move memory written before typed principals onto principal-keyed
-             namespaces (`ID-002`). Reports and changes nothing by default.
+  migrate    Move memory and the session log written before typed principals
+             onto principal-keyed namespaces (`ID-002`, M3 deliverable 2). A
+             gateway refuses to start on an unmigrated session log, because
+             every conversation would read as empty. Reports and changes nothing by default.
              `--apply` performs it, and needs `--backup PATH` (or an explicit
              `--no-backup`) because it rewrites the database in place.
              `--channel NAME` names the channel legacy conversations arrived
@@ -392,9 +406,11 @@ where
                 config.session_db_path = Some(next_path(&mut args, "--session-db-path")?);
             }
             "--env-file" => {
-                let _ = next_path(&mut args, "--env-file")?;
+                config.env_file = Some(next_path(&mut args, "--env-file")?);
             }
-            option if option.starts_with("--env-file=") => {}
+            option if option.starts_with("--env-file=") => {
+                config.env_file = option.strip_prefix("--env-file=").map(PathBuf::from);
+            }
             "--no-env-override" => {}
             // `catalog`'s and `calibrate`'s own options. Parsed by those
             // subcommands from the raw argv, since they name a source tree
@@ -502,6 +518,12 @@ fn start(config: ServiceConfig) -> Result<(), String> {
         .try_clone()
         .map_err(|err| format!("failed to clone log handle: {err}"))?;
 
+    // Checked here as well as in `serve`, because `serve` is detached: its
+    // stdout goes to the log file and the operator running `start` would see
+    // only a startup timeout. The same check twice is cheap; a refusal nobody
+    // reads is not.
+    refuse_unmigrated_sessions(&config)?;
+
     let owner_token = gateway_owner_token()?;
     let mut command = Command::new(exe);
     command
@@ -519,6 +541,9 @@ fn start(config: ServiceConfig) -> Result<(), String> {
     }
     if let Some(path) = &config.session_db_path {
         command.arg("--session-db-path").arg(path);
+    }
+    if let Some(path) = &config.env_file {
+        command.arg("--env-file").arg(path);
     }
     detach_gateway_process(&mut command);
 
@@ -779,6 +804,12 @@ fn serve(config: &ServiceConfig) -> Result<(), String> {
             display_optional_path(&config.session_db_path)
         ),
     )?;
+
+    // Before anything is served, and independently of whether any channel is
+    // enabled: a session log still keyed by bare conversation ids would read
+    // as empty under principal keys, which is the one failure that looks like
+    // working software (M3 deliverable 2).
+    refuse_unmigrated_sessions(config)?;
 
     let workspace_config = WorkspaceConfig::load(&agent_config_path(config))
         .map_err(|err| format!("failed to load workspace config: {err}"))?;
@@ -1472,11 +1503,22 @@ fn migrate(config: &ServiceConfig) -> Result<(), String> {
         .map_err(|err| format!("failed to plan the migration: {err}"))?;
     print!("{}", plan.report());
 
+    // The session log is the second half, added by M3 deliverable 2. Reported
+    // together with the memory namespaces because they are one upgrade from
+    // the operator's side — and because a database that migrated one and not
+    // the other is a gateway that refuses to start.
+    let session_plan = migrate_sessions::plan(&store, &settings)
+        .map_err(|err| format!("failed to plan the session migration: {err}"))?;
+    if !session_plan.is_empty() {
+        println!();
+        print!("{}", session_plan.report());
+    }
+
     if !has("--apply") {
         println!("\nNothing was changed. Re-run with --apply to perform this migration.");
         return Ok(());
     }
-    if plan.rewrites.is_empty() {
+    if plan.rewrites.is_empty() && session_plan.is_empty() {
         println!("\nNothing to apply.");
         return Ok(());
     }
@@ -1506,8 +1548,19 @@ fn migrate(config: &ServiceConfig) -> Result<(), String> {
     let moved = migrate::apply(&store, &plan)
         .map_err(|err| format!("the migration was rolled back: {err}"))?;
     println!("moved {moved} record(s)");
+    // Its own transaction, after the namespaces. A failure here leaves the
+    // namespace migration applied and the session tables untouched, which is
+    // a state the next run plans correctly rather than one it has to detect.
+    let rekeyed = migrate_sessions::apply(&store, &settings, &session_plan)
+        .map_err(|err| format!("the session migration was rolled back: {err}"))?;
+    if rekeyed > 0 {
+        println!("rekeyed {rekeyed} session item(s)");
+    }
     if plan.blocked.is_empty() {
-        println!("schema version is now {}", migrate::IDENTITY_SCHEMA_VERSION);
+        println!(
+            "schema version is now {}",
+            migrate_sessions::SESSION_PRINCIPAL_SCHEMA_VERSION
+        );
     } else {
         println!(
             "{} namespace(s) still need a decision, so the schema version stays at {version}",
@@ -1515,6 +1568,47 @@ fn migrate(config: &ServiceConfig) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// Refuse to serve a database whose session log predates principal keying.
+///
+/// The check is cheap and the alternative is silent: every conversation would
+/// start over, the model would answer as if it had never spoken to anyone, and
+/// nothing in the log would say why. Reported here rather than left to the
+/// runtime because a gateway with no channels enabled builds no runtime, and
+/// "it started fine" is exactly the wrong thing to learn.
+fn refuse_unmigrated_sessions(config: &ServiceConfig) -> Result<(), String> {
+    let db_path = session_path(config);
+    if !db_path.exists() {
+        return Ok(());
+    }
+    let store = SqliteStore::open(&db_path)
+        .map_err(|err| format!("failed to open {}: {err}", db_path.display()))?;
+    let schema = migrate_sessions::session_schema(&store)
+        .map_err(|err| format!("failed to inspect the session schema: {err}"))?;
+    if schema != migrate_sessions::SessionSchema::Legacy {
+        return Ok(());
+    }
+    let message = format!(
+        "refusing to serve {}: its session log is still keyed by conversation id, so every \
+         conversation would read as empty. Run `agentos-gateway migrate --channel NAME --apply \
+         --backup PATH` first (M3 deliverable 2).",
+        db_path.display()
+    );
+    let _ = log_line(config, &message);
+    Err(message)
+}
+
+/// The agent id this deployment is configured with, for a subcommand that
+/// needs a principal and was given only part of one.
+///
+/// Read from `agent.toml` rather than defaulted to a constant: `[agent].id`
+/// keys every principal in the store (M7 / `CFG-001`), so a purge that
+/// guessed would name a conversation that does not exist and report zero.
+pub(crate) fn configured_agent_id(config: &ServiceConfig) -> Result<String, String> {
+    WorkspaceConfig::load(&agent_config_path(config))
+        .map(|workspace| workspace.agent.id.to_string())
+        .map_err(|err| format!("failed to load workspace config: {err}"))
 }
 
 fn session_path(config: &ServiceConfig) -> PathBuf {

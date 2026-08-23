@@ -280,6 +280,17 @@ done
 
 load_env_file "$env_file"
 
+# The shipped .env.example carries a bare `AGENTOS_HOME=` placeholder, and the
+# loader above exports it — set, and empty. Every path this script derives is
+# already anchored on the `$agentos_home` computed at the top, but the *binary*
+# reads `AGENTOS_HOME` for itself and an empty one is no anchor at all: it
+# resolved the workspace root relative to whatever directory the process
+# started in. From `/`, `agentos tui` opened `/workspace/agentos.sqlite` — a
+# database outside the install prefix entirely, which the clean-room release
+# check had been quietly relying on. Re-export the anchor this script actually
+# resolved (M3 deliverable 2).
+export AGENTOS_HOME="${AGENTOS_HOME:-$agentos_home}"
+
 export AGENTOS_AGENT_CONFIG_PATH="${AGENTOS_AGENT_CONFIG_PATH:-$agentos_home/workspace/agent.toml}"
 export AGENTOS_SESSION_DB_PATH="${AGENTOS_SESSION_DB_PATH:-$agentos_home/workspace/agentos.sqlite}"
 export AGENTOS_RUN_STATE_PATH="${AGENTOS_RUN_STATE_PATH:-$agentos_home/workspace/runs/cli-run-1.json}"

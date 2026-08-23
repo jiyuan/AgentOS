@@ -126,28 +126,65 @@ check "the gateway stops" run stop
 check "status reports stopped" stopped
 
 echo "== a database written before this binary"
-if [[ ! -f "$db" ]]; then
-  # The idle gateway has no reason to open the session store, so create it the
-  # way any real deployment would — by running the migrate command, which
-  # refuses on a missing file and tells us so.
-  run purge --conversation rehearsal-seed --yes rehearsal-seed >/dev/null 2>&1 || true
-fi
-check "a session database exists to migrate" test -f "$db"
-
-# A record under the pre-`ID-001` namespace shape: five segments with a bare
-# conversation id where a principal now goes. Written with python's sqlite3
-# rather than by hand-rolling the schema, so the table is the real one the
-# runtime created and only the row is synthetic.
+# Written here rather than by the gateway, because the point is to have a
+# database this build did *not* create: `memory_records` without the identity
+# columns, and session tables keyed by a bare conversation id. That is what an
+# older release left behind, and reproducing it is the only way to rehearse an
+# upgrade rather than a fresh install.
 python3 - "$db" <<'PY'
 import sqlite3, sys
+
 conn = sqlite3.connect(sys.argv[1])
+conn.executescript(
+    """
+    CREATE TABLE memory_records (
+        row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id TEXT UNIQUE,
+        namespace TEXT NOT NULL,
+        body_json TEXT NOT NULL,
+        metadata_json TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE session_items (
+        row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id TEXT NOT NULL,
+        ordinal INTEGER NOT NULL,
+        item_json TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(conversation_id, ordinal)
+    );
+    CREATE TABLE session_epochs (
+        row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id TEXT NOT NULL,
+        epoch_ordinal INTEGER NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    """
+)
 conn.execute(
     "INSERT INTO memory_records (id, namespace, body_json, metadata_json) VALUES (?, ?, ?, ?)",
     ("legacy-1", "private/conversation/42/semantic/general", '{"text":"remember"}', "{}"),
 )
+conn.execute(
+    "INSERT INTO session_items (conversation_id, ordinal, item_json) VALUES (?, ?, ?)",
+    ("42", 0, '{"message":{"role":"user","content":"legacy turn"}}'),
+)
 conn.commit()
 conn.close()
 PY
+check "a session database exists to migrate" test -f "$db"
+
+session_key_count() {
+  python3 - "$db" "$1" <<'PY'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+columns = {row[1] for row in conn.execute("PRAGMA table_info(session_items)")}
+column = "conversation_key" if "conversation_key" in columns else "conversation_id"
+query = f"SELECT COUNT(*) FROM session_items WHERE {column} = ?"
+print(conn.execute(query, (sys.argv[2],)).fetchone()[0])
+PY
+}
+
 legacy_count() {
   python3 - "$db" <<'PY'
 import sqlite3, sys
@@ -158,7 +195,17 @@ print(conn.execute(
 ).fetchone()[0])
 PY
 }
-check "the legacy row is there before migrating" test "$(legacy_count)" = "1"
+check "the legacy memory row is there before migrating" test "$(legacy_count)" = "1"
+check "the legacy session row is there before migrating" \
+  test "$(session_key_count 42)" = "1"
+
+echo "== a gateway refuses to serve an unmigrated session log"
+# Without this guard the failure is silent: every conversation reads as empty
+# and the agent answers as if it had never spoken to anyone.
+run start >"$scratch/refused.log" 2>&1 && refused=0 || refused=1
+check "start fails rather than serving" test "$refused" -eq 1
+check "and says which command fixes it" grep -q "agentos-gateway migrate" "$scratch/refused.log"
+check "nothing is serving" stopped
 
 echo "== migration reports before it changes anything"
 run migrate --channel telegram >"$scratch/plan.log" 2>&1 || true
@@ -174,6 +221,12 @@ run migrate --channel telegram --apply "--backup=$backup" >"$scratch/apply.log" 
   exit 1
 }
 check "the backup was written" test -s "$backup"
+check "the session log is rekeyed onto a principal" \
+  test "$(session_key_count v1.rehearsal.telegram.42.n)" = "1"
+check "and nothing is left under the bare id" test "$(session_key_count 42)" = "0"
+check "the migrated gateway starts" run start
+check "status reports running" started
+check "the migrated gateway stops" run stop
 check "the legacy namespace is gone" test "$(legacy_count)" = "0"
 check "the record is now principal-keyed" bash -c \
   'python3 - "$1" <<PY
@@ -189,15 +242,32 @@ echo "== rollback"
 # that the current binary runs on the restored, older data.
 cp "$backup" "$db"
 rm -f "$db-wal" "$db-shm"
-check "the legacy row is back" test "$(legacy_count)" = "1"
-check "the current binary starts on rolled-back data" run start
-check "status reports running" started
-check "and stops cleanly" run stop
-check "status reports stopped" stopped
+check "the legacy memory row is back" test "$(legacy_count)" = "1"
+check "the legacy session key is back" test "$(session_key_count 42)" = "1"
+
+# And the current binary refuses it again, which is the honest outcome rather
+# than a regression: rolling the *data* back does not roll the *binary* back,
+# and the guard is what stops a rolled-back deployment quietly serving empty
+# conversations. Recovery from here is to migrate again, so that is rehearsed
+# too — a rollback an operator cannot come back from is not a rollback.
+run start >"$scratch/refused-after-rollback.log" 2>&1 && refused=0 || refused=1
+check "the current binary refuses the rolled-back data" test "$refused" -eq 1
+check "and names the migration again" \
+  grep -q "agentos-gateway migrate" "$scratch/refused-after-rollback.log"
 check "the migration can be replanned after a rollback" bash -c \
   '"$1" migrate --channel telegram --env-file "$2" --pid-path "$3" --log-path "$4" \
      --config "$5" --session-db-path "$6" | grep -q "private/conversation/42"' \
   _ "$gateway" "$home/.env" "$pid" "$log" "$home/workspace/agent.toml" "$db"
+
+run migrate --channel telegram --apply --no-backup >"$scratch/reapply.log" 2>&1 || {
+  cat "$scratch/reapply.log" >&2
+  echo "re-applying the migration after a rollback failed" >&2
+  exit 1
+}
+check "re-migrating restores a servable deployment" run start
+check "status reports running" started
+check "and stops cleanly" run stop
+check "status reports stopped" stopped
 
 if [[ "$failures" -gt 0 ]]; then
   echo >&2

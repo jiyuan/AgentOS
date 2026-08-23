@@ -15,7 +15,7 @@ use agentos_interfaces::orchestrator::StreamSink;
 use agentos_interfaces::{Channel, ChannelError, Egress};
 use agentos_llm::{env as agentos_env, LlmModelController};
 use agentos_proto::{
-    AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole, RunId, SpanKind,
+    AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole, Principal, RunId, SpanKind,
 };
 use async_trait::async_trait;
 use std::collections::BTreeMap;
@@ -491,7 +491,16 @@ async fn run_tui_loop(
                 continue;
             }
             Some(TuiInput::Slash(SlashCommand::Clear)) => {
-                let removed = session.clear_session(&channel.conversation_id)?;
+                // `/clear` moves this participant's epoch, so it is keyed
+                // by the full principal (M3 deliverable 2). The TUI has one
+                // participant — the person at the keyboard — and no sender to
+                // distinguish, so the conversation-wide principal is who they
+                // are here.
+                let removed = session.clear_session(&Principal::conversation(
+                    active_agent.clone(),
+                    channel.id.clone(),
+                    channel.conversation_id.clone(),
+                ))?;
                 println!("{}", slash::format_clear(removed, "TUI"));
                 turn = 1;
                 continue;

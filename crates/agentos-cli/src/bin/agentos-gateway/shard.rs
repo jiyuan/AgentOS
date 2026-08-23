@@ -24,7 +24,7 @@ use agentos_core::r#loop::{
 use agentos_core::runner::{PausedRun, ResumeDecision, RunnerDeps};
 use agentos_core::runtime::{AgentRuntime, RuntimeDepsScope};
 use agentos_interfaces::{Egress, StreamEgress};
-use agentos_proto::{ConversationId, Envelope, InterruptionId, RunId};
+use agentos_proto::{ConversationId, Envelope, InterruptionId, Principal, RunId};
 use async_trait::async_trait;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -580,17 +580,30 @@ impl ShardTurns<'_> {
     async fn clear_conversation(&self, input: &Envelope) -> Result<(), String> {
         let config = &self.context.config;
         let channel_name = self.context.channel_name;
+        // The full principal, sender included: `/clear` moves the epoch of
+        // the participant who typed it, and in a group conversation that must
+        // not move anybody else's
+        // (M3 deliverable 2, [ADR-0006](../../../../../docs/adr/0006-CLEAR_EPOCH.md)).
+        let principal = Principal::conversation(
+            self.context.runtime.active_agent.clone(),
+            input.channel_id.clone(),
+            input.conversation_id.clone(),
+        )
+        .with_sender(Arc::clone(&input.sender));
         let removed = self
             .context
             .runtime
             .session
-            .clear_session(&input.conversation_id)
+            .clear_session(&principal)
             .map_err(|err| format!("failed to clear {channel_name} conversation history: {err}"))?;
         let jobs = self
             .context
             .runtime
             .jobs()
-            .dispose_conversation(&input.conversation_id);
+            // Without the sender: the jobs belong to the conversation, and
+            // clearing ends all of them, not just the ones this participant
+            // started.
+            .dispose_conversation(&principal.clone().without_sender());
         log_line(
             config,
             &format!(

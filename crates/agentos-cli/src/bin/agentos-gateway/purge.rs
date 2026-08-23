@@ -5,9 +5,13 @@
 //! is allowed to touch, so each of them makes the operator look at what they
 //! are destroying before it happens:
 //!
-//! - `--conversation ID --yes ID` removes one conversation's session log. The
-//!   original mode, unchanged: the id is small enough to be the confirmation
-//!   itself ([ADR-0006](../../../../../../docs/adr/0006-CLEAR_EPOCH.md)).
+//! - `--conversation ID --channel NAME --yes ID` removes one conversation's
+//!   session log. The id is small enough to be the confirmation itself
+//!   ([ADR-0006](../../../../../../docs/adr/0006-CLEAR_EPOCH.md)). `--channel`
+//!   became required with M3 deliverable 2: a session is keyed by a principal
+//!   now, so "conversation 42" no longer names one thing — Telegram's 42 and
+//!   Feishu's 42 are different logs, which is the point. `--agent` defaults to
+//!   `[agent].id`, as it does for `migrate`.
 //! - `--sessions --before DATE` removes whole conversations idle since before
 //!   that date.
 //! - `--audit --before DATE` removes rows from `safety_events` and
@@ -34,7 +38,7 @@ use super::{session_path, ServiceConfig};
 use agentos_core::audit::{self, SafetyEvent, SafetyEventKind, SafetyJournal, SafetyOutcome};
 use agentos_core::memory::SqliteStore;
 use agentos_core::retention::cutoff_from_date;
-use agentos_proto::ConversationId;
+use agentos_proto::{AgentId, ChannelId, ConversationId, Principal};
 use std::env;
 
 /// Rows a single report will list before it starts summarizing. A deployment
@@ -83,13 +87,23 @@ pub(super) fn purge(config: &ServiceConfig) -> Result<(), String> {
             &value("--yes"),
         );
     }
-    purge_one_conversation(&store()?, &value("--conversation"), &value("--yes"))
+    purge_one_conversation(
+        &store()?,
+        config,
+        &value("--conversation"),
+        &value("--channel"),
+        &value("--agent"),
+        &value("--yes"),
+    )
 }
 
 /// Irreversibly delete one conversation's session log.
 fn purge_one_conversation(
     store: &SqliteStore,
+    config: &ServiceConfig,
     conversation: &Option<String>,
+    channel: &Option<String>,
+    agent: &Option<String>,
     confirmed: &Option<String>,
 ) -> Result<(), String> {
     let conversation = conversation.clone().ok_or_else(|| {
@@ -97,6 +111,18 @@ fn purge_one_conversation(
          or --audit --before DATE for the audit stores)"
             .to_owned()
     })?;
+    // No default, for the reason `migrate` has none: a session is keyed by
+    // channel now, and guessing would delete a conversation the operator did
+    // not name.
+    let channel = channel.clone().ok_or_else(|| {
+        "--channel NAME is required: a session is keyed by principal, so a conversation id \
+         alone names one log per channel rather than one log"
+            .to_owned()
+    })?;
+    let agent = match agent {
+        Some(agent) => agent.clone(),
+        None => super::configured_agent_id(config)?,
+    };
     let confirmed = confirmed.clone().ok_or_else(|| {
         format!(
             "--yes {conversation} is required: this deletes the log irreversibly, and `/clear` \
@@ -109,12 +135,16 @@ fn purge_one_conversation(
         ));
     }
 
-    let conversation_id = ConversationId::new(conversation.clone());
+    let principal = Principal::conversation(
+        AgentId::new(agent),
+        ChannelId::new(channel.clone()),
+        ConversationId::new(conversation.clone()),
+    );
     let removed = store
-        .purge_session(&conversation_id)
+        .purge_session(&principal)
         .map_err(|err| format!("failed to purge '{conversation}': {err}"))?;
-    record_session_purge(store, &conversation, removed, "an operator");
-    println!("purged {removed} item(s) from conversation '{conversation}'");
+    record_session_purge(store, &principal, removed, "an operator");
+    println!("purged {removed} item(s) from {channel} conversation '{conversation}'");
     Ok(())
 }
 
@@ -149,8 +179,13 @@ fn purge_idle_sessions(
         "{} conversation(s) with {items} item(s) have no activity on or after {before}:",
         idle.len()
     );
-    for (conversation, count) in idle.iter().take(MAX_LISTED) {
-        println!("  {} ({count} items)", conversation.as_str());
+    for (principal, count) in idle.iter().take(MAX_LISTED) {
+        println!(
+            "  {}:{} ({count} items, agent {})",
+            principal.channel.as_str(),
+            principal.conversation.as_str(),
+            principal.agent.as_str()
+        );
     }
     if idle.len() > MAX_LISTED {
         println!("  … and {} more", idle.len() - MAX_LISTED);
@@ -184,13 +219,13 @@ fn purge_idle_sessions(
     // one, and an operator reading the events later wants to see which
     // conversations went, not that some number of them did.
     let mut removed_total = 0;
-    for (conversation, _) in &idle {
+    for (principal, _) in &idle {
         let removed = store
-            .purge_session(conversation)
-            .map_err(|err| format!("failed to purge '{}': {err}", conversation.as_str()))?;
+            .purge_session(principal)
+            .map_err(|err| format!("failed to purge '{}': {err}", principal.conversation_name()))?;
         record_session_purge(
             store,
-            conversation.as_str(),
+            principal,
             removed,
             &format!("an operator, idle before {before}"),
         );
@@ -260,13 +295,17 @@ fn purge_audit(
 
 /// The one deletion the runtime performs on purpose, so the one that most
 /// needs a record that it happened (M6 / `AUD-001`).
-fn record_session_purge(store: &SqliteStore, conversation: &str, removed: usize, by: &str) {
+fn record_session_purge(store: &SqliteStore, principal: &Principal, removed: usize, by: &str) {
     SafetyJournal::new(Some(store)).record(
         SafetyEvent::new(
             SafetyEventKind::SessionPurged,
             SafetyOutcome::Purged,
-            conversation.to_owned(),
+            principal.conversation_name(),
         )
+        // The principal is on the event as a `Principal` too; the subject
+        // carries its name so a reader grepping for a conversation finds the
+        // purge without decoding anything.
+        .with_principal(principal.clone().without_sender())
         .with_detail(format!("{removed} session items deleted by {by}")),
     );
 }
