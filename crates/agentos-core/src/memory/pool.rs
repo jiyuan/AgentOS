@@ -172,6 +172,62 @@ impl Drop for PooledConnection<'_> {
     }
 }
 
+/// How long [`request_wal`] keeps asking. The same budget as [`BUSY_TIMEOUT`],
+/// because it is the same wait — see that function for why SQLite will not do
+/// it for us.
+const WAL_RETRY_BUDGET: std::time::Duration = BUSY_TIMEOUT;
+
+/// Between attempts. Short, because the contention it waits out is one other
+/// connection finishing a schema-creation transaction on a new file.
+const WAL_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Put the database into WAL, waiting out another connection that is holding
+/// it, and answer with the mode it ended up in.
+///
+/// **The one place in the store that retries by hand.** `busy_timeout` covers
+/// every other statement; it does not cover this one. `PRAGMA journal_mode =
+/// WAL` needs an exclusive lock, and SQLite returns `SQLITE_BUSY` for it
+/// *immediately* rather than invoking the busy handler, because two
+/// connections both blocking on the same upgrade would deadlock.
+///
+/// It can only contend on a database that is *new*. The journal mode is a
+/// property of the file, so once one connection has set it every later one is
+/// answered `wal` with no lock taken at all. That is why this survived M8: the
+/// pipeline and every test opened a database that already existed. A gateway
+/// serving two channels builds two pools on two threads in the same second,
+/// and on a first run neither file exists yet — so one channel's loop died at
+/// startup with "database is locked" (M9 / `CI-002`).
+fn request_wal(conn: &Connection) -> Result<String, MemoryError> {
+    let deadline = std::time::Instant::now() + WAL_RETRY_BUDGET;
+    loop {
+        // `journal_mode` answers with the mode it ended up in, so it is a
+        // query rather than a statement — `execute_batch` reports "Execute
+        // returned results" for it.
+        match conn.query_row("PRAGMA journal_mode = WAL;", [], |row| {
+            row.get::<_, String>(0)
+        }) {
+            Ok(mode) => return Ok(mode),
+            Err(err) if is_busy(&err) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(WAL_RETRY_PAUSE);
+            }
+            Err(err) => return Err(super::memory_sqlite_error(err)),
+        }
+    }
+}
+
+fn is_busy(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked,
+                ..
+            },
+            _
+        )
+    )
+}
+
 /// Settings every connection to a store shares. Per connection, not per
 /// database, for `busy_timeout` and `foreign_keys`; `journal_mode` is a
 /// property of the file, but setting it on each is harmless and means the
@@ -184,12 +240,7 @@ pub(crate) fn apply_pragmas(conn: &Connection, wal: bool) -> Result<(), MemoryEr
     if !wal {
         return Ok(());
     }
-    // `journal_mode` answers with the mode it ended up in, so it is a query
-    // rather than a statement — `execute_batch` reports "Execute returned
-    // results" for it.
-    let mode: String = conn
-        .query_row("PRAGMA journal_mode = WAL;", [], |row| row.get(0))
-        .map_err(super::memory_sqlite_error)?;
+    let mode = request_wal(conn)?;
     if !mode.eq_ignore_ascii_case("wal") {
         // A database on a filesystem without shared-memory support (some
         // network mounts) refuses WAL and stays in rollback mode. Worth

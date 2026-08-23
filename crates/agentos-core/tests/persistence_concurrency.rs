@@ -16,7 +16,8 @@ use agentos_core::memory::{
 use agentos_interfaces::memory::Query;
 use agentos_proto::{AgentId, ChannelId, ConversationId, TaskId};
 use serde_json::json;
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
+use std::thread;
 
 fn caller() -> MemoryCaller {
     MemoryCaller {
@@ -153,4 +154,46 @@ fn only_one_contender_holds_the_reflection_lease() {
         .expect("the query runs")
         .expect("somebody holds it");
     assert_eq!(leader.holder.as_ref(), held[0]);
+}
+
+/// Two channels' shard sets build their pools at the same second, on a
+/// database that does not exist yet.
+///
+/// This is what a two-channel gateway does on its first run, and it failed:
+/// `PRAGMA journal_mode = WAL` needs an exclusive lock and SQLite answers
+/// `SQLITE_BUSY` for it without consulting the busy handler, so the loser's
+/// channel loop died at startup with "database is locked". Every earlier test
+/// opened a database that already existed, where the pragma is answered with
+/// no lock at all — which is why M8 shipped with this in it and M9 found it by
+/// finally running `tests/gateway_pipeline.py` (`CI-002`).
+///
+/// Four openers rather than two, repeated, because one pair racing once
+/// reproduced it only about half the time.
+#[test]
+fn concurrent_opens_of_a_new_database_all_succeed() {
+    for attempt in 0..10 {
+        let tree = support::temp_tree(&format!("fresh-open-{attempt}"));
+        let path = tree.path().join("agentos.sqlite");
+        let barrier = Arc::new(Barrier::new(4));
+
+        let failures: Vec<String> = (0..4)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    SqliteStore::open(&path).err().map(|err| err.to_string())
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .filter_map(|handle| handle.join().expect("the opener thread joins"))
+            .collect();
+
+        assert!(
+            failures.is_empty(),
+            "attempt {attempt}: {} of 4 concurrent opens failed: {failures:?}",
+            failures.len()
+        );
+    }
 }
