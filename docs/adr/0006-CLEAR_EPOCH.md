@@ -1,6 +1,6 @@
 # ADR-0006 — `/clear` starts a new epoch; it does not delete
 
-- Status: accepted; implemented by M6 / `STATE-001` except principal keying
+- Status: accepted; implemented by M6 / `STATE-001`, completed by M3 deliverable 2
 - Date: 2026-08-21
 - Milestone: M6
 
@@ -78,12 +78,27 @@ group conversation cannot clear another's state.
 
 Two departures from the decision above:
 
-- **The epoch is keyed by conversation, not by principal.** `Session::load`
-  takes a bare `ConversationId`, so a per-principal epoch would be unreadable
-  by the one query that has to apply it. Principal keying arrives with M3
-  deliverable 2, which is where the `Session` semver break lives. Until then,
-  one participant's `/clear` in a group conversation clears the shared view —
-  stated in the capability matrix rather than left to be discovered.
+- **The epoch was keyed by conversation, not by principal, until M3
+  deliverable 2.** `Session::load` took a bare `ConversationId`, so a
+  per-principal epoch would have been unreadable by the one query that has to
+  apply it. That is now done, and it settled a question the decision above left
+  open: what a `/clear` with *no* sender means.
+
+  **There are two levels, and the epoch is the maximum of them.** A `/clear`
+  from a participant is written against their full principal and hides history
+  for them alone — the group-chat case this ADR asks for. A `/clear` with no
+  sender is written against the conversation and hides history for everyone in
+  it; the TUI's single participant writes one, and so does the migration, since
+  a pre-principal epoch meant exactly "hidden from everybody". Taking the
+  maximum is what makes the two compose: a conversation-wide clear cannot be
+  escaped by having spoken before it, and a participant clearing afterwards
+  still moves only their own line.
+
+  One consequence worth stating: two participants in a group conversation can
+  legitimately see different prefixes of one shared log, so the model's context
+  now depends on who spoke. That is what "cannot clear another's state" means
+  when the transcript is shared, and the alternative — one epoch for everyone —
+  is the behaviour this ADR rejected.
 - **The purge does not cross `Approve`.** `Approve` gates what the *model* may
   do; a purge is an operator's decision about their own records, with no run to
   pause and no model asking, so routing it through the run policy would be a

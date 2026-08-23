@@ -421,10 +421,9 @@ telemetry, and silently never sent.
   returns only items at or after the newest epoch. It lives there because the
   epoch has to constrain every reader of `session_items` — `fork` included,
   which would otherwise copy hidden history into a child — and a filter at the
-  call sites is a filter somebody forgets. The epoch is keyed by conversation
-  rather than by principal, which ADR-0006 asks for; that waits on `Session`
-  being principal-keyed (M3 deliverable 2), so in a group conversation one
-  participant's `/clear` still clears the shared view.
+  call sites is a filter somebody forgets. The epoch is keyed by *principal*,
+  which is what ADR-0006 asks for — see §9.0 for how a participant's marker and
+  the conversation's compose.
 - **Pressure.** `prompt::tokens` estimates how much of the context window a
   request occupies. It is a heuristic, not a tokenizer, and uses two rates
   because a 4:1 characters-per-token divisor badly under-counts CJK text.
@@ -489,10 +488,12 @@ Roadmap D1–D3 and G1–G2. All of this sits around the loop, not inside it.
 - **Background jobs.** A tool on the `[jobs].promotable` allowlist becomes a
   background job instead of failing at its deadline. Jobs report progress, can be
   killed, and outlive the turn that started them. Every job belongs to exactly
-  one `ConversationId` and every registry operation is fenced by the asking
+  one conversation — named by a `Principal`, so `telegram:42` and `feishu:42`
+  are not the same owner — and every registry operation is fenced by the asking
   conversation, so a model that can name an id still cannot reach across
-  conversations. Surfaced by the `job_status`, `job_output`, and `job_kill`
-  tools.
+  conversations. A finished job is held for `[jobs].completed_retention_secs`
+  and then forgotten. Surfaced by the `job_status`, `job_output`, and
+  `job_kill` tools.
 - **Conversations as actors.** The gateway no longer runs one serial
   receive → run → send loop. Each conversation has an `Inbox` and is assigned by
   stable hash to one of `[gateway].shards` OS threads, each with its own
@@ -545,6 +546,27 @@ Roadmap D1–D3 and G1–G2. All of this sits around the loop, not inside it.
   one: reflection is off by default and needs an LLM, retention is on and
   needs nothing, and gating the second on the first would silently disable it
   almost everywhere.
+
+### 9.0 What a session is keyed by
+
+`Session::{load, append, fork}` take a `Principal`, and the store reads two
+names out of it (M3 deliverable 2). `conversation_name()` — agent, channel,
+conversation, no sender — identifies the *transcript*, and everyone speaking in
+a conversation shares one. `storage_name()` identifies the *participant*, and
+only the `/clear` epoch uses it.
+
+`session_epochs` therefore carries both columns, and `current_epoch` takes the
+maximum of the two markers. A participant's `/clear` moves their own line; a
+`/clear` with no sender — the TUI's, an operator's, or a migrated
+pre-principal marker — moves everybody's. Two participants in a group
+conversation can consequently see different prefixes of one shared log, which
+is what [ADR-0006](adr/0006-CLEAR_EPOCH.md)'s "one participant cannot clear
+another's state" means once the transcript is shared.
+
+A database written before this reads as *empty* under principal keys rather
+than failing, so `agentos-gateway start` and `serve` both refuse it and name
+`agentos-gateway migrate`, which rebuilds `session_items` and `session_epochs`
+in one transaction alongside the memory-namespace migration.
 
 ### 9.1 Retention
 

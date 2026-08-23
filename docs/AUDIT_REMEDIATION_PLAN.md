@@ -466,12 +466,13 @@ Size: L — ~254 `conversation_id` and ~111 `channel_id` sites; `Session` keys o
 deliberate semver break; and the migration needs a `schema_version` table that
 does not exist — the schema is four bare `CREATE TABLE IF NOT EXISTS`
 (`memory/sqlite.rs:52-124`)
-Status: **substantially done** — all four slices landed. Memory, episodes,
-attachments, and approval prompts are keyed by identity; both remote channels
-fail closed; `agentos-gateway migrate` moves legacy data and reports what the
-old encoding made ambiguous. Deliverable 2 is partly outstanding: sessions,
-`/clear`, jobs, and task sessions still key on a bare `ConversationId`, which
-is where the `Session` semver break lives.
+Status: **done** — all four slices, and deliverable 2's remainder. Memory,
+episodes, attachments, approval prompts, *and now the session log, `/clear`
+and background jobs* are keyed by identity; both remote channels fail closed;
+`agentos-gateway migrate` moves legacy data — memory namespaces and session
+rows — and reports what the old encoding made ambiguous. The `Session` semver
+break is taken: its methods key on `&Principal`, and the workspace is at
+0.7.0.
 Dependencies: M0, plus a persistence schema-version mechanism built as part of
 this milestone
 
@@ -489,8 +490,44 @@ Deliverables:
 1. Introduce a versioned principal/session key containing agent or tenant,
    channel, conversation, and sender where authorization requires sender identity,
    with canonical length-prefixed bytes and stable storage names.
-2. Use the principal for sessions, memory scopes, approval tickets, `/clear`,
-   jobs, task sessions, and audit events.
+2. **Done**, in two passes. Memory scopes, approval tickets and audit events
+   landed with `ID-001`; sessions, `/clear` and jobs are the remainder, closed
+   after M9.
+
+   `Session::{load, append, fork}` now take `&Principal`, and the store reads
+   *two* names out of it. `Principal::conversation_name` identifies the
+   transcript — everyone in a conversation shares one, so append and fork
+   ignore the sender. `Principal::storage_name` identifies the participant, and
+   only the `/clear` epoch uses it. `session_epochs` therefore carries both
+   columns, and `current_epoch` takes the maximum of the participant's marker
+   and the conversation's: a member of a group chat clears their own view, an
+   operator or a single-participant TUI clears everyone's, and the two compose
+   without a special case. Two participants can now legitimately see different
+   prefixes of one shared log; see
+   [ADR-0006](adr/0006-CLEAR_EPOCH.md) for why that is the point rather than a
+   side effect.
+
+   `JobRegistry` fences by principal too. That fence decides whether a
+   `job_output` call may read a job's bytes, and `telegram:42` and `feishu:42`
+   were one key.
+
+   **Task sessions are deliberately not changed**, and the reason is recorded
+   rather than left implied. A task id is a run id, which is unique — except
+   for the literal `main`/`min` that `OrchestratorStrategy::task_id` returns,
+   which `TaskWorkspace::task_dir` maps to one shared directory for the whole
+   deployment. That is a real cross-conversation share, but it is a share of
+   *scratch* — `state.toml` and a `sessions/` directory whose files are named
+   by run id — not of transcript or memory, and re-keying it would move every
+   existing task directory for a benefit no acceptance criterion names. It is
+   listed in §13 as a deferral with that reasoning.
+
+   Migration is `agentos-gateway migrate`, extended to rebuild
+   `session_items`/`session_epochs` under principal keys in its own
+   transaction, reported alongside the namespace plan. **A gateway refuses to
+   start on an unmigrated session log** — checked in `start` before it spawns
+   and again in `serve`, because the alternative is silent: every conversation
+   would read as empty and the agent would answer as if it had never spoken to
+   anyone.
 3. Replace lossy namespace encoding with injective encoding (unpadded base64url
    for arbitrary components) rather than replacement sanitization.
 4. Bind approval resolution to the principal that received the prompt and, for
@@ -523,10 +560,13 @@ Acceptance criteria:
 - Property tests prove `child(call) <= parent(call)` for randomized rules,
   operations, **and arguments**.
 - `telegram:42`, `feishu:42`, and another agent's `telegram:42` never share
-  session or memory state.
+  session or memory state. **Met** — memory with `ID-001`, sessions with
+  deliverable 2's remainder; `tests/session_epoch.rs` asserts all three at the
+  session layer.
 - Two formerly colliding namespace components, such as `a/b` and `a_b`, remain
   distinct.
 - A second group participant cannot approve or clear the initiator's state.
+  **Met** — approval with `AUTH-001`, `/clear` with deliverable 2's remainder.
 - An unset channel allowlist rejects rather than accepts.
 - Widening configurations fail at startup with actionable diagnostics.
 - Legacy collisions are reported; records are never silently merged.
@@ -1293,6 +1333,18 @@ Not release-rescue dependencies:
   ships to third parties.
 - New channel integrations before principal, containment, and durable-ingress
   work is complete.
+- **Principal-keyed task workspaces.** M3 deliverable 2 keyed sessions, memory,
+  approvals, audit events and jobs by principal and deliberately left task
+  directories alone. A task id is a run id, which is unique — except the
+  literal `main` and `min` that `OrchestratorStrategy::task_id` returns, which
+  `TaskWorkspace::task_dir` maps to one directory shared by the whole
+  deployment. That is a genuine cross-conversation share, and it is a share of
+  *scratch*: a `state.toml` and a `sessions/` directory whose files are named
+  by run id. No transcript, no memory, no authorization decision. Re-keying it
+  would move every existing task directory on every deployment for a benefit
+  no acceptance criterion names, so the cost lands before the value. Worth
+  doing when task state starts carrying something a second conversation should
+  not see.
 
 ## 14. Risk register
 

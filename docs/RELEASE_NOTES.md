@@ -30,10 +30,14 @@ this project made and what the code did.
   hardcoded `main-agent`. It now keys every trace, episode, memory record and
   safety event — so setting it on an existing deployment orphans memory written
   under the old id. There is no rename path.
-- **Memory written before v0.7.0 is under old keys** (`ID-001`, `ID-002`).
-  `agentos-gateway migrate` reports what it would move and applies with
-  `--apply --backup PATH`. It needs `--channel NAME`: the old rows do not record
-  one and it cannot be inferred.
+- **Memory *and the session log* written before v0.7.0 are under old keys**
+  (`ID-001`, `ID-002`, M3 deliverable 2). `agentos-gateway migrate` reports
+  what it would move and applies with `--apply --backup PATH`. It needs
+  `--channel NAME`: the old rows do not record one and it cannot be inferred.
+  **The gateway refuses to start until this has run** — an unmigrated session
+  log reads as empty, and every conversation would silently start over.
+  `agentos-gateway purge --conversation ID` needs `--channel NAME` now too,
+  for the same reason.
 - **A stdio MCP server must speak MCP** (`MCP-001`). The old client was not a
   JSON-RPC client; a server built against it will no longer work. See below.
 - **Stop the old gateway with the old binary before upgrading** (`GW-001`).
@@ -46,6 +50,18 @@ this project made and what the code did.
   refuse to start on a host with no sandbox backend.
 
 ### Authorization and identity
+
+**Sessions and jobs are keyed by principal** (M3 deliverable 2). This was the
+last thing keyed on the number the transport chose, so Telegram's chat `42`,
+Feishu's chat `42` and a second agent sharing the database were one transcript.
+`Session::{load, append, fork}` now take a `Principal` — the semver break the
+milestone was waiting on, and why this release is 0.7.0. The store reads two
+names out of it: the conversation names the *transcript*, which its
+participants share, and the full principal names the *`/clear` epoch*, which is
+theirs alone. So one member of a group chat clearing their view no longer
+clears anybody else's, and two participants can legitimately see different
+prefixes of one log. `JobRegistry` fences on the same key, which matters
+because that fence decides who may read a job's output.
 
 **Principals are typed and namespaces are injective** (`ID-001`, `ID-002`). Two
 conversations whose ids differed only in punctuation could land in one memory
