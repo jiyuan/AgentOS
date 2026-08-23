@@ -12,8 +12,16 @@ resolver = "2"
 [workspace.package]
 version = "0.6.0"
 edition = "2021"
-license = "MIT license"
+license = "MIT"
 repository = "https://github.com/jiyuan/AgentOS"
+# Unpublished, and this says so rather than leaving it to be discovered.
+# `cargo-semver-checks` already needs `--baseline-rev` because there is no
+# crates.io baseline; stating it here makes the same fact machine-readable, and
+# it is what lets `deny.toml` allow `path = "…"` workspace dependencies while
+# still refusing a wildcard version on an external crate (M9 / `CI-002`).
+# Removing this line for a crate is the deliberate act of publishing it, and it
+# will then require real version requirements on its path dependencies.
+publish = false
 
 [workspace.dependencies]
 agentos-core = { path = "crates/agentos-core" }

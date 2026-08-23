@@ -1,0 +1,109 @@
+# Dependency policy (M9 / `CI-002`, deliverable 5).
+#
+# Four questions, asked of the whole graph on every push: is anything here
+# known-vulnerable, is anything here under a licence this project cannot ship,
+# is anything here linked twice, and did any of it come from somewhere other
+# than crates.io.
+#
+# The first is the reason the file exists. Nothing in this repository was
+# looking at the advisory database, so a vulnerability in a transitive
+# dependency was something a contributor might notice — and adding this check
+# immediately found two (`RUSTSEC-2026-0204` in `crossbeam-epoch` and
+# `RUSTSEC-2026-0258` in `h2`), both fixed by a lockfile bump in the same
+# commit. The fourth matters for a different reason: an agent runtime that
+# executes model-chosen tool calls should not also be pulling build inputs from
+# a git URL somebody added in a hurry.
+#
+# # Exceptions expire
+#
+# Every entry that suppresses a finding carries an `# expires: YYYY-MM-DD`
+# comment on the line above it, and `scripts/check-dependencies.sh` fails when
+# that date has passed. An exception without an expiry is not an exception, it
+# is a policy change made quietly — the whole failure mode
+# `config/undocumented.txt` and `config/maturity.txt` exist to prevent, applied
+# to dependencies.
+#
+# The one exception shape with no expiry is a *permanent* one, written as
+# `# permanent:` with its reason. Those are for findings that are structurally
+# not applicable rather than not yet fixed; the script requires one prefix or
+# the other.
+
+[graph]
+# The targets this project actually supports (M2 / `CI-001`). Restricting the
+# graph is not cosmetic: without it every `windows-*` crate in the tree is
+# audited, licence-checked and duplicate-checked for a platform no CI job
+# builds and no release archive ships.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+all-features = true
+
+[advisories]
+version = 2
+# Unmaintained and unsound advisories are warnings rather than errors: both are
+# judgements about future risk rather than a known exploitable defect, and a
+# gate that blocks every merge on somebody else's archived repository stops
+# being read. A *vulnerability* is an error, with no ignore list.
+unmaintained = "workspace"
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# Permissive only, and exactly what the graph actually contains — an unused
+# allowance is a decision made in advance for a case nobody has looked at. A
+# new licence therefore fails the check and gets added deliberately, which is
+# the point: copyleft entering a release archive should be somebody's decision
+# rather than a transitive bump.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+# A duplicate is a real cost — two copies of a crate in the binary, and two
+# versions of whatever types cross between them — so it is an error with a
+# named list rather than a warning nobody reads.
+multiple-versions = "deny"
+wildcards = "deny"
+# Workspace crates are the exception: they are path dependencies at one version
+# by construction, and `*` is how a workspace names them.
+allow-wildcard-paths = true
+
+skip = [
+    # expires: 2027-02-28 — `criterion` (dev-only) pins hashbrown 0.14 through
+    # `plotters`; the runtime graph is on 0.17. Revisit when criterion 0.6 is
+    # adopted.
+    { crate = "hashbrown@0.14.5" },
+    # expires: 2027-02-28 — `rustls` and `reqwest` are mid-migration between
+    # webpki-roots majors. Both are pulled by the same `reqwest`, so this
+    # resolves itself on the next reqwest bump.
+    { crate = "webpki-roots@0.26.11" },
+    # expires: 2027-02-28 — `toml_edit` is still on winnow 0.7 while `toml` has
+    # moved to 1.0.
+    { crate = "winnow@0.7.15" },
+]
+
+deny = []
+
+[sources]
+# Everything comes from crates.io. A git dependency is not forbidden in
+# principle, but it has to be added here deliberately: a URL in a Cargo.toml is
+# a build input nobody reviews twice.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
