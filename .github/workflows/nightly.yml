@@ -1,0 +1,151 @@
+# Scheduled qualification that is too slow, too noisy, or too rare to gate a
+# push on (M9 / `CI-002`, deliverable 6).
+#
+# Everything here is a job that would either add ten minutes to every pull
+# request or fail on runner scheduling rather than on code. Splitting them off
+# is not a way of making them optional — a failure opens the same question as a
+# red `ci`, and the workflow can be dispatched by hand against a branch before
+# a release.
+#
+# What is deliberately *not* here: fuzzing. `cargo-fuzz` needs a nightly
+# sanitizer build and a corpus, and the inputs worth fuzzing in this tree — the
+# MCP framer, the Feishu fragment reassembler, the config parser — are each
+# already driven by a property or interop test against a peer that imports
+# nothing from this repository. A fuzz target with no corpus is a slow random
+# test; adding one should follow a real crash, not precede it.
+
+name: Nightly
+
+on:
+  schedule:
+    # 04:00 UTC. After the working day in both hemispheres this project is
+    # developed in, so a failure is waiting rather than interrupting.
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  # A hundred times the case count the per-push run uses. `Policy::narrow` is
+  # the one invariant in this tree where a counterexample is a security bug
+  # rather than a bug, so it is worth the search.
+  deep-properties:
+    name: policy narrowing, 100k cases
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable @ 2026-08
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Narrowing property search
+        env:
+          PROPTEST_CASES: "100000"
+        run: cargo test --locked -p agentos-core --test policy_narrow_props --release
+
+  # The suite has crash-injection and concurrency tests whose failures are
+  # scheduling-dependent: `tests/ingress_ledger.rs` kills a simulated process
+  # at three points, and `tests/persistence_concurrency.rs` races four opens of
+  # a database that does not exist yet — a race that shipped in M8 and
+  # reproduced about half the time. Repetition is how those are found.
+  fault-injection:
+    name: crash and concurrency, repeated (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable @ 2026-08
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Build the tests once
+        run: cargo test --locked -p agentos-core --no-run
+      - name: Twenty rounds
+        run: |
+          for round in $(seq 1 20); do
+            echo "::group::round $round"
+            cargo test --locked -p agentos-core --test ingress_ledger
+            cargo test --locked -p agentos-core --test persistence_concurrency
+            cargo test --locked -p agentos-core --test state_durability
+            cargo test --locked -p agentos-cli --test gateway_lifecycle
+            echo "::endgroup::"
+          done
+
+  # Miri, where it means anything.
+  #
+  # `agentos-proto` only: it is serde types plus hand-written base64url and
+  # component encoding — slicing and byte arithmetic, which is exactly where
+  # undefined behaviour hides and exactly what Miri sees. The other crates open
+  # files, spawn processes and run a multi-threaded tokio runtime, none of
+  # which Miri supports, so pointing it at them would report unsupported
+  # operations rather than defects.
+  miri:
+    name: miri (agentos-proto)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable @ 2026-08
+        with:
+          toolchain: nightly
+          components: miri
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Interpret the wire types
+        run: cargo +nightly miri test --locked -p agentos-proto
+
+  # The full fifty-task set, both channels, rather than the five the per-push
+  # job runs. Includes the guardrail probes and the tool-use prompts, whose
+  # replies are worth a human reading even when nothing fails.
+  soak:
+    name: gateway pipeline, full task set
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable @ 2026-08
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Build the gateway
+        run: cargo build --locked -p agentos-cli --bin agentos-gateway
+      - name: Fifty tasks across both channels
+        run: bash scripts/check-gateway-pipeline.sh --tasks tests/test_tasks.json --timeout 90
+      - name: Upload the pipeline report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: soak-report
+          path: |
+            tests/issues.json
+            tests/_artifacts/agentos-gateway.log
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # The budget BENCHMARKS.md states, checked against a measurement. Not the
+  # per-bench microsecond figures — those are one machine's and a shared runner
+  # would fail on scheduling — but the 2 ms ceiling, which is three orders of
+  # magnitude away and only crossed by something structural.
+  performance:
+    name: loop overhead against the budget
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable @ 2026-08
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Loop overhead
+        run: bash scripts/check-loop-budget.sh
+
+  # An advisory published after the last push is exactly the finding a
+  # per-push job cannot produce, because nothing pushed.
+  advisories:
+    name: dependency advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable @ 2026-08
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
+        with:
+          tool: cargo-deny
+      - name: Dependency policy
+        run: bash scripts/check-dependencies.sh

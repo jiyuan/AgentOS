@@ -1,8 +1,25 @@
-# CI for Agent OS. Wires the existing manual verification matrix
-# (docs/PLAN.md "Ongoing Verification Matrix") into GitHub Actions — no new
-# policy, just machine enforcement of the checks contributors already run.
+# Required checks for Agent OS (M9 / `CI-002`).
 #
-# Scheduled as Phase 1.3 of docs/OPTIMIZATION_ROADMAP.md.
+# The previous revision of this file was a report rather than a gate: no
+# `--locked`, no action pinned by digest, `dtolnay/rust-toolchain@stable` on a
+# moving branch, and `semver-checks` suppressed twice over — `continue-on-error`
+# *and* a trailing `|| echo`. `tests/gateway_pipeline.py` was invoked by
+# nothing, and neither release script ran.
+#
+# # One required check
+#
+# Branch protection names `ci` and nothing else. Every job below feeds it, so
+# adding a job makes it required automatically — the failure mode this avoids
+# is a new job that nobody adds to the protection rule and that therefore never
+# blocks anything, which is how a suite quietly stops gating.
+#
+# # Pinning
+#
+# Actions are pinned by commit SHA with the tag in a trailing comment. A tag is
+# a moving pointer somebody else controls, and `@stable` is a *branch*: the
+# toolchain a build used was whatever that branch said the moment it ran, which
+# is not a thing a failed build can be reproduced against. Bumping a pin is a
+# reviewable diff.
 
 name: CI
 
@@ -13,23 +30,29 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # A dependency that cannot be fetched should fail rather than retry for
+  # minutes on a runner that has no network.
+  CARGO_NET_RETRY: 2
+
+permissions:
+  contents: read
 
 jobs:
   checks:
-    name: fmt, clippy, boundaries, module size, catalogs
+    name: fmt, clippy, boundaries, module size, catalogs, surface
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable @ 2026-08
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Format check
         run: cargo fmt --all --check
       - name: Type check
-        run: cargo check --workspace
+        run: cargo check --workspace --locked
       - name: Clippy (warnings are errors)
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Import boundaries
         run: bash scripts/check-import-boundaries.sh
       - name: Module size ceiling
@@ -38,11 +61,16 @@ jobs:
         run: bash scripts/check-provider-calls.sh
       - name: Generated catalogs are current
         run: bash scripts/check-catalogs.sh
+      # The catalogs, the capability matrix and the release notes are each
+      # ratcheted against the code; this is the one that checks they agree with
+      # each other.
+      - name: Artifact, catalogs, matrix and notes describe one surface
+        run: bash scripts/check-release-surface.sh
 
   # Both supported platforms, not just the cheap one. macOS is the point of the
   # matrix rather than a bonus: it is the only place Seatbelt exists, and
-  # tests/sandbox.rs now *fails* rather than skips when a supported target
-  # cannot enforce a sandbox, so this job is what makes that assertion real
+  # tests/sandbox.rs *fails* rather than skips when a supported target cannot
+  # enforce a sandbox, so this job is what makes that assertion real
   # (M2 / `CI-001`).
   test:
     name: workspace tests (${{ matrix.os }})
@@ -52,16 +80,49 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable @ 2026-08
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Run tests
         run: cargo test --workspace --locked
       # A skip here means the runner could not enforce a sandbox, which the
-      # suite now treats as a failure. Named separately so the log says which
+      # suite treats as a failure. Named separately so the log says which
       # mechanism was in force rather than leaving it to be inferred.
       - name: Report the sandbox mechanism
         run: cargo test -p agentos-core --locked --test sandbox -- --nocapture
+
+  # Everything that needs a whole binary rather than a test harness: the
+  # lifecycle transitions an existing deployment performs, and one end-to-end
+  # cycle through both channel adapters.
+  rehearsals:
+    name: upgrade, rollback, gateway pipeline (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable @ 2026-08
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Build the gateway
+        run: cargo build --locked -p agentos-cli --bin agentos-gateway
+      - name: Restart, upgrade, migration and rollback
+        run: bash scripts/rehearse-upgrade.sh
+      - name: Gateway pipeline against mock channels
+        run: bash scripts/check-gateway-pipeline.sh
+      # The pipeline's own report, which says more than the exit code when a
+      # task fails on one platform and not the other.
+      - name: Upload the pipeline report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gateway-pipeline-${{ matrix.os }}
+          path: |
+            tests/issues.json
+            tests/_artifacts/agentos-gateway.log
+          if-no-files-found: ignore
+          retention-days: 7
 
   bench-smoke:
     name: bench compile + smoke (${{ matrix.os }})
@@ -71,12 +132,13 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable @ 2026-08
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # Smoke mode only: CI runners are too noisy to gate on timings, so this
       # proves every bench (criterion and custom harnesses) still compiles
-      # and runs, nothing more.
+      # and runs, nothing more. The nightly workflow is where timings are
+      # compared against BENCHMARKS.md.
       - name: Smoke-run benches
         run: cargo bench -p agentos-core --locked -- --test
 
@@ -88,46 +150,93 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable @ 2026-08
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # Packages an archive, extracts it, installs from both the archive and
       # the source checkout into isolated prefixes under a redirected HOME,
-      # validates every packaged documentation link, and completes one offline
-      # `builtin.echo` turn with no repository reachable. That last step is §5
-      # of docs/AUDIT_REMEDIATION_PLAN.md's definition of done, and nothing
-      # exercised it before this job existed.
+      # validates every packaged documentation link, starts and stops the
+      # packaged gateway, and completes one offline `builtin.echo` turn with no
+      # repository reachable. That last step is §5 of
+      # docs/AUDIT_REMEDIATION_PLAN.md's definition of done.
       - name: Clean-room archive and install check
         run: bash scripts/check-release-archive.sh
 
-  semver-checks:
-    name: semver-checks (advisory)
+  dependencies:
+    name: advisories, licences, duplicates, sources
     runs-on: ubuntu-latest
-    # Advisory while interface evolution policy settles: surfaces breaking
-    # changes in the job log without blocking the merge. Flip to required
-    # before tagging a release.
-    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable @ 2026-08
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
+        with:
+          tool: cargo-deny
+      # Blocking. An advisory against a dependency is the one class of finding
+      # nobody in this repository was looking at, and it costs a lockfile bump
+      # to fix. Suppressions live in deny.toml and expire; the script fails on
+      # an expired one.
+      - name: Dependency policy
+        run: bash scripts/check-dependencies.sh
+
+  semver:
+    name: public interface semver
+    runs-on: ubuntu-latest
     steps:
       # Full history so the git baseline below is reachable.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable @ 2026-08
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install cargo-semver-checks
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
         with:
           tool: cargo-semver-checks
-      # These crates are unpublished, so the default crates.io baseline can't be
-      # fetched. Compare against the PR base commit (or the previous commit on a
-      # push) via git instead. Reported as a warning, not a hard failure, so the
-      # advisory job stays green while the diff is still visible in the log.
+      # Blocking, and no `|| echo`. It was advisory "while interface evolution
+      # policy settles", which is a state that never ends on its own.
+      #
+      # The escape hatch is the one cargo-semver-checks already understands: a
+      # breaking change passes once the crate version is bumped to match it.
+      # That is the correct response to breaking an extension API, and it does
+      # not need an exception mechanism of its own.
+      #
+      # These crates are unpublished (`publish = false`), so the crates.io
+      # baseline cannot be fetched. Compare against the PR base commit, or the
+      # previous commit on a push.
       - name: Check interface crates
         run: |
           baseline="${{ github.event.pull_request.base.sha }}"
           [ -z "$baseline" ] && baseline="HEAD^"
           echo "semver baseline: $baseline"
           for crate in agentos-interfaces agentos-proto; do
-            cargo semver-checks check-release -p "$crate" --baseline-rev "$baseline" \
-              || echo "::warning::$crate: semver-checks reported changes vs $baseline (advisory; see log)"
+            cargo semver-checks check-release -p "$crate" --baseline-rev "$baseline"
+          done
+
+  # The single required check. Branch protection names this job; it passes only
+  # if every job above did, and `always()` means a *skipped* dependency is
+  # reported rather than silently satisfying it.
+  ci:
+    name: ci
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - checks
+      - test
+      - rehearsals
+      - bench-smoke
+      - release-smoke
+      - dependencies
+      - semver
+    steps:
+      - name: Every required job succeeded
+        run: |
+          results='${{ join(needs.*.result, ' ') }}'
+          echo "job results: $results"
+          for result in $results; do
+            if [ "$result" != "success" ]; then
+              echo "::error::a required job did not succeed ($results)"
+              exit 1
+            fi
           done

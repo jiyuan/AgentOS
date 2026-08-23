@@ -183,6 +183,26 @@ else
   failures=$((failures + 1))
 fi
 
+echo "== the packaged gateway starts and stops"
+# The other half of "installed and working": a turn proves the CLI runs, and
+# this proves the *service* does — that the wrapper's paths exist, that the
+# gateway can take its control-file lock under the install prefix, and that
+# `stop` finds and ends it (M9 / `CI-002`). No channels are enabled in the
+# shipped config by default, so this needs no network and no credentials.
+if run_installed "$agentos" gateway-start >"$scratch/gw-start.log" 2>&1; then
+  check "the packaged gateway reports running" bash -c \
+    'cd / && HOME="$1" AGENTOS_LLM_PROVIDER=builtin.echo "$2" gateway-status | grep -q "status: running"' \
+    _ "$home_dir" "$agentos"
+  run_installed "$agentos" gateway-stop >"$scratch/gw-stop.log" 2>&1 || true
+  check "the packaged gateway reports stopped after gateway-stop" bash -c \
+    'cd / && HOME="$1" AGENTOS_LLM_PROVIDER=builtin.echo "$2" gateway-status | grep -q "status: stopped"' \
+    _ "$home_dir" "$agentos"
+else
+  echo "  FAIL  the packaged gateway did not start" >&2
+  sed -n '1,40p' "$scratch/gw-start.log" >&2
+  failures=$((failures + 1))
+fi
+
 echo "== installing from the source checkout"
 # The other half of the same contract, and the one that used to copy the
 # developer's runtime state: `cp -r "$root/workspace"` pulled agentos.sqlite,
