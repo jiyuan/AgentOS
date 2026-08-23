@@ -5,11 +5,12 @@
 //! `current_thread` runtime, and run one conversation's turns on it while the
 //! router keeps receiving for everyone else.
 
-use super::run_memory_reflection;
 use super::{
     build_reflection_cron, channel_display_name, channel_stream_sink, command_reply_envelope,
     failure_envelope, fire_due_crons, log_line, log_trace, ServiceConfig, CRON_SCAN_INTERVAL_SECS,
+    RETENTION_SWEEP_INTERVAL_SECS,
 };
+use super::{run_memory_reflection, run_retention_sweep};
 use agentos_cli::slash::{self, Parsed, SessionUsage, SlashCommand, SlashContext};
 use agentos_core::crons::{CronStore, MemoryMaintenanceCron};
 use agentos_core::gateway::{
@@ -100,6 +101,7 @@ pub(super) fn run_shard_thread(
             cron_store,
             reflection_cron: RefCell::new(reflection_cron),
             last_cron_scan: Cell::new(0),
+            last_retention_sweep: Cell::new(0),
             pending_approvals: RefCell::new(HashMap::new()),
             expired: RefCell::new(Vec::new()),
         };
@@ -157,6 +159,9 @@ struct ShardTurns<'a> {
     cron_store: CronStore,
     reflection_cron: RefCell<Option<MemoryMaintenanceCron>>,
     last_cron_scan: Cell<u64>,
+    /// When the retention sweep last ran, so it keeps its own much slower
+    /// cadence inside the cron scan's.
+    last_retention_sweep: Cell<u64>,
     /// Runs waiting on an approval, keyed by conversation.
     ///
     /// The serial loop used to answer an approval by blocking on
@@ -660,6 +665,20 @@ impl ShardTurns<'_> {
         )
         .await;
         *self.reflection_cron.borrow_mut() = reflection;
-        reflected
+        reflected?;
+        if now.saturating_sub(self.last_retention_sweep.get()) < RETENTION_SWEEP_INTERVAL_SECS {
+            return Ok(());
+        }
+        self.last_retention_sweep.set(now);
+        // After reflection rather than before: reflection's own retention
+        // budgets can end a record's life, and sweeping the stores first would
+        // leave what it freed until the next tick.
+        run_retention_sweep(
+            &self.context.config,
+            self.context.channel_name,
+            &self.context.runtime,
+            &self.context.ledger,
+        )
+        .await
     }
 }

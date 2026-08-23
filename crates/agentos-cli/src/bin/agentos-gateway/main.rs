@@ -1,5 +1,4 @@
 use agentos_cli::slash::{self, Parsed, SessionUsage, SlashCommand};
-use agentos_core::audit::{SafetyEvent, SafetyEventKind, SafetyJournal, SafetyOutcome};
 use agentos_core::channels::{feishu::FeishuChannel, telegram::TelegramChannel};
 use agentos_core::config::{effective, WorkspaceConfig};
 use agentos_core::crons::{CronSchedule, CronStore, MemoryMaintenanceCron};
@@ -10,7 +9,9 @@ use agentos_core::gateway::{
 use agentos_core::memory::migrate::{self, MigrationSettings};
 use agentos_core::memory::{
     lease_holder_id, MemoryManager, SqliteStore, DEFAULT_LEASE_TTL, REFLECTION_LEASE,
+    RETENTION_LEASE,
 };
+use agentos_core::retention::{RetentionSweep, RetentionTargets};
 use agentos_core::runner::ResumeDecision;
 use agentos_core::runtime::{AgentRuntime, RuntimePaths};
 use agentos_core::sandbox;
@@ -31,6 +32,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod calibrate;
 mod catalog;
+mod purge;
 mod shard;
 
 use shard::{run_shard_thread, ShardContext};
@@ -136,6 +138,73 @@ async fn run_memory_reflection(
         ),
     }
 }
+/// Apply `[retention]`, `[spill]` and `[jobs].completed_retention_secs` on an
+/// idle tick, logging one line when anything was actually removed
+/// (M7 / `QUOTA-001`).
+///
+/// Guarded by its own lease, for the same reason reflection is: shard 0 exists
+/// once per *channel*, so a Telegram-and-Feishu deployment would otherwise walk
+/// the same trace directory twice at once and race itself over which process
+/// gets to unlink a file. A separate lease from reflection's because the two
+/// are not one job — reflection is off by default and needs an LLM, retention
+/// is on and needs nothing, and gating one on the other would silently disable
+/// retention on most deployments.
+///
+/// Nothing here touches the session log or the audit stores. Those are deleted
+/// only by `agentos-gateway purge`, which is the whole point of the split — see
+/// `agentos_core::retention`.
+async fn run_retention_sweep(
+    config: &ServiceConfig,
+    channel_name: &str,
+    runtime: &AgentRuntime,
+    ledger: &IngressLedger,
+) -> Result<(), String> {
+    let workspace = &runtime.workspace_config;
+    if !workspace.retention.sweeps_anything()
+        && workspace.spill.retention_secs().is_none()
+        && workspace.spill.max_bytes().is_none()
+        && workspace.jobs.completed_job_max_age().is_none()
+    {
+        return Ok(());
+    }
+    let holder = lease_holder_id(channel_name);
+    match runtime
+        .session
+        .try_acquire_lease(RETENTION_LEASE, &holder, DEFAULT_LEASE_TTL)
+    {
+        Ok(Some(_lease)) => {}
+        Ok(None) => return Ok(()),
+        Err(err) => {
+            return log_line(
+                config,
+                &format!("{channel_name} could not ask for the retention lease: {err}"),
+            );
+        }
+    }
+
+    let targets = RetentionTargets {
+        trace_dir: Some(runtime_paths(config).trace_dir),
+        attachments_dir: Some(attachments_dir_path(config)),
+        gateway_log: Some(config.log_path.clone()),
+    };
+    let report = RetentionSweep {
+        retention: &workspace.retention,
+        spill_config: &workspace.spill,
+        targets: &targets,
+        spill: runtime.spill(),
+        ingress: Some(ledger),
+        jobs: Some(runtime.jobs()),
+        completed_job_max_age: workspace.jobs.completed_job_max_age(),
+    }
+    .run()
+    .await;
+
+    if report.is_empty() {
+        return Ok(());
+    }
+    log_line(config, &format!("{channel_name} retention: {report}"))
+}
+
 const DEFAULT_LOG_RELPATH: &str = "logs/agentos-gateway.log";
 const OWNER_TOKEN_ENV: &str = "AGENTOS_GATEWAY_OWNER_TOKEN";
 
@@ -143,6 +212,15 @@ const OWNER_TOKEN_ENV: &str = "AGENTOS_GATEWAY_OWNER_TOKEN";
 /// have one-minute resolution, so a 30s scan never misses a tick while
 /// avoiding a re-read of every TOML on each one-second idle poll.
 const CRON_SCAN_INTERVAL_SECS: u64 = 30;
+
+/// How often the retention sweep walks the stores.
+///
+/// Far slower than the cron scan, because the two are not the same kind of
+/// work. A cron scan re-reads a handful of TOML files and must not miss a
+/// minute-resolution tick; a retention sweep stats every trace file and every
+/// attachment directory, and nothing goes wrong if a file that became eligible
+/// at 09:01 is removed at 09:15.
+const RETENTION_SWEEP_INTERVAL_SECS: u64 = 900;
 
 #[cfg(unix)]
 unsafe extern "C" {
@@ -223,7 +301,7 @@ fn run() -> Result<(), String> {
         }
         "serve" => serve(&config),
         "migrate" => migrate(&config),
-        "purge" => purge(&config),
+        "purge" => purge::purge(&config),
         "-h" | "--help" | "help" => {
             usage();
             Ok(())
@@ -260,11 +338,16 @@ Subcommands:
              on, which the old rows do not record; `--agent NAME` likewise.
              `--assume-literal-underscores` accepts the literal reading of ids
              the old encoder made ambiguous — see the report before using it.
-  purge      Irreversibly delete one conversation's session log. This is not
-             `/clear`, which hides history behind an epoch marker and removes
-             nothing; this is the operation for somebody asking to be
-             forgotten. Requires `--conversation ID` and `--yes ID` naming the
-             same conversation twice, and records a safety event.
+  purge      Irreversibly delete records. Never `/clear`, which hides history
+             behind an epoch marker and removes nothing. Three modes, each
+             recording a safety event:
+             `--conversation ID --yes ID` deletes one conversation's session
+             log — the operation for somebody asking to be forgotten.
+             `--sessions --before YYYY-MM-DD` deletes whole conversations idle
+             since before that date. `--audit --before YYYY-MM-DD` deletes rows
+             from safety_events and memory_access_log, which nothing else ever
+             removes (ADR-0005). Both bulk modes report and change nothing
+             until `--apply --yes N`, where N is the count they printed.
 
 All workspace paths derive from $AGENTOS_HOME (set in .env or the process env).
 If unset, $AGENTOS_HOME defaults to the parent dir of the loaded .env file,
@@ -318,13 +401,30 @@ where
             // rather than a runtime path.
             "--check" => {}
             option if option.starts_with("--root=") => {}
-            // `migrate`'s own options, parsed the same way and for the same
-            // reason: they describe a one-off operation, not the service.
-            "--apply" | "--no-backup" | "--assume-literal-underscores" => {}
+            // `migrate`'s and `purge`'s own options, parsed the same way and
+            // for the same reason: they describe a one-off operation, not the
+            // service.
+            //
+            // Named here as well as read there, because this loop rejects
+            // anything it does not recognise — which is right, and which made
+            // `purge --conversation ID --yes ID` fail with "unknown option"
+            // for as long as it has existed. Every flag a subcommand reads
+            // needs a line here or it cannot be typed (M7 / `QUOTA-001`).
+            "--apply"
+            | "--no-backup"
+            | "--assume-literal-underscores"
+            | "--audit"
+            | "--sessions" => {}
+            "--channel" | "--agent" | "--backup" | "--conversation" | "--yes" | "--before" => {
+                let _ = args.next();
+            }
             option
                 if option.starts_with("--channel=")
                     || option.starts_with("--agent=")
-                    || option.starts_with("--backup=") => {}
+                    || option.starts_with("--backup=")
+                    || option.starts_with("--conversation=")
+                    || option.starts_with("--yes=")
+                    || option.starts_with("--before=") => {}
             "-h" | "--help" => {
                 usage();
                 std::process::exit(0);
@@ -1316,69 +1416,6 @@ fn runtime_paths(config: &ServiceConfig) -> RuntimePaths {
 /// place and the report is the part that needs reading: the old encoding lost
 /// information, so some namespaces cannot be migrated without a human deciding
 /// what they meant.
-/// Irreversibly delete a conversation's session log.
-///
-/// Deliberately here and not behind a slash command
-/// ([ADR-0006](../../../../../docs/adr/0006-CLEAR_EPOCH.md)). `Approve` gates
-/// what the *model* is allowed to do; a purge is an operator's decision about
-/// their own records, so gating it on the run policy would be a category
-/// error — there is no run to pause and no model asking. What it is gated on
-/// instead is shell access to the host and naming the conversation twice, so
-/// it cannot be reached by a message in the conversation it would destroy.
-fn purge(config: &ServiceConfig) -> Result<(), String> {
-    let flags: Vec<String> = env::args().skip(2).collect();
-    let value = |name: &str| {
-        let mut args = flags.iter();
-        while let Some(flag) = args.next() {
-            if let Some(inline) = flag.strip_prefix(&format!("{name}=")) {
-                return Some(inline.to_owned());
-            }
-            if flag == name {
-                return args.next().cloned();
-            }
-        }
-        None
-    };
-
-    let conversation =
-        value("--conversation").ok_or_else(|| "--conversation ID is required".to_owned())?;
-    let confirmed = value("--yes").ok_or_else(|| {
-        format!(
-            "--yes {conversation} is required: this deletes the log irreversibly, and `/clear` \
-             is what you want if you only need the model to start fresh"
-        )
-    })?;
-    if confirmed != conversation {
-        return Err(format!(
-            "--yes named '{confirmed}' but --conversation named '{conversation}'"
-        ));
-    }
-
-    let db_path = session_path(config);
-    if !db_path.exists() {
-        return Err(format!("no database at {}", db_path.display()));
-    }
-    let store = SqliteStore::open(&db_path)
-        .map_err(|err| format!("failed to open {}: {err}", db_path.display()))?;
-    let conversation_id = ConversationId::new(conversation.clone());
-    let removed = store
-        .purge_session(&conversation_id)
-        .map_err(|err| format!("failed to purge '{conversation}': {err}"))?;
-
-    // The one deletion the runtime performs on purpose, so it is the one that
-    // most needs a record that it happened (M6 / `AUD-001`).
-    SafetyJournal::new(Some(&store)).record(
-        SafetyEvent::new(
-            SafetyEventKind::SessionPurged,
-            SafetyOutcome::Purged,
-            conversation.clone(),
-        )
-        .with_detail(format!("{removed} session items deleted by an operator")),
-    );
-    println!("purged {removed} item(s) from conversation '{conversation}'");
-    Ok(())
-}
-
 fn migrate(config: &ServiceConfig) -> Result<(), String> {
     let flags: Vec<String> = env::args().skip(2).collect();
     let has = |name: &str| flags.iter().any(|flag| flag == name);
@@ -1575,9 +1612,17 @@ fn log_line(config: &ServiceConfig, message: &str) -> Result<(), String> {
         .map_err(|err| format!("system time error: {err}"))?
         .as_secs();
     let line = format!("[{ts}] {message}\n");
-    OpenOptions::new()
-        .create(true)
-        .append(true)
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    // Private, like every other file the runtime writes (M8 / `GW-001`). The
+    // log names conversations, senders and the text of errors, and rotation
+    // (M7 / `QUOTA-001`) creates more of these files rather than fewer.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
         .open(&config.log_path)
         .and_then(|mut file| {
             use std::io::Write;
