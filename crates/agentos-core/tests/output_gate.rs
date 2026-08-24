@@ -122,7 +122,7 @@ fn deps<'a>(
         cancel: CancellationToken::new(),
         steering: None,
         audit: Default::default(),
-        granted_authority: &[],
+        delegated_authority: None,
     }
 }
 

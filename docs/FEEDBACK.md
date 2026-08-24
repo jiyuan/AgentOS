@@ -607,3 +607,73 @@
 - **Actual Behavior**: The first parse attempt passed the newer `aliases:` keyword to the host's Ruby 2.6 Psych API and failed before reading the workflow.
 - **Root Cause**: The validation command assumed a newer Psych method signature than the macOS system Ruby provides.
 - **Suggested Fix**: Use `YAML.load_file(path)` for workflows without aliases on this host; the corrected command parsed `.github/workflows/ci.yml` successfully.
+
+## [2026-08-23 22:44] TOOL [RESOLVED]
+
+- **Agent**: /root
+- **Task**: Update ADR-0003 after completing the first R1 identity slice.
+- **Guideline Violated**: GUIDELINES > Efficiency
+- **Expected Behavior**: An ADR patch should match the inspected text and apply in one invocation.
+- **Actual Behavior**: The first patch included a duplicated sentence that appeared only in earlier command output, so patch verification rejected the entire edit without changing the file.
+- **Root Cause**: The patch was prepared from a truncated/visually repeated excerpt instead of re-reading the exact target lines first.
+- **Suggested Fix**: Re-read the precise hunk before patching documentation; the corrected, smaller patch applied and the documentation checks remained green.
+
+## [2026-08-23 23:36] CONSISTENCY [RESOLVED]
+
+- **Agent**: /root
+- **Task**: Implement the immutable authorized-plan boundary for AUTH-005.
+- **Guideline Violated**: Code conventions > typed domain errors and blocking Clippy gate
+- **Expected Behavior**: The authorization transition should return a compact typed result that passes the warnings-as-errors gate on its first check.
+- **Actual Behavior**: The first implementation returned `Result<(Plan, Option<_>), (Plan, Unauthorized)>`; Clippy rejected both the large inline error and the complex tuple type.
+- **Root Cause**: The initial API preserved the old tuple-shaped executor flow instead of modeling executable, denied-tool, and refused outcomes as domain types.
+- **Suggested Fix**: Use `ActPlan` and `AuthorizationFailure`, boxing the refused plan; the revised API passed workspace Clippy and made the denial disposition structurally explicit.
+
+## [2026-08-24 22:48] CORRECTNESS [RESOLVED]
+
+- **Agent**: /root
+- **Task**: Replace clock-seeded approval tickets with nonce-and-counter ticket identities for AUTH-003.
+- **Guideline Violated**: GUIDELINES > Correctness
+- **Expected Behavior**: Parsing a freshly minted base64url ticket should preserve the exact approval-instance identity.
+- **Actual Behavior**: The first parser revision retained the legacy base36 lowercasing step, so uppercase base64url nonce bytes changed during parsing and the instance/ticket equality check failed.
+- **Root Cause**: The ticket alphabet changed from case-insensitive base36 to case-sensitive base64url, but the normalization rule changed only its accepted characters.
+- **Suggested Fix**: Preserve ticket bytes exactly during parse and pin the behavior with a case-preserving serialization round-trip test; the corrected parser passes the approval, witness, and channel callback suites.
+
+## [2026-08-24 22:48] TOOL
+
+- **Agent**: /root
+- **Task**: Run the full workspace suite after AUTH-003.
+- **Guideline Violated**: GUIDELINES > Correctness
+- **Expected Behavior**: The persistent gateway lifecycle test should observe graceful SIGTERM handling consistently in both isolated and full-suite execution.
+- **Actual Behavior**: `the_serving_process_holds_the_control_file_and_releases_it_on_sigterm` passed in isolation but intermittently exited directly with SIGTERM in the full suite.
+- **Root Cause**: The existing startup publication/signal-handler race tracked as roadmap finding `AF-025` lets the test signal after the control lock is visible but before shutdown handling is ready.
+- **Suggested Fix**: Complete `CTRL-002`/`AF-025` by publishing the serving lock only after signal handlers are installed; keep the isolated passing rerun and AUTH-003 targeted gates separate until that lifecycle fix lands.
+
+## [2026-08-24 22:48] CONSISTENCY [RESOLVED]
+
+- **Agent**: /root
+- **Task**: Run structural and audit-register gates for AUTH-003.
+- **Guideline Violated**: GUIDELINES > Consistency
+- **Expected Behavior**: New implementation code should stay below the module ceiling, and every completed audit regression should carry its stable finding marker when first added.
+- **Actual Behavior**: The first structural pass found `loop/mod.rs` at 839 lines, and the first audit-register pass found five completed tests without their `AF-*` markers.
+- **Root Cause**: Exact resume logic was initially placed in the loop root, and roadmap IDs were recorded in the roadmap but not repeated on the corresponding regression functions.
+- **Suggested Fix**: Move ticketed resume into `loop/resume.rs` and annotate each regression with its stable `AF-010` through `AF-015` identifier; both gates pass after those corrections.
+
+## [2026-08-24 23:31] TOOL [RESOLVED]
+
+- **Agent**: /root
+- **Task**: Apply a mechanical dependency-field rename while implementing AUTH-004.
+- **Guideline Violated**: GUIDELINES > Efficiency
+- **Expected Behavior**: A mechanical rewrite should use the portable locale rule already established in this feedback log.
+- **Actual Behavior**: The attempted Perl rewrite inherited unavailable `C.UTF-8` locale settings and stopped before changing any files.
+- **Root Cause**: The command did not apply the existing `LC_ALL=C LANG=C` remediation before invoking host Perl.
+- **Suggested Fix**: Use `apply_patch` for the scoped field edits, as the corrected implementation did; reserve Perl rewrites for cases where the portable locale is explicitly set.
+
+## [2026-08-24 23:31] TOOL [RESOLVED]
+
+- **Agent**: /root
+- **Task**: Run the complete `agentos-core` suite after AUTH-004.
+- **Guideline Violated**: FEEDBACK > Review Cycle > Per-session
+- **Expected Behavior**: The prior resolved feedback about loopback fixtures should be applied before invoking the full suite.
+- **Actual Behavior**: The first run used the managed sandbox and seven egress tests failed to bind loopback sockets; the approved rerun passed those fixtures and reached only the existing native macOS Seatbelt `AF-020` blocker.
+- **Root Cause**: The full-suite command was started before consulting the existing environment-specific remediation in this log.
+- **Suggested Fix**: Run `cargo test -p agentos-core` with the already approved local-test permission when verifying this repository; keep native Seatbelt enforcement assigned to macOS CI until `SBX-002` closes `AF-020`.

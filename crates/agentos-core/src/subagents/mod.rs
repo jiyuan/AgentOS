@@ -1,11 +1,14 @@
-use crate::approve::{DelegationGrant, Policy, PolicyError};
+use crate::approve::{
+    DelegatedAuthority, DelegationGrantError, DelegationGrantTemplate, DelegationScope, Policy,
+    PolicyError,
+};
 use crate::audit::SafetyLog;
 use crate::config::CompactionConfig;
 use crate::memory::{InMemorySession, MemoryManager};
 use crate::prompt::Compaction;
-use crate::r#loop::{InputGuardrailEntry, OutputGuardrailEntry, ToolGuardrailEntry};
+use crate::r#loop::{InputGuardrailEntry, OutputGuardrailEntry, ResumeWitness, ToolGuardrailEntry};
 use crate::runner::{
-    resume_run, run_envelope, PausedRun, ResumeDecision, RunOutcome, RunnerDeps, TraceSink,
+    resume_run, run_envelope, PausedRun, RunOutcome, RunnerDeps, TraceSink,
     SESSION_SCOPE_EPHEMERAL, SESSION_SCOPE_KEY,
 };
 use crate::spill::{ContentLimits, SpillStore, DEFAULT_TOOL_RESULT_INLINE_BYTES};
@@ -15,7 +18,10 @@ use agentos_interfaces::guardrail::{InputGuardrail, OutputGuardrail, ToolGuardra
 use agentos_interfaces::orchestrator::{Orchestrator, SubAgentSpec};
 use agentos_interfaces::session::Session;
 use agentos_llm::Llm;
-use agentos_proto::{AgentId, ChannelId, ConversationId, Envelope, Message, Principal, RunId};
+use agentos_proto::{
+    ActorPrincipal, AgentId, ChannelId, ConversationId, ConversationPrincipal, Envelope, Message,
+    RunId,
+};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use thiserror::Error;
@@ -40,6 +46,16 @@ pub enum SubAgentError {
     Run(Arc<str>),
     #[error("sub-agent paused unexpectedly")]
     Paused,
+    #[error("delegation grant failed: {0}")]
+    Grant(#[from] DelegationGrantError),
+    #[error("system clock is before the Unix epoch; delegation grants fail closed")]
+    ClockUnavailable,
+    #[error("delegation requires a sender-qualified initiating parent actor")]
+    MissingInitiatingActor,
+    #[error("paused child is missing its bound delegation scope")]
+    MissingDelegationScope,
+    #[error("paused child has an invalid delegation scope: {0}")]
+    InvalidDelegationScope(Arc<str>),
 }
 
 pub struct SubAgentDefinition {
@@ -69,7 +85,7 @@ pub struct SubAgentDefinition {
     /// structural: `prepare` narrows against the immediate parent with only
     /// this delegatee's grants, and a sub-agent of a sub-agent is narrowed
     /// with its own, never with these.
-    pub delegation_grants: Vec<DelegationGrant>,
+    pub delegation_grants: Vec<DelegationGrantTemplate>,
 }
 
 impl SubAgentDefinition {
@@ -98,7 +114,7 @@ impl SubAgentDefinition {
     /// Authority this sub-agent holds beyond its parent. Empty by default:
     /// a sub-agent gets nothing its parent does not have unless an operator
     /// wrote down why.
-    pub fn with_delegation_grants(mut self, grants: Vec<DelegationGrant>) -> Self {
+    pub fn with_delegation_grants(mut self, grants: Vec<DelegationGrantTemplate>) -> Self {
         self.delegation_grants = grants;
         self
     }
@@ -200,7 +216,7 @@ pub struct SubAgentInvocation {
     policy: Policy,
     /// The grants narrowing had to invoke to admit this child's policy. The
     /// parent records their issuance; the child's `Approve` records each use.
-    grants_relied_on: Vec<DelegationGrant>,
+    delegated_authority: DelegatedAuthority,
     input: Envelope,
     run_id: RunId,
     channel_capacity: usize,
@@ -229,8 +245,11 @@ pub struct SubAgentInvocation {
 
 mod branch;
 
+const DELEGATION_SCOPE_KEY: &str = "agentos_delegation_scope";
+
 use branch::seed_from_parent;
 pub use branch::{child_input_envelope, child_run_id, parent_conversation_id, parent_principal};
+pub(crate) use branch::{ChildIdentitySource, CHILD_IDENTITY_SOURCE_KEY};
 
 /// The point in a parent conversation a child is branched from.
 #[derive(Clone, Debug)]
@@ -238,7 +257,7 @@ pub struct ParentSeed {
     /// The parent conversation, as a principal rather than a bare id — the
     /// fork has to name *which* agent's `telegram:42` it is copying from
     /// (M3 deliverable 2).
-    pub principal: Principal,
+    pub principal: ConversationPrincipal,
     /// Items of the parent's log to copy. Taken from the parent's *in-memory*
     /// transcript, which is the delegation point as the parent sees it; the
     /// store holds a prefix of that, because the turn in flight is not
@@ -348,7 +367,8 @@ impl SubAgentRegistry {
         &self,
         spec: &SubAgentSpec,
         parent_policy: &Policy,
-        input: Envelope,
+        initiating_actor: ActorPrincipal,
+        mut input: Envelope,
         run_id: RunId,
     ) -> Result<SubAgentInvocation, SubAgentError> {
         let definition = self
@@ -359,11 +379,92 @@ impl SubAgentRegistry {
                 agent_id: spec.agent_id.clone(),
                 policy_id: Arc::clone(&spec.policy_id),
             })?;
-        let narrowed = Policy::narrow_with_grants(
-            parent_policy,
-            &definition.policy,
-            &definition.delegation_grants,
+        let issued_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| SubAgentError::ClockUnavailable)?
+            .as_secs();
+        let scope = DelegationScope::mint(
+            initiating_actor,
+            definition.agent_id.clone(),
+            Arc::clone(&definition.policy_id),
+            issued_at,
         )?;
+        input.metadata.insert(
+            Arc::from(DELEGATION_SCOPE_KEY),
+            serde_json::to_value(&scope).map_err(|error| {
+                SubAgentError::InvalidDelegationScope(Arc::from(error.to_string()))
+            })?,
+        );
+        input.metadata.insert(
+            Arc::from("kind"),
+            serde_json::Value::String("subagent_input".to_owned()),
+        );
+        self.prepare_bound(definition, parent_policy, input, run_id, scope, issued_at)
+    }
+
+    pub fn prepare_resume(
+        &self,
+        spec: &SubAgentSpec,
+        parent_policy: &Policy,
+        initiating_actor: ActorPrincipal,
+        input: Envelope,
+        run_id: RunId,
+        paused_state: &agentos_interfaces::RunState,
+    ) -> Result<SubAgentInvocation, SubAgentError> {
+        let definition = self
+            .definitions
+            .get(&(spec.agent_id.clone(), Arc::clone(&spec.policy_id)))
+            .cloned()
+            .ok_or_else(|| SubAgentError::Unknown {
+                agent_id: spec.agent_id.clone(),
+                policy_id: Arc::clone(&spec.policy_id),
+            })?;
+        let scope_value = paused_state
+            .transcript
+            .items
+            .iter()
+            // The child input carrying the kernel-written scope follows any
+            // parent history that was seeded into the conversation. Search
+            // newest-first so untrusted historical metadata cannot shadow it.
+            .rev()
+            .find(|item| {
+                item.message.role == agentos_proto::MessageRole::User
+                    && item
+                        .metadata
+                        .get("kind")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("subagent_input")
+            })
+            .and_then(|item| item.metadata.get(DELEGATION_SCOPE_KEY))
+            .cloned()
+            .ok_or(SubAgentError::MissingDelegationScope)?;
+        let scope: DelegationScope = serde_json::from_value(scope_value)
+            .map_err(|error| SubAgentError::InvalidDelegationScope(Arc::from(error.to_string())))?;
+        scope.validate_binding(
+            &initiating_actor,
+            &definition.agent_id,
+            &definition.policy_id,
+        )?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| SubAgentError::ClockUnavailable)?
+            .as_secs();
+        self.prepare_bound(definition, parent_policy, input, run_id, scope, now)
+    }
+
+    fn prepare_bound(
+        &self,
+        definition: Arc<SubAgentDefinition>,
+        parent_policy: &Policy,
+        input: Envelope,
+        run_id: RunId,
+        scope: DelegationScope,
+        now: u64,
+    ) -> Result<SubAgentInvocation, SubAgentError> {
+        let authority =
+            DelegatedAuthority::issue(&definition.delegation_grants, parent_policy, scope)?;
+        let narrowed =
+            Policy::narrow_with_grants(parent_policy, &definition.policy, &authority, now)?;
         // X5: state the security property over the policy the child run is
         // actually handed, rather than trusting that the call above produced
         // it. Independent of how `narrow` decides individual rules.
@@ -372,7 +473,7 @@ impl SubAgentRegistry {
         Ok(SubAgentInvocation {
             definition,
             policy: narrowed.policy,
-            grants_relied_on: narrowed.grants_relied_on,
+            delegated_authority: authority.restricted(narrowed.grants_relied_on),
             input,
             run_id,
             channel_capacity: self.channel_capacity,
@@ -396,8 +497,13 @@ impl SubAgentInvocation {
     /// The grants narrowing had to invoke to admit this delegation. The
     /// caller records their issuance — it is the one that holds the parent
     /// run, and therefore the principal the grant was exercised for.
-    pub fn grants_relied_on(&self) -> &[DelegationGrant] {
-        &self.grants_relied_on
+    pub fn grants_relied_on(&self) -> &[crate::approve::DelegationGrant] {
+        self.delegated_authority.grants()
+    }
+
+    /// Runtime authority bound to this exact delegation generation.
+    pub fn delegated_authority(&self) -> &DelegatedAuthority {
+        &self.delegated_authority
     }
 
     /// Tie this child run to `parent`, so cancelling the parent cancels it.
@@ -424,7 +530,7 @@ impl SubAgentInvocation {
 
         let definition = self.definition;
         let child_policy = self.policy;
-        let granted_authority = self.grants_relied_on;
+        let delegated_authority = self.delegated_authority;
         let safety_log = self.safety_log;
         let run_id = self.run_id;
         let trace_sink = self.trace_sink;
@@ -518,7 +624,7 @@ impl SubAgentInvocation {
                 // Sub-agents never stream to the parent's egress.
                 stream_sink: None,
                 safety_log: safety_log.as_deref(),
-                granted_authority: &granted_authority,
+                delegated_authority: Some(&delegated_authority),
             };
             let result = match run_envelope(input, run_id, &deps).await {
                 Ok(RunOutcome::Finished { state, output }) => {
@@ -558,11 +664,11 @@ impl SubAgentInvocation {
     pub async fn resume(
         self,
         paused: SubAgentPausedRun,
-        decision: ResumeDecision,
+        witness: ResumeWitness,
     ) -> Result<SubAgentRun, SubAgentError> {
         let definition = self.definition;
         let child_policy = self.policy;
-        let granted_authority = self.grants_relied_on;
+        let delegated_authority = self.delegated_authority;
         let safety_log = self.safety_log;
         let trace_sink = self.trace_sink;
         let task_workspace = self.task_workspace;
@@ -572,11 +678,6 @@ impl SubAgentInvocation {
         let summarizer = self.summarizer;
         let compaction_config = self.compaction_config;
         let cancel = self.cancel;
-        let child_approval_id = paused
-            .state
-            .pending_approval()
-            .map(|approval| approval.id.clone())
-            .ok_or_else(|| SubAgentError::Run(Arc::from("paused child has no pending approval")))?;
         let local = LocalSet::new();
         local
             .run_until(async move {
@@ -641,14 +742,14 @@ impl SubAgentInvocation {
                     cancel: cancel.clone(),
                     steering: None,
                     safety_log: safety_log.as_deref(),
-                    granted_authority: &granted_authority,
+                    delegated_authority: Some(&delegated_authority),
                 };
                 let paused_run = PausedRun {
                     channel_id: paused.channel_id.clone(),
                     conversation_id: paused.conversation_id.clone(),
                     state: paused.state,
                 };
-                match resume_run(paused_run, &child_approval_id, decision, &deps).await {
+                match resume_run(paused_run, witness, &deps).await {
                     Ok(RunOutcome::Finished { state, output }) => {
                         Ok(SubAgentRun::Finished(SubAgentRunOutput {
                             agent_id: definition.agent_id.clone(),

@@ -12,6 +12,7 @@ mod hybrid;
 mod in_memory;
 mod lease;
 pub mod migrate;
+pub mod migrate_child_sessions;
 pub mod migrate_sessions;
 mod pool;
 mod qdrant;

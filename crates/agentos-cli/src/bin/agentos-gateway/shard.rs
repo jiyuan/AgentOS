@@ -19,12 +19,12 @@ use agentos_core::gateway::{
 };
 use agentos_core::r#loop::{
     route, ApprovalBinding, ApprovalOutcome, ApprovalTicket, InputGuardrailEntry,
-    OutputGuardrailEntry, Routed, ToolGuardrailEntry,
+    OutputGuardrailEntry, ResumeWitness, Routed, ToolGuardrailEntry,
 };
-use agentos_core::runner::{PausedRun, ResumeDecision, RunnerDeps};
+use agentos_core::runner::{PausedRun, RunnerDeps};
 use agentos_core::runtime::{AgentRuntime, RuntimeDepsScope};
 use agentos_interfaces::{Egress, StreamEgress};
-use agentos_proto::{ConversationId, Envelope, InterruptionId, Principal, RunId};
+use agentos_proto::{ActorPrincipal, ConversationId, Envelope, InterruptionId, RunId};
 use async_trait::async_trait;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -127,7 +127,7 @@ enum Answered {
 /// A decided approval, ready to resume.
 struct Resume {
     pending: PendingApproval,
-    decision: ResumeDecision,
+    witness: ResumeWitness,
 }
 
 /// A run parked on an approval, and what it takes to answer it.
@@ -251,13 +251,15 @@ impl ShardTurns<'_> {
     /// Senders who may answer any prompt, from `[policy]
     /// approval_administrators`. Empty in the usual case, which is what makes
     /// a prompt answerable only by the person it was put to.
-    fn approval_administrators(&self) -> Vec<Arc<str>> {
+    fn approval_administrators(&self) -> Vec<ActorPrincipal> {
         self.context
             .runtime
             .workspace_config
             .policy
             .approval_administrators
-            .clone()
+            .iter()
+            .map(|administrator| administrator.actor())
+            .collect()
     }
 
     async fn handle(&self, turn: Turn) -> Result<(), String> {
@@ -325,7 +327,7 @@ impl ShardTurns<'_> {
         // on? Only an envelope carrying that prompt's ticket does.
         let outcome = match self.decide(&input)? {
             Answered::Resume(resume) => {
-                let Resume { pending, decision } = *resume;
+                let Resume { pending, witness } = *resume;
                 let Some(approval_id) = pending
                     .paused
                     .state
@@ -344,12 +346,10 @@ impl ShardTurns<'_> {
                         "{channel_name} approval {} ({}) resolved: {}",
                         approval_id.as_str(),
                         pending.binding.ticket,
-                        decision.outcome().as_str()
+                        witness.outcome().as_str()
                     ),
                 )?;
-                service
-                    .resume(egress, pending.paused, &approval_id, decision)
-                    .await
+                service.resume(egress, pending.paused, witness).await
             }
             Answered::NotYours(ticket) => {
                 return self
@@ -399,8 +399,27 @@ impl ShardTurns<'_> {
                     paused.conversation_id.clone(),
                     PendingApproval {
                         // Bound to the sender whose message caused the pause.
-                        binding: ApprovalBinding::new(ticket, Arc::clone(&input.sender))
-                            .with_administrators(self.approval_administrators()),
+                        binding: {
+                            let approval = paused
+                                .state
+                                .pending_approval()
+                                .ok_or_else(|| "paused run had no approval".to_owned())?;
+                            let prompting = ActorPrincipal::new(
+                                paused.state.active_agent.clone(),
+                                paused.channel_id.clone(),
+                                paused.conversation_id.clone(),
+                                Arc::clone(&input.sender),
+                            );
+                            ApprovalBinding::new(
+                                approval.approval_instance_id.clone(),
+                                ticket,
+                                approval.id.clone(),
+                                prompting,
+                                expires_at,
+                            )
+                            .ok_or_else(|| "approval instance did not match ticket".to_owned())?
+                            .with_administrators(self.approval_administrators())
+                        },
                         paused,
                         expires_at,
                     },
@@ -466,21 +485,13 @@ impl ShardTurns<'_> {
             Routed::Unrelated => Ok(Answered::Run),
             Routed::Stale { ticket } => Ok(Answered::Stale(ticket)),
             Routed::NotYours { ticket } => Ok(Answered::NotYours(ticket)),
-            Routed::Decides { outcome, reason } => {
+            Routed::Decides { witness } => {
                 let entry = pending
                     .remove(&input.conversation_id)
                     .expect("a decision implies a pending approval");
-                let decision = match outcome {
-                    ApprovalOutcome::Approved => ResumeDecision::Approve,
-                    _ => ResumeDecision::Reject {
-                        reason: reason.unwrap_or_else(|| {
-                            Arc::from(format!("rejected by {} user", self.context.channel_name))
-                        }),
-                    },
-                };
                 Ok(Answered::Resume(Box::new(Resume {
                     pending: entry,
-                    decision,
+                    witness,
                 })))
             }
         }
@@ -529,16 +540,22 @@ impl ShardTurns<'_> {
                 self.output_guardrails,
                 self.tool_guardrails,
             );
+            let resolver = ActorPrincipal::new(
+                pending.paused.state.active_agent.clone(),
+                pending.paused.channel_id.clone(),
+                pending.paused.conversation_id.clone(),
+                Arc::from("agentos-system"),
+            );
+            let Some(witness) = pending.binding.unanswered_witness(
+                resolver,
+                ApprovalOutcome::Cancelled,
+                Arc::from("approval prompt expired before it was answered"),
+            ) else {
+                return Err("could not create expiry witness".to_owned());
+            };
             let resumed = self
                 .service(&deps)
-                .resume(
-                    self.context.egress.as_ref(),
-                    pending.paused,
-                    &approval_id,
-                    ResumeDecision::Cancel {
-                        reason: Arc::from("approval prompt expired before it was answered"),
-                    },
-                )
+                .resume(self.context.egress.as_ref(), pending.paused, witness)
                 .await;
             // Cancelling fails the run closed, so an error here is the
             // expected shape, not a problem: report it and move on.
@@ -584,17 +601,17 @@ impl ShardTurns<'_> {
         // the participant who typed it, and in a group conversation that must
         // not move anybody else's
         // (M3 deliverable 2, [ADR-0006](../../../../../docs/adr/0006-CLEAR_EPOCH.md)).
-        let principal = Principal::conversation(
+        let principal = ActorPrincipal::new(
             self.context.runtime.active_agent.clone(),
             input.channel_id.clone(),
             input.conversation_id.clone(),
-        )
-        .with_sender(Arc::clone(&input.sender));
+            Arc::clone(&input.sender),
+        );
         let removed = self
             .context
             .runtime
             .session
-            .clear_session(&principal)
+            .clear_session(principal.as_principal())
             .map_err(|err| format!("failed to clear {channel_name} conversation history: {err}"))?;
         let jobs = self
             .context
@@ -603,7 +620,7 @@ impl ShardTurns<'_> {
             // Without the sender: the jobs belong to the conversation, and
             // clearing ends all of them, not just the ones this participant
             // started.
-            .dispose_conversation(&principal.clone().without_sender());
+            .dispose_conversation(principal.conversation().as_principal());
         log_line(
             config,
             &format!(

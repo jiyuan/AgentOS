@@ -2,9 +2,10 @@ use crate::approve::{tool_call_approval_id, PolicyDecision};
 use crate::audit::{ArgumentDigest, SafetyEvent, SafetyEventKind, SafetyOutcome};
 use agentos_interfaces::orchestrator::{Plan, SubOrchSpec};
 use agentos_interfaces::run_state::{Interruption, InterruptionAction, RunState};
-use agentos_proto::{InterruptionId, ToolCall};
+use agentos_proto::{ApprovalInstanceId, InterruptionId, ToolCall};
 use std::sync::Arc;
 
+use super::ApprovalTicket;
 use super::{plan_subject, ApproveCtx, LoopDeps};
 
 pub(super) enum ApproveTransition {
@@ -102,6 +103,22 @@ fn pause_for_approval(ctx: ApproveCtx, deps: &LoopDeps<'_>, reason: Arc<str>) ->
     };
 
     let interruption_id = InterruptionId::new(approval_id);
+    let ticket = match ApprovalTicket::mint() {
+        Ok(ticket) => ticket,
+        Err(error) => {
+            return ApproveTransition::Unsupported {
+                state: ctx.state,
+                reason: Arc::from(format!("could not create approval ticket: {error}")),
+            }
+        }
+    };
+    let Some(prompting_principal) = deps.audit.actor_principal() else {
+        return ApproveTransition::Unsupported {
+            state: ctx.state,
+            reason: Arc::from("approval requires a sender-qualified prompting principal"),
+        };
+    };
+    let approval_instance_id = ApprovalInstanceId::new(ticket.as_str());
     // Recorded here, at the pause, and not when someone answers: the question
     // having been asked is the fact a later reader needs, and it is the one
     // the old code left no trace of at all. An answer that never comes is then
@@ -112,16 +129,21 @@ fn pause_for_approval(ctx: ApproveCtx, deps: &LoopDeps<'_>, reason: Arc<str>) ->
         subject,
     )
     .with_detail(reason.as_ref())
-    .with_interruption(interruption_id.clone());
+    .with_interruption(interruption_id.clone())
+    .with_approval_instance(approval_instance_id.clone());
     if let Some(digest) = digest {
         event = event.with_digest(digest);
     }
     deps.audit.record(event);
 
     let mut state = ctx.state;
-    state
-        .approvals
-        .push(Interruption::pending(interruption_id, action));
+    state.approvals.push(Interruption::pending(
+        approval_instance_id,
+        ticket.as_str(),
+        prompting_principal,
+        interruption_id,
+        action,
+    ));
     ApproveTransition::Pause { state }
 }
 

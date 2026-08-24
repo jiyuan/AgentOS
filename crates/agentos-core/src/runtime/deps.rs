@@ -45,7 +45,7 @@ impl<'a> RuntimeDepsScope<'a> {
             safety_log: Some(self.runtime.session.as_ref()),
             // The top-level run is nobody's delegatee, so it holds no granted
             // authority. Only a sub-agent's `RunnerDeps` carries any.
-            granted_authority: &[],
+            delegated_authority: None,
         }
     }
 
@@ -102,7 +102,7 @@ impl<'a> RuntimeDepsScope<'a> {
             safety_log: Some(self.runtime.session.as_ref()),
             // The top-level run is nobody's delegatee, so it holds no granted
             // authority. Only a sub-agent's `RunnerDeps` carries any.
-            granted_authority: &[],
+            delegated_authority: None,
         }
     }
 

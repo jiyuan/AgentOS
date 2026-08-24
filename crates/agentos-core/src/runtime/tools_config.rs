@@ -1,4 +1,7 @@
-use crate::approve::{DelegationGrant, Policy, PolicyAction, PolicyRule, PolicyVerb};
+use crate::approve::{
+    DelegationGrantTemplate, Policy, PolicyAction, PolicyRule, PolicyVerb,
+    MAX_DELEGATION_GRANT_LIFETIME_SECS,
+};
 use crate::config::{LimitsConfig, MemoryPolicyConfig, SubAgentConfig, WorkspaceConfig};
 use crate::jobs::JobRegistry;
 use crate::memory::MemoryManager;
@@ -208,7 +211,7 @@ pub(super) fn subagent_policy(
     subagent: &SubAgentConfig,
     parent: &Policy,
 ) -> Result<Policy, String> {
-    let grants = subagent_delegation_grants(subagent)?;
+    let grants = subagent_delegation_grant_templates(subagent)?;
     let mut policy = Policy::default();
     // Grants first, because `decide` is first-match-wins: a grant governs the
     // calls it covers, and the inherited rules below govern everything else.
@@ -268,9 +271,9 @@ fn parent_rules_for_tool<'a>(
 /// Kept next to `subagent_policy` because the two are read together: the
 /// policy states what the sub-agent asks for, and these state which parts of
 /// that the operator has authorised it to hold beyond the parent.
-pub(super) fn subagent_delegation_grants(
+pub(super) fn subagent_delegation_grant_templates(
     subagent: &SubAgentConfig,
-) -> Result<Vec<DelegationGrant>, String> {
+) -> Result<Vec<DelegationGrantTemplate>, String> {
     subagent
         .delegation_grants
         .iter()
@@ -300,6 +303,29 @@ pub(super) fn subagent_delegation_grants(
                     subagent.id, grant.tool
                 ));
             }
+            if grant.expires_at.is_some() {
+                return Err(format!(
+                    "sub-agent '{}' uses legacy `expires_at` for tool '{}'; replace it with \
+                     `lifetime_secs = N` (maximum {MAX_DELEGATION_GRANT_LIFETIME_SECS}) so each \
+                     delegation receives a fresh actor-bound runtime grant",
+                    subagent.id, grant.tool
+                ));
+            }
+            let lifetime_secs = grant.lifetime_secs.ok_or_else(|| {
+                format!(
+                    "sub-agent '{}' grant for tool '{}' is an unscoped standing grant; add \
+                     `lifetime_secs = N` (maximum {MAX_DELEGATION_GRANT_LIFETIME_SECS}) so the \
+                     runtime can bind a mandatory expiry to each delegation",
+                    subagent.id, grant.tool
+                )
+            })?;
+            if lifetime_secs == 0 || lifetime_secs > MAX_DELEGATION_GRANT_LIFETIME_SECS {
+                return Err(format!(
+                    "sub-agent '{}' grant for tool '{}' sets lifetime_secs={lifetime_secs}; \
+                     expected 1..={MAX_DELEGATION_GRANT_LIFETIME_SECS}",
+                    subagent.id, grant.tool
+                ));
+            }
             if !subagent
                 .tools
                 .iter()
@@ -311,12 +337,12 @@ pub(super) fn subagent_delegation_grants(
                     subagent.id, grant.tool
                 ));
             }
-            Ok(DelegationGrant {
+            Ok(DelegationGrantTemplate {
                 action: PolicyAction::Tool(Arc::clone(&grant.tool)),
                 decision,
                 arg_equals: grant.arg_equals.clone(),
                 reason: Arc::clone(&grant.reason),
-                expires_at: grant.expires_at,
+                lifetime_secs,
             })
         })
         .collect()
@@ -541,12 +567,12 @@ fn ask_tool_once(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::approve::PolicyDecision;
+    use crate::approve::{DelegatedAuthority, DelegationScope, PolicyDecision};
     use crate::config::DelegationGrantConfig;
     use crate::memory::InMemoryMemory;
     use agentos_interfaces::orchestrator::Plan;
     use agentos_interfaces::tool::{SandboxMode, ToolPersistenceScope, ToolSafety, ToolSideEffect};
-    use agentos_proto::{ToolCall, ToolCallId};
+    use agentos_proto::{ActorPrincipal, AgentId, ChannelId, ConversationId, ToolCall, ToolCallId};
     use serde_json::{json, value::RawValue};
 
     fn tool_plan(name: &str, args: serde_json::Value) -> Plan {
@@ -555,6 +581,25 @@ mod tests {
             name: Arc::from(name),
             args: RawValue::from_string(args.to_string()).expect("test args are valid JSON"),
         })
+    }
+
+    fn issue_templates(
+        templates: &[DelegationGrantTemplate],
+        parent: &Policy,
+    ) -> DelegatedAuthority {
+        let scope = DelegationScope::mint(
+            ActorPrincipal::new(
+                AgentId::new("parent"),
+                ChannelId::new("telegram"),
+                ConversationId::new("group"),
+                "alice",
+            ),
+            AgentId::new("child"),
+            "child-policy",
+            100,
+        )
+        .expect("test scope mints");
+        DelegatedAuthority::issue(templates, parent, scope).expect("test grants issue")
     }
 
     fn config_with_parent_tools(tools: &[&str]) -> WorkspaceConfig {
@@ -730,19 +775,23 @@ mod tests {
                 decision: Arc::from("allow"),
                 arg_equals: BTreeMap::new(),
                 reason: Arc::from("unattended nightly maintenance"),
+                lifetime_secs: Some(60),
                 expires_at: None,
             }],
             ..SubAgentConfig::default()
         };
-        let grants = subagent_delegation_grants(&child_config).expect("the grant is valid");
+        let grants =
+            subagent_delegation_grant_templates(&child_config).expect("the grant is valid");
 
         // `subagent_policy` emits the granted rule ahead of the inherited one.
         let child = subagent_policy(&child_config, &parent).expect("child policy builds");
 
-        let effective =
-            Policy::narrow_with_grants(&parent, &child, &grants).expect("the granted tool narrows");
+        let authority = issue_templates(&grants, &parent);
+        let effective = Policy::narrow_with_grants(&parent, &child, &authority, 100)
+            .expect("the granted tool narrows");
         assert_eq!(
-            effective.grants_relied_on, grants,
+            effective.grants_relied_on,
+            authority.grants(),
             "the grant is reported as relied on, which is what gets an issuance record"
         );
         let effective = effective.policy;
@@ -773,11 +822,13 @@ mod tests {
                 decision: Arc::from("allow"),
                 arg_equals: BTreeMap::new(),
                 reason: Arc::from("would have no effect"),
+                lifetime_secs: Some(60),
                 expires_at: None,
             }],
             ..SubAgentConfig::default()
         };
-        let error = subagent_delegation_grants(&child_config).expect_err("the grant is inert");
+        let error =
+            subagent_delegation_grant_templates(&child_config).expect_err("the grant is inert");
         assert!(error.contains("does not list in `tools`"), "{error}");
     }
 
@@ -790,11 +841,12 @@ mod tests {
                 decision: Arc::from("allow"),
                 arg_equals: BTreeMap::new(),
                 reason: Arc::from("   "),
+                lifetime_secs: Some(60),
                 expires_at: None,
             }],
             ..SubAgentConfig::default()
         };
-        assert!(subagent_delegation_grants(&with_empty_reason)
+        assert!(subagent_delegation_grant_templates(&with_empty_reason)
             .expect_err("an unexplained grant is rejected")
             .contains("empty reason"));
 
@@ -805,19 +857,18 @@ mod tests {
                 decision: Arc::from("deny"),
                 arg_equals: BTreeMap::new(),
                 reason: Arc::from("narrowing needs no grant"),
+                lifetime_secs: Some(60),
                 expires_at: None,
             }],
             ..SubAgentConfig::default()
         };
-        assert!(subagent_delegation_grants(&denying)
+        assert!(subagent_delegation_grant_templates(&denying)
             .expect_err("a denying grant is rejected")
             .contains("a grant widens authority"));
     }
 
     #[test]
-    fn an_expired_grant_does_not_elevate() {
-        let config = config_with_parent_tools(&["shell"]);
-        let parent = policy_for_config(&config);
+    fn legacy_absolute_expiry_is_rejected_with_migration_guidance() {
         let child_config = SubAgentConfig {
             tools: vec![Arc::from("shell")],
             delegation_grants: vec![DelegationGrantConfig {
@@ -825,14 +876,17 @@ mod tests {
                 decision: Arc::from("allow"),
                 arg_equals: BTreeMap::new(),
                 reason: Arc::from("expired last century"),
+                lifetime_secs: None,
                 expires_at: Some(1),
             }],
             ..SubAgentConfig::default()
         };
-        let grants = subagent_delegation_grants(&child_config).expect("the grant parses");
-        let child = subagent_policy(&child_config, &parent).expect("child policy builds");
-
-        assert!(Policy::narrow_with_grants(&parent, &child, &grants).is_err());
+        let error = subagent_delegation_grant_templates(&child_config)
+            .expect_err("legacy expiry must fail closed");
+        assert!(
+            error.contains("replace it with `lifetime_secs = N`"),
+            "{error}"
+        );
     }
 
     /// The same safety property, reached differently. It used to be a widening
@@ -881,14 +935,16 @@ mod tests {
                 decision: Arc::from("allow"),
                 arg_equals: BTreeMap::new(),
                 reason: Arc::from("should not defeat an explicit deny"),
+                lifetime_secs: Some(60),
                 expires_at: None,
             }],
             ..SubAgentConfig::default()
         };
-        let grants = subagent_delegation_grants(&child_config).expect("the grant parses");
+        let grants = subagent_delegation_grant_templates(&child_config).expect("the grant parses");
         let child = subagent_policy(&child_config, &parent).expect("child policy builds");
 
-        assert!(Policy::narrow_with_grants(&parent, &child, &grants).is_err());
+        let authority = issue_templates(&grants, &parent);
+        assert!(Policy::narrow_with_grants(&parent, &child, &authority, 100).is_err());
     }
 
     /// A tool the *parent* allows outright stays allowed for the sub-agent;

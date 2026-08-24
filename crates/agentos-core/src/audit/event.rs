@@ -9,7 +9,7 @@
 //! they enter is [`ArgumentDigest::of`], which keeps the hash and drops the
 //! bytes.
 
-use agentos_proto::{InterruptionId, Principal, RunId};
+use agentos_proto::{ApprovalInstanceId, InterruptionId, Principal, RunId};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
@@ -194,9 +194,9 @@ pub struct SafetyEvent {
     pub outcome: SafetyOutcome,
     /// Who the decision was made for.
     ///
-    /// `None` only for events that precede any conversation: a delegation
-    /// grant is issued while the runtime is being built, before a principal
-    /// exists. An absent principal is that case, not an unknown one.
+    /// `None` only for events that precede any conversation, such as an
+    /// operator maintenance action. Delegation grants are issued per running
+    /// delegation and therefore always have a sender-qualified principal.
     pub principal: Option<Principal>,
     /// The run the decision happened in, where there is one.
     pub run_id: Option<RunId>,
@@ -210,6 +210,14 @@ pub struct SafetyEvent {
     pub argument_digest: Option<ArgumentDigest>,
     /// The pause this event belongs to, for the two approval kinds.
     pub interruption_id: Option<InterruptionId>,
+    /// The unique asking shared by requested and resolved events.
+    pub approval_instance_id: Option<ApprovalInstanceId>,
+    /// Stable ID shared by a delegation grant's issuance and use events.
+    pub delegation_grant_id: Option<Arc<str>>,
+    /// The actor the approval was put to.
+    pub prompting_principal: Option<Principal>,
+    /// The actor who answered, including an authorized administrator.
+    pub resolver_principal: Option<Principal>,
 }
 
 impl SafetyEvent {
@@ -228,6 +236,10 @@ impl SafetyEvent {
             detail: None,
             argument_digest: None,
             interruption_id: None,
+            approval_instance_id: None,
+            delegation_grant_id: None,
+            prompting_principal: None,
+            resolver_principal: None,
         }
     }
 
@@ -263,6 +275,26 @@ impl SafetyEvent {
 
     pub fn with_interruption(mut self, id: InterruptionId) -> Self {
         self.interruption_id = Some(id);
+        self
+    }
+
+    pub fn with_approval_instance(mut self, id: ApprovalInstanceId) -> Self {
+        self.approval_instance_id = Some(id);
+        self
+    }
+
+    pub fn with_delegation_grant(mut self, id: Arc<str>) -> Self {
+        self.delegation_grant_id = Some(id);
+        self
+    }
+
+    pub fn with_approval_actors(
+        mut self,
+        prompting: Principal,
+        resolver: Option<Principal>,
+    ) -> Self {
+        self.prompting_principal = Some(prompting);
+        self.resolver_principal = resolver;
         self
     }
 }

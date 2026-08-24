@@ -7,20 +7,21 @@ use agentos_core::gateway::{
     DEFAULT_IDLE_INTERVAL,
 };
 use agentos_core::memory::migrate::{self, MigrationSettings};
-use agentos_core::memory::migrate_sessions;
 use agentos_core::memory::{
     lease_holder_id, MemoryManager, SqliteStore, DEFAULT_LEASE_TTL, REFLECTION_LEASE,
     RETENTION_LEASE,
 };
+use agentos_core::memory::{migrate_child_sessions, migrate_sessions};
+use agentos_core::r#loop::{ApprovalBinding, ApprovalOutcome};
 use agentos_core::retention::{RetentionSweep, RetentionTargets};
-use agentos_core::runner::ResumeDecision;
 use agentos_core::runtime::{AgentRuntime, RuntimePaths};
 use agentos_core::sandbox;
 use agentos_interfaces::orchestrator::StreamSink;
 use agentos_interfaces::{Channel, Egress, StreamEgress};
 use agentos_llm::env as agentos_env;
 use agentos_proto::{
-    AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole, RunId, SpanKind,
+    ActorPrincipal, AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole, RunId,
+    SpanKind,
 };
 use std::collections::BTreeMap;
 use std::env;
@@ -1306,7 +1307,12 @@ async fn fire_due_crons(
                 log_trace(config, &state)?;
                 scheduler.record_success(&task_id, now)
             }
-            Ok(GatewayRun::Paused { paused, ticket, .. }) => {
+            Ok(GatewayRun::Paused {
+                paused,
+                ticket,
+                expires_at,
+                ..
+            }) => {
                 // A cron tick has no one behind it, so the prompt it just sent
                 // can never be answered. Resolve it as `Unavailable` rather
                 // than leaving a paused run parked forever — and not as a
@@ -1318,22 +1324,31 @@ async fn fire_due_crons(
                          no interactive user — resolving as unavailable"
                     ),
                 )?;
-                if let Some(approval_id) = paused
-                    .state
-                    .pending_approval()
-                    .map(|approval| approval.id.clone())
-                {
-                    // Fails the run closed; the error is the expected shape.
-                    let _ = gateway_service
-                        .resume(
-                            egress,
-                            paused,
-                            &approval_id,
-                            ResumeDecision::Unavailable {
-                                reason: Arc::from("no interactive user behind a cron run"),
-                            },
+                if let Some(approval) = paused.state.pending_approval() {
+                    let binding = ApprovalBinding::new(
+                        approval.approval_instance_id.clone(),
+                        ticket,
+                        approval.id.clone(),
+                        approval.prompting_principal.clone(),
+                        expires_at,
+                    );
+                    let resolver = ActorPrincipal::new(
+                        paused.state.active_agent.clone(),
+                        paused.channel_id.clone(),
+                        paused.conversation_id.clone(),
+                        Arc::from("agentos-system"),
+                    );
+                    let witness = binding.and_then(|binding| {
+                        binding.unanswered_witness(
+                            resolver,
+                            ApprovalOutcome::Unavailable,
+                            Arc::from("no interactive user behind a cron run"),
                         )
-                        .await;
+                    });
+                    // Fails the run closed; the error is the expected shape.
+                    if let Some(witness) = witness {
+                        let _ = gateway_service.resume(egress, paused, witness).await;
+                    }
                 }
                 scheduler.record_failure(
                     &task_id,
@@ -1513,12 +1528,19 @@ fn migrate(config: &ServiceConfig) -> Result<(), String> {
         println!();
         print!("{}", session_plan.report());
     }
+    let mut child_session_plan = migrate_child_sessions::plan(&store)
+        .map_err(|err| format!("failed to plan the child session migration: {err}"))?;
+    if !child_session_plan.is_empty() {
+        println!();
+        print!("{}", child_session_plan.report());
+    }
 
     if !has("--apply") {
         println!("\nNothing was changed. Re-run with --apply to perform this migration.");
         return Ok(());
     }
-    if plan.rewrites.is_empty() && session_plan.is_empty() {
+    if plan.rewrites.is_empty() && session_plan.is_empty() && child_session_plan.rewrites.is_empty()
+    {
         println!("\nNothing to apply.");
         return Ok(());
     }
@@ -1555,6 +1577,22 @@ fn migrate(config: &ServiceConfig) -> Result<(), String> {
         .map_err(|err| format!("the session migration was rolled back: {err}"))?;
     if rekeyed > 0 {
         println!("rekeyed {rekeyed} session item(s)");
+    }
+    // A pre-principal table cannot expose delegated principal keys until the
+    // table rebuild above. Re-plan after it, so one `migrate --apply` handles
+    // both generations without asking the operator to discover a second pass.
+    if !session_plan.is_empty() {
+        child_session_plan = migrate_child_sessions::plan(&store)
+            .map_err(|err| format!("failed to plan the child session migration: {err}"))?;
+        if !child_session_plan.is_empty() {
+            println!();
+            print!("{}", child_session_plan.report());
+        }
+    }
+    let child_rekeyed = migrate_child_sessions::apply(&store, &child_session_plan)
+        .map_err(|err| format!("the child session migration was rolled back: {err}"))?;
+    if child_rekeyed > 0 {
+        println!("rekeyed {child_rekeyed} legacy child session item(s)");
     }
     if plan.blocked.is_empty() {
         println!(

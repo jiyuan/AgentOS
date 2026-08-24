@@ -1,9 +1,8 @@
 use super::telemetry::{
     field_key, record_subagent_failure, record_telemetry_event, subagent_telemetry_fields,
 };
-use super::{LoopDeps, RunError};
+use super::{LoopDeps, ResumeWitness, RunError};
 use crate::audit::{SafetyEvent, SafetyEventKind, SafetyOutcome};
-use crate::runner::ResumeDecision;
 use crate::subagents::{
     child_input_envelope, child_run_id, parent_principal, ParentSeed, SubAgentError,
     SubAgentPausedRun, SubAgentRun, SubAgentRunOutput,
@@ -95,7 +94,15 @@ pub(super) async fn execute_delegate(
         boundary: state.transcript.items.len(),
     };
     let invocation = match subagents
-        .prepare(spec, deps.policy, input, run_id)
+        .prepare(
+            spec,
+            deps.policy,
+            deps.audit
+                .actor_principal()
+                .ok_or(SubAgentError::MissingInitiatingActor)?,
+            input,
+            run_id,
+        )
         .map(|invocation| invocation.with_cancel(&deps.cancel).with_parent_seed(seed))
     {
         Ok(invocation) => invocation,
@@ -104,7 +111,7 @@ pub(super) async fn execute_delegate(
             return Err(error.into());
         }
     };
-    // Narrowing happens per delegation, so this is where a standing grant in
+    // Narrowing happens per delegation, so this is where a bounded template in
     // `agent.toml` becomes authority actually conferred on a running child.
     // Recorded by the parent, because the parent is the principal the
     // elevation was made against (M6 / `AUD-001`).
@@ -115,7 +122,8 @@ pub(super) async fn execute_delegate(
                 SafetyOutcome::Issued,
                 spec.agent_id.as_str(),
             )
-            .with_detail(grant.reason.as_ref()),
+            .with_detail(grant.reason())
+            .with_delegation_grant(Arc::from(grant.id())),
         );
     }
     record_telemetry_event(
@@ -211,9 +219,23 @@ pub(super) async fn execute_resume_delegate(
         metadata: BTreeMap::new(),
     };
     let invocation = subagents
-        .prepare(spec, deps.policy, input, paused.state.run_id.clone())?
+        .prepare_resume(
+            spec,
+            deps.policy,
+            deps.audit
+                .actor_principal()
+                .ok_or(SubAgentError::MissingInitiatingActor)?,
+            input,
+            paused.state.run_id.clone(),
+            &paused.state,
+        )?
         .with_cancel(&deps.cancel);
-    match Box::pin(invocation.resume(paused, ResumeDecision::Approve)).await? {
+    let witness = paused
+        .state
+        .pending_approval()
+        .and_then(ResumeWitness::approved_internal)
+        .ok_or_else(|| SubAgentError::Run(Arc::from("child approval witness is incomplete")))?;
+    match Box::pin(invocation.resume(paused, witness)).await? {
         SubAgentRun::Finished(result) => {
             let parent_id = trace::run_span_id(state);
             let span_id = trace::record_span(

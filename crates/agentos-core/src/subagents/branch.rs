@@ -11,8 +11,10 @@
 use super::{ParentSeed, SubAgentSpec, SESSION_SCOPE_EPHEMERAL, SESSION_SCOPE_KEY};
 use agentos_interfaces::session::Session;
 use agentos_proto::{
-    base64url, AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole, Principal, RunId,
+    base64url, AgentId, ChannelId, ConversationId, ConversationPrincipal, Envelope, Message,
+    MessageRole, Principal, RunId,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -24,6 +26,89 @@ use std::sync::Arc;
 /// reports instead of leaving a future reader to infer it.
 const CHILD_CONVERSATION_VERSION: u8 = 1;
 const CHILD_CONVERSATION_DOMAIN: &[u8] = b"agentos.child-conversation";
+pub(crate) const CHILD_IDENTITY_SOURCE_KEY: &str = "subagent_identity_source";
+
+/// The complete source tuple persisted beside a delegated input.
+///
+/// The rendered child id is already injective. Persisting this tuple is for
+/// migration and operator diagnostics: a pre-versioned session key may be
+/// rekeyed only when its rows state every input the new derivation requires.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct ChildIdentitySource {
+    version: u8,
+    parent: String,
+    child_agent: AgentId,
+    policy_id: Arc<str>,
+    task: ChildTaskDiscriminator,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+enum ChildTaskDiscriminator {
+    Default,
+    TaskId(Arc<str>),
+    Prompt(Arc<str>),
+}
+
+impl ChildIdentitySource {
+    fn from_spec(spec: &SubAgentSpec, parent_state: &agentos_interfaces::RunState) -> Self {
+        let task_id = spec
+            .metadata
+            .get("task_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty());
+        let prompt = spec
+            .metadata
+            .get("prompt")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty());
+        let task = match (task_id, prompt) {
+            (Some(task_id), _) => ChildTaskDiscriminator::TaskId(Arc::from(task_id)),
+            (None, Some(prompt)) => ChildTaskDiscriminator::Prompt(Arc::from(prompt)),
+            (None, None) => ChildTaskDiscriminator::Default,
+        };
+        Self {
+            version: CHILD_CONVERSATION_VERSION,
+            parent: parent_principal(parent_state).storage_name(),
+            child_agent: spec.agent_id.clone(),
+            policy_id: Arc::clone(&spec.policy_id),
+            task,
+        }
+    }
+
+    pub(crate) fn conversation_id(&self) -> Option<ConversationId> {
+        if self.version != CHILD_CONVERSATION_VERSION {
+            return None;
+        }
+        let parent =
+            ConversationPrincipal::try_from(Principal::from_storage_name(&self.parent)?).ok()?;
+        let mut source = Vec::new();
+        push_child_component(&mut source, CHILD_CONVERSATION_DOMAIN);
+        source.push(self.version);
+        push_child_component(&mut source, &parent.canonical_bytes());
+        push_child_component(&mut source, self.child_agent.as_str().as_bytes());
+        push_child_component(&mut source, self.policy_id.as_bytes());
+        match &self.task {
+            ChildTaskDiscriminator::Default => source.push(0),
+            ChildTaskDiscriminator::TaskId(task_id) => {
+                source.push(1);
+                push_child_component(&mut source, task_id.as_bytes());
+            }
+            ChildTaskDiscriminator::Prompt(prompt) => {
+                source.push(2);
+                push_child_component(&mut source, prompt.as_bytes());
+            }
+        }
+        Some(ConversationId::new(format!(
+            "child.v{CHILD_CONVERSATION_VERSION}.{}",
+            base64url(&source)
+        )))
+    }
+
+    pub(crate) fn child_agent(&self) -> &AgentId {
+        &self.child_agent
+    }
+}
 
 /// Branch a sub-agent's conversation from its parent's, once (roadmap X6).
 ///
@@ -58,21 +143,28 @@ pub(super) async fn seed_from_parent(
     // built from the sub-agent's `agent_id` — not the parent's. A mismatch
     // here would fork into a conversation nobody ever reads and leave the
     // sub-agent starting empty, silently.
-    let child = Principal::conversation(
+    let child = ConversationPrincipal::new(
         child_agent.clone(),
         input.channel_id.clone(),
         input.conversation_id.clone(),
     );
-    match session.fork(&seed.principal, seed.boundary, &child).await {
+    match session
+        .fork(
+            seed.principal.as_principal(),
+            seed.boundary,
+            child.as_principal(),
+        )
+        .await
+    {
         Ok(items) => tracing::info!(
-            parent_conversation = %seed.principal.conversation_name(),
-            child_conversation = %child.conversation_name(),
+            parent_conversation = %seed.principal.storage_name(),
+            child_conversation = %child.storage_name(),
             items,
             "sub-agent conversation seeded from parent"
         ),
         Err(error) => tracing::debug!(
-            parent_conversation = %seed.principal.conversation_name(),
-            child_conversation = %child.conversation_name(),
+            parent_conversation = %seed.principal.storage_name(),
+            child_conversation = %child.storage_name(),
             error = %error,
             "sub-agent conversation not seeded; starting from its own history"
         ),
@@ -91,7 +183,7 @@ pub(super) async fn seed_from_parent(
 /// ones [`parent_conversation_id`] already used — a run with no such metadata
 /// is a test or an embedded caller, and keying it on the run id keeps it
 /// distinct from everything else rather than merging it with everything else.
-pub fn parent_principal(parent_state: &agentos_interfaces::RunState) -> Principal {
+pub fn parent_principal(parent_state: &agentos_interfaces::RunState) -> ConversationPrincipal {
     let field = |name: &str| {
         parent_state
             .transcript
@@ -101,7 +193,7 @@ pub fn parent_principal(parent_state: &agentos_interfaces::RunState) -> Principa
             .and_then(Value::as_str)
             .map(Arc::<str>::from)
     };
-    Principal::conversation(
+    ConversationPrincipal::new(
         parent_state.active_agent.clone(),
         field("channel_id").map_or_else(|| ChannelId::new("unknown"), ChannelId::new),
         parent_conversation_id(parent_state),
@@ -150,6 +242,12 @@ pub fn child_input_envelope(
         Arc::from("parent_run_id"),
         Value::String(parent_state.run_id.as_str().to_owned()),
     );
+    let source = ChildIdentitySource::from_spec(spec, parent_state);
+    metadata.insert(
+        Arc::from(CHILD_IDENTITY_SOURCE_KEY),
+        serde_json::to_value(&source)
+            .expect("the child identity source contains only serializable wire values"),
+    );
 
     Envelope {
         channel_id: ChannelId::new(format!("subagent:{}", spec.agent_id.as_str())),
@@ -173,45 +271,9 @@ fn child_conversation_id(
     spec: &SubAgentSpec,
     parent_state: &agentos_interfaces::RunState,
 ) -> ConversationId {
-    let parent = parent_principal(parent_state).without_sender();
-    let mut source = Vec::new();
-    push_child_component(&mut source, CHILD_CONVERSATION_DOMAIN);
-    source.push(CHILD_CONVERSATION_VERSION);
-    push_child_component(&mut source, &parent.canonical_bytes());
-    push_child_component(&mut source, spec.agent_id.as_str().as_bytes());
-    push_child_component(&mut source, spec.policy_id.as_bytes());
-
-    // Prefer an explicit task id when a caller has one. Ordinary direct and
-    // routed delegation carries only `prompt`, where the complete prompt is
-    // the stable discriminator. Keeping the bytes rather than a short hash is
-    // what makes this encoding injective rather than merely unlikely to
-    // collide. Blank prompts retain the old "default task" behavior.
-    let task_id = spec
-        .metadata
-        .get("task_id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty());
-    let prompt = spec
-        .metadata
-        .get("prompt")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty());
-    match (task_id, prompt) {
-        (Some(task_id), _) => {
-            source.push(1);
-            push_child_component(&mut source, task_id.as_bytes());
-        }
-        (None, Some(prompt)) => {
-            source.push(2);
-            push_child_component(&mut source, prompt.as_bytes());
-        }
-        (None, None) => source.push(0),
-    }
-
-    ConversationId::new(format!(
-        "child.v{CHILD_CONVERSATION_VERSION}.{}",
-        base64url(&source)
-    ))
+    ChildIdentitySource::from_spec(spec, parent_state)
+        .conversation_id()
+        .expect("a freshly constructed child identity source is versioned and senderless")
 }
 
 fn push_child_component(into: &mut Vec<u8>, component: &[u8]) {
@@ -441,7 +503,10 @@ mod tests {
         let envelope = child_input_envelope(&spec, &parent);
         assert!(envelope.conversation_id.as_str().starts_with("child.v1."));
         assert_eq!(
-            parent_principal(&parent).conversation.as_str(),
+            parent_principal(&parent)
+                .as_principal()
+                .conversation
+                .as_str(),
             "parent-run",
             "embedded callers still fall back to the run id as the parent conversation"
         );

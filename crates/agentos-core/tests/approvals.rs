@@ -11,18 +11,18 @@ use agentos_core::approve::{Policy, PolicyAction, PolicyRule, PolicyVerb};
 use agentos_core::gateway::{GatewayRun, GatewayService};
 use agentos_core::memory::InMemorySession;
 use agentos_core::r#loop::{
-    route, ApprovalBinding, ApprovalOutcome, ApprovalTicket, Routed, EXPIRES_AT_KEY,
+    route, ApprovalBinding, ApprovalOutcome, ApprovalTicket, ResumeWitness, Routed, EXPIRES_AT_KEY,
     INTERRUPTION_KEY, PROMPT_KIND, TICKET_KEY,
 };
-use agentos_core::runner::{ResumeDecision, RunnerError};
+use agentos_core::runner::RunnerError;
 use agentos_core::tools::ToolRegistry;
 use agentos_interfaces::orchestrator::{Orchestrator, OrchestratorError, Plan, RunContext};
 use agentos_interfaces::test_support::MockChannel;
 use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
-use agentos_interfaces::{Channel, RunState};
+use agentos_interfaces::Channel;
 use agentos_proto::{
-    ChannelId, ConversationId, Envelope, Message, MessageRole, RunId, ToolCall, ToolCallId,
-    ToolResult, ToolStatus,
+    ActorPrincipal, ChannelId, ConversationId, Envelope, Message, MessageRole, RunId, ToolCall,
+    ToolCallId, ToolResult, ToolStatus,
 };
 use async_trait::async_trait;
 use serde_json::{json, value::RawValue, Value};
@@ -36,10 +36,6 @@ const SENDER: &str = "user";
 
 /// An approval bound to that sender, so these tests exercise the ticket rules
 /// rather than tripping over the `AUTH-001` sender check.
-fn binding_for(ticket: &ApprovalTicket) -> ApprovalBinding {
-    ApprovalBinding::new(ticket.clone(), SENDER)
-}
-
 const GATED_TOOL: &str = "gated";
 
 fn envelope(text: &str) -> Envelope {
@@ -121,6 +117,41 @@ struct Paused {
     prompt: Envelope,
     ticket: ApprovalTicket,
     expires_at: Option<u64>,
+}
+
+fn binding_for(paused: &Paused) -> ApprovalBinding {
+    let approval = paused
+        .paused
+        .state
+        .pending_approval()
+        .expect("paused run carries an approval");
+    ApprovalBinding::new(
+        approval.approval_instance_id.clone(),
+        paused.ticket.clone(),
+        approval.id.clone(),
+        approval.prompting_principal.clone(),
+        paused.expires_at,
+    )
+    .expect("instance matches ticket")
+}
+
+fn human_witness(paused: &Paused, text: &str) -> ResumeWitness {
+    let Routed::Decides { witness } = route(Some(&binding_for(paused)), &envelope(text)) else {
+        panic!("answer must create a witness");
+    };
+    witness
+}
+
+fn unanswered_witness(paused: &Paused, outcome: ApprovalOutcome, reason: &str) -> ResumeWitness {
+    let resolver = ActorPrincipal::new(
+        paused.paused.state.active_agent.clone(),
+        paused.paused.channel_id.clone(),
+        paused.paused.conversation_id.clone(),
+        "agentos-system",
+    );
+    binding_for(paused)
+        .unanswered_witness(resolver, outcome, Arc::from(reason))
+        .expect("unanswered outcome creates a witness")
 }
 
 /// Drive a run to its approval prompt.
@@ -236,7 +267,7 @@ async fn an_unrelated_message_does_not_decide_a_pending_approval() {
         "ok do it",
     ] {
         assert_eq!(
-            route(Some(&binding_for(&paused.ticket)), &envelope(text)),
+            route(Some(&binding_for(&paused)), &envelope(text)),
             Routed::Unrelated,
             "{text:?} must be ordinary input, not an approval"
         );
@@ -276,7 +307,7 @@ async fn a_stale_ticket_does_not_decide_the_current_prompt() {
 
     let answer = envelope(&format!("/approve {}", first.ticket));
     assert_eq!(
-        route(Some(&binding_for(&second.ticket)), &answer),
+        route(Some(&binding_for(&second)), &answer),
         Routed::Stale {
             ticket: first.ticket.clone()
         }
@@ -300,19 +331,13 @@ async fn an_answer_naming_the_prompt_approves_it() {
 
     let paused = pause_for_approval(&service, &channel, "g2-approve").await;
     let answer = envelope(&format!("/approve {}", paused.ticket));
-    let Routed::Decides { outcome, .. } = route(Some(&binding_for(&paused.ticket)), &answer) else {
+    let Routed::Decides { witness } = route(Some(&binding_for(&paused)), &answer) else {
         panic!("an answer naming the prompt must decide it");
     };
-    assert_eq!(outcome, ApprovalOutcome::Approved);
+    assert_eq!(witness.outcome(), ApprovalOutcome::Approved);
 
-    let approval_id = approval_id(&paused.paused.state);
     let resumed = service
-        .resume(
-            channel.egress().as_ref(),
-            paused.paused,
-            &approval_id,
-            ResumeDecision::Approve,
-        )
+        .resume(channel.egress().as_ref(), paused.paused, witness)
         .await
         .expect("an approved run resumes");
     let GatewayRun::Finished { output, .. } = resumed else {
@@ -338,30 +363,20 @@ async fn an_expired_prompt_records_cancelled_not_rejected() {
     let channel = MockChannel::new("approvals");
 
     let expired = pause_for_approval(&service, &channel, "g2-expired").await;
-    let expired_id = approval_id(&expired.paused.state);
+    let expired_witness = unanswered_witness(
+        &expired,
+        ApprovalOutcome::Cancelled,
+        "approval prompt expired before it was answered",
+    );
     let cancelled = service
-        .resume(
-            channel.egress().as_ref(),
-            expired.paused,
-            &expired_id,
-            ResumeDecision::Cancel {
-                reason: Arc::from("approval prompt expired before it was answered"),
-            },
-        )
+        .resume(channel.egress().as_ref(), expired.paused, expired_witness)
         .await
         .expect_err("a cancelled approval fails the run closed");
 
     let refused = pause_for_approval(&service, &channel, "g2-refused").await;
-    let refused_id = approval_id(&refused.paused.state);
+    let rejected_witness = human_witness(&refused, &format!("/deny {} not today", refused.ticket));
     let rejected = service
-        .resume(
-            channel.egress().as_ref(),
-            refused.paused,
-            &refused_id,
-            ResumeDecision::Reject {
-                reason: Arc::from("not today"),
-            },
-        )
+        .resume(channel.egress().as_ref(), refused.paused, rejected_witness)
         .await
         .expect_err("a rejected approval fails the run closed");
 
@@ -401,60 +416,17 @@ async fn a_run_with_nobody_to_ask_records_unavailable() {
     let channel = MockChannel::new("approvals");
 
     let paused = pause_for_approval(&service, &channel, "g2-unavailable").await;
-    let approval_id = approval_id(&paused.paused.state);
+    let witness = unanswered_witness(
+        &paused,
+        ApprovalOutcome::Unavailable,
+        "no interactive user behind a cron run",
+    );
     let error = service
-        .resume(
-            channel.egress().as_ref(),
-            paused.paused,
-            &approval_id,
-            ResumeDecision::Unavailable {
-                reason: Arc::from("no interactive user behind a cron run"),
-            },
-        )
+        .resume(channel.egress().as_ref(), paused.paused, witness)
         .await
         .expect_err("an unanswerable approval fails the run closed");
     assert!(error.to_string().contains("unavailable"), "got: {error}");
     assert_eq!(ran.load(Ordering::Relaxed), 0);
-}
-
-/// Every decision maps to exactly one outcome, and only one of them runs the
-/// action.
-#[test]
-fn every_resume_decision_names_its_outcome() {
-    let reason: Arc<str> = Arc::from("because");
-    let pairs = [
-        (ResumeDecision::Approve, ApprovalOutcome::Approved),
-        (
-            ResumeDecision::Reject {
-                reason: Arc::clone(&reason),
-            },
-            ApprovalOutcome::Rejected,
-        ),
-        (
-            ResumeDecision::Cancel {
-                reason: Arc::clone(&reason),
-            },
-            ApprovalOutcome::Cancelled,
-        ),
-        (
-            ResumeDecision::Unavailable { reason },
-            ApprovalOutcome::Unavailable,
-        ),
-    ];
-    for (decision, expected) in pairs {
-        assert_eq!(decision.outcome(), expected);
-        assert_eq!(
-            expected.permits_action(),
-            matches!(decision, ResumeDecision::Approve)
-        );
-    }
-}
-
-fn approval_id(state: &RunState) -> agentos_proto::InterruptionId {
-    state
-        .pending_approval()
-        .map(|approval| approval.id.clone())
-        .expect("a paused run carries the approval it is waiting on")
 }
 
 /// Reach the `RunError` inside a gateway error, so two failures can be compared

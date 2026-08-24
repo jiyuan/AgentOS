@@ -6,6 +6,7 @@
 //! thing: `[policy]` decides *permission* and `[guardrails]` inspects
 //! *content*, and a deployment needs both.
 
+use agentos_proto::{ActorPrincipal, AgentId, ChannelId, ConversationId};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -22,13 +23,37 @@ pub struct PolicyConfig {
     /// decides memory, and a config that says both fails to load rather than
     /// letting one silently win (M7 / `MEM-001`).
     pub allowlist: Vec<Arc<str>>,
-    /// Senders who may answer any approval prompt, not only their own.
+    /// Fully-qualified actors who may answer matching approval prompts, not
+    /// only their own.
     ///
     /// Empty by default: a prompt is answerable by the person it was put to.
     /// In a group conversation that is what stops one participant deciding
-    /// another's approval. Name a sender id here only when someone genuinely
-    /// needs to unblock other people's prompts.
-    pub approval_administrators: Vec<Arc<str>>,
+    /// another's approval. Bare legacy sender strings are rejected because
+    /// the same sender id on Telegram and Feishu is not the same actor.
+    pub approval_administrators: Vec<ApprovalAdministrator>,
+}
+
+/// One exact administrator identity. No component is optional: widening an
+/// administrator across agents, channels, or conversations requires separate
+/// explicit entries.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalAdministrator {
+    pub agent: AgentId,
+    pub channel: ChannelId,
+    pub conversation: ConversationId,
+    pub sender: Arc<str>,
+}
+
+impl ApprovalAdministrator {
+    pub fn actor(&self) -> ActorPrincipal {
+        ActorPrincipal::new(
+            self.agent.clone(),
+            self.channel.clone(),
+            self.conversation.clone(),
+            Arc::clone(&self.sender),
+        )
+    }
 }
 
 impl Default for PolicyConfig {
@@ -128,5 +153,38 @@ impl Default for GuardrailsConfig {
                 .collect(),
             shell_profiles: default_shell_profiles(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_legacy_approval_administrator_is_rejected() {
+        let error = toml::from_str::<PolicyConfig>(
+            r#"approval_administrators = ["same-id-on-every-channel"]"#,
+        )
+        .expect_err("a bare sender id is ambiguous");
+        assert!(error.to_string().contains("approval_administrators"));
+    }
+
+    #[test]
+    fn administrator_requires_a_complete_actor_principal() {
+        let parsed = toml::from_str::<PolicyConfig>(
+            r#"
+approval_administrators = [{ agent = "agent", channel = "telegram", conversation = "chat", sender = "ops" }]
+"#,
+        )
+        .expect("a complete actor selector parses");
+        assert_eq!(
+            parsed.approval_administrators[0].actor(),
+            ActorPrincipal::new(
+                AgentId::new("agent"),
+                ChannelId::new("telegram"),
+                ConversationId::new("chat"),
+                "ops",
+            )
+        );
     }
 }

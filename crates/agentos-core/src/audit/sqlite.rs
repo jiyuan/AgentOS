@@ -9,7 +9,7 @@
 use super::event::{ArgumentDigest, SafetyEvent, SafetyEventKind, SafetyOutcome};
 use super::journal::{SafetyLog, SafetyLogError, StoredSafetyEvent};
 use crate::memory::SqliteStore;
-use agentos_proto::{InterruptionId, Principal, RunId};
+use agentos_proto::{ApprovalInstanceId, InterruptionId, Principal, RunId};
 use rusqlite::{params, Connection};
 use std::sync::Arc;
 
@@ -31,6 +31,10 @@ pub(crate) fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             detail TEXT,
             argument_digest TEXT,
             interruption_id TEXT,
+            approval_instance_id TEXT,
+            delegation_grant_id TEXT,
+            prompting_principal TEXT,
+            resolver_principal TEXT,
             recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
 
@@ -40,7 +44,26 @@ pub(crate) fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_safety_events_run
             ON safety_events(run_id, row_id);
         "#,
-    )
+    )?;
+    ensure_column(conn, "approval_instance_id")?;
+    ensure_column(conn, "delegation_grant_id")?;
+    ensure_column(conn, "prompting_principal")?;
+    ensure_column(conn, "resolver_principal")
+}
+
+fn ensure_column(conn: &Connection, column: &str) -> rusqlite::Result<()> {
+    let mut statement = conn.prepare("PRAGMA table_info(safety_events)")?;
+    let names = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for name in names {
+        if name? == column {
+            return Ok(());
+        }
+    }
+    conn.execute(
+        &format!("ALTER TABLE safety_events ADD COLUMN {column} TEXT"),
+        [],
+    )?;
+    Ok(())
 }
 
 impl SafetyLog for SqliteStore {
@@ -49,8 +72,9 @@ impl SafetyLog for SqliteStore {
         conn.execute(
             "INSERT INTO safety_events \
              (kind, outcome, principal, agent_id, channel_id, conversation_id, sender, \
-              run_id, subject, detail, argument_digest, interruption_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+              run_id, subject, detail, argument_digest, interruption_id, approval_instance_id, \
+              delegation_grant_id, prompting_principal, resolver_principal) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 event.kind.as_str(),
                 event.outcome.as_str(),
@@ -76,6 +100,19 @@ impl SafetyLog for SqliteStore {
                 event.detail.as_deref(),
                 event.argument_digest.as_ref().map(ArgumentDigest::as_str),
                 event.interruption_id.as_ref().map(InterruptionId::as_str),
+                event
+                    .approval_instance_id
+                    .as_ref()
+                    .map(ApprovalInstanceId::as_str),
+                event.delegation_grant_id.as_deref(),
+                event
+                    .prompting_principal
+                    .as_ref()
+                    .map(Principal::storage_name),
+                event
+                    .resolver_principal
+                    .as_ref()
+                    .map(Principal::storage_name),
             ],
         )
         .map_err(sqlite_error)?;
@@ -87,7 +124,8 @@ impl SafetyLog for SqliteStore {
         let mut statement = conn
             .prepare(
                 "SELECT row_id, kind, outcome, principal, run_id, subject, detail, \
-                 argument_digest, interruption_id, recorded_at \
+                 argument_digest, interruption_id, approval_instance_id, delegation_grant_id, prompting_principal, \
+                 resolver_principal, recorded_at \
                  FROM safety_events ORDER BY row_id DESC LIMIT ?1",
             )
             .map_err(sqlite_error)?;
@@ -100,9 +138,13 @@ impl SafetyLog for SqliteStore {
                 let detail: Option<String> = row.get(6)?;
                 let digest: Option<String> = row.get(7)?;
                 let interruption: Option<String> = row.get(8)?;
+                let approval_instance: Option<String> = row.get(9)?;
+                let delegation_grant_id: Option<String> = row.get(10)?;
+                let prompting_principal: Option<String> = row.get(11)?;
+                let resolver_principal: Option<String> = row.get(12)?;
                 Ok(StoredSafetyEvent {
                     row_id: row.get(0)?,
-                    recorded_at: Arc::from(row.get::<_, String>(9)?),
+                    recorded_at: Arc::from(row.get::<_, String>(13)?),
                     event: SafetyEvent {
                         kind: parse_kind(&kind),
                         outcome: parse_outcome(&outcome),
@@ -116,6 +158,14 @@ impl SafetyLog for SqliteStore {
                         detail: detail.map(Arc::from),
                         argument_digest: digest.map(|digest| ArgumentDigest::from_stored(&digest)),
                         interruption_id: interruption.map(InterruptionId::new),
+                        approval_instance_id: approval_instance.map(ApprovalInstanceId::new),
+                        delegation_grant_id: delegation_grant_id.map(Arc::from),
+                        prompting_principal: prompting_principal
+                            .as_deref()
+                            .and_then(Principal::from_storage_name),
+                        resolver_principal: resolver_principal
+                            .as_deref()
+                            .and_then(Principal::from_storage_name),
                     },
                 })
             })

@@ -373,7 +373,7 @@ pub fn runner_deps<'a>(
         cancel: Default::default(),
         steering: None,
         safety_log: None,
-        granted_authority: &[],
+        delegated_authority: None,
     }
 }
 

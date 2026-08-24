@@ -1,8 +1,8 @@
 use crate::orchestrator::{SubAgentSpec, SubOrchSpec};
 use crate::session::Transcript;
 use agentos_proto::{
-    AgentId, ChannelId, ConversationId, InterruptionId, RunId, SchemaVersion, TaskId, ToolCall,
-    TraceEvent, TraceSpan, Usage,
+    ActorPrincipal, AgentId, ApprovalInstanceId, ChannelId, ConversationId, InterruptionId, RunId,
+    SchemaVersion, TaskId, ToolCall, TraceEvent, TraceSpan, Usage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -10,6 +10,15 @@ use std::sync::Arc;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Interruption {
+    /// Unique identity of this asking, even when the gated action is retried.
+    pub approval_instance_id: ApprovalInstanceId,
+    /// The exact channel capability bound one-to-one to this instance.
+    pub approval_ticket: Arc<str>,
+    /// The actor this asking belongs to.
+    pub prompting_principal: ActorPrincipal,
+    /// Filled exactly once when the approval is resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolver_principal: Option<ActorPrincipal>,
     pub id: InterruptionId,
     pub action: InterruptionAction,
     pub status: ApprovalStatus,
@@ -32,8 +41,18 @@ fn is_false(value: &bool) -> bool {
 
 impl Interruption {
     /// A new interruption, awaiting a decision.
-    pub fn pending(id: InterruptionId, action: InterruptionAction) -> Self {
+    pub fn pending(
+        approval_instance_id: ApprovalInstanceId,
+        approval_ticket: impl Into<Arc<str>>,
+        prompting_principal: ActorPrincipal,
+        id: InterruptionId,
+        action: InterruptionAction,
+    ) -> Self {
         Self {
+            approval_instance_id,
+            approval_ticket: approval_ticket.into(),
+            prompting_principal,
+            resolver_principal: None,
             id,
             action,
             status: ApprovalStatus::Pending,
@@ -147,93 +166,10 @@ impl RunState {
             .find(|interruption| interruption.is_pending())
     }
 
-    pub fn approve(&mut self, id: &InterruptionId) -> bool {
-        for interruption in &mut self.approvals {
-            if &interruption.id == id {
-                interruption.status = ApprovalStatus::Approved;
-                return true;
-            }
-        }
-        false
-    }
-
-    pub fn reject(&mut self, id: &InterruptionId, reason: impl Into<Arc<str>>) -> bool {
-        let reason = reason.into();
-        for interruption in &mut self.approvals {
-            if &interruption.id == id {
-                interruption.status = ApprovalStatus::Rejected {
-                    reason: Arc::clone(&reason),
-                };
-                return true;
-            }
-        }
-        false
-    }
-
-    /// The action of the first approved-but-not-yet-acted-on interruption,
-    /// marking it acted on.
-    ///
-    /// Marks rather than removes. The name is kept because the *effect* on the
-    /// caller is unchanged — each approval yields its action exactly once —
-    /// but the record survives, which is the point.
-    pub fn take_approved_action(&mut self) -> Option<InterruptionAction> {
-        let interruption = self.approvals.iter_mut().find(|interruption| {
-            !interruption.consumed && interruption.status == ApprovalStatus::Approved
-        })?;
-        interruption.consumed = true;
-        Some(interruption.action.clone())
-    }
-
-    pub fn take_approved_tool_call(&mut self) -> Option<ToolCall> {
-        match self.take_approved_action()? {
-            InterruptionAction::ToolCall(call) => Some(call),
-            InterruptionAction::Delegate(_)
-            | InterruptionAction::Escalate(_)
-            | InterruptionAction::Handoff { .. }
-            | InterruptionAction::ResumeSubAgent { .. } => None,
-        }
-    }
-
-    /// Mark an approval as ended without a decision. See
-    /// [`ApprovalStatus::Unanswered`].
-    pub fn mark_unanswered(&mut self, id: &InterruptionId, reason: impl Into<Arc<str>>) -> bool {
-        let reason = reason.into();
-        for interruption in &mut self.approvals {
-            if &interruption.id == id {
-                interruption.status = ApprovalStatus::Unanswered {
-                    reason: Arc::clone(&reason),
-                };
-                return true;
-            }
-        }
-        false
-    }
-
-    pub fn take_rejected_reason(&mut self) -> Option<Arc<str>> {
-        let interruption = self.approvals.iter_mut().find(|interruption| {
-            !interruption.consumed && matches!(interruption.status, ApprovalStatus::Rejected { .. })
-        })?;
-        interruption.consumed = true;
-        match &interruption.status {
-            ApprovalStatus::Rejected { reason } => Some(Arc::clone(reason)),
-            ApprovalStatus::Pending
-            | ApprovalStatus::Approved
-            | ApprovalStatus::Unanswered { .. } => None,
-        }
-    }
-
-    /// Take the reason an approval ended without a decision, removing it.
-    pub fn take_unanswered_reason(&mut self) -> Option<Arc<str>> {
-        let interruption = self.approvals.iter_mut().find(|interruption| {
-            !interruption.consumed
-                && matches!(interruption.status, ApprovalStatus::Unanswered { .. })
-        })?;
-        interruption.consumed = true;
-        match &interruption.status {
-            ApprovalStatus::Unanswered { reason } => Some(Arc::clone(reason)),
-            ApprovalStatus::Pending
-            | ApprovalStatus::Approved
-            | ApprovalStatus::Rejected { .. } => None,
-        }
+    /// The sole pending interruption, for kernel-internal lifecycle updates.
+    pub fn pending_approval_mut(&mut self) -> Option<&mut Interruption> {
+        self.approvals
+            .iter_mut()
+            .find(|interruption| interruption.is_pending())
     }
 }

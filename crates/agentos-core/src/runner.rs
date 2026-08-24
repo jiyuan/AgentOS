@@ -1,4 +1,4 @@
-use crate::approve::{DelegationGrant, Policy};
+use crate::approve::{DelegatedAuthority, Policy};
 use crate::audit::{SafetyJournal, SafetyLog, SafetyOutcome};
 use crate::hooks::Hooks;
 mod audit;
@@ -9,8 +9,8 @@ mod task_session;
 use crate::memory::MemoryManager;
 use crate::prompt::Compaction;
 use crate::r#loop::{
-    resume_approved, ApprovalOutcome, FinalOutput, InputGuardrailEntry, LoopDeps,
-    OutputGuardrailEntry, RunError, RunLoopState, StartCtx, Steering, StepFailure,
+    enter_approved, ApprovalOutcome, FinalOutput, InputGuardrailEntry, LoopDeps,
+    OutputGuardrailEntry, ResumeWitness, RunError, RunLoopState, StartCtx, Steering, StepFailure,
     ToolGuardrailEntry,
 };
 use crate::spill::ContentLimits;
@@ -19,10 +19,11 @@ use crate::task_workspace::{TaskWorkspace, TaskWorkspaceError};
 use crate::tools::ToolRegistry;
 use crate::trace;
 use agentos_interfaces::orchestrator::{Orchestrator, StreamSink};
+use agentos_interfaces::run_state::ApprovalStatus;
 use agentos_interfaces::session::{Item, Session, SessionError, Transcript};
 use agentos_interfaces::RunState;
 use agentos_proto::{
-    AgentId, ChannelId, ConversationId, Envelope, InterruptionId, Principal, RunId, SpanKind,
+    AgentId, ChannelId, ConversationId, ConversationPrincipal, Envelope, RunId, SpanKind,
 };
 use audit::{record_resolution, record_terminal_error};
 use episodes::{record_denied_episode, record_error_episode, record_finished_episode, EpisodeSeed};
@@ -129,7 +130,7 @@ pub struct RunnerDeps<'a> {
     /// Authority this run holds that its parent does not. Set only when this
     /// is a sub-agent run whose narrowing needed a
     /// `[[subagents.delegation_grants]]` entry.
-    pub granted_authority: &'a [DelegationGrant],
+    pub delegated_authority: Option<&'a DelegatedAuthority>,
 }
 
 pub trait TraceSink: Send + Sync {
@@ -178,36 +179,6 @@ pub struct PausedRun {
     pub state: RunState,
 }
 
-/// What a caller decided about a pending approval.
-///
-/// One variant per [`ApprovalOutcome`], so a run cannot be resumed without
-/// saying which of the four things happened. Three of them fail closed; only
-/// [`ResumeDecision::Approve`] lets the gated action run.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ResumeDecision {
-    /// Someone holding the prompt's ticket said yes.
-    Approve,
-    /// Someone holding the prompt's ticket said no.
-    Reject { reason: Arc<str> },
-    /// The prompt expired before anyone answered.
-    Cancel { reason: Arc<str> },
-    /// There was nobody who could answer — a run with no interactive user
-    /// behind it, such as a cron tick that hit an `ask_user` policy.
-    Unavailable { reason: Arc<str> },
-}
-
-impl ResumeDecision {
-    /// The outcome this decision records.
-    pub fn outcome(&self) -> ApprovalOutcome {
-        match self {
-            Self::Approve => ApprovalOutcome::Approved,
-            Self::Reject { .. } => ApprovalOutcome::Rejected,
-            Self::Cancel { .. } => ApprovalOutcome::Cancelled,
-            Self::Unavailable { .. } => ApprovalOutcome::Unavailable,
-        }
-    }
-}
-
 pub async fn run_envelope(
     input: Envelope,
     run_id: RunId,
@@ -222,16 +193,16 @@ pub async fn run_envelope(
     // carried because `Session::load` applies *this participant's* `/clear`
     // epoch; the items it returns belong to the conversation, which is why
     // `append` below can be given the same value and ignore the sender.
-    let principal = Principal::conversation(
+    let conversation_principal = ConversationPrincipal::new(
         deps.active_agent.clone(),
         input.channel_id.clone(),
         input.conversation_id.clone(),
-    )
-    .with_sender(Arc::clone(&input.sender));
+    );
+    let principal = conversation_principal.actor(Arc::clone(&input.sender));
     let mut transcript = if ephemeral_session {
         Transcript::default()
     } else {
-        deps.session.load(&principal).await?
+        deps.session.load(principal.as_principal()).await?
     };
     let persisted_len = transcript.items.len();
     let mut input_metadata = input.metadata.clone();
@@ -268,15 +239,8 @@ pub async fn run_envelope(
     // is started by somebody, and which participant that was decides who an
     // approval prompt may be answered by. A resume is keyed on the pause it
     // answers, which the interruption id already names.
-    let audit = SafetyJournal::new(deps.safety_log).for_run(
-        Principal::conversation(
-            deps.active_agent.clone(),
-            input.channel_id.clone(),
-            input.conversation_id.clone(),
-        )
-        .with_sender(Arc::clone(&input.sender)),
-        run_id.clone(),
-    );
+    let audit = SafetyJournal::new(deps.safety_log)
+        .for_run(principal.clone().into_principal(), run_id.clone());
 
     let loop_deps = LoopDeps {
         orchestrator: deps.orchestrator,
@@ -295,7 +259,7 @@ pub async fn run_envelope(
         cancel: deps.cancel.clone(),
         steering: deps.steering.clone(),
         audit: audit.clone(),
-        granted_authority: deps.granted_authority,
+        delegated_authority: deps.delegated_authority,
     };
     let mut current = RunLoopState::Start(StartCtx { state });
 
@@ -324,7 +288,9 @@ pub async fn run_envelope(
             RunLoopState::Paused(state) => {
                 if !ephemeral_session {
                     let append_items = state.transcript.items[persisted_len..].to_vec();
-                    deps.session.append(&principal, append_items).await?;
+                    deps.session
+                        .append(principal.as_principal(), append_items)
+                        .await?;
                 }
                 persist_task_session_items(
                     task_session.as_ref(),
@@ -341,45 +307,80 @@ pub async fn run_envelope(
 
 pub async fn resume_run(
     mut paused: PausedRun,
-    approval_id: &InterruptionId,
-    decision: ResumeDecision,
+    witness: ResumeWitness,
     deps: &RunnerDeps<'_>,
 ) -> Result<RunOutcome, RunnerError> {
     let persisted_len = paused.state.transcript.items.len();
     let trace_span_start = paused.state.trace_spans.len();
     let trace_event_start = paused.state.trace_events.len();
     let task_session = activate_task_workspace_for_resume(&mut paused.state, deps)?;
-    let outcome = decision.outcome();
+    let outcome = witness.outcome;
+    let approval_id = witness.interruption_id.clone();
+    let approval_instance_id = witness.approval_instance_id.clone();
     let audit = SafetyJournal::new(deps.safety_log).for_run(
-        Principal::conversation(
-            paused.state.active_agent.clone(),
-            paused.channel_id.clone(),
-            paused.conversation_id.clone(),
-        ),
+        witness.prompting_principal.clone().into_principal(),
         paused.state.run_id.clone(),
     );
     // What the pause was about, read before the decision is applied — the
     // interruption stops being the pending one the moment it is answered.
-    let subject: Arc<str> = paused
-        .state
-        .pending_approval()
-        .map(|approval| Arc::from(approval_action_label(&approval.action).1))
-        .unwrap_or_else(|| Arc::from("unknown"));
-    match decision {
-        ResumeDecision::Approve => {
-            paused.state.approve(approval_id);
+    let Some(interruption) = paused.state.approvals.iter_mut().find(|interruption| {
+        interruption.approval_instance_id == approval_instance_id
+            && interruption.approval_ticket.as_ref() == witness.ticket.as_str()
+            && interruption.id == approval_id
+            && interruption.prompting_principal == witness.prompting_principal
+            && interruption.status == ApprovalStatus::Pending
+            && !interruption.consumed
+    }) else {
+        return Err(RunError::NotResumable.into());
+    };
+    let prompt = witness.prompting_principal.as_principal();
+    if prompt.agent != paused.state.active_agent
+        || prompt.channel != paused.channel_id
+        || prompt.conversation != paused.conversation_id
+    {
+        return Err(RunError::NotResumable.into());
+    }
+    if matches!(
+        outcome,
+        ApprovalOutcome::Approved | ApprovalOutcome::Rejected
+    ) && witness
+        .expires_at
+        .is_some_and(|expires_at| crate::gateway::unix_now() >= expires_at)
+    {
+        return Err(RunError::NotResumable.into());
+    }
+    let subject: Arc<str> = Arc::from(approval_action_label(&interruption.action).1);
+    interruption.resolver_principal = Some(witness.resolver_principal.clone());
+    if let agentos_interfaces::run_state::InterruptionAction::ResumeSubAgent {
+        child_state, ..
+    } = &mut interruption.action
+    {
+        if let Some(child) = child_state.pending_approval_mut() {
+            child.resolver_principal = Some(witness.resolver_principal.clone());
+        }
+    }
+    match outcome {
+        ApprovalOutcome::Approved => {
+            interruption.status = ApprovalStatus::Approved;
             // The record that used to be a deletion. `take_approved_action`
             // now marks the interruption rather than removing it, and this is
             // the durable half of the same change (M6 / `AUD-001`).
-            record_resolution(&audit, SafetyOutcome::Approved, &subject, approval_id, None);
+            record_resolution(&audit, SafetyOutcome::Approved, &subject, &witness, None);
         }
-        ResumeDecision::Reject { reason } => {
-            paused.state.reject(approval_id, Arc::clone(&reason));
+        ApprovalOutcome::Rejected => {
+            let reason = witness
+                .reason
+                .clone()
+                .unwrap_or_else(|| Arc::from("approval rejected"));
+            interruption.status = ApprovalStatus::Rejected {
+                reason: Arc::clone(&reason),
+            };
+            interruption.consumed = true;
             record_resolution(
                 &audit,
                 SafetyOutcome::Rejected,
                 &subject,
-                approval_id,
+                &witness,
                 Some(reason.as_ref()),
             );
             record_denied_episode(
@@ -402,16 +403,21 @@ pub async fn resume_run(
         // Expired, or nobody to ask. Fails the run closed like a denial, but
         // as a distinct error and a distinct episode outcome — the audit trail
         // has to be able to tell a refusal from a question nobody answered.
-        ResumeDecision::Cancel { reason } | ResumeDecision::Unavailable { reason } => {
+        ApprovalOutcome::Cancelled | ApprovalOutcome::Unavailable => {
+            let reason = witness
+                .reason
+                .clone()
+                .unwrap_or_else(|| Arc::from("approval went unanswered"));
             let reason: Arc<str> = Arc::from(format!("{reason} ({})", outcome.as_str()));
-            paused
-                .state
-                .mark_unanswered(approval_id, Arc::clone(&reason));
+            interruption.status = ApprovalStatus::Unanswered {
+                reason: Arc::clone(&reason),
+            };
+            interruption.consumed = true;
             record_resolution(
                 &audit,
                 SafetyOutcome::Unanswered,
                 &subject,
-                approval_id,
+                &witness,
                 Some(reason.as_ref()),
             );
             persist_trace_records_with_sink(
@@ -444,9 +450,9 @@ pub async fn resume_run(
         cancel: deps.cancel.clone(),
         steering: deps.steering.clone(),
         audit: audit.clone(),
-        granted_authority: deps.granted_authority,
+        delegated_authority: deps.delegated_authority,
     };
-    let mut current = match resume_approved(paused.state) {
+    let mut current = match enter_approved(paused.state, &approval_instance_id) {
         Ok(current) => current,
         Err(failure) => {
             let error = record_failed_run(
@@ -715,12 +721,14 @@ async fn finish(
         // No sender: appending is conversation-keyed, and `finish` is also
         // reached from a resume, where the participant who answered the
         // approval is not necessarily the one who spoke.
-        let principal = Principal::conversation(
+        let principal = ConversationPrincipal::new(
             deps.active_agent.clone(),
             channel_id.clone(),
             conversation_id.clone(),
         );
-        deps.session.append(&principal, append_items).await?;
+        deps.session
+            .append(principal.as_principal(), append_items)
+            .await?;
     }
     persist_task_session_items(
         active_task_session(&state, deps).as_ref(),
@@ -791,8 +799,9 @@ fn record_run_finish(state: &mut RunState, hooks: Option<&Hooks>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::approve::{DelegationGrant, Policy, PolicyAction, PolicyRule, PolicyVerb};
-    use crate::memory::InMemorySession;
+    use crate::approve::{DelegationGrantTemplate, Policy, PolicyAction, PolicyRule, PolicyVerb};
+    use crate::audit::{SafetyEventKind, SafetyLog};
+    use crate::memory::{InMemorySession, SqliteStore};
     use crate::r#loop::ToolGuardrailEntry;
     use crate::subagents::{SubAgentDefinition, SubAgentRegistry};
     use crate::tools::ToolRegistry;
@@ -801,7 +810,8 @@ mod tests {
     use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
     use agentos_interfaces::{InterruptionAction, Orchestrator};
     use agentos_proto::{
-        AgentId, ConversationId, Message, MessageRole, ToolCall, ToolCallId, ToolResult, ToolStatus,
+        AgentId, ConversationId, Message, MessageRole, Principal, ToolCall, ToolCallId, ToolResult,
+        ToolStatus,
     };
     use async_trait::async_trait;
     use serde_json::{json, value::RawValue};
@@ -863,7 +873,7 @@ mod tests {
             cancel: Default::default(),
             steering: None,
             safety_log: None,
-            granted_authority: &[],
+            delegated_authority: None,
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),
@@ -888,14 +898,35 @@ mod tests {
             InterruptionAction::ResumeSubAgent { child_state, .. }
                 if child_state.approvals.len() == 1
         ));
-        let approval_id = approval.id.clone();
+        let ticket = crate::r#loop::ApprovalTicket::parse(&approval.approval_ticket)
+            .expect("stored ticket parses");
+        let binding = crate::r#loop::ApprovalBinding::new(
+            approval.approval_instance_id.clone(),
+            ticket.clone(),
+            approval.id.clone(),
+            approval.prompting_principal.clone(),
+            None,
+        )
+        .expect("instance matches ticket");
+        let answer = Envelope {
+            channel_id: ChannelId::new("telegram"),
+            conversation_id: ConversationId::new("chat-1"),
+            sender: Arc::from("user"),
+            message: Message::text(MessageRole::User, format!("/approve {ticket}")),
+            metadata: BTreeMap::new(),
+        };
+        let crate::r#loop::Routed::Decides { witness } =
+            crate::r#loop::route(Some(&binding), &answer)
+        else {
+            panic!("answer should produce witness");
+        };
 
         let paused = PausedRun {
             channel_id: ChannelId::new("telegram"),
             conversation_id: ConversationId::new("chat-1"),
             state: paused_state,
         };
-        let output = match resume_run(paused, &approval_id, ResumeDecision::Approve, &deps)
+        let output = match resume_run(paused, witness, &deps)
             .await
             .expect("resume should finish")
         {
@@ -919,10 +950,20 @@ mod tests {
     /// covers exactly the tool named.
     #[tokio::test]
     async fn a_granted_subagent_tool_runs_without_parent_approval() {
-        let session = Arc::new(InMemorySession::default());
+        let database_path = std::env::temp_dir().join(format!(
+            "agentos-grant-events-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("test clock is after the Unix epoch")
+                .as_nanos()
+        ));
+        let session = Arc::new(SqliteStore::open(&database_path).expect("audit store opens"));
         let child_orchestrator = Arc::new(ChildApprovalOrchestrator);
         let parent_orchestrator = ParentDelegateOrchestrator;
-        let mut registry = SubAgentRegistry::new().with_session(session.clone());
+        let mut registry = SubAgentRegistry::new()
+            .with_session(session.clone())
+            .with_safety_log(Some(session.clone()));
         let mut tools = ToolRegistry::new();
         tools.register(MockApprovalTool);
         let tools = Arc::new(tools);
@@ -935,12 +976,12 @@ mod tests {
             )
             .with_tools(tools)
             .with_max_turns(4)
-            .with_delegation_grants(vec![DelegationGrant {
+            .with_delegation_grants(vec![DelegationGrantTemplate {
                 action: PolicyAction::Tool(Arc::from("mock")),
                 decision: PolicyVerb::Allow,
                 arg_equals: BTreeMap::new(),
                 reason: Arc::from("the delegated task cannot pause for approval"),
-                expires_at: None,
+                lifetime_secs: 60,
             }]),
         );
         let parent_policy = Policy {
@@ -980,8 +1021,8 @@ mod tests {
             compaction: Default::default(),
             cancel: Default::default(),
             steering: None,
-            safety_log: None,
-            granted_authority: &[],
+            safety_log: Some(session.as_ref()),
+            delegated_authority: None,
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),
@@ -1003,6 +1044,24 @@ mod tests {
             output.message.content.as_ref(),
             "parent saw: child finished"
         );
+        let events = session.recent(16).expect("grant events read back");
+        let issued = events
+            .iter()
+            .find(|event| event.event.kind == SafetyEventKind::DelegationGrantIssued)
+            .expect("grant issuance is durable");
+        let used = events
+            .iter()
+            .find(|event| event.event.kind == SafetyEventKind::DelegationGrantUsed)
+            .expect("grant use is durable");
+        assert_eq!(
+            issued.event.delegation_grant_id,
+            used.event.delegation_grant_id
+        );
+        assert!(issued.event.delegation_grant_id.is_some());
+        drop(deps);
+        drop(registry);
+        drop(session);
+        std::fs::remove_file(database_path).expect("temporary audit store removes");
     }
 
     #[tokio::test]
@@ -1036,7 +1095,7 @@ mod tests {
             cancel: Default::default(),
             steering: None,
             safety_log: None,
-            granted_authority: &[],
+            delegated_authority: None,
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),
@@ -1092,7 +1151,7 @@ mod tests {
             cancel: Default::default(),
             steering: None,
             safety_log: None,
-            granted_authority: &[],
+            delegated_authority: None,
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),
@@ -1161,7 +1220,7 @@ mod tests {
             cancel: Default::default(),
             steering: None,
             safety_log: None,
-            granted_authority: &[],
+            delegated_authority: None,
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),
@@ -1248,7 +1307,7 @@ mod tests {
             cancel: Default::default(),
             steering: None,
             safety_log: None,
-            granted_authority: &[],
+            delegated_authority: None,
         };
         let mut metadata = BTreeMap::new();
         metadata.insert(
@@ -1541,7 +1600,7 @@ mod tests {
             cancel: Default::default(),
             steering: None,
             safety_log: None,
-            granted_authority: &[],
+            delegated_authority: None,
         };
         let input = Envelope {
             channel_id: ChannelId::new("telegram"),

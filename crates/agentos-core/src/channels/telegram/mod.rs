@@ -775,7 +775,7 @@ mod tests {
     /// can correlate it without reading any prose (roadmap G2).
     #[test]
     fn a_button_press_becomes_a_correlated_answer() {
-        let ticket = crate::r#loop::ApprovalTicket::mint();
+        let ticket = crate::r#loop::ApprovalTicket::mint().expect("OS entropy is available");
         let update = json!({
             "update_id": 42,
             "callback_query": {
@@ -817,7 +817,7 @@ mod tests {
     /// redelivered update is a new message and the agent answers twice.
     #[test]
     fn both_kinds_of_update_carry_the_transport_delivery_id() {
-        let ticket = crate::r#loop::ApprovalTicket::mint();
+        let ticket = crate::r#loop::ApprovalTicket::mint().expect("OS entropy is available");
         for update in [
             json!({
                 "update_id": 4242,
@@ -958,7 +958,7 @@ mod tests {
 
     #[test]
     fn approval_actions_render_as_one_keyboard_row() {
-        let ticket = crate::r#loop::ApprovalTicket::mint();
+        let ticket = crate::r#loop::ApprovalTicket::mint().expect("OS entropy is available");
         let markup =
             inline_keyboard(Some(&crate::r#loop::prompt_actions(&ticket))).expect("a keyboard");
         let parsed: Value = serde_json::from_str(&markup).expect("valid JSON");

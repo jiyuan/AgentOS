@@ -1,25 +1,28 @@
 # ADR-0003 — A typed principal is the key for every isolated resource
 
-- Status: accepted; partially implemented
+- Status: accepted; identity persistence implemented, approval binding pending
 - Date: 2026-08-21
-- Milestone: M3 (`ID-001`, `ID-002`, `AUTH-001` landed; deliverable 2 partly
-  outstanding)
+- Milestone: M3 and R1 (`ID-001`, `ID-002`, `AUTH-001`, and `ID-003` landed;
+  `AUTH-003` remains)
 
 ## What is implemented
 
-`Principal` exists in `agentos-proto` with both encodings. Memory scopes,
-episode records, attachment path segments, and the memory tool's owner
-resolution are keyed by it; `agentos-gateway migrate` moves data written under
-the old namespaces, reporting what the old encoding made ambiguous rather than
-guessing. Both remote channels fail closed on identity and refuse an
-unattributed event on every path, and an approval prompt is answerable only by
-the sender it was put to or a configured administrator.
+`Principal` exists in `agentos-proto` with both encodings. The
+`ConversationPrincipal` and `ActorPrincipal` wrappers make senderless shared
+state and sender-qualified action identity distinct constructors and types.
+Memory scopes, sessions, `/clear` epochs, jobs, episode records, attachment
+path segments, and the memory tool's owner resolution are principal-keyed.
+`agentos-gateway migrate` moves data written under old namespaces and session
+keys, reporting ambiguous records rather than guessing.
 
-What is *not* yet done: sessions, `/clear`, jobs, and task sessions still key
-on a bare `ConversationId` rather than a principal, so state isolation there
-rests on the conversation id being unique — which it is per channel, and is not
-across them. That is the rest of the milestone's deliverable 2, and it is where
-the `Session` trait's semver break lives.
+Delegated conversations additionally use a versioned injective encoding of the
+complete parent conversation principal, child definition and policy, and task
+discriminator. The source tuple is persisted so complete legacy rows can be
+rekeyed; incomplete or colliding legacy rows are reported and left quarantined.
+
+What is *not* yet done is the stronger approval-instance and resolver binding
+specified by `AUTH-003`: approval tickets and administrator selectors still
+need to carry the complete actor scope throughout resolution.
 
 ## Context
 
@@ -43,12 +46,13 @@ There is also no `schema_version` table — the schema is four bare
 
 ## Decision
 
-**One versioned principal type is the key for sessions, memory scopes,
-approval tickets, `/clear`, jobs, task sessions, and audit events.** It
-carries agent-or-tenant, channel, conversation, and — wherever authorization
-depends on *who asked* — sender. It serializes to canonical
-length-prefixed bytes, so no component's contents can be mistaken for a
-delimiter, and to a stable storage name derived from those bytes.
+**One versioned wire principal, with distinct conversation and actor wrappers,
+is the key for sessions, memory scopes, approval tickets, `/clear`, jobs, task
+sessions, and audit events.** It carries agent-or-tenant, channel,
+conversation, and — wherever authorization depends on *who asked* — sender.
+It serializes to canonical length-prefixed bytes, so no component's contents
+can be mistaken for a delimiter, and to a stable storage name derived from
+those bytes.
 
 **Encoding is injective, never sanitizing.** Arbitrary components are encoded
 with unpadded base64url. Replacement sanitization is prohibited: it is exactly
@@ -67,8 +71,8 @@ compatibility option may exist, but an event with no attributable sender is
 rejected even under it — "allow everyone" is still not "allow nobody in
 particular".
 
-`Session` keys on `&ConversationId` in `agentos-interfaces`, so this is a
-deliberate semver break, recorded as such.
+`Session` keys on `&Principal` in `agentos-interfaces`; changing it from
+`&ConversationId` was the deliberate semver break recorded by this ADR.
 
 ## Consequences
 

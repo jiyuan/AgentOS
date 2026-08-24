@@ -1,4 +1,4 @@
-use crate::approve::{DelegationGrant, Policy};
+use crate::approve::{DelegatedAuthority, Policy};
 use crate::audit::{ArgumentDigest, SafetyEvent, SafetyEventKind, SafetyJournal, SafetyOutcome};
 use crate::hooks::Hooks;
 use crate::prompt::Compaction;
@@ -12,7 +12,7 @@ use agentos_interfaces::guardrail::{
 };
 use agentos_interfaces::orchestrator::{Orchestrator, Plan, RunContext, StreamSink};
 use agentos_interfaces::run_state::{Interruption, InterruptionAction, RunState};
-use agentos_proto::{InterruptionId, Message, SpanKind};
+use agentos_proto::{ApprovalInstanceId, InterruptionId, Message, SpanKind};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -26,6 +26,7 @@ mod batch;
 mod budget;
 mod cancel;
 mod delegate;
+mod delegation_grant;
 mod error;
 mod escalate;
 mod handoff;
@@ -33,6 +34,7 @@ mod items;
 mod output;
 mod planning;
 mod request;
+mod resume;
 mod steering;
 mod telemetry;
 mod tool_call;
@@ -40,10 +42,10 @@ mod tool_call;
 use approval::{approve_transition, ApproveTransition};
 pub use approval_route::{
     parse_action_data, prompt_actions, prompt_interruption, route, ApprovalBinding,
-    ApprovalOutcome, ApprovalTicket, Routed, ACTIONS_KEY, APPROVE, DECISION_KEY, DENY,
-    EXPIRES_AT_KEY, INTERRUPTION_KEY, PROMPT_KIND, REASON_KEY, TICKET_KEY,
+    ApprovalOutcome, ApprovalTicket, ResumeWitness, Routed, TicketError, ACTIONS_KEY, APPROVE,
+    DECISION_KEY, DENY, EXPIRES_AT_KEY, INTERRUPTION_KEY, PROMPT_KIND, REASON_KEY, TICKET_KEY,
 };
-use authorization::plan_subject;
+use authorization::{plan_subject, ActPlan, AuthorizedPlan};
 pub use authorization::{Authorization, Unauthorized};
 use budget::{budget_exhausted_finish, record_llm_usage};
 use cancel::{cancelled_finish, unless_cancelled};
@@ -55,6 +57,8 @@ use items::{
     assistant_tool_call_item, subagent_result_item, suborchestrator_result_item, tool_result_item,
 };
 use request::record_request_header;
+pub(crate) use resume::enter_approved;
+pub use resume::resume_approved;
 pub use steering::{Steered, Steering, DEFAULT_STEERING_CAPACITY};
 use tool_call::{denied_tool_result, execute_tool, spill_oversized};
 
@@ -95,7 +99,7 @@ pub struct LoopDeps<'a> {
     /// `[[subagents.delegation_grants]]`. Empty for every run that is not a
     /// sub-agent whose narrowing needed a grant. The `Approve` state records
     /// a use when a call falls under one of these.
-    pub granted_authority: &'a [DelegationGrant],
+    pub delegated_authority: Option<&'a DelegatedAuthority>,
 }
 
 pub struct InputGuardrailEntry<'a> {
@@ -143,48 +147,6 @@ impl RunLoopState {
     }
 }
 
-pub fn resume_approved(state: RunState) -> Result<RunLoopState, StepFailure> {
-    let mut state = state;
-    if let Some(reason) = state.take_rejected_reason() {
-        return Err(StepFailure::new(state, RunError::ApprovalDenied { reason }));
-    }
-    if let Some(reason) = state.take_unanswered_reason() {
-        return Err(StepFailure::new(
-            state,
-            RunError::ApprovalUnanswered { reason },
-        ));
-    }
-
-    let turns = resume_turns(&state);
-    let Some(action) = state.take_approved_action() else {
-        return Err(StepFailure::new(state, RunError::NotResumable));
-    };
-    let plan = match action {
-        InterruptionAction::ToolCall(call) => Plan::CallTool(call),
-        InterruptionAction::Delegate(spec) => Plan::Delegate(spec),
-        InterruptionAction::Escalate(spec) => Plan::Escalate(spec),
-        InterruptionAction::Handoff { agent_id, payload } => Plan::Handoff(agent_id, payload),
-        InterruptionAction::ResumeSubAgent {
-            spec,
-            child_channel_id,
-            child_conversation_id,
-            child_state,
-        } => Plan::ResumeSubAgent {
-            spec,
-            child_channel_id,
-            child_conversation_id,
-            child_state,
-        },
-    };
-    Ok(RunLoopState::Act(ActCtx {
-        authorized: Authorization::approved_by_human(&plan),
-        state,
-        plan,
-        turns,
-        denied: None,
-    }))
-}
-
 #[derive(Debug)]
 pub struct StartCtx {
     pub state: RunState,
@@ -204,23 +166,29 @@ pub struct ApproveCtx {
 }
 
 #[derive(Debug)]
+/// State that may enter the action executor only after approval.
+///
+/// The private authorized plan makes literal construction outside this crate a
+/// compile error:
+///
+/// ```compile_fail
+/// use agentos_core::r#loop::ActCtx;
+/// use agentos_interfaces::RunState;
+/// # fn cannot_fabricate(state: RunState) {
+/// let _ = ActCtx { state, turns: 0 };
+/// # }
+/// ```
 pub struct ActCtx {
     pub state: RunState,
-    pub plan: Plan,
     pub turns: usize,
-    /// Set when the Approve state denied this (tool) plan. The Act state then
-    /// records a denied `ToolResult` instead of executing the tool, keeping the
-    /// `Plan -> Approve -> Act -> Observe` progression intact so the model can
-    /// read the denial and replan on the next turn.
-    pub denied: Option<Arc<str>>,
-    /// Proof that `plan` crossed `Approve`.
+    /// The immutable plan, its approval witness, and any denied-tool
+    /// disposition.
     ///
-    /// Private, and [`Authorization`] has no public constructor, so this
-    /// struct cannot be built by a literal outside the crate — which is what
-    /// closes the transition hole `AGENTS.md` used to say review enforced
-    /// (M6 / `STATE-001`). `Act` also checks the witness against the plan it
-    /// was handed, so a caller holding a real `ActCtx` cannot swap one in.
-    authorized: Authorization,
+    /// Private, and [`AuthorizedPlan`] has no public constructor, so this
+    /// struct cannot be built by a literal outside the crate. Because the plan
+    /// itself is inside that private value, a caller holding a genuine
+    /// `ActCtx` cannot swap the action, payload, or denial state either.
+    authorized_plan: AuthorizedPlan,
 }
 
 #[derive(Debug)]
@@ -498,24 +466,24 @@ async fn approve(ctx: ApproveCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, S
             // The elevation was recorded when narrowing admitted it; this is
             // the record that it was exercised. Only on `Allow`: a grant that
             // covers a call the child was denied anyway granted nothing.
-            for grant in deps.granted_authority {
-                if grant.covers(&plan) {
-                    deps.audit.record(
-                        SafetyEvent::new(
-                            SafetyEventKind::DelegationGrantUsed,
-                            SafetyOutcome::Used,
-                            plan_subject(&plan),
-                        )
-                        .with_detail(grant.reason.as_ref()),
-                    );
+            if let Err(reason) = delegation_grant::validate(&plan, deps) {
+                let subject = plan_subject(&plan);
+                if let Plan::CallTool(call) = plan {
+                    return Ok(RunLoopState::Act(ActCtx {
+                        authorized_plan: AuthorizedPlan::denied_tool(Plan::CallTool(call), reason),
+                        state,
+                        turns,
+                    }));
                 }
+                return Err(StepFailure::new(
+                    state,
+                    RunError::StructuralDenial { subject, reason },
+                ));
             }
             Ok(RunLoopState::Act(ActCtx {
-                authorized: Authorization::allowed(&plan),
+                authorized_plan: AuthorizedPlan::allowed(plan),
                 state,
-                plan,
                 turns,
-                denied: None,
             }))
         }
         ApproveTransition::DenyTool {
@@ -535,11 +503,9 @@ async fn approve(ctx: ApproveCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, S
             );
             let plan = Plan::CallTool(call);
             Ok(RunLoopState::Act(ActCtx {
-                authorized: Authorization::allowed(&plan),
+                authorized_plan: AuthorizedPlan::denied_tool(plan, reason),
                 state,
-                plan,
                 turns,
-                denied: Some(reason),
             }))
         }
         ApproveTransition::Deny {
@@ -569,18 +535,20 @@ async fn approve(ctx: ApproveCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, S
 async fn act(ctx: ActCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, StepFailure> {
     let ActCtx {
         mut state,
-        plan,
         turns,
-        denied,
-        authorized,
+        authorized_plan,
     } = ctx;
     // Re-assert, idempotently, on the way in. `Approve` decided this plan, but
     // a decision made one state ago is not the same thing as a decision made
     // now: the witness has to name *this* plan, and the policy has to still
     // agree. A denied call skips the check because it is not going to run —
     // recording the denial is the whole of what happens to it.
-    if denied.is_none() {
-        if let Err(refusal) = authorized.admits(&plan, deps.policy) {
+    let (plan, denied) = match authorized_plan.into_act(deps.policy) {
+        Ok(ActPlan::Execute(plan)) => (plan, None),
+        Ok(ActPlan::DeniedTool { call, reason }) => (Plan::CallTool(call), Some(reason)),
+        Err(failure) => {
+            let plan = *failure.plan;
+            let refusal = failure.error;
             let subject = plan_subject(&plan);
             deps.audit.record_reason(
                 SafetyEventKind::PolicyDenial,
@@ -596,7 +564,7 @@ async fn act(ctx: ActCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, StepFailu
                 },
             ));
         }
-    }
+    };
     match plan {
         Plan::CallTool(call) => {
             // Record the assistant turn that requested the tool *before*
@@ -640,7 +608,7 @@ async fn act(ctx: ActCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, StepFailu
                 state.transcript.items.push(subagent_result_item(result));
             }
             Ok(DelegateOutcome::Paused(paused)) => {
-                return pause_for_subagent_approval(state, spec, paused);
+                return pause_for_subagent_approval(state, spec, paused, deps);
             }
         },
         Plan::Escalate(spec) => match execute_escalate(&mut state, deps, &spec).await {
@@ -655,7 +623,7 @@ async fn act(ctx: ActCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, StepFailu
                 stage_agent,
                 paused,
             }) => {
-                return pause_for_subagent_approval(state, stage_agent, *paused);
+                return pause_for_subagent_approval(state, stage_agent, *paused, deps);
             }
         },
         // Unreachable: `plan` splits every batch into single calls before
@@ -694,7 +662,7 @@ async fn act(ctx: ActCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, StepFailu
                     state.transcript.items.push(subagent_result_item(result));
                 }
                 Ok(DelegateOutcome::Paused(paused)) => {
-                    return pause_for_subagent_approval(state, spec, paused);
+                    return pause_for_subagent_approval(state, spec, paused, deps);
                 }
             }
         }
@@ -711,6 +679,7 @@ fn pause_for_subagent_approval(
     mut state: RunState,
     spec: agentos_interfaces::orchestrator::SubAgentSpec,
     paused: crate::subagents::SubAgentPausedRun,
+    deps: &LoopDeps<'_>,
 ) -> Result<RunLoopState, StepFailure> {
     let Some(child_approval) = paused.state.pending_approval() else {
         return Err(StepFailure::new(state, SubAgentError::Paused));
@@ -720,7 +689,36 @@ fn pause_for_subagent_approval(
         spec.agent_id.as_str(),
         child_approval.id.as_str()
     ));
+    let ticket = ApprovalTicket::mint().map_err(|error| {
+        StepFailure::new(
+            state.clone(),
+            RunError::ApprovalUnsupported {
+                reason: Arc::from(format!("could not create approval ticket: {error}")),
+            },
+        )
+    })?;
+    let prompting_principal = deps.audit.actor_principal().ok_or_else(|| {
+        StepFailure::new(
+            state.clone(),
+            RunError::ApprovalUnsupported {
+                reason: Arc::from("approval requires a sender-qualified prompting principal"),
+            },
+        )
+    })?;
+    let approval_instance_id = ApprovalInstanceId::new(ticket.as_str());
+    deps.audit.record(
+        SafetyEvent::new(
+            SafetyEventKind::ApprovalRequested,
+            SafetyOutcome::Requested,
+            format!("subagent {}", spec.agent_id.as_str()),
+        )
+        .with_interruption(approval_id.clone())
+        .with_approval_instance(approval_instance_id.clone()),
+    );
     state.approvals.push(Interruption::pending(
+        approval_instance_id,
+        ticket.as_str(),
+        prompting_principal,
         approval_id,
         InterruptionAction::ResumeSubAgent {
             spec,

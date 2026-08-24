@@ -61,6 +61,7 @@ fn conversation_memory(principal: Principal) -> MemoryScope {
 }
 
 #[tokio::test]
+/// AF-001: legacy-equivalent sources must not share persistent state.
 async fn colliding_legacy_sources_do_not_share_transcript_or_memory() {
     let sources = [
         child_input_envelope(&spec("default"), &parent("agent-a", "telegram", "42")),

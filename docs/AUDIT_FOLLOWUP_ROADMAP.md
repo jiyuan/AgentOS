@@ -2,7 +2,7 @@
 
 Drafted: 2026-08-23
 
-Status: **draft — no implementation slice is complete**
+Status: **R0 implemented; R1 underway with `ID-003`, `AUTH-003`, `AUTH-004`, and `AUTH-005` complete**
 
 Baseline: branch `docs/audit-remediation-plan`, commit `d4b2e94`
 
@@ -216,6 +216,7 @@ incomplete principal, incomplete plan, ambiguous ticket, or unscoped grant.
 ### `AUTH-003` — Unique tickets and actor-bound approval resolution
 
 - Priority: P1.
+- Status: Complete (2026-08-23).
 - Files: `crates/agentos-core/src/loop/approval_route.rs`, approval/run-state
   modules, `crates/agentos-core/src/runner.rs`, runner audit helpers, gateway
   approval routing, approval and safety-event tests.
@@ -804,7 +805,7 @@ ID sequence, and complete-row artifact resolution.
 
 | ID | Finding | Priority | Corrective slice | Acceptance evidence | Regression artifact | Execution | Status |
 |---|---|---:|---|---|---|---|---|
-| `AF-001` | Child session namespace omits parent channel/agent/policy | P0 | `ID-003` | Cross-channel, cross-agent, cross-policy fork/memory isolation | `crates/agentos-core/tests/subagent_identity.rs::colliding_legacy_sources_do_not_share_transcript_or_memory` | `portable` | Open |
+| `AF-001` | Child session namespace omits parent channel/agent/policy | P0 | `ID-003` | Cross-channel, cross-agent, cross-policy fork/memory isolation | `crates/agentos-core/tests/subagent_identity.rs::colliding_legacy_sources_do_not_share_transcript_or_memory` | `portable` | Complete |
 | `AF-002` | Feishu ACK precedes durable ingress | P0 | `GW-002` | ACK-order crash fixture | `crates/agentos-core/tests/gateway_ingress_crash.rs::feishu_ack_follows_durable_ingress_commit` | `native-linux+macos` | Open |
 | `AF-003` | Telegram checkpoint advances without recoverable replay | P0 | `GW-002` | Cursor/restart/replay fixture | `crates/agentos-core/tests/gateway_ingress_crash.rs::telegram_cursor_never_advances_past_unrecoverable_input` | `native-linux+macos` | Open |
 | `AF-004` | Ingress ledger error logs and continues | P0 | `GW-002` | SQLite failpoint proves no ACK or execution | `crates/agentos-core/tests/gateway_ingress_crash.rs::ledger_failure_prevents_ack_and_execution` | `portable` | Open |
@@ -812,13 +813,13 @@ ID sequence, and complete-row artifact resolution.
 | `AF-006` | Legacy unsettled rows lack replay payload behind an advanced cursor | P0 | `GW-002` | Pre-roadmap migration quarantine fixture | `crates/agentos-core/tests/gateway_ingress_crash.rs::legacy_unsettled_rows_are_quarantined_before_cursor_advance` | `portable` | Open |
 | `AF-007` | Steering/requeue loses envelope metadata and ingress ID | P1 | `GW-003` | Multi-sender steering/displacement | `crates/agentos-core/tests/gateway_steering.rs::displaced_envelope_preserves_principal_and_ingress_id` | `portable` | Open |
 | `AF-008` | Remote paused approvals exist only in memory | P1 | `STATE-002` | Pause/restart/policy-change/resolve matrix | `crates/agentos-core/tests/approval_recovery.rs::paused_approval_survives_restart_and_policy_change` | `native-linux+macos` | Open |
-| `AF-009` | Authorization commitment omits plan fields; plan is swappable | P1 | `AUTH-005` | Per-field mutation and compile-fail tests | `crates/agentos-core/tests/authorization_commitment.rs::mutating_any_plan_field_invalidates_authorization` | `portable` | Open |
-| `AF-010` | Public resume path accepts bare interruption/decision identifiers | P1 | `AUTH-003` | Opaque actor-bound witness negative tests | `crates/agentos-core/tests/approval_witness.rs::resume_rejects_bare_or_wrong_actor_witness` | `portable` | Open |
-| `AF-011` | Approval ticket initialization can collide and lacks one prompt ID | P1 | `AUTH-003` | Deterministic synchronized initialization test | `crates/agentos-core/tests/approval_witness.rs::synchronized_prompts_receive_distinct_ids` | `portable` | Open |
-| `AF-012` | Interruption resolution can select an old non-pending entry | P1 | `AUTH-003` | Exact pending-instance lifecycle | `crates/agentos-core/tests/approval_witness.rs::resolution_selects_only_the_exact_pending_instance` | `portable` | Open |
-| `AF-013` | Bare administrator sender IDs can cross channel namespaces | P1 | `AUTH-003` | Telegram/Feishu selector and migration test | `crates/agentos-core/tests/channel_admin_identity.rs::same_sender_id_on_two_channels_is_not_one_administrator` | `portable` | Open |
-| `AF-014` | Delegation grants are not actor-bound or mandatorily expiring | P1 | `AUTH-004` | Actor/channel/agent/expiry/non-transitive matrix | `crates/agentos-core/tests/delegation_grants.rs::grant_is_actor_bound_expiring_and_non_transitive` | `portable` | Open |
-| `AF-015` | Approval resolution audit omits the resolver | P1 | `AUTH-003` | Requested/resolved actor correlation | `crates/agentos-core/tests/safety_events.rs::approval_resolution_records_requester_and_resolver` | `portable` | Open |
+| `AF-009` | Authorization commitment omits plan fields; plan is swappable | P1 | `AUTH-005` | Per-field mutation and compile-fail tests | `crates/agentos-core/src/loop/authorization.rs::mutating_any_plan_field_invalidates_authorization` | `portable` | Complete |
+| `AF-010` | Public resume path accepts bare interruption/decision identifiers | P1 | `AUTH-003` | Opaque actor-bound witness negative tests | `crates/agentos-core/tests/approval_witness.rs::resume_rejects_bare_or_wrong_actor_witness` | `portable` | Complete |
+| `AF-011` | Approval ticket initialization can collide and lacks one prompt ID | P1 | `AUTH-003` | Deterministic synchronized initialization test | `crates/agentos-core/src/loop/approval_route.rs::synchronized_prompts_receive_distinct_ids` | `portable` | Complete |
+| `AF-012` | Interruption resolution can select an old non-pending entry | P1 | `AUTH-003` | Exact pending-instance lifecycle | `crates/agentos-core/tests/approval_witness.rs::resolution_selects_only_the_exact_pending_instance` | `portable` | Complete |
+| `AF-013` | Bare administrator sender IDs can cross channel namespaces | P1 | `AUTH-003` | Telegram/Feishu selector and migration test | `crates/agentos-core/tests/channel_admin_identity.rs::same_sender_id_on_two_channels_is_not_one_administrator` | `portable` | Complete |
+| `AF-014` | Delegation grants are not actor-bound or mandatorily expiring | P1 | `AUTH-004` | Actor/channel/agent/expiry/non-transitive matrix | `crates/agentos-core/tests/delegation_grants.rs::grant_is_actor_bound_expiring_and_non_transitive` | `portable` | Complete |
+| `AF-015` | Approval resolution audit omits the resolver | P1 | `AUTH-003` | Requested/resolved actor correlation | `crates/agentos-core/tests/safety_events.rs::approval_resolution_records_requester_and_resolver` | `portable` | Complete |
 | `AF-016` | Best-effort journal writes can leave required safety evidence absent | P1 | `AUD-002` | Approval/grant/denial/refusal append failpoints | `crates/agentos-core/tests/audit_failpoints.rs::required_safety_event_failure_aborts_the_action` | `portable` | Open |
 | `AF-017` | Failed/retried provider calls lose attempt manifests | P1 | `REQ-002` | Failure/retry/compaction/cancellation goldens | `crates/agentos-core/tests/request_attempts.rs::every_failed_retried_or_cancelled_attempt_is_durable` | `portable` | Open |
 | `AF-018` | Task/attachment writes and skill traversal bypass rooted I/O | P1 | `FS-002`, `FS-003` | Symlink/race/main-min/outside-canary matrix | `crates/agentos-core/tests/rooted_io.rs::all_model_selected_paths_refuse_symlink_escape_and_swap` | `native-linux+macos` | Open |

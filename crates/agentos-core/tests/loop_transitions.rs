@@ -20,8 +20,10 @@
 mod support;
 
 use agentos_core::approve::{Policy, PolicyAction, PolicyRule, PolicyVerb};
+use agentos_core::audit::SafetyJournal;
 use agentos_core::r#loop::{
-    resume_approved, LoopDeps, RunError, RunLoopState, StartCtx, ToolGuardrailEntry,
+    resume_approved, route, ApprovalBinding, ApprovalTicket, LoopDeps, Routed, RunError,
+    RunLoopState, StartCtx, ToolGuardrailEntry,
 };
 use agentos_core::tools::ToolRegistry;
 use agentos_interfaces::orchestrator::{Orchestrator, OrchestratorError, Plan, RunContext};
@@ -29,7 +31,8 @@ use agentos_interfaces::session::{Item, Transcript};
 use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
 use agentos_interfaces::RunState;
 use agentos_proto::{
-    AgentId, Message, MessageRole, RunId, ToolCall, ToolCallId, ToolResult, ToolStatus,
+    AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole, Principal, RunId, ToolCall,
+    ToolCallId, ToolResult, ToolStatus,
 };
 use async_trait::async_trait;
 use serde_json::value::RawValue;
@@ -137,8 +140,16 @@ fn deps<'a>(
         compaction: Default::default(),
         cancel: Default::default(),
         steering: None,
-        audit: Default::default(),
-        granted_authority: &[],
+        audit: SafetyJournal::detached().for_run(
+            Principal::conversation(
+                AgentId::new("agent"),
+                ChannelId::new("test"),
+                ConversationId::new("conv"),
+            )
+            .with_sender("user"),
+            RunId::new("run"),
+        ),
+        delegated_authority: None,
     }
 }
 
@@ -204,14 +215,27 @@ async fn an_ask_user_policy_stops_at_paused_and_resumes_into_act() {
             break state;
         }
     };
-    let mut paused = paused;
-    let approval_id = paused
-        .pending_approval()
-        .expect("the run is waiting on something")
-        .id
-        .clone();
-    assert!(paused.approve(&approval_id));
-    let resumed = resume_approved(paused).expect("an approved pause resumes");
+    let approval = paused.pending_approval().expect("pending approval");
+    let ticket = ApprovalTicket::parse(&approval.approval_ticket).expect("ticket parses");
+    let binding = ApprovalBinding::new(
+        approval.approval_instance_id.clone(),
+        ticket.clone(),
+        approval.id.clone(),
+        approval.prompting_principal.clone(),
+        None,
+    )
+    .expect("instance matches ticket");
+    let answer = Envelope {
+        channel_id: ChannelId::new("test"),
+        conversation_id: ConversationId::new("conv"),
+        sender: Arc::from("user"),
+        message: Message::text(MessageRole::User, format!("/approve {ticket}")),
+        metadata: BTreeMap::new(),
+    };
+    let Routed::Decides { witness } = route(Some(&binding), &answer) else {
+        panic!("answer creates witness");
+    };
+    let resumed = resume_approved(paused, witness).expect("an approved pause resumes");
     assert_eq!(name(&resumed), "Act");
 }
 
@@ -282,24 +306,12 @@ async fn a_denied_handoff_ends_the_run_as_a_structural_denial() {
 async fn act_cannot_be_reached_without_approve() {
     // The security property the table cannot state.
     //
-    // This does not compile, and that is the test:
-    //
-    // ```compile_fail
-    // RunLoopState::Act(ActCtx {
-    //     state: user_state(),
-    //     plan: Plan::CallTool(call()),
-    //     turns: 0,
-    //     denied: None,
-    // })
-    // ```
-    //
-    // `ActCtx` carries a private `Authorization` with no public constructor,
-    // so the literal above is rejected with "cannot construct `ActCtx` with
-    // struct literal syntax due to private fields" — there is no expression
-    // outside `agentos-core` that produces the missing one. What remains
+    // `ActCtx`'s rustdoc carries the executable `compile_fail` half: its plan,
+    // witness, and denied/executable disposition live in one private value, so
+    // an external literal cannot fabricate or alter them. What remains
     // reachable is the loop itself, so this asserts the positive: an `Act`
-    // obtained by driving the loop does execute, which is what makes the
-    // absence above a closed door rather than a broken one.
+    // obtained by driving the loop does execute, which is what makes that
+    // closed door an ordering guarantee rather than a broken state.
     let orchestrator = CallThenReply;
     let policy = Policy::allow_tools([TOOL]);
     let tools = registry();
@@ -325,44 +337,39 @@ async fn act_cannot_be_reached_without_approve() {
 }
 
 #[tokio::test]
-async fn a_plan_swapped_after_approve_is_refused_at_act() {
-    // The other half of the hole, and the one a marker type would miss: a
-    // caller holding a *legitimate* `ActCtx` can still assign over `plan`,
-    // because the field is public and has to be for the loop to be inspectable.
-    // The authorization names the plan it was issued for, so the swap is
-    // caught in `Act` before anything runs.
+async fn a_live_denial_after_approve_still_stops_act() {
     let orchestrator = CallThenReply;
-    // Both tools are allowed, so a plain re-check against the policy would
-    // wave this through. Only the fingerprint catches it.
-    let policy = Policy::allow_tools([TOOL, "other"]);
+    let allowing = Policy::allow_tools([TOOL]);
     let tools = registry();
-    let deps = deps(&orchestrator, &policy, &tools, &[]);
-
+    let allowing_deps = deps(&orchestrator, &allowing, &tools, &[]);
     let mut current = RunLoopState::Start(StartCtx {
         state: user_state(),
     });
-    let mut act = loop {
-        current = current.step(&deps).await.expect("stepping to Act");
+    let act = loop {
+        current = current
+            .step(&allowing_deps)
+            .await
+            .expect("the allowing policy reaches Act");
         if let RunLoopState::Act(ctx) = current {
             break ctx;
         }
     };
-    act.plan = Plan::CallTool(ToolCall {
-        id: ToolCallId::new("swapped"),
-        name: Arc::from("other"),
-        args: RawValue::from_string("{}".to_owned()).expect("static args are valid JSON"),
-    });
 
+    let denying = Policy {
+        rules: Vec::new(),
+        default_decision: PolicyVerb::Deny,
+    };
+    let denying_deps = deps(&orchestrator, &denying, &tools, &[]);
     let failure = RunLoopState::Act(act)
-        .step(&deps)
+        .step(&denying_deps)
         .await
-        .expect_err("a substituted plan must not run");
+        .expect_err("the live denial must stop the previously allowed plan");
     assert!(
         matches!(
             failure.error(),
-            RunError::StructuralDenial { subject, .. } if subject.as_ref() == "other"
+            RunError::StructuralDenial { subject, .. } if subject.as_ref() == TOOL
         ),
-        "expected a structural denial naming the substituted tool, got {:?}",
+        "expected a live-policy denial naming the tool, got {:?}",
         failure.error()
     );
 }

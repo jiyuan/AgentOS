@@ -15,7 +15,9 @@
 //!    without pausing, so the unattended case stays available and becomes
 //!    declared rather than implied (`AUTH-002`).
 
-use agentos_core::approve::{DelegationGrant, Policy, PolicyAction, PolicyRule, PolicyVerb};
+use agentos_core::approve::{
+    DelegationGrantTemplate, Policy, PolicyAction, PolicyRule, PolicyVerb,
+};
 use agentos_core::memory::InMemorySession;
 use agentos_core::runner::{run_envelope, RunOutcome, RunnerDeps};
 use agentos_core::subagents::{SubAgentDefinition, SubAgentRegistry};
@@ -153,7 +155,7 @@ fn child_registry(session: Arc<InMemorySession>, child_policy: Policy) -> SubAge
 fn child_registry_with_grants(
     session: Arc<InMemorySession>,
     child_policy: Policy,
-    grants: Vec<DelegationGrant>,
+    grants: Vec<DelegationGrantTemplate>,
 ) -> SubAgentRegistry {
     let mut tools = ToolRegistry::new();
     tools.register(EchoTool);
@@ -221,7 +223,7 @@ fn runner_deps<'a>(
         cancel: Default::default(),
         steering: None,
         safety_log: None,
-        granted_authority: &[],
+        delegated_authority: None,
     }
 }
 
@@ -320,12 +322,12 @@ async fn a_granted_child_allow_over_a_parent_ask_user_runs_without_pause() {
     let registry = child_registry_with_grants(
         session.clone(),
         Policy::allow_tools([TOOL_NAME]),
-        vec![DelegationGrant {
+        vec![DelegationGrantTemplate {
             action: PolicyAction::Tool(Arc::from(TOOL_NAME)),
             decision: PolicyVerb::Allow,
             arg_equals: BTreeMap::new(),
             reason: Arc::from("the delegated task cannot pause for approval"),
-            expires_at: None,
+            lifetime_secs: 60,
         }],
     );
     let parent = DelegatingParent;

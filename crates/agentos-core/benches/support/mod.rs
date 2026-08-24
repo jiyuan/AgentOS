@@ -16,7 +16,8 @@ use agentos_interfaces::session::{Item, Transcript};
 use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
 use agentos_interfaces::RunState;
 use agentos_proto::{
-    AgentId, Message, MessageRole, RunId, ToolCall, ToolCallId, ToolResult, ToolStatus,
+    AgentId, ChannelId, ConversationId, Message, MessageRole, Principal, RunId, ToolCall,
+    ToolCallId, ToolResult, ToolStatus,
 };
 use async_trait::async_trait;
 use serde_json::value::RawValue;
@@ -145,7 +146,15 @@ pub fn make_deps<'a>(
         compaction: Default::default(),
         cancel: Default::default(),
         steering: None,
-        audit: SafetyJournal::detached(),
+        audit: SafetyJournal::detached().for_run(
+            Principal::conversation(
+                AgentId::new("bench-agent"),
+                ChannelId::new("bench"),
+                ConversationId::new("bench"),
+            )
+            .with_sender("bench-user"),
+            RunId::new("bench-run"),
+        ),
         granted_authority: &[],
     }
 }

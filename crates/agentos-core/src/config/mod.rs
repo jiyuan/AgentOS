@@ -48,6 +48,7 @@ pub use subagents::{DelegationGrantConfig, SubAgentConfig};
 
 pub(crate) use orchestrator::stage_execution_order;
 
+use crate::approve::MAX_DELEGATION_GRANT_LIFETIME_SECS;
 use normalize::normalize_domain;
 use orchestrator::rule_from_config;
 use subagents::{normalize_memory_tool, normalize_memory_view, subagent_metadata};
@@ -562,6 +563,30 @@ impl WorkspaceConfig {
                     subagent.id
                 ));
             }
+            for grant in &subagent.delegation_grants {
+                if grant.expires_at.is_some() {
+                    return Err(format!(
+                        "sub-agent '{}' uses legacy `expires_at` for tool '{}'; replace it with \
+                         `lifetime_secs = N` (maximum {MAX_DELEGATION_GRANT_LIFETIME_SECS}) so \
+                         each delegation receives a fresh actor-bound runtime grant",
+                        subagent.id, grant.tool
+                    ));
+                }
+                let lifetime_secs = grant.lifetime_secs.ok_or_else(|| {
+                    format!(
+                        "sub-agent '{}' grant for tool '{}' is an unscoped standing grant; add \
+                         `lifetime_secs = N` (maximum {MAX_DELEGATION_GRANT_LIFETIME_SECS})",
+                        subagent.id, grant.tool
+                    )
+                })?;
+                if lifetime_secs == 0 || lifetime_secs > MAX_DELEGATION_GRANT_LIFETIME_SECS {
+                    return Err(format!(
+                        "sub-agent '{}' grant for tool '{}' sets lifetime_secs={lifetime_secs}; \
+                         expected 1..={MAX_DELEGATION_GRANT_LIFETIME_SECS}",
+                        subagent.id, grant.tool
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -1011,6 +1036,56 @@ stages = [
                 .dispatch,
             agentos_interfaces::orchestrator::DispatchTarget::Direct
         );
+    }
+
+    #[test]
+    fn delegation_grant_config_requires_a_bounded_relative_lifetime() {
+        let grant = |lifetime_secs, expires_at| DelegationGrantConfig {
+            tool: Arc::from("shell"),
+            decision: Arc::from("allow"),
+            arg_equals: BTreeMap::new(),
+            reason: Arc::from("bounded unattended task"),
+            lifetime_secs,
+            expires_at,
+        };
+        let mut missing = WorkspaceConfig {
+            subagents: vec![SubAgentConfig {
+                tools: vec![Arc::from("shell")],
+                delegation_grants: vec![grant(None, None)],
+                ..SubAgentConfig::default()
+            }],
+            ..WorkspaceConfig::default()
+        };
+        assert!(missing
+            .validate_subagents()
+            .expect_err("a standing grant is rejected")
+            .contains("unscoped standing grant"));
+
+        let mut legacy = WorkspaceConfig {
+            subagents: vec![SubAgentConfig {
+                tools: vec![Arc::from("shell")],
+                delegation_grants: vec![grant(None, Some(123))],
+                ..SubAgentConfig::default()
+            }],
+            ..WorkspaceConfig::default()
+        };
+        assert!(legacy
+            .validate_subagents()
+            .expect_err("an absolute expiry is rejected")
+            .contains("replace it with `lifetime_secs = N`"));
+
+        let mut too_long = WorkspaceConfig {
+            subagents: vec![SubAgentConfig {
+                tools: vec![Arc::from("shell")],
+                delegation_grants: vec![grant(Some(MAX_DELEGATION_GRANT_LIFETIME_SECS + 1), None)],
+                ..SubAgentConfig::default()
+            }],
+            ..WorkspaceConfig::default()
+        };
+        assert!(too_long
+            .validate_subagents()
+            .expect_err("an overlong grant is rejected")
+            .contains("expected 1..="));
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {

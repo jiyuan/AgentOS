@@ -20,6 +20,7 @@ macro_rules! id_type {
 }
 
 id_type!(AgentId);
+id_type!(ApprovalInstanceId);
 id_type!(ChannelId);
 id_type!(ConversationId);
 id_type!(InterruptionId);

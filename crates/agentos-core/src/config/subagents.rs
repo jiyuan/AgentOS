@@ -98,7 +98,7 @@ pub struct SubAgentConfig {
     pub delegation_grants: Vec<DelegationGrantConfig>,
 }
 
-/// One standing elevation for one sub-agent and one tool.
+/// One bounded elevation template for one sub-agent and one tool.
 ///
 /// Deliberately limited to tools. A grant over `handoff`, `delegate`, or
 /// `escalate` — let alone every action at once — has no current use case, and
@@ -118,9 +118,14 @@ pub struct DelegationGrantConfig {
     /// Why this sub-agent needs authority its parent withheld. Required: a
     /// grant nobody can explain is a grant nobody can review.
     pub reason: Arc<str>,
-    /// Unix seconds after which the grant stops applying. Omit for a standing
-    /// grant.
+    /// Maximum lifetime of each runtime grant issued from this template, in
+    /// seconds. Required and capped by the kernel. Each delegation computes a
+    /// mandatory absolute expiry from its own issuance time.
     #[serde(default)]
+    pub lifetime_secs: Option<u64>,
+    /// Legacy absolute expiry. Retained only so loading old configuration can
+    /// return an actionable migration error; it never authorizes a grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
 }
 

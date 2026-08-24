@@ -1,6 +1,8 @@
 [package]
 name = "agentos-core"
-version.workspace = true
+# AUTH-004 replaces reusable standing grants with bounded, principal-bound
+# runtime grant instances. That intentionally advances the pre-1.0 API line.
+version = "0.10.0"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
@@ -13,6 +15,7 @@ agentos-proto.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 croner.workspace = true
+getrandom.workspace = true
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 # Landlock and `prctl` for the Linux sandbox (roadmap X2): raw syscalls, no
 # wrapper crate, because the surface used is three numbers and two structs.

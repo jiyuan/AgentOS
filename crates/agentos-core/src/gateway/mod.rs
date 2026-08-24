@@ -32,13 +32,13 @@ pub use shutdown::{
     install_shutdown_handler, request_shutdown, shutdown_requested, DEFAULT_SHUTDOWN_GRACE_SECS,
 };
 
-use crate::r#loop::ApprovalTicket;
+use crate::r#loop::{ApprovalTicket, ResumeWitness, RunError};
 use crate::runner::{
-    approval_prompt_envelope, resume_run, run_envelope, PausedRun, ResumeDecision, RunOutcome,
-    RunnerDeps, RunnerError,
+    approval_prompt_envelope, resume_run, run_envelope, PausedRun, RunOutcome, RunnerDeps,
+    RunnerError,
 };
 use agentos_interfaces::{Channel, ChannelError, Egress, RunState};
-use agentos_proto::{Envelope, InterruptionId, RunId};
+use agentos_proto::{Envelope, RunId};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -152,12 +152,11 @@ impl<'a> GatewayService<'a> {
         &self,
         egress: &dyn Egress,
         paused: PausedRun,
-        approval_id: &InterruptionId,
-        decision: ResumeDecision,
+        witness: ResumeWitness,
     ) -> Result<GatewayRun, GatewayError> {
         let channel_id = paused.channel_id.clone();
         let conversation_id = paused.conversation_id.clone();
-        match resume_run(paused, approval_id, decision, self.deps).await? {
+        match resume_run(paused, witness, self.deps).await? {
             RunOutcome::Finished { state, output } => {
                 egress.send(output.clone()).await?;
                 Ok(GatewayRun::Finished { state, output })
@@ -178,12 +177,17 @@ impl<'a> GatewayService<'a> {
         egress: &dyn Egress,
         paused: PausedRun,
     ) -> Result<GatewayRun, GatewayError> {
-        let ticket = ApprovalTicket::mint();
+        let Some(ticket) = paused
+            .state
+            .pending_approval()
+            .and_then(|approval| ApprovalTicket::parse(&approval.approval_ticket))
+        else {
+            return Err(RunnerError::Run(RunError::NotResumable).into());
+        };
         let expires_at = self
             .approval_expiry
             .map(|expiry| unix_now() + expiry.as_secs());
-        let prompt =
-            approval_prompt_envelope(&paused, Arc::clone(&self.sender), &ticket, expires_at);
+        let prompt = approval_prompt_envelope(&paused, Arc::clone(&self.sender), expires_at);
         if let Some(prompt) = &prompt {
             egress.send(prompt.clone()).await?;
         }

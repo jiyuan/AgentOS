@@ -7,6 +7,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use thiserror::Error;
 
+mod grants;
+
+pub use grants::{
+    DelegatedAuthority, DelegationGrant, DelegationGrantError, DelegationGrantTemplate,
+    DelegationScope, MAX_DELEGATION_GRANT_LIFETIME_SECS,
+};
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyDecision {
@@ -150,7 +157,7 @@ impl Policy {
     ///
     /// See [`Self::narrow_with_grants`] for the rule this enforces.
     pub fn narrow(parent: &Self, child: &Self) -> Result<Self, PolicyError> {
-        Ok(Self::narrow_with_grants(parent, child, &[])?.policy)
+        Ok(Self::narrow_inner(parent, child, None)?.policy)
     }
 
     /// Narrow `child` against `parent`, treating `grants` as authority the
@@ -175,7 +182,16 @@ impl Policy {
     pub fn narrow_with_grants(
         parent: &Self,
         child: &Self,
-        grants: &[DelegationGrant],
+        authority: &DelegatedAuthority,
+        now: u64,
+    ) -> Result<Narrowed, PolicyError> {
+        Self::narrow_inner(parent, child, Some((authority, now)))
+    }
+
+    fn narrow_inner(
+        parent: &Self,
+        child: &Self,
+        authority: Option<(&DelegatedAuthority, u64)>,
     ) -> Result<Narrowed, PolicyError> {
         if !default_decision_covers(&parent.default_decision, &child.default_decision) {
             return Err(PolicyError::Widened(Arc::from("default")));
@@ -202,10 +218,11 @@ impl Policy {
             {
                 continue;
             }
-            let Some(grant) = grants
-                .iter()
-                .find(|grant| grant.permits(&witness, &child_decision, parent))
-            else {
+            let Some(grant) = authority.and_then(|(authority, now)| {
+                authority.grants().iter().find(|grant| {
+                    grant.permits(&witness, &child_decision, parent, authority.scope(), now)
+                })
+            }) else {
                 return Err(PolicyError::Widened(witness_label(&witness)));
             };
             // One entry per grant, not per witness it covered: the audit
@@ -236,109 +253,6 @@ pub struct Narrowed {
     /// The grants narrowing had to invoke. Empty in the ordinary case, which
     /// is a delegation that only ever restricts.
     pub grants_relied_on: Vec<DelegationGrant>,
-}
-
-/// Standing authority for one delegatee to hold a decision its parent does not.
-///
-/// The explicit form of what `parent_exposes_tool` used to do implicitly for
-/// every sub-agent at once. A grant names exactly one action, may pin exact
-/// argument values, and elevates only against the immediate parent — each
-/// level of delegation needs its own grant, declared by the operator, so a
-/// sub-agent cannot pass its authority further down.
-///
-/// Bounded expiry and durable issuance/use records are the half of
-/// [ADR-0001](../../../../docs/adr/0001-POLICY_NARROWING.md) that needs the
-/// safety-event store: `expires_at` is honoured here and optional, and M6 adds
-/// issuance at runtime plus a record of every use. Until then a grant is a
-/// standing authorization in `agent.toml`, which is at least visible, scoped,
-/// and reviewable — none of which was true of the escape hatch.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct DelegationGrant {
-    /// The action this grant covers. `Any` is deliberately representable but
-    /// should be rare: it grants across every tool.
-    pub action: PolicyAction,
-    /// The decision the delegatee may hold for `action`.
-    pub decision: PolicyVerb,
-    /// Exact argument values the grant is limited to. Empty means the grant
-    /// covers every call to `action`.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub arg_equals: BTreeMap<Arc<str>, Value>,
-    /// Why this authority exists. Required, because a grant nobody can explain
-    /// is a grant nobody can review.
-    pub reason: Arc<str>,
-    /// Unix seconds after which the grant no longer applies. `None` is a
-    /// standing grant.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<u64>,
-}
-
-impl DelegationGrant {
-    /// Whether this grant authorises `decision` for `call`.
-    ///
-    /// Four conditions, all necessary: the grant is unexpired; it matches this
-    /// exact call, arguments included; it is at least as permissive as the
-    /// decision it is being asked to justify; and the parent does not deny the
-    /// call outright.
-    ///
-    /// The parent is not consulted for *authority* — the point of a grant is
-    /// that the parent does not hold it — but an explicit parent `Deny`
-    /// outranks a grant, so a grant cannot re-permit what an operator wrote a
-    /// rule to stop.
-    fn permits(&self, call: &Plan, decision: &PolicyDecision, parent: &Policy) -> bool {
-        if self.is_expired(now_unix_seconds()) {
-            return false;
-        }
-        if decision_permissiveness(decision) > permissiveness(&self.decision) {
-            return false;
-        }
-        let tool_args = match call {
-            Plan::CallTool(tool_call) => serde_json::from_str::<Value>(tool_call.args.get()).ok(),
-            _ => None,
-        };
-        if !self.as_rule().matches(call, tool_args.as_ref()) {
-            return false;
-        }
-        !matches!(parent.decide(call), PolicyDecision::Deny { .. })
-    }
-
-    /// Whether this grant is the authority a live call is running under.
-    ///
-    /// Narrower than [`Self::permits`] on purpose: `permits` answers "may this
-    /// elevation exist", which needs the parent policy and the decision being
-    /// justified. This answers "is this the call the grant named", which is
-    /// what the safety log records when the child actually makes it (M6 /
-    /// `AUD-001`). An expired grant covers nothing — narrowing would not have
-    /// admitted the delegation, and a long-running child must not keep an
-    /// authority past its expiry.
-    pub fn covers(&self, plan: &Plan) -> bool {
-        if self.is_expired(now_unix_seconds()) {
-            return false;
-        }
-        let tool_args = match plan {
-            Plan::CallTool(tool_call) => serde_json::from_str::<Value>(tool_call.args.get()).ok(),
-            _ => None,
-        };
-        self.as_rule().matches(plan, tool_args.as_ref())
-    }
-
-    fn is_expired(&self, now: u64) -> bool {
-        self.expires_at.is_some_and(|expiry| now >= expiry)
-    }
-
-    fn as_rule(&self) -> PolicyRule {
-        PolicyRule {
-            action: self.action.clone(),
-            decision: self.decision.clone(),
-            reason: None,
-            arg_equals: self.arg_equals.clone(),
-        }
-    }
-}
-
-fn now_unix_seconds() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs())
 }
 
 /// A call name that appears in no rule, standing for "every other tool".
@@ -611,7 +525,7 @@ pub fn tool_call_approval_id(call: &ToolCall) -> Arc<str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentos_proto::ToolCallId;
+    use agentos_proto::{ActorPrincipal, ChannelId, ConversationId, ToolCallId};
     use serde_json::value::RawValue;
 
     fn tool_call(name: &str, args_json: &str) -> Plan {
@@ -620,6 +534,37 @@ mod tests {
             name: Arc::from(name),
             args: RawValue::from_string(args_json.to_owned()).expect("valid JSON"),
         })
+    }
+
+    fn authority(
+        parent: &Policy,
+        tool: &str,
+        arg_equals: BTreeMap<Arc<str>, Value>,
+    ) -> DelegatedAuthority {
+        let scope = DelegationScope::mint(
+            ActorPrincipal::new(
+                AgentId::new("parent"),
+                ChannelId::new("telegram"),
+                ConversationId::new("group"),
+                "alice",
+            ),
+            AgentId::new("child"),
+            "child-policy",
+            100,
+        )
+        .expect("test generation mints");
+        DelegatedAuthority::issue(
+            &[DelegationGrantTemplate {
+                action: PolicyAction::Tool(Arc::from(tool)),
+                decision: PolicyVerb::Allow,
+                arg_equals,
+                reason: Arc::from("test grant"),
+                lifetime_secs: 60,
+            }],
+            parent,
+            scope,
+        )
+        .expect("test grant issues")
     }
 
     #[test]
@@ -726,15 +671,9 @@ mod tests {
     fn a_grant_admits_exactly_the_pair_narrowing_refused() {
         let parent = Policy::ask_user_tools(["shell"]);
         let child = Policy::allow_tools(["shell"]);
-        let grants = vec![DelegationGrant {
-            action: PolicyAction::Tool(Arc::from("shell")),
-            decision: PolicyVerb::Allow,
-            arg_equals: BTreeMap::new(),
-            reason: Arc::from("unattended maintenance window"),
-            expires_at: None,
-        }];
+        let authority = authority(&parent, "shell", BTreeMap::new());
 
-        Policy::narrow_with_grants(&parent, &child, &grants)
+        Policy::narrow_with_grants(&parent, &child, &authority, 100)
             .expect("a declared grant admits the elevation");
     }
 
@@ -743,15 +682,9 @@ mod tests {
     fn a_grant_does_not_cover_a_different_tool() {
         let parent = Policy::ask_user_tools(["shell", "file"]);
         let child = Policy::allow_tools(["file"]);
-        let grants = vec![DelegationGrant {
-            action: PolicyAction::Tool(Arc::from("shell")),
-            decision: PolicyVerb::Allow,
-            arg_equals: BTreeMap::new(),
-            reason: Arc::from("shell only"),
-            expires_at: None,
-        }];
+        let authority = authority(&parent, "shell", BTreeMap::new());
 
-        assert!(Policy::narrow_with_grants(&parent, &child, &grants).is_err());
+        assert!(Policy::narrow_with_grants(&parent, &child, &authority, 100).is_err());
     }
 
     /// Nor does a grant pinned to specific arguments justify an unconstrained
@@ -760,15 +693,13 @@ mod tests {
     fn an_argument_pinned_grant_does_not_justify_an_unconstrained_rule() {
         let parent = Policy::ask_user_tools(["file"]);
         let child = Policy::allow_tools(["file"]);
-        let grants = vec![DelegationGrant {
-            action: PolicyAction::Tool(Arc::from("file")),
-            decision: PolicyVerb::Allow,
-            arg_equals: BTreeMap::from([(Arc::from("operation"), serde_json::json!("read"))]),
-            reason: Arc::from("reads only"),
-            expires_at: None,
-        }];
+        let authority = authority(
+            &parent,
+            "file",
+            BTreeMap::from([(Arc::from("operation"), serde_json::json!("read"))]),
+        );
 
-        assert!(Policy::narrow_with_grants(&parent, &child, &grants).is_err());
+        assert!(Policy::narrow_with_grants(&parent, &child, &authority, 100).is_err());
     }
 
     /// A child that keeps the grant's constraint is admitted, so the pinned
@@ -785,15 +716,14 @@ mod tests {
             }],
             default_decision: PolicyVerb::Deny,
         };
-        let grants = vec![DelegationGrant {
-            action: PolicyAction::Tool(Arc::from("file")),
-            decision: PolicyVerb::Allow,
-            arg_equals: BTreeMap::from([(Arc::from("operation"), serde_json::json!("read"))]),
-            reason: Arc::from("reads only"),
-            expires_at: None,
-        }];
+        let authority = authority(
+            &parent,
+            "file",
+            BTreeMap::from([(Arc::from("operation"), serde_json::json!("read"))]),
+        );
 
-        Policy::narrow_with_grants(&parent, &child, &grants).expect("the pinned grant applies");
+        Policy::narrow_with_grants(&parent, &child, &authority, 100)
+            .expect("the pinned grant applies");
     }
 
     /// A child rule may be *more* constrained than the grant: the grant's call
@@ -813,15 +743,14 @@ mod tests {
             }],
             default_decision: PolicyVerb::Deny,
         };
-        let grants = vec![DelegationGrant {
-            action: PolicyAction::Tool(Arc::from("file")),
-            decision: PolicyVerb::Allow,
-            arg_equals: BTreeMap::from([(Arc::from("operation"), serde_json::json!("read"))]),
-            reason: Arc::from("reads only"),
-            expires_at: None,
-        }];
+        let authority = authority(
+            &parent,
+            "file",
+            BTreeMap::from([(Arc::from("operation"), serde_json::json!("read"))]),
+        );
 
-        Policy::narrow_with_grants(&parent, &child, &grants).expect("a stricter child is fine");
+        Policy::narrow_with_grants(&parent, &child, &authority, 100)
+            .expect("a stricter child is fine");
     }
 
     /// A parent rule constrained to one operation does not license a child

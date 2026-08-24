@@ -28,6 +28,7 @@
 
 use crate::ids::{AgentId, ChannelId, ConversationId};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::sync::Arc;
 
 /// Bumped when the encoding changes shape. Present in both encodings so a
@@ -47,6 +48,127 @@ pub struct Principal {
     /// whole", which is a different principal, not a missing one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender: Option<Arc<str>>,
+}
+
+/// A senderless principal naming one shared conversation.
+///
+/// Session and conversation-owned memory code should construct this type,
+/// rather than constructing a [`Principal`] and relying on a later call site
+/// to remember that `sender` must be absent.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ConversationPrincipal(Principal);
+
+/// A sender-qualified principal naming the actor who initiated an action.
+///
+/// Authorization code should require this type at its boundary. It cannot be
+/// produced by the senderless conversation constructor, which keeps a shared
+/// session namespace from being mistaken for an acting identity.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ActorPrincipal(Principal);
+
+/// Why an untyped principal cannot be used at a typed identity boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrincipalKindError {
+    /// An actor identity was required, but the sender component was absent.
+    MissingSender,
+    /// A conversation identity was required, but a sender component was set.
+    UnexpectedSender,
+}
+
+impl fmt::Display for PrincipalKindError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingSender => formatter.write_str("an actor principal requires a sender"),
+            Self::UnexpectedSender => {
+                formatter.write_str("a conversation principal must not contain a sender")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PrincipalKindError {}
+
+impl ConversationPrincipal {
+    /// Construct the senderless identity shared by a conversation's members.
+    pub fn new(agent: AgentId, channel: ChannelId, conversation: ConversationId) -> Self {
+        Self(Principal::conversation(agent, channel, conversation))
+    }
+
+    /// Narrow this conversation identity to the participant acting in it.
+    pub fn actor(&self, sender: impl Into<Arc<str>>) -> ActorPrincipal {
+        ActorPrincipal(self.0.clone().with_sender(sender))
+    }
+
+    /// Borrow the wire principal used by existing persistence interfaces.
+    pub fn as_principal(&self) -> &Principal {
+        &self.0
+    }
+
+    /// Consume the typed wrapper and return its wire representation.
+    pub fn into_principal(self) -> Principal {
+        self.0
+    }
+
+    /// The stable principal key used for shared conversation state.
+    pub fn storage_name(&self) -> String {
+        self.0.storage_name()
+    }
+
+    /// Canonical bytes for commitments and derived identities.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        self.0.canonical_bytes()
+    }
+}
+
+impl ActorPrincipal {
+    /// Construct the identity of one participant acting in a conversation.
+    pub fn new(
+        agent: AgentId,
+        channel: ChannelId,
+        conversation: ConversationId,
+        sender: impl Into<Arc<str>>,
+    ) -> Self {
+        ConversationPrincipal::new(agent, channel, conversation).actor(sender)
+    }
+
+    /// Borrow the wire principal used by existing authorization/audit APIs.
+    pub fn as_principal(&self) -> &Principal {
+        &self.0
+    }
+
+    /// Consume the typed wrapper and return its wire representation.
+    pub fn into_principal(self) -> Principal {
+        self.0
+    }
+
+    /// Recover the senderless conversation this actor belongs to.
+    pub fn conversation(&self) -> ConversationPrincipal {
+        ConversationPrincipal(self.0.clone().without_sender())
+    }
+}
+
+impl TryFrom<Principal> for ConversationPrincipal {
+    type Error = PrincipalKindError;
+
+    fn try_from(principal: Principal) -> Result<Self, Self::Error> {
+        if principal.sender.is_some() {
+            return Err(PrincipalKindError::UnexpectedSender);
+        }
+        Ok(Self(principal))
+    }
+}
+
+impl TryFrom<Principal> for ActorPrincipal {
+    type Error = PrincipalKindError;
+
+    fn try_from(principal: Principal) -> Result<Self, Self::Error> {
+        if principal.sender.is_none() {
+            return Err(PrincipalKindError::MissingSender);
+        }
+        Ok(Self(principal))
+    }
 }
 
 impl Principal {
@@ -271,6 +393,28 @@ pub fn base64url_decode(input: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn typed_principals_keep_session_and_actor_construction_separate() {
+        let conversation = super::ConversationPrincipal::new(
+            super::AgentId::new("main"),
+            super::ChannelId::new("telegram"),
+            super::ConversationId::new("42"),
+        );
+        assert!(conversation.as_principal().sender.is_none());
+
+        let actor = conversation.actor("alice");
+        assert_eq!(actor.as_principal().sender.as_deref(), Some("alice"));
+        assert_eq!(actor.conversation(), conversation);
+        assert_eq!(
+            super::ActorPrincipal::try_from(conversation.clone().into_principal()),
+            Err(super::PrincipalKindError::MissingSender)
+        );
+        assert_eq!(
+            super::ConversationPrincipal::try_from(actor.into_principal()),
+            Err(super::PrincipalKindError::UnexpectedSender)
+        );
+    }
+
     /// The two names differ only in the sender field, and the conversation
     /// name is what every participant shares.
     #[test]

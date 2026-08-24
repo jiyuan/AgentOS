@@ -11,7 +11,10 @@
 
 use agentos_core::approve::Policy;
 use agentos_core::audit::SafetyJournal;
-use agentos_core::r#loop::{resume_approved, LoopDeps, RunLoopState, StartCtx};
+use agentos_core::r#loop::{
+    resume_approved, route, ApprovalBinding, ApprovalTicket, LoopDeps, Routed, RunLoopState,
+    StartCtx,
+};
 use agentos_core::tools::ToolRegistry;
 use agentos_interfaces::orchestrator::{Orchestrator, OrchestratorError, Plan, RunContext};
 use agentos_interfaces::run_state::ApprovalStatus;
@@ -19,7 +22,8 @@ use agentos_interfaces::session::{Item, Transcript};
 use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
 use agentos_interfaces::RunState;
 use agentos_proto::{
-    AgentId, Message, MessageRole, RunId, ToolCall, ToolCallId, ToolResult, ToolStatus,
+    AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole, Principal, RunId, ToolCall,
+    ToolCallId, ToolResult, ToolStatus,
 };
 use async_trait::async_trait;
 use serde_json::value::RawValue;
@@ -131,8 +135,16 @@ fn deps<'a>(
         compaction: Default::default(),
         cancel: Default::default(),
         steering: None,
-        audit: SafetyJournal::detached(),
-        granted_authority: &[],
+        audit: SafetyJournal::detached().for_run(
+            Principal::conversation(
+                AgentId::new("invariant-agent"),
+                ChannelId::new("test"),
+                ConversationId::new("conv"),
+            )
+            .with_sender("user"),
+            RunId::new("invariant-run"),
+        ),
+        delegated_authority: None,
     }
 }
 
@@ -205,7 +217,7 @@ async fn paused_run_state_json_round_trips_and_resumes_with_trace_continuity() {
 
     // Persist to JSON and restore, as a gateway process restart would.
     let json = serde_json::to_string(&paused).expect("paused RunState serializes");
-    let mut restored: RunState = serde_json::from_str(&json).expect("paused RunState deserializes");
+    let restored: RunState = serde_json::from_str(&json).expect("paused RunState deserializes");
 
     // Round-trip fidelity: the restored state is JSON-identical to the
     // paused one (full-struct comparison; RunState does not derive PartialEq).
@@ -223,9 +235,27 @@ async fn paused_run_state_json_round_trips_and_resumes_with_trace_continuity() {
     );
 
     // Approve and resume the restored state to completion.
-    let approval_id = restored.approvals[0].id.clone();
-    assert!(restored.approve(&approval_id));
-    let mut current = resume_approved(restored).expect("approved state resumes");
+    let approval = restored.pending_approval().expect("pending approval");
+    let ticket = ApprovalTicket::parse(&approval.approval_ticket).expect("ticket parses");
+    let binding = ApprovalBinding::new(
+        approval.approval_instance_id.clone(),
+        ticket.clone(),
+        approval.id.clone(),
+        approval.prompting_principal.clone(),
+        None,
+    )
+    .expect("instance matches ticket");
+    let answer = Envelope {
+        channel_id: ChannelId::new("test"),
+        conversation_id: ConversationId::new("conv"),
+        sender: Arc::from("user"),
+        message: Message::text(MessageRole::User, format!("/approve {ticket}")),
+        metadata: BTreeMap::new(),
+    };
+    let Routed::Decides { witness } = route(Some(&binding), &answer) else {
+        panic!("answer creates witness");
+    };
+    let mut current = resume_approved(restored, witness).expect("approved state resumes");
     let finished = loop {
         current = current
             .step(&deps)

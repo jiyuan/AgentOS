@@ -265,7 +265,7 @@ fn clone_deps<'a>(deps: &RunnerDeps<'a>) -> RunnerDeps<'a> {
         cancel: deps.cancel.clone(),
         steering: deps.steering.clone(),
         safety_log: deps.safety_log,
-        granted_authority: deps.granted_authority,
+        delegated_authority: deps.delegated_authority,
     }
 }
 

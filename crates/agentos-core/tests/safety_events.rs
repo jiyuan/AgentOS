@@ -11,10 +11,12 @@ mod support;
 use agentos_core::approve::{Policy, PolicyAction, PolicyRule, PolicyVerb};
 use agentos_core::audit::{SafetyEventKind, SafetyLog, SafetyOutcome, StoredSafetyEvent};
 use agentos_core::memory::SqliteStore;
-use agentos_core::r#loop::ToolGuardrailEntry;
+use agentos_core::r#loop::{
+    route, ApprovalBinding, ApprovalOutcome, ApprovalTicket, ResumeWitness, Routed,
+    ToolGuardrailEntry,
+};
 use agentos_core::runner::{
-    resume_run, run_envelope, JsonlTraceSink, PausedRun, ResumeDecision, RunOutcome, RunnerDeps,
-    TraceSink,
+    resume_run, run_envelope, JsonlTraceSink, PausedRun, RunOutcome, RunnerDeps, TraceSink,
 };
 use agentos_core::tools::ToolRegistry;
 use agentos_interfaces::guardrail::{GuardrailError, GuardrailOutcome, ToolGuardrail};
@@ -22,8 +24,8 @@ use agentos_interfaces::orchestrator::{Orchestrator, OrchestratorError, Plan, Ru
 use agentos_interfaces::run_state::ApprovalStatus;
 use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
 use agentos_proto::{
-    AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole, RunId, ToolCall,
-    ToolCallId, ToolResult, ToolStatus,
+    ActorPrincipal, AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole, RunId,
+    ToolCall, ToolCallId, ToolResult, ToolStatus,
 };
 use async_trait::async_trait;
 use std::collections::BTreeMap;
@@ -35,6 +37,62 @@ const SENDER: &str = "operator";
 const AGENT: &str = "audited-agent";
 const CHANNEL: &str = "audit-channel";
 const CONVERSATION: &str = "audit-conversation";
+
+fn approval_witness(
+    state: &agentos_interfaces::RunState,
+    outcome: ApprovalOutcome,
+    reason: Option<&str>,
+) -> ResumeWitness {
+    let approval = state.pending_approval().expect("pending approval");
+    let ticket = ApprovalTicket::parse(&approval.approval_ticket).expect("ticket parses");
+    let binding = ApprovalBinding::new(
+        approval.approval_instance_id.clone(),
+        ticket.clone(),
+        approval.id.clone(),
+        approval.prompting_principal.clone(),
+        None,
+    )
+    .expect("instance matches ticket");
+    if matches!(
+        outcome,
+        ApprovalOutcome::Approved | ApprovalOutcome::Rejected
+    ) {
+        let verb = if outcome == ApprovalOutcome::Approved {
+            "approve"
+        } else {
+            "deny"
+        };
+        let content = reason.map_or_else(
+            || format!("/{verb} {ticket}"),
+            |reason| format!("/{verb} {ticket} {reason}"),
+        );
+        let Routed::Decides { witness } = route(
+            Some(&binding),
+            &Envelope {
+                channel_id: ChannelId::new(CHANNEL),
+                conversation_id: ConversationId::new(CONVERSATION),
+                sender: Arc::from(SENDER),
+                message: Message::text(MessageRole::User, content),
+                metadata: BTreeMap::new(),
+            },
+        ) else {
+            panic!("human answer creates witness");
+        };
+        return witness;
+    }
+    binding
+        .unanswered_witness(
+            ActorPrincipal::new(
+                AgentId::new(AGENT),
+                ChannelId::new(CHANNEL),
+                ConversationId::new(CONVERSATION),
+                "agentos-system",
+            ),
+            outcome,
+            Arc::from(reason.unwrap_or("unanswered")),
+        )
+        .expect("unanswered outcome")
+}
 
 /// Planted in the tool arguments of every run below. If this string is ever
 /// findable in a stored event, the redaction contract is broken.
@@ -220,7 +278,7 @@ fn deps_with_trace<'a>(
         cancel: Default::default(),
         steering: None,
         safety_log: Some(safety_log),
-        granted_authority: &[],
+        delegated_authority: None,
     }
 }
 
@@ -256,9 +314,10 @@ async fn an_approval_leaves_a_question_and_an_answer_that_outlive_the_process() 
     };
     let approval_id = paused_state
         .pending_approval()
-        .expect("the run is waiting on something")
+        .expect("pending approval")
         .id
         .clone();
+    let witness = approval_witness(&paused_state, ApprovalOutcome::Approved, None);
 
     resume_run(
         PausedRun {
@@ -266,8 +325,7 @@ async fn an_approval_leaves_a_question_and_an_answer_that_outlive_the_process() 
             conversation_id: ConversationId::new(CONVERSATION),
             state: paused_state,
         },
-        &approval_id,
-        ResumeDecision::Approve,
+        witness,
         &deps,
     )
     .await
@@ -303,6 +361,102 @@ async fn an_approval_leaves_a_question_and_an_answer_that_outlive_the_process() 
 }
 
 #[tokio::test]
+/// AF-015: the correlated events name both the requester and administrator.
+async fn approval_resolution_records_requester_and_resolver() {
+    let tree = support::temp_tree("safety-admin-approval");
+    let path = tree.path().join("store.sqlite");
+    let store = store_at(&path);
+    let orchestrator = CallOnce;
+    let policy = policy(PolicyVerb::AskUser);
+    let tools = registry();
+    let deps = deps(
+        &orchestrator,
+        store.as_ref(),
+        &policy,
+        &tools,
+        store.as_ref(),
+        &[],
+    );
+    let RunOutcome::Paused(paused_state) =
+        run_envelope(envelope(), RunId::new("run-admin-approve"), &deps)
+            .await
+            .expect("the gated call pauses")
+    else {
+        panic!("ask_user pauses");
+    };
+    let approval = paused_state.pending_approval().expect("pending approval");
+    let ticket = ApprovalTicket::parse(&approval.approval_ticket).expect("ticket parses");
+    let administrator = ActorPrincipal::new(
+        AgentId::new(AGENT),
+        ChannelId::new(CHANNEL),
+        ConversationId::new(CONVERSATION),
+        "administrator",
+    );
+    let binding = ApprovalBinding::new(
+        approval.approval_instance_id.clone(),
+        ticket.clone(),
+        approval.id.clone(),
+        approval.prompting_principal.clone(),
+        None,
+    )
+    .expect("instance matches ticket")
+    .with_administrators(vec![administrator.clone()]);
+    let answer = Envelope {
+        channel_id: ChannelId::new(CHANNEL),
+        conversation_id: ConversationId::new(CONVERSATION),
+        sender: Arc::from("administrator"),
+        message: Message::text(MessageRole::User, format!("/approve {ticket}")),
+        metadata: BTreeMap::new(),
+    };
+    let Routed::Decides { witness } = route(Some(&binding), &answer) else {
+        panic!("administrator answer creates witness");
+    };
+    resume_run(
+        PausedRun {
+            channel_id: ChannelId::new(CHANNEL),
+            conversation_id: ConversationId::new(CONVERSATION),
+            state: paused_state,
+        },
+        witness,
+        &deps,
+    )
+    .await
+    .expect("administrator-approved run finishes");
+
+    let events = reread(&path);
+    let requested = events
+        .iter()
+        .find(|stored| stored.event.kind == SafetyEventKind::ApprovalRequested)
+        .expect("requested event");
+    let resolved = events
+        .iter()
+        .find(|stored| stored.event.kind == SafetyEventKind::ApprovalResolved)
+        .expect("resolved event");
+    let requester = ActorPrincipal::new(
+        AgentId::new(AGENT),
+        ChannelId::new(CHANNEL),
+        ConversationId::new(CONVERSATION),
+        SENDER,
+    );
+    assert_eq!(
+        requested.event.approval_instance_id,
+        resolved.event.approval_instance_id
+    );
+    assert_eq!(
+        requested.event.prompting_principal.as_ref(),
+        Some(requester.as_principal())
+    );
+    assert_eq!(
+        resolved.event.prompting_principal.as_ref(),
+        Some(requester.as_principal())
+    );
+    assert_eq!(
+        resolved.event.resolver_principal.as_ref(),
+        Some(administrator.as_principal())
+    );
+}
+
+#[tokio::test]
 async fn a_successful_approval_is_retained_in_the_state_rather_than_deleted() {
     let tree = support::temp_tree("safety-retain");
     let path = tree.path().join("store.sqlite");
@@ -326,11 +480,7 @@ async fn a_successful_approval_is_retained_in_the_state_rather_than_deleted() {
     else {
         panic!("an ask_user policy must pause");
     };
-    let approval_id = paused_state
-        .pending_approval()
-        .expect("the run is waiting on something")
-        .id
-        .clone();
+    let witness = approval_witness(&paused_state, ApprovalOutcome::Approved, None);
 
     let RunOutcome::Finished { state, .. } = resume_run(
         PausedRun {
@@ -338,8 +488,7 @@ async fn a_successful_approval_is_retained_in_the_state_rather_than_deleted() {
             conversation_id: ConversationId::new(CONVERSATION),
             state: paused_state,
         },
-        &approval_id,
-        ResumeDecision::Approve,
+        witness,
         &deps,
     )
     .await
@@ -376,19 +525,17 @@ async fn a_refusal_and_a_question_nobody_answered_are_different_rows() {
         &[],
     );
 
-    for (run, decision, expected) in [
+    for (run, outcome, reason, expected) in [
         (
             "run-rejected",
-            ResumeDecision::Reject {
-                reason: Arc::from("no"),
-            },
+            ApprovalOutcome::Rejected,
+            "no",
             SafetyOutcome::Rejected,
         ),
         (
             "run-unanswered",
-            ResumeDecision::Cancel {
-                reason: Arc::from("nobody was there"),
-            },
+            ApprovalOutcome::Cancelled,
+            "nobody was there",
             SafetyOutcome::Unanswered,
         ),
     ] {
@@ -400,9 +547,10 @@ async fn a_refusal_and_a_question_nobody_answered_are_different_rows() {
         };
         let approval_id = paused_state
             .pending_approval()
-            .expect("the run is waiting on something")
+            .expect("pending approval")
             .id
             .clone();
+        let witness = approval_witness(&paused_state, outcome, Some(reason));
         // Both fail the run closed, which is the point: the record has to
         // survive the error path, not only the happy one.
         resume_run(
@@ -411,8 +559,7 @@ async fn a_refusal_and_a_question_nobody_answered_are_different_rows() {
                 conversation_id: ConversationId::new(CONVERSATION),
                 state: paused_state,
             },
-            &approval_id,
-            decision,
+            witness,
             &deps,
         )
         .await

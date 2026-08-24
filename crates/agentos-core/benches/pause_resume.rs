@@ -16,10 +16,14 @@
 mod support;
 
 use agentos_core::approve::Policy;
-use agentos_core::r#loop::{resume_approved, RunLoopState};
+use agentos_core::r#loop::{
+    resume_approved, route, ApprovalBinding, ApprovalTicket, ResumeWitness, Routed, RunLoopState,
+};
 use agentos_interfaces::RunState;
+use agentos_proto::{ChannelId, ConversationId, Envelope, Message, MessageRole};
 use criterion::{criterion_group, criterion_main, Criterion};
 use std::hint::black_box;
+use std::sync::Arc;
 use support::{
     current_thread_runtime, drive, echo_tool_registry, fresh_state, make_deps,
     ScriptedToolOrchestrator, BENCH_TOOL_NAME,
@@ -35,13 +39,28 @@ fn pause_run(
     }
 }
 
-fn approve_first_pending(state: &mut RunState) {
-    let id = state
-        .pending_approval()
-        .expect("paused run has a pending approval")
-        .id
-        .clone();
-    assert!(state.approve(&id), "approval id matches pending entry");
+fn approval_witness(state: &RunState) -> ResumeWitness {
+    let approval = state.pending_approval().expect("pending approval");
+    let ticket = ApprovalTicket::parse(&approval.approval_ticket).expect("ticket parses");
+    let binding = ApprovalBinding::new(
+        approval.approval_instance_id.clone(),
+        ticket.clone(),
+        approval.id.clone(),
+        approval.prompting_principal.clone(),
+        None,
+    )
+    .expect("instance matches ticket");
+    let answer = Envelope {
+        channel_id: ChannelId::new("bench"),
+        conversation_id: ConversationId::new("bench"),
+        sender: Arc::from("bench-user"),
+        message: Message::text(MessageRole::User, format!("/approve {ticket}")),
+        metadata: Default::default(),
+    };
+    let Routed::Decides { witness } = route(Some(&binding), &answer) else {
+        panic!("answer creates witness");
+    };
+    witness
 }
 
 fn bench_ask_user_pause_resume(c: &mut Criterion) {
@@ -56,11 +75,11 @@ fn bench_ask_user_pause_resume(c: &mut Criterion) {
             let paused = pause_run(&runtime, &deps);
 
             let json = serde_json::to_string(&paused).expect("paused RunState serializes");
-            let mut restored: RunState =
+            let restored: RunState =
                 serde_json::from_str(&json).expect("paused RunState deserializes");
-            approve_first_pending(&mut restored);
+            let witness = approval_witness(&restored);
 
-            let mut current = resume_approved(restored).expect("approved state resumes");
+            let mut current = resume_approved(restored, witness).expect("approved state resumes");
             let finished = runtime.block_on(async {
                 loop {
                     current = current.step(&deps).await.expect("resume step succeeds");

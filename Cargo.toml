@@ -32,6 +32,7 @@ agentos-proto = { path = "crates/agentos-proto" }
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 croner = "3"
+getrandom = "0.3"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }
 rusqlite = { version = "0.32", features = ["bundled"] }

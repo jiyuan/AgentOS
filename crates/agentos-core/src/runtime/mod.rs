@@ -39,7 +39,8 @@ pub use mcp_config::register_configured_mcp;
 mod tools_config;
 
 use tools_config::{
-    build_parent_tools, subagent_delegation_grants, subagent_memory_tool_enabled, subagent_policy,
+    build_parent_tools, subagent_delegation_grant_templates, subagent_memory_tool_enabled,
+    subagent_policy,
 };
 pub use tools_config::{
     phase5_policy, register_builtin_tool, BUILTIN_TOOL_NAMES, RUNTIME_TOOL_NAMES,
@@ -684,7 +685,7 @@ pub fn build_subagents(
         .with_tools(Arc::new(tools))
         .with_max_turns(subagent.max_turns)
         .with_seed_from_parent(subagent.seed_from_parent)
-        .with_delegation_grants(subagent_delegation_grants(subagent)?);
+        .with_delegation_grants(subagent_delegation_grant_templates(subagent)?);
         if subagent.memory_view.as_ref() != "none" || subagent_memory_tool_enabled(subagent) {
             definition = definition.with_memory_manager(memory_manager.clone());
         }

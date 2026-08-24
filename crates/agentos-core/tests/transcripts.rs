@@ -18,9 +18,9 @@ mod support;
 use agentos_core::approve::{Policy, PolicyAction, PolicyRule, PolicyVerb};
 use agentos_core::memory::InMemorySession;
 use agentos_core::orchestrator::MaxOrchestrator;
-use agentos_core::r#loop::{route, ApprovalBinding, ApprovalTicket};
+use agentos_core::r#loop::{route, ApprovalBinding, ApprovalTicket, Routed};
 use agentos_core::runner::{
-    approval_prompt_envelope, resume_run, run_envelope, PausedRun, ResumeDecision, RunOutcome,
+    approval_prompt_envelope, resume_run, run_envelope, PausedRun, RunOutcome,
     SESSION_SCOPE_EPHEMERAL, SESSION_SCOPE_KEY,
 };
 use agentos_core::subagents::{SubAgentDefinition, SubAgentRegistry};
@@ -29,7 +29,9 @@ use agentos_interfaces::orchestrator::{
 };
 use agentos_interfaces::session::{Item, Session};
 use agentos_interfaces::tool::Tool;
-use agentos_proto::{AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole, RunId};
+use agentos_proto::{
+    AgentId, ApprovalInstanceId, ChannelId, ConversationId, Envelope, Message, MessageRole, RunId,
+};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -203,10 +205,9 @@ async fn golden_approval_pause_and_resume() {
     .await
     .expect("a gated tool call pauses cleanly");
 
-    let RunOutcome::Paused(state) = paused_outcome else {
+    let RunOutcome::Paused(mut state) = paused_outcome else {
         panic!("an ask_user tool call must pause, not finish");
     };
-    let paused_view = support::normalize_approvals(&state);
 
     // G2: pin the prompt the gateway sends. It is what a user has to answer,
     // so the metadata a channel reads (ticket, the interruption it gates, when
@@ -214,6 +215,12 @@ async fn golden_approval_pause_and_resume() {
     // are part of the contract. The ticket and expiry are fixed here rather
     // than minted so the golden is stable.
     let ticket = ApprovalTicket::parse("g2fixture").expect("a well-formed fixture ticket");
+    let approval = state
+        .pending_approval_mut()
+        .expect("paused state carries approval");
+    approval.approval_instance_id = ApprovalInstanceId::new(ticket.as_str());
+    approval.approval_ticket = Arc::from(ticket.as_str());
+    let paused_view = support::normalize_approvals(&state);
     let prompt = approval_prompt_envelope(
         &PausedRun {
             channel_id: ChannelId::new(CHANNEL),
@@ -221,7 +228,6 @@ async fn golden_approval_pause_and_resume() {
             state: state.clone(),
         },
         Arc::from("golden-agent"),
-        &ticket,
         Some(1_700_000_000),
     )
     .expect("a paused run has a prompt");
@@ -234,7 +240,15 @@ async fn golden_approval_pause_and_resume() {
     // Bound to the sender `user_envelope` stamps, so these route against a
     // prompt that really was put to them and the answers below fail for the
     // reason under test rather than for being someone else's.
-    let binding = ApprovalBinding::new(ticket.clone(), support::SENDER);
+    let approval = state.pending_approval().expect("approval remains pending");
+    let binding = ApprovalBinding::new(
+        approval.approval_instance_id.clone(),
+        ticket.clone(),
+        approval.id.clone(),
+        approval.prompting_principal.clone(),
+        None,
+    )
+    .expect("instance matches ticket");
     let undecided: Vec<Value> = ["y", "yes, go ahead", "approve", "/approve"]
         .into_iter()
         .map(|text| {
@@ -245,12 +259,10 @@ async fn golden_approval_pause_and_resume() {
             })
         })
         .collect();
-    // Resume the way the gateway does: by the id the paused run is actually
-    // waiting on, not a guessed one.
-    let approval_id = state
-        .pending_approval()
-        .map(|approval| approval.id.clone())
-        .expect("a paused run carries the approval it is waiting on");
+    let answer = user_envelope("/approve g2fixture");
+    let Routed::Decides { witness } = route(Some(&binding), &answer) else {
+        panic!("ticketed answer creates witness");
+    };
 
     let resumed = resume_run(
         PausedRun {
@@ -258,8 +270,7 @@ async fn golden_approval_pause_and_resume() {
             conversation_id: ConversationId::new(CONVERSATION),
             state,
         },
-        &approval_id,
-        ResumeDecision::Approve,
+        witness,
         &deps,
     )
     .await

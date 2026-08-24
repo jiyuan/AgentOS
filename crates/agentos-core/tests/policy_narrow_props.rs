@@ -24,9 +24,14 @@
 //! 6. A child default verb more permissive than the parent's is rejected.
 //! 7. A grant admits exactly what it names, and no more.
 
-use agentos_core::approve::{Policy, PolicyAction, PolicyDecision, PolicyRule, PolicyVerb};
+use agentos_core::approve::{
+    DelegatedAuthority, DelegationGrantTemplate, DelegationScope, Policy, PolicyAction,
+    PolicyDecision, PolicyRule, PolicyVerb,
+};
 use agentos_interfaces::orchestrator::{OrchestratorTemplate, Plan, SubAgentSpec, SubOrchSpec};
-use agentos_proto::{AgentId, TaskId, ToolCall, ToolCallId};
+use agentos_proto::{
+    ActorPrincipal, AgentId, ChannelId, ConversationId, TaskId, ToolCall, ToolCallId,
+};
 use proptest::prelude::*;
 use serde_json::value::RawValue;
 use serde_json::Value;
@@ -302,5 +307,49 @@ proptest! {
             "child default {child_default:?} must not widen parent default {:?}",
             parent.default_decision,
         );
+    }
+
+    #[test]
+    fn grant_backed_narrowing_exists_only_for_its_argument_and_clock_interval(
+        now in 900_u64..1_101,
+    ) {
+        let parent = Policy::ask_user_tools(["alpha"]);
+        let child = Policy {
+            rules: vec![PolicyRule {
+                action: PolicyAction::Tool(Arc::from("alpha")),
+                decision: PolicyVerb::Allow,
+                reason: None,
+                arg_equals: BTreeMap::from([(Arc::from("op"), Value::from("read"))]),
+            }],
+            default_decision: PolicyVerb::Deny,
+        };
+        let scope = DelegationScope::for_generation(
+            ActorPrincipal::new(
+                AgentId::new("parent"),
+                ChannelId::new("telegram"),
+                ConversationId::new("group"),
+                "alice",
+            ),
+            AgentId::new("child"),
+            "child-policy",
+            "delegation.v1.property-generation",
+            1_000,
+        )
+        .expect("static property scope is valid");
+        let authority = DelegatedAuthority::issue(
+            &[DelegationGrantTemplate {
+                action: PolicyAction::Tool(Arc::from("alpha")),
+                decision: PolicyVerb::Allow,
+                arg_equals: BTreeMap::from([(Arc::from("op"), Value::from("read"))]),
+                reason: Arc::from("property-test read grant"),
+                lifetime_secs: 60,
+            }],
+            &parent,
+            scope,
+        )
+        .expect("bounded property grant issues");
+
+        let admitted = Policy::narrow_with_grants(&parent, &child, &authority, now).is_ok();
+        prop_assert_eq!(admitted, (1_000..1_060).contains(&now));
     }
 }

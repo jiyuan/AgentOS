@@ -411,7 +411,7 @@ mod tests {
             cancel: Default::default(),
             steering: None,
             audit: crate::audit::SafetyJournal::detached(),
-            granted_authority: &[],
+            delegated_authority: None,
             compaction: Compaction {
                 summarizer,
                 config: CompactionConfig::default(),

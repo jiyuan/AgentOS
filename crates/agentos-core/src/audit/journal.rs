@@ -1,7 +1,7 @@
 //! The sink a run writes safety events to, and the handle it writes through.
 
 use super::event::{SafetyEvent, SafetyEventKind, SafetyOutcome};
-use agentos_proto::{Principal, RunId};
+use agentos_proto::{ActorPrincipal, Principal, RunId};
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::{error, info};
@@ -86,6 +86,14 @@ impl<'a> SafetyJournal<'a> {
         self.log.is_some()
     }
 
+    /// The sender-qualified actor this run is executing for, whether or not a
+    /// log backend is attached.
+    pub fn actor_principal(&self) -> Option<ActorPrincipal> {
+        self.principal
+            .clone()
+            .and_then(|principal| principal.try_into().ok())
+    }
+
     /// Write one event, stamped with this run's identity.
     ///
     /// Takes the event by value and returns nothing: an event is written once
@@ -97,6 +105,9 @@ impl<'a> SafetyJournal<'a> {
         let mut event = event;
         if event.principal.is_none() {
             event.principal = self.principal.clone();
+        }
+        if event.kind == SafetyEventKind::ApprovalRequested && event.prompting_principal.is_none() {
+            event.prompting_principal = self.principal.clone();
         }
         if event.run_id.is_none() {
             event.run_id = self.run_id.clone();

@@ -11,12 +11,13 @@ pub mod usage;
 
 pub use envelope::{Envelope, INGRESS_ID_KEY};
 pub use ids::{
-    AgentId, ChannelId, ConversationId, InterruptionId, Namespace, RecordId, RunId, SchemaVersion,
-    SpanId, TaskId, ToolCallId,
+    AgentId, ApprovalInstanceId, ChannelId, ConversationId, InterruptionId, Namespace, RecordId,
+    RunId, SchemaVersion, SpanId, TaskId, ToolCallId,
 };
 pub use message::{Attachment, AttachmentKind, Message, MessageRole};
 pub use principal::{
-    base64url, base64url_decode, decode_component, encode_component, Principal, PRINCIPAL_VERSION,
+    base64url, base64url_decode, decode_component, encode_component, ActorPrincipal,
+    ConversationPrincipal, Principal, PrincipalKindError, PRINCIPAL_VERSION,
 };
 pub use request::{RequestHeader, RequestSection, RequestSource};
 pub use tool::{ToolCall, ToolResult, ToolStatus};

@@ -63,13 +63,14 @@ clears anybody else's, and two participants can legitimately see different
 prefixes of one log. `JobRegistry` fences on the same key, which matters
 because that fence decides who may read a job's output.
 
-**Principals are typed and namespaces are injective** (`ID-001`, `ID-002`). Two
-conversations whose ids differed only in punctuation could land in one memory
-namespace and read each other's records. `agentos_proto::Principal` and an
-injective encoding replaced the string concatenation; memory, episodes and
-attachments are keyed by it; `schema_version` and `agentos-gateway migrate`
-move what was written under the old keys, reporting the ambiguous cases rather
-than guessing.
+**Principals are typed and namespaces are injective** (`ID-001`, `ID-002`,
+`ID-003`). Two conversations whose ids differed only in punctuation could land
+in one memory namespace and read each other's records.
+`ConversationPrincipal` and `ActorPrincipal` distinguish shared conversation
+state from a sender-qualified action. Delegated conversations commit to the
+complete parent principal, child definition and policy, and task discriminator;
+their source tuple lets `agentos-gateway migrate` rekey complete legacy rows
+while reporting incomplete or colliding rows rather than guessing.
 
 **A remote sender is authenticated, and an approval is answered by name**
 (`AUTH-001`). Both channels fail closed on an unrecognised sender. An approval
@@ -77,17 +78,38 @@ prompt issues a ticket, and an envelope that does not carry it back is ordinary
 input however affirmative it sounds — in a group conversation, a prompt belongs
 to the person it was put to.
 
+**Approval resolution is unique and actor-bound** (`AUTH-003`). Every asking
+now mints one approval instance from a once-generated 128-bit OS-CSPRNG nonce
+and a checked atomic counter. The persisted interruption, channel ticket, and
+requested/resolved safety events share that identity. Resume APIs accept only
+an opaque witness bound to the exact pending ticket, requester, resolver,
+expiry, and outcome; consumed or mismatched interruptions fail closed.
+Approval administrators are complete agent/channel/conversation/sender
+principals, so a sender id configured for one channel has no authority in
+another, and both actors survive in the durable audit record.
+
 **Sub-agent policies only narrow** (`AUTH-002`). `Policy::narrow` decides a
 finite set of witness calls with both policies instead of comparing rules, so
 first-match ordering is respected and arguments are covered. A sub-agent that
 must exceed its parent needs an explicit `[[subagents.delegation_grants]]`
 naming one tool.
 
-**`Approve` is re-asserted where the action happens** (`STATE-001`). `ActCtx`
-carries a private `Authorization` naming the plan it was issued for, so a
-hand-built one does not compile and a real one cannot be moved to a different
-plan; `act()` re-decides against the live policy and accepts `ask_user` only
-when a human answered.
+**Delegation grants are principal-bound and expiring** (`AUTH-004`). Configured
+grant entries are lifetime-bounded templates, not reusable authority. Each
+delegation mints a runtime instance bound to the sender-qualified parent actor,
+delegatee agent and policy, exact tool and optional arguments, and a fresh
+delegation generation. The one-hour kernel maximum is checked at load and
+issuance; rollback before issuance and forward movement to expiry both fail
+closed. Paused children retain the original generation and expiry, while grant
+issuance and use events share one stable grant ID. Legacy `expires_at` and
+standing entries now fail load with `lifetime_secs` migration guidance.
+
+**`Approve` is re-asserted where the action happens** (`STATE-001`, `AUTH-005`).
+`ActCtx` privately owns an immutable plan together with a domain-separated
+commitment to its complete serialized form, including payloads, metadata,
+routes, policies, and resumed child state. A hand-built context does not
+compile, the plan or denied disposition cannot be replaced after approval, and
+`act()` still re-decides against the live policy immediately before execution.
 
 ### Isolation, filesystem, process, network
 

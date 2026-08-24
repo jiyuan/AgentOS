@@ -3,9 +3,12 @@ use agentos_core::channels::{feishu::FeishuChannel, telegram::TelegramChannel};
 use agentos_core::crons::{CronSchedule, CronStore, CronTask};
 use agentos_core::gateway::{GatewayRun, GatewayService};
 use agentos_core::memory::{MemoryManager, SqliteStore};
-use agentos_core::r#loop::{route, ApprovalBinding, ApprovalOutcome, ApprovalTicket, Routed};
+use agentos_core::r#loop::{
+    route, ApprovalBinding, ApprovalTicket, ResumeWitness, Routed, APPROVE, DECISION_KEY, DENY,
+    REASON_KEY, TICKET_KEY,
+};
 use agentos_core::runner::{
-    delete_paused_run, load_paused_run, save_paused_run, ResumeDecision, RunnerDeps,
+    delete_paused_run, load_paused_run, save_paused_run, PausedRun, RunnerDeps,
 };
 use agentos_core::runtime::{AgentRuntime, OrchestratorStrategy, RuntimePaths};
 use agentos_core::skills::{
@@ -390,24 +393,20 @@ where
         GatewayRun::Finished { state, .. } => {
             print_trace(&state);
         }
-        GatewayRun::Paused { paused, ticket, .. } => {
+        GatewayRun::Paused {
+            paused,
+            ticket,
+            expires_at,
+            ..
+        } => {
             save_paused_run(state_path, &paused)?;
-            let Some(approval_id) = paused
-                .state
-                .pending_approval()
-                .map(|approval| approval.id.clone())
-            else {
-                eprintln!("run paused without a pending approval");
-                return Ok(());
-            };
-
-            let Some(decision) = await_approval(channel, &ticket).await else {
+            let Some(witness) = await_approval(channel, &paused, &ticket, expires_at).await else {
                 eprintln!("paused run saved: {}", state_path.display());
                 return Ok(());
             };
             let paused = load_paused_run(state_path)?;
             let outcome = gateway_service
-                .resume(channel.egress().as_ref(), paused, &approval_id, decision)
+                .resume(channel.egress().as_ref(), paused, witness)
                 .await;
             delete_paused_run(state_path)?;
             match outcome? {
@@ -430,7 +429,12 @@ where
 /// decides, `y` approves — meant any input at all authorised a tool call, which
 /// is exactly the ambient authority the item removes. Input that is not an
 /// answer is reported and the wait continues; `None` means the channel closed.
-async fn await_approval<C>(channel: &mut C, ticket: &ApprovalTicket) -> Option<ResumeDecision>
+async fn await_approval<C>(
+    channel: &mut C,
+    paused: &PausedRun,
+    ticket: &ApprovalTicket,
+    expires_at: Option<u64>,
+) -> Option<ResumeWitness>
 where
     C: Channel,
 {
@@ -438,19 +442,18 @@ where
     // channel stamps on every envelope. Binding it anyway rather than passing
     // the check something that always matches: the day a second sender can
     // reach this loop, it should already be checked.
-    let binding = ApprovalBinding::new(ticket.clone(), TUI_SENDER);
+    let approval = paused.state.pending_approval()?;
+    let binding = ApprovalBinding::new(
+        approval.approval_instance_id.clone(),
+        ticket.clone(),
+        approval.id.clone(),
+        approval.prompting_principal.clone(),
+        expires_at,
+    )?;
     loop {
         let answer = channel.receive().await?;
         match route(Some(&binding), &answer) {
-            Routed::Decides {
-                outcome: ApprovalOutcome::Approved,
-                ..
-            } => return Some(ResumeDecision::Approve),
-            Routed::Decides { reason, .. } => {
-                return Some(ResumeDecision::Reject {
-                    reason: reason.unwrap_or_else(|| Arc::from("rejected by user")),
-                })
-            }
+            Routed::Decides { witness } => return Some(witness),
             Routed::Stale { ticket: named } => {
                 println!("That approval ({named}) is not the one waiting. Answer {ticket}.");
             }
@@ -550,25 +553,21 @@ async fn run_tui_loop(
                 session_usage.record_run(&state.usage);
                 print_trace(&state);
             }
-            GatewayRun::Paused { paused, ticket, .. } => {
+            GatewayRun::Paused {
+                paused,
+                ticket,
+                expires_at,
+                ..
+            } => {
                 save_paused_run(state_path, &paused)?;
-                let Some(approval_id) = paused
-                    .state
-                    .pending_approval()
-                    .map(|approval| approval.id.clone())
+                let Some(witness) = await_approval(channel, &paused, &ticket, expires_at).await
                 else {
-                    eprintln!("run paused without a pending approval");
-                    turn += 1;
-                    continue;
-                };
-
-                let Some(decision) = await_approval(channel, &ticket).await else {
                     eprintln!("paused run saved: {}", state_path.display());
                     return Ok(());
                 };
                 let paused = load_paused_run(state_path)?;
                 let outcome = gateway_service
-                    .resume(channel.egress().as_ref(), paused, &approval_id, decision)
+                    .resume(channel.egress().as_ref(), paused, witness)
                     .await;
                 delete_paused_run(state_path)?;
                 match outcome? {
@@ -596,11 +595,7 @@ where
     C: Channel,
 {
     let paused = load_paused_run(state_path)?;
-    let Some(approval_id) = paused
-        .state
-        .pending_approval()
-        .map(|approval| approval.id.clone())
-    else {
+    let Some(approval) = paused.state.pending_approval() else {
         eprintln!("paused run has no pending approval");
         return Ok(());
     };
@@ -611,21 +606,62 @@ where
     } else {
         2
     };
-    let decision = match args.get(verb_at).map(String::as_str) {
-        Some("reject") => ResumeDecision::Reject {
-            reason: args.get(verb_at + 1).map_or_else(
+    let (decision, reason): (&str, Option<Arc<str>>) = match args.get(verb_at).map(String::as_str) {
+        Some("reject") => (
+            DENY,
+            Some(args.get(verb_at + 1).map_or_else(
                 || Arc::from("rejected by user"),
                 |reason| Arc::from(reason.as_str()),
-            ),
-        },
-        Some("approve") | None => ResumeDecision::Approve,
+            )),
+        ),
+        Some("approve") | None => (APPROVE, None),
         Some(other) => {
             return Err(format!("unknown resume decision: {other}").into());
         }
     };
+    let ticket = ApprovalTicket::parse(&approval.approval_ticket)
+        .ok_or("paused run has an invalid approval ticket")?;
+    let binding = ApprovalBinding::new(
+        approval.approval_instance_id.clone(),
+        ticket.clone(),
+        approval.id.clone(),
+        approval.prompting_principal.clone(),
+        None,
+    )
+    .ok_or("paused run has a mismatched approval instance")?;
+    let sender = approval
+        .prompting_principal
+        .as_principal()
+        .sender
+        .clone()
+        .ok_or("paused approval has no prompting sender")?;
+    let mut answer = Envelope {
+        channel_id: paused.channel_id.clone(),
+        conversation_id: paused.conversation_id.clone(),
+        sender,
+        message: Message::text(MessageRole::User, ""),
+        metadata: BTreeMap::new(),
+    };
+    answer.metadata.insert(
+        Arc::from(TICKET_KEY),
+        serde_json::Value::String(ticket.as_str().to_owned()),
+    );
+    answer.metadata.insert(
+        Arc::from(DECISION_KEY),
+        serde_json::Value::String(decision.to_owned()),
+    );
+    if let Some(reason) = reason {
+        answer.metadata.insert(
+            Arc::from(REASON_KEY),
+            serde_json::Value::String(reason.to_string()),
+        );
+    }
+    let Routed::Decides { witness } = route(Some(&binding), &answer) else {
+        return Err("local approval did not produce a resume witness".into());
+    };
     let gateway_service = GatewayService::new(deps, Arc::from(deps.active_agent.as_str()));
     let outcome = gateway_service
-        .resume(channel.egress().as_ref(), paused, &approval_id, decision)
+        .resume(channel.egress().as_ref(), paused, witness)
         .await;
     delete_paused_run(state_path)?;
     match outcome? {

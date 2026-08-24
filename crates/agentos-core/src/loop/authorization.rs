@@ -11,13 +11,13 @@
 //! unchecked constructor for resuming a `Paused` run, which is the case that
 //! matters. This closes the same hole with a witness:
 //!
-//! - [`Authorization`] has **no public constructor**, so `ActCtx` cannot be
-//!   built by a literal outside this crate at all. That is the fabrication
-//!   half.
-//! - It carries a fingerprint of the plan it was issued for, so a caller
-//!   holding a legitimate `ActCtx` cannot assign a different plan over the
-//!   approved one. That is the substitution half — and it is the half a plain
-//!   marker type would miss.
+//! - [`AuthorizedPlan`] owns the plan and the witness together, and both are
+//!   private inside `ActCtx`. A caller can neither fabricate an act context nor
+//!   replace the plan or the denied/executable disposition after approval.
+//! - [`Authorization`] carries a canonical commitment to the complete
+//!   serialized [`Plan`]. It is not a hand-maintained selection of fields, so
+//!   tool ids, routing payloads, child state, metadata, and future serialized
+//!   fields all participate automatically.
 //! - `Act` re-decides the plan against the live policy before running it, so a
 //!   denial that appeared between `Approve` and `Act` still stops the call.
 //!   `ask_user` passes only when a human actually answered, which is exactly
@@ -25,20 +25,50 @@
 
 use crate::approve::{Policy, PolicyDecision};
 use agentos_interfaces::orchestrator::Plan;
+use agentos_proto::ToolCall;
 use sha2::{Digest, Sha256};
+use std::io::{self, Write};
 use std::sync::Arc;
+
+const PLAN_COMMITMENT_DOMAIN: &[u8] = b"agentos.plan-authorization";
+const PLAN_COMMITMENT_VERSION: u8 = 1;
+
+/// A domain-separated SHA-256 commitment to one complete serialized plan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PlanCommitment([u8; 32]);
 
 /// Why a plan in `ActCtx` may run.
 ///
 /// Minted only by `Approve` and by the resume path. See the module docs for
-/// why the fingerprint is part of it.
+/// why the complete plan commitment is part of it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Authorization {
-    plan: Arc<str>,
+    plan: PlanCommitment,
     /// Set when a human answered an `ask_user` pause. `Act` then accepts a
     /// policy that still says `ask_user`, which it must — being approved is
     /// precisely the state of having been asked about and permitted.
     human_approved: bool,
+}
+
+/// A plan whose approval witness and execution disposition cannot be changed
+/// independently after `Approve` constructs it.
+#[derive(Debug)]
+pub(super) struct AuthorizedPlan {
+    plan: Plan,
+    authorization: Authorization,
+    denied_tool: Option<Arc<str>>,
+}
+
+/// The only two dispositions `Act` can receive from an approved plan.
+pub(super) enum ActPlan {
+    Execute(Plan),
+    DeniedTool { call: ToolCall, reason: Arc<str> },
+}
+
+/// A plan refused by its commitment or the live policy.
+pub(super) struct AuthorizationFailure {
+    pub plan: Box<Plan>,
+    pub error: Unauthorized,
 }
 
 /// Why `Act` refused to run a plan it was handed.
@@ -59,7 +89,7 @@ impl Authorization {
     /// Issued by the `Approve` state for a plan the policy allowed.
     pub(super) fn allowed(plan: &Plan) -> Self {
         Self {
-            plan: fingerprint(plan),
+            plan: commitment(plan),
             human_approved: false,
         }
     }
@@ -67,17 +97,17 @@ impl Authorization {
     /// Issued when a paused run resumes because somebody said yes.
     pub(super) fn approved_by_human(plan: &Plan) -> Self {
         Self {
-            plan: fingerprint(plan),
+            plan: commitment(plan),
             human_approved: true,
         }
     }
 
     /// Whether `plan` may run under this authorization and `policy`.
     ///
-    /// Cheap enough for the hot path: one SHA-256 over a short canonical
-    /// string, plus the policy decision the loop would make anyway.
+    /// One streaming SHA-256 over canonical JSON, plus the live policy
+    /// decision the loop would make anyway. No plan-sized allocation is made.
     pub(super) fn admits(&self, plan: &Plan, policy: &Policy) -> Result<(), Unauthorized> {
-        if self.plan != fingerprint(plan) {
+        if self.plan != commitment(plan) {
             return Err(Unauthorized::PlanSubstituted);
         }
         match policy.decide(plan) {
@@ -90,6 +120,65 @@ impl Authorization {
                     Err(Unauthorized::Unanswered { reason })
                 }
             }
+        }
+    }
+}
+
+impl AuthorizedPlan {
+    pub(super) fn allowed(plan: Plan) -> Self {
+        let authorization = Authorization::allowed(&plan);
+        Self {
+            plan,
+            authorization,
+            denied_tool: None,
+        }
+    }
+
+    pub(super) fn approved_by_human(plan: Plan) -> Self {
+        let authorization = Authorization::approved_by_human(&plan);
+        Self {
+            plan,
+            authorization,
+            denied_tool: None,
+        }
+    }
+
+    pub(super) fn denied_tool(plan: Plan, reason: Arc<str>) -> Self {
+        let authorization = Authorization::allowed(&plan);
+        Self {
+            plan,
+            authorization,
+            denied_tool: Some(reason),
+        }
+    }
+
+    /// Consume the inseparable plan/witness pair for `Act`.
+    ///
+    /// A denied disposition is valid only for a single tool call. Checking it
+    /// here prevents a future constructor mistake from using the denial path
+    /// to skip the live-policy decision for a structural action.
+    pub(super) fn into_act(self, policy: &Policy) -> Result<ActPlan, AuthorizationFailure> {
+        if self.authorization.plan != commitment(&self.plan) {
+            return Err(AuthorizationFailure {
+                plan: Box::new(self.plan),
+                error: Unauthorized::PlanSubstituted,
+            });
+        }
+        if let Some(reason) = self.denied_tool {
+            return match self.plan {
+                Plan::CallTool(call) => Ok(ActPlan::DeniedTool { call, reason }),
+                plan => Err(AuthorizationFailure {
+                    plan: Box::new(plan),
+                    error: Unauthorized::PlanSubstituted,
+                }),
+            };
+        }
+        match self.authorization.admits(&self.plan, policy) {
+            Ok(()) => Ok(ActPlan::Execute(self.plan)),
+            Err(error) => Err(AuthorizationFailure {
+                plan: Box::new(self.plan),
+                error,
+            }),
         }
     }
 }
@@ -108,114 +197,294 @@ pub(super) fn plan_subject(plan: &Plan) -> Arc<str> {
     }
 }
 
-/// A canonical name for what a plan would do, hashed.
+/// Commit to the complete serde representation of `Plan` (`AUTH-005`).
 ///
-/// Hashed rather than kept verbatim because a tool call's arguments are
-/// model-supplied and unbounded, and this value is held in memory for the
-/// whole `Act` state. Two plans agree here exactly when they would ask the
-/// policy engine the same question — which is the property the check needs,
-/// and the reason a `Reply` (which the policy always allows) is distinguished
-/// only by its variant.
-fn fingerprint(plan: &Plan) -> Arc<str> {
+/// JSON is deterministic here: every struct has declaration order, metadata
+/// uses `BTreeMap`, and this workspace does not enable serde_json's
+/// insertion-order map feature. Streaming into the digest avoids retaining a
+/// second, attacker-sized copy of tool arguments or resumed child state.
+fn commitment(plan: &Plan) -> PlanCommitment {
     let mut hasher = Sha256::new();
-    match plan {
-        Plan::Reply(_) => hasher.update(b"reply"),
-        Plan::CallTool(call) => {
-            hasher.update(b"tool\0");
-            hasher.update(call.name.as_bytes());
-            hasher.update(b"\0");
-            hasher.update(call.args.get().as_bytes());
-        }
-        Plan::CallTools(calls) => {
-            hasher.update(b"tools\0");
-            for call in calls {
-                hasher.update(call.name.as_bytes());
-                hasher.update(b"\0");
-                hasher.update(call.args.get().as_bytes());
-                hasher.update(b"\0");
-            }
-        }
-        Plan::Delegate(spec) => {
-            hasher.update(b"delegate\0");
-            hasher.update(spec.agent_id.as_str().as_bytes());
-            hasher.update(b"\0");
-            hasher.update(spec.policy_id.as_bytes());
-        }
-        Plan::Escalate(spec) => {
-            hasher.update(b"escalate\0");
-            hasher.update(spec.template.name.as_bytes());
-            hasher.update(b"\0");
-            hasher.update(spec.task_id.as_str().as_bytes());
-        }
-        Plan::Handoff(agent_id, _) => {
-            hasher.update(b"handoff\0");
-            hasher.update(agent_id.as_str().as_bytes());
-        }
-        Plan::ResumeSubAgent { spec, .. } => {
-            hasher.update(b"resume\0");
-            hasher.update(spec.agent_id.as_str().as_bytes());
-            hasher.update(b"\0");
-            hasher.update(spec.policy_id.as_bytes());
-        }
+    hasher.update(PLAN_COMMITMENT_DOMAIN);
+    hasher.update([PLAN_COMMITMENT_VERSION]);
+    serde_json::to_writer(DigestWriter(&mut hasher), plan)
+        .expect("Plan serialization contains no fallible map keys or non-finite numbers");
+    PlanCommitment(hasher.finalize().into())
+}
+
+struct DigestWriter<'a>(&'a mut Sha256);
+
+impl Write for DigestWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
     }
-    let mut rendered = String::with_capacity(64);
-    for byte in hasher.finalize() {
-        rendered.push_str(&format!("{byte:02x}"));
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
-    Arc::from(rendered)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::approve::PolicyVerb;
-    use agentos_proto::{AgentId, ToolCall, ToolCallId};
+    use agentos_interfaces::orchestrator::{
+        OrchestratorTemplate, Stage, SubAgentSpec, SubOrchSpec,
+    };
+    use agentos_interfaces::RunState;
+    use agentos_proto::{
+        AgentId, ChannelId, ConversationId, Message, MessageRole, RunId, TaskId, ToolCall,
+        ToolCallId,
+    };
     use serde_json::value::RawValue;
+    use serde_json::Value;
+    use std::collections::BTreeMap;
 
-    fn call(name: &str, args: &str) -> Plan {
+    fn call_with(id: &str, name: &str, args: &str) -> Plan {
         Plan::CallTool(ToolCall {
-            id: ToolCallId::new("c"),
+            id: ToolCallId::new(id),
             name: Arc::from(name),
             args: RawValue::from_string(args.to_owned()).expect("valid JSON"),
         })
     }
 
-    #[test]
-    fn the_same_call_fingerprints_the_same_and_a_different_one_does_not() {
-        assert_eq!(
-            fingerprint(&call("shell", r#"{"command":"ls"}"#)),
-            fingerprint(&call("shell", r#"{"command":"ls"}"#))
-        );
-        // Arguments are part of it: a policy constrained on `arg_equals` would
-        // decide these two differently.
-        assert_ne!(
-            fingerprint(&call("shell", r#"{"command":"ls"}"#)),
-            fingerprint(&call("shell", r#"{"command":"rm"}"#))
-        );
-        assert_ne!(
-            fingerprint(&call("shell", "{}")),
-            fingerprint(&call("file", "{}"))
-        );
-        // A tool named to collide with the variant tag cannot forge another
-        // variant's fingerprint, because the tag is separated by a NUL the
-        // name cannot contain in any shipped tool and is hashed positionally.
-        assert_ne!(
-            fingerprint(&Plan::Handoff(AgentId::new("x"), None)),
-            fingerprint(&call("handoff", "\"x\""))
-        );
+    fn call(name: &str, args: &str) -> Plan {
+        call_with("c", name, args)
+    }
+
+    fn metadata(value: &str) -> BTreeMap<Arc<str>, Value> {
+        BTreeMap::from([(Arc::from("scope"), Value::String(value.to_owned()))])
+    }
+
+    fn child(agent: &str, policy: &str, value: &str) -> SubAgentSpec {
+        SubAgentSpec {
+            agent_id: AgentId::new(agent),
+            policy_id: Arc::from(policy),
+            metadata: metadata(value),
+        }
+    }
+
+    fn escalation() -> Plan {
+        Plan::Escalate(SubOrchSpec {
+            template: OrchestratorTemplate {
+                name: Arc::from("pipeline"),
+                stages: vec![Stage {
+                    name: Arc::from("review"),
+                    agent: child("reviewer", "restricted", "stage"),
+                    depends_on: vec![Arc::from("prepare")],
+                }],
+            },
+            task_id: TaskId::new("task-1"),
+            policy_id: Arc::from("pipeline-policy"),
+            metadata: metadata("escalate"),
+        })
+    }
+
+    fn resumed() -> Plan {
+        let mut state = RunState::new(RunId::new("child-run"), AgentId::new("worker"));
+        state.task_id = Some(TaskId::new("child-task"));
+        Plan::ResumeSubAgent {
+            spec: child("worker", "restricted", "resume"),
+            child_channel_id: ChannelId::new("subagent:worker"),
+            child_conversation_id: ConversationId::new("child.v1.identity"),
+            child_state: Box::new(state),
+        }
+    }
+
+    fn clone_plan(plan: &Plan) -> Plan {
+        serde_json::from_value(
+            serde_json::to_value(plan).expect("fixture plan serializes without loss"),
+        )
+        .expect("fixture plan round trips")
+    }
+
+    fn assert_substitutions_rejected(original: Plan, substitutions: Vec<(&str, Plan)>) {
+        let policy = Policy {
+            rules: Vec::new(),
+            default_decision: PolicyVerb::Allow,
+        };
+        let authorization = Authorization::allowed(&original);
+        assert_eq!(authorization.admits(&original, &policy), Ok(()));
+        for (field, substitution) in substitutions {
+            assert_eq!(
+                authorization.admits(&substitution, &policy),
+                Err(Unauthorized::PlanSubstituted),
+                "mutating {field} preserved the authorization commitment"
+            );
+        }
     }
 
     #[test]
-    fn a_swapped_plan_is_refused_even_though_the_policy_allows_it() {
-        // The substitution half. Both calls are allowed, so a re-check against
-        // the policy alone would pass this; the authorization was issued for
-        // one of them.
-        let policy = Policy::allow_tools(["shell", "file"]);
-        let authorization = Authorization::allowed(&call("shell", "{}"));
-        assert_eq!(authorization.admits(&call("shell", "{}"), &policy), Ok(()));
+    fn the_same_plan_commits_the_same_and_a_different_one_does_not() {
         assert_eq!(
-            authorization.admits(&call("file", "{}"), &policy),
-            Err(Unauthorized::PlanSubstituted)
+            commitment(&call("shell", r#"{"command":"ls"}"#)),
+            commitment(&call("shell", r#"{"command":"ls"}"#))
+        );
+        assert_ne!(
+            commitment(&call("shell", r#"{"command":"ls"}"#)),
+            commitment(&call("shell", r#"{"command":"rm"}"#))
+        );
+        assert_ne!(
+            commitment(&call("shell", "{}")),
+            commitment(&call("file", "{}"))
+        );
+        assert_ne!(
+            commitment(&Plan::Handoff(AgentId::new("x"), None)),
+            commitment(&call("handoff", "\"x\""))
+        );
+    }
+
+    /// AF-009: every field omitted by the old hand-maintained fingerprint is
+    /// independently changed while the original authorization is retained.
+    #[test]
+    fn mutating_any_plan_field_invalidates_authorization() {
+        assert_substitutions_rejected(
+            call_with("call-1", "shell", r#"{"command":"ls"}"#),
+            vec![
+                (
+                    "CallTool.id",
+                    call_with("call-2", "shell", r#"{"command":"ls"}"#),
+                ),
+                (
+                    "CallTool.name",
+                    call_with("call-1", "file", r#"{"command":"ls"}"#),
+                ),
+                (
+                    "CallTool.args",
+                    call_with("call-1", "shell", r#"{"command":"rm"}"#),
+                ),
+            ],
+        );
+
+        let delegate = Plan::Delegate(child("worker", "restricted", "one"));
+        let mut delegate_agent = clone_plan(&delegate);
+        let Plan::Delegate(spec) = &mut delegate_agent else {
+            unreachable!("fixture variant")
+        };
+        spec.agent_id = AgentId::new("other");
+        let mut delegate_policy = clone_plan(&delegate);
+        let Plan::Delegate(spec) = &mut delegate_policy else {
+            unreachable!("fixture variant")
+        };
+        spec.policy_id = Arc::from("other-policy");
+        let mut delegate_metadata = clone_plan(&delegate);
+        let Plan::Delegate(spec) = &mut delegate_metadata else {
+            unreachable!("fixture variant")
+        };
+        spec.metadata = metadata("two");
+        assert_substitutions_rejected(
+            delegate,
+            vec![
+                ("Delegate.agent_id", delegate_agent),
+                ("Delegate.policy_id", delegate_policy),
+                ("Delegate.metadata", delegate_metadata),
+            ],
+        );
+
+        assert_substitutions_rejected(
+            Plan::Handoff(AgentId::new("target"), Some(Value::from("payload"))),
+            vec![
+                (
+                    "Handoff.agent_id",
+                    Plan::Handoff(AgentId::new("other"), Some(Value::from("payload"))),
+                ),
+                (
+                    "Handoff.payload",
+                    Plan::Handoff(AgentId::new("target"), None),
+                ),
+            ],
+        );
+
+        let escalate = escalation();
+        let mut template_name = clone_plan(&escalate);
+        let Plan::Escalate(spec) = &mut template_name else {
+            unreachable!("fixture variant")
+        };
+        spec.template.name = Arc::from("other-pipeline");
+        let mut stages = clone_plan(&escalate);
+        let Plan::Escalate(spec) = &mut stages else {
+            unreachable!("fixture variant")
+        };
+        spec.template.stages[0].depends_on.push(Arc::from("extra"));
+        let mut task_id = clone_plan(&escalate);
+        let Plan::Escalate(spec) = &mut task_id else {
+            unreachable!("fixture variant")
+        };
+        spec.task_id = TaskId::new("task-2");
+        let mut policy_id = clone_plan(&escalate);
+        let Plan::Escalate(spec) = &mut policy_id else {
+            unreachable!("fixture variant")
+        };
+        spec.policy_id = Arc::from("other-policy");
+        let mut escalate_metadata = clone_plan(&escalate);
+        let Plan::Escalate(spec) = &mut escalate_metadata else {
+            unreachable!("fixture variant")
+        };
+        spec.metadata = metadata("other");
+        assert_substitutions_rejected(
+            escalate,
+            vec![
+                ("Escalate.template.name", template_name),
+                ("Escalate.template.stages", stages),
+                ("Escalate.task_id", task_id),
+                ("Escalate.policy_id", policy_id),
+                ("Escalate.metadata", escalate_metadata),
+            ],
+        );
+
+        let resume = resumed();
+        let mut resume_spec = clone_plan(&resume);
+        let Plan::ResumeSubAgent { spec, .. } = &mut resume_spec else {
+            unreachable!("fixture variant")
+        };
+        spec.metadata = metadata("other");
+        let mut resume_channel = clone_plan(&resume);
+        let Plan::ResumeSubAgent {
+            child_channel_id, ..
+        } = &mut resume_channel
+        else {
+            unreachable!("fixture variant")
+        };
+        *child_channel_id = ChannelId::new("subagent:other");
+        let mut resume_conversation = clone_plan(&resume);
+        let Plan::ResumeSubAgent {
+            child_conversation_id,
+            ..
+        } = &mut resume_conversation
+        else {
+            unreachable!("fixture variant")
+        };
+        *child_conversation_id = ConversationId::new("child.v1.other");
+        let mut resume_state = clone_plan(&resume);
+        let Plan::ResumeSubAgent { child_state, .. } = &mut resume_state else {
+            unreachable!("fixture variant")
+        };
+        child_state.run_id = RunId::new("other-run");
+        assert_substitutions_rejected(
+            resume,
+            vec![
+                ("ResumeSubAgent.spec", resume_spec),
+                ("ResumeSubAgent.child_channel_id", resume_channel),
+                ("ResumeSubAgent.child_conversation_id", resume_conversation),
+                ("ResumeSubAgent.child_state", resume_state),
+            ],
+        );
+
+        assert_substitutions_rejected(
+            Plan::Reply(Message::text(MessageRole::Assistant, "one")),
+            vec![(
+                "Reply.message",
+                Plan::Reply(Message::text(MessageRole::Assistant, "two")),
+            )],
+        );
+        assert_substitutions_rejected(
+            Plan::CallTools(vec![ToolCall {
+                id: ToolCallId::new("batch-1"),
+                name: Arc::from("shell"),
+                args: RawValue::from_string("{}".to_owned()).expect("valid JSON"),
+            }]),
+            vec![("CallTools.calls", Plan::CallTools(Vec::new()))],
         );
     }
 

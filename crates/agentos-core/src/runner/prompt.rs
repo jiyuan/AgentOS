@@ -29,10 +29,10 @@ use std::sync::Arc;
 pub fn approval_prompt_envelope(
     paused: &PausedRun,
     sender: Arc<str>,
-    ticket: &ApprovalTicket,
     expires_at: Option<u64>,
 ) -> Option<Envelope> {
     let approval = paused.state.pending_approval()?;
+    let ticket = ApprovalTicket::parse(&approval.approval_ticket)?;
     let mut metadata = BTreeMap::new();
     metadata.insert(Arc::from("kind"), Value::String(PROMPT_KIND.to_owned()));
     metadata.insert(
@@ -43,7 +43,7 @@ pub fn approval_prompt_envelope(
         Arc::from(TICKET_KEY),
         Value::String(ticket.as_str().to_owned()),
     );
-    metadata.insert(Arc::from(ACTIONS_KEY), prompt_actions(ticket));
+    metadata.insert(Arc::from(ACTIONS_KEY), prompt_actions(&ticket));
     if let Some(expires_at) = expires_at {
         metadata.insert(Arc::from(EXPIRES_AT_KEY), Value::from(expires_at));
     }

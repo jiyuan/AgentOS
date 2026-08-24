@@ -24,11 +24,12 @@
 //! conversation's inbox (roadmap G1), so talking past a pending approval is
 //! just talking.
 
-use agentos_proto::{Envelope, InterruptionId};
+use agentos_proto::{base64url, ActorPrincipal, ApprovalInstanceId, Envelope, InterruptionId};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, OnceLock};
+use thiserror::Error;
 
 /// Envelope metadata: the prompt's ticket, on the prompt and on any answer.
 pub const TICKET_KEY: &str = "approval_ticket";
@@ -91,27 +92,78 @@ impl ApprovalOutcome {
 /// Unique per prompt rather than per action — see the module docs. Short
 /// enough to fit a Telegram `callback_data` payload alongside a verb, and
 /// short enough that a user on a text-only channel can type it.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct ApprovalTicket(Arc<str>);
+
+/// Why a fresh approval capability could not be issued.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum TicketError {
+    /// The operating system could not provide the per-process CSPRNG nonce.
+    #[error("operating-system entropy unavailable")]
+    EntropyUnavailable,
+    /// Every counter value under this process nonce has been used.
+    #[error("approval ticket counter exhausted")]
+    CounterExhausted,
+}
+
+trait NonceSource: Send + Sync {
+    fn fill(&self, nonce: &mut [u8; 16]) -> Result<(), TicketError>;
+}
+
+struct OsNonceSource;
+
+impl NonceSource for OsNonceSource {
+    fn fill(&self, nonce: &mut [u8; 16]) -> Result<(), TicketError> {
+        getrandom::fill(nonce).map_err(|_| TicketError::EntropyUnavailable)
+    }
+}
+
+struct TicketIssuer {
+    prefix: Arc<str>,
+    next: AtomicU64,
+}
+
+impl TicketIssuer {
+    fn initialize(source: &dyn NonceSource) -> Result<Self, TicketError> {
+        let mut nonce = [0_u8; 16];
+        source.fill(&mut nonce)?;
+        Ok(Self {
+            // `a1` is a format/version marker. The nonce is unpadded
+            // base64url (22 bytes), leaving ample room for the counter and a
+            // channel verb inside Telegram's 64-byte callback ceiling.
+            prefix: Arc::from(format!("a1{}", base64url(&nonce))),
+            next: AtomicU64::new(0),
+        })
+    }
+
+    fn mint(&self) -> Result<ApprovalTicket, TicketError> {
+        let counter = self
+            .next
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| TicketError::CounterExhausted)?;
+        Ok(ApprovalTicket(Arc::from(format!(
+            "{}{}",
+            self.prefix,
+            base36(counter)
+        ))))
+    }
+}
 
 impl ApprovalTicket {
     /// Mint a ticket for a new prompt.
     ///
-    /// Seeded from the wall clock so tickets do not restart at the same value
-    /// after a process restart: a button pressed from before a restart should
-    /// look stale, not land on whatever prompt now holds that number.
-    pub fn mint() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let seeded = NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            Some(if current == 0 { seed() } else { current + 1 })
-        });
-        let value = match seeded {
-            Ok(0) => seed(),
-            Ok(previous) => previous + 1,
-            // `fetch_update` with an always-`Some` closure cannot fail.
-            Err(previous) => previous,
-        };
-        Self(Arc::from(base36(value)))
+    /// A 128-bit OS-CSPRNG nonce is generated exactly once for the process;
+    /// each asking then claims one checked counter value beneath it.
+    pub fn mint() -> Result<Self, TicketError> {
+        static ISSUER: OnceLock<Result<TicketIssuer, TicketError>> = OnceLock::new();
+        ISSUER
+            .get_or_init(|| TicketIssuer::initialize(&OsNonceSource))
+            .as_ref()
+            .map_err(Clone::clone)?
+            .mint()
     }
 
     /// Read a ticket someone sent back. Rejects anything that is not the
@@ -120,12 +172,14 @@ impl ApprovalTicket {
     pub fn parse(input: &str) -> Option<Self> {
         let trimmed = input.trim();
         if trimmed.is_empty()
-            || trimmed.len() > 32
-            || !trimmed.bytes().all(|b| b.is_ascii_alphanumeric())
+            || trimmed.len() > 40
+            || !trimmed
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
         {
             return None;
         }
-        Some(Self(Arc::from(trimmed.to_ascii_lowercase())))
+        Some(Self(Arc::from(trimmed)))
     }
 
     pub fn as_str(&self) -> &str {
@@ -137,16 +191,6 @@ impl std::fmt::Display for ApprovalTicket {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
-}
-
-fn seed() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|since| since.as_micros() as u64)
-        // A clock before the epoch is not worth failing a run over; any
-        // non-zero start is fine because uniqueness only has to hold among
-        // prompts that are alive at the same time.
-        .unwrap_or(1)
 }
 
 fn base36(mut value: u64) -> String {
@@ -167,10 +211,7 @@ fn base36(mut value: u64) -> String {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Routed {
     /// Names the pending prompt and decides it.
-    Decides {
-        outcome: ApprovalOutcome,
-        reason: Option<Arc<str>>,
-    },
+    Decides { witness: ResumeWitness },
     /// Names a prompt that is not the pending one: a button from an asking
     /// that has already been answered or has expired. It decides nothing, and
     /// it is not conversation input either — the sender pressed a control, not
@@ -196,36 +237,148 @@ pub enum Routed {
 /// to say *whose*.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApprovalBinding {
+    pub approval_instance_id: ApprovalInstanceId,
     pub ticket: ApprovalTicket,
-    /// The sender the prompt was put to: whoever sent the message that caused
-    /// the run to pause.
-    pub asked_of: Arc<str>,
-    /// Senders who may answer any prompt in this deployment, from
+    pub interruption_id: InterruptionId,
+    /// The actor the prompt was put to: whoever sent the message that caused
+    /// the run to pause, fully qualified by agent/channel/conversation.
+    pub prompting_principal: ActorPrincipal,
+    pub expires_at: Option<u64>,
+    /// Principals who may answer matching prompts, from
     /// `[policy] approval_administrators`. Empty in the usual case.
-    pub administrators: Vec<Arc<str>>,
+    pub administrators: Vec<ActorPrincipal>,
 }
 
 impl ApprovalBinding {
-    pub fn new(ticket: ApprovalTicket, asked_of: impl Into<Arc<str>>) -> Self {
-        Self {
-            ticket,
-            asked_of: asked_of.into(),
-            administrators: Vec::new(),
+    pub fn new(
+        approval_instance_id: ApprovalInstanceId,
+        ticket: ApprovalTicket,
+        interruption_id: InterruptionId,
+        prompting_principal: ActorPrincipal,
+        expires_at: Option<u64>,
+    ) -> Option<Self> {
+        // One-to-one, deliberately simple: the instance identifier is the
+        // ticket text under a distinct type. A persisted record where they
+        // differ is corrupt rather than something routing may guess at.
+        if approval_instance_id.as_str() != ticket.as_str() {
+            return None;
         }
+        Some(Self {
+            approval_instance_id,
+            ticket,
+            interruption_id,
+            prompting_principal,
+            expires_at,
+            administrators: Vec::new(),
+        })
     }
 
-    pub fn with_administrators(mut self, administrators: Vec<Arc<str>>) -> Self {
+    pub fn with_administrators(mut self, administrators: Vec<ActorPrincipal>) -> Self {
         self.administrators = administrators;
         self
     }
 
-    /// Whether `sender` may answer this prompt.
-    fn answerable_by(&self, sender: &str) -> bool {
-        self.asked_of.as_ref() == sender
-            || self
-                .administrators
-                .iter()
-                .any(|admin| admin.as_ref() == sender)
+    /// Whether this exact actor may answer this prompt.
+    fn answerable_by(&self, actor: &ActorPrincipal) -> bool {
+        &self.prompting_principal == actor || self.administrators.iter().any(|admin| admin == actor)
+    }
+
+    /// Create the opaque witness for expiry or a non-interactive run. The
+    /// caller states who resolved it even when that actor is the runtime
+    /// itself, so audit never falls back to an unqualified conversation.
+    pub fn unanswered_witness(
+        &self,
+        resolver_principal: ActorPrincipal,
+        outcome: ApprovalOutcome,
+        reason: Arc<str>,
+    ) -> Option<ResumeWitness> {
+        if !matches!(
+            outcome,
+            ApprovalOutcome::Cancelled | ApprovalOutcome::Unavailable
+        ) {
+            return None;
+        }
+        Some(self.witness(resolver_principal, outcome, Some(reason)))
+    }
+
+    fn witness(
+        &self,
+        resolver_principal: ActorPrincipal,
+        outcome: ApprovalOutcome,
+        reason: Option<Arc<str>>,
+    ) -> ResumeWitness {
+        ResumeWitness {
+            approval_instance_id: self.approval_instance_id.clone(),
+            ticket: self.ticket.clone(),
+            interruption_id: self.interruption_id.clone(),
+            prompting_principal: self.prompting_principal.clone(),
+            resolver_principal,
+            expires_at: self.expires_at,
+            outcome,
+            reason,
+        }
+    }
+}
+
+/// Opaque authority to resolve exactly one pending approval instance.
+///
+/// Its fields are private and it can only be minted by actor-qualified routing
+/// or by [`ApprovalBinding::unanswered_witness`]. Possessing an interruption
+/// id and a decision is therefore insufficient to reach the public resume API.
+///
+/// ```compile_fail
+/// use agentos_core::r#loop::{ApprovalOutcome, ApprovalTicket, ResumeWitness};
+/// use agentos_proto::{ActorPrincipal, ApprovalInstanceId, InterruptionId};
+/// # fn cannot_fabricate(
+/// #     actor: ActorPrincipal,
+/// #     ticket: ApprovalTicket,
+/// # ) {
+/// let _ = ResumeWitness {
+///     approval_instance_id: ApprovalInstanceId::new("instance"),
+///     ticket,
+///     interruption_id: InterruptionId::new("interruption"),
+///     prompting_principal: actor.clone(),
+///     resolver_principal: actor,
+///     expires_at: None,
+///     outcome: ApprovalOutcome::Approved,
+///     reason: None,
+/// };
+/// # }
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResumeWitness {
+    pub(crate) approval_instance_id: ApprovalInstanceId,
+    pub(crate) ticket: ApprovalTicket,
+    pub(crate) interruption_id: InterruptionId,
+    pub(crate) prompting_principal: ActorPrincipal,
+    pub(crate) resolver_principal: ActorPrincipal,
+    pub(crate) expires_at: Option<u64>,
+    pub(crate) outcome: ApprovalOutcome,
+    pub(crate) reason: Option<Arc<str>>,
+}
+
+impl ResumeWitness {
+    pub fn outcome(&self) -> ApprovalOutcome {
+        self.outcome
+    }
+
+    pub(crate) fn approved_internal(
+        interruption: &agentos_interfaces::run_state::Interruption,
+    ) -> Option<Self> {
+        let ticket = ApprovalTicket::parse(&interruption.approval_ticket)?;
+        if ticket.as_str() != interruption.approval_instance_id.as_str() {
+            return None;
+        }
+        Some(Self {
+            approval_instance_id: interruption.approval_instance_id.clone(),
+            ticket,
+            interruption_id: interruption.id.clone(),
+            prompting_principal: interruption.prompting_principal.clone(),
+            resolver_principal: interruption.resolver_principal.clone()?,
+            expires_at: None,
+            outcome: ApprovalOutcome::Approved,
+            reason: None,
+        })
     }
 }
 
@@ -246,7 +399,14 @@ pub fn route(pending: Option<&ApprovalBinding>, envelope: &Envelope) -> Routed {
     let Some(pending) = pending.filter(|pending| pending.ticket == ticket) else {
         return Routed::Stale { ticket };
     };
-    if !pending.answerable_by(&envelope.sender) {
+    let prompting = pending.prompting_principal.as_principal();
+    let resolver = ActorPrincipal::new(
+        prompting.agent.clone(),
+        envelope.channel_id.clone(),
+        envelope.conversation_id.clone(),
+        Arc::clone(&envelope.sender),
+    );
+    if !pending.answerable_by(&resolver) {
         return Routed::NotYours { ticket };
     }
     let outcome = if decision == APPROVE {
@@ -254,7 +414,9 @@ pub fn route(pending: Option<&ApprovalBinding>, envelope: &Envelope) -> Routed {
     } else {
         ApprovalOutcome::Rejected
     };
-    Routed::Decides { outcome, reason }
+    Routed::Decides {
+        witness: pending.witness(resolver, outcome, reason),
+    }
 }
 
 /// Extract `(ticket, verb, reason)` from an envelope, from its metadata if a
@@ -349,8 +511,10 @@ pub fn prompt_interruption(envelope: &Envelope) -> Option<InterruptionId> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentos_proto::{ChannelId, ConversationId, Message, MessageRole};
+    use agentos_proto::{AgentId, ChannelId, ConversationId, Message, MessageRole};
     use std::collections::BTreeMap;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Barrier;
 
     /// The sender every envelope in these tests carries.
     const SENDER: &str = "user";
@@ -358,7 +522,30 @@ mod tests {
     /// A prompt put to that sender, so these tests exercise ticket routing
     /// rather than the sender check — which has its own tests below.
     fn pending_for(ticket_value: &str) -> ApprovalBinding {
-        ApprovalBinding::new(ticket(ticket_value), SENDER)
+        ApprovalBinding::new(
+            ApprovalInstanceId::new(ticket_value),
+            ticket(ticket_value),
+            InterruptionId::new("approval-action"),
+            actor(SENDER, "test"),
+            None,
+        )
+        .expect("instance and ticket match")
+    }
+
+    fn actor(sender: &str, channel: &str) -> ActorPrincipal {
+        ActorPrincipal::new(
+            AgentId::new("agent"),
+            ChannelId::new(channel),
+            ConversationId::new("conv"),
+            sender,
+        )
+    }
+
+    fn decided(routed: Routed) -> (ApprovalOutcome, Option<Arc<str>>) {
+        match routed {
+            Routed::Decides { witness } => (witness.outcome, witness.reason),
+            other => panic!("expected decision, got {other:?}"),
+        }
     }
 
     fn text(content: &str) -> Envelope {
@@ -404,18 +591,12 @@ mod tests {
     fn a_slash_command_naming_the_pending_ticket_decides_it() {
         let pending = pending_for("k3f");
         assert_eq!(
-            route(Some(&pending), &text("/approve k3f")),
-            Routed::Decides {
-                outcome: ApprovalOutcome::Approved,
-                reason: None
-            }
+            decided(route(Some(&pending), &text("/approve k3f"))),
+            (ApprovalOutcome::Approved, None)
         );
         assert_eq!(
-            route(Some(&pending), &text("/deny k3f too risky")),
-            Routed::Decides {
-                outcome: ApprovalOutcome::Rejected,
-                reason: Some(Arc::from("too risky")),
-            }
+            decided(route(Some(&pending), &text("/deny k3f too risky"))),
+            (ApprovalOutcome::Rejected, Some(Arc::from("too risky")))
         );
     }
 
@@ -444,11 +625,8 @@ mod tests {
     fn an_unreadable_verb_fails_closed() {
         let pending = pending_for("k3f");
         assert_eq!(
-            route(Some(&pending), &pressed("k3f", "aprove")),
-            Routed::Decides {
-                outcome: ApprovalOutcome::Rejected,
-                reason: None
-            }
+            decided(route(Some(&pending), &pressed("k3f", "aprove"))),
+            (ApprovalOutcome::Rejected, None)
         );
     }
 
@@ -505,34 +683,42 @@ mod tests {
     #[test]
     fn the_sender_who_was_asked_still_decides() {
         let pending = pending_for("k3f");
-        assert!(matches!(
-            route(Some(&pending), &text("/approve k3f")),
-            Routed::Decides {
-                outcome: ApprovalOutcome::Approved,
-                ..
-            }
-        ));
+        assert_eq!(
+            decided(route(Some(&pending), &text("/approve k3f"))).0,
+            ApprovalOutcome::Approved
+        );
     }
 
     /// The named exception. An administrator can unblock someone else's
     /// prompt — deliberately configured, never the default.
     #[test]
     fn a_configured_administrator_may_answer_for_someone_else() {
-        let pending =
-            pending_for("k3f").with_administrators(vec![Arc::from("ops"), Arc::from("oncall")]);
+        let pending = pending_for("k3f")
+            .with_administrators(vec![actor("ops", "test"), actor("oncall", "test")]);
         let answer = from_sender(text("/approve k3f"), "oncall");
 
-        assert!(matches!(
-            route(Some(&pending), &answer),
-            Routed::Decides {
-                outcome: ApprovalOutcome::Approved,
-                ..
-            }
-        ));
+        assert_eq!(
+            decided(route(Some(&pending), &answer)).0,
+            ApprovalOutcome::Approved
+        );
         // And someone who is not on that list still cannot.
         let intruder = from_sender(text("/approve k3f"), "someone-else");
         assert_eq!(
             route(Some(&pending), &intruder),
+            Routed::NotYours {
+                ticket: ticket("k3f")
+            }
+        );
+    }
+
+    #[test]
+    fn an_administrator_identity_does_not_cross_channels() {
+        let pending = pending_for("k3f").with_administrators(vec![actor("oncall", "telegram")]);
+        let mut answer = from_sender(text("/approve k3f"), "oncall");
+        answer.channel_id = ChannelId::new("feishu");
+
+        assert_eq!(
+            route(Some(&pending), &answer),
             Routed::NotYours {
                 ticket: ticket("k3f")
             }
@@ -568,7 +754,9 @@ mod tests {
     /// Two prompts for the same action must not share a name.
     #[test]
     fn minted_tickets_are_unique() {
-        let minted: Vec<_> = (0..64).map(|_| ApprovalTicket::mint()).collect();
+        let minted: Vec<_> = (0..64)
+            .map(|_| ApprovalTicket::mint().expect("OS entropy is available"))
+            .collect();
         let mut seen = std::collections::BTreeSet::new();
         for ticket in &minted {
             assert!(seen.insert(ticket.as_str().to_owned()), "{ticket} repeated");
@@ -579,7 +767,7 @@ mod tests {
     /// Round-trip: what a channel renders is what it can read back.
     #[test]
     fn action_payloads_round_trip_within_telegrams_limit() {
-        let ticket = ApprovalTicket::mint();
+        let ticket = ApprovalTicket::mint().expect("OS entropy is available");
         let actions = prompt_actions(&ticket);
         let entries = actions.as_array().expect("an array of buttons");
         assert_eq!(entries.len(), 2);
@@ -588,6 +776,79 @@ mod tests {
             assert!(data.len() <= 64, "callback_data must fit Telegram's limit");
             assert_eq!(parse_action_data(data), Some((expected, ticket.clone())));
         }
+    }
+
+    struct FixedNonce {
+        calls: AtomicUsize,
+    }
+
+    impl NonceSource for FixedNonce {
+        fn fill(&self, nonce: &mut [u8; 16]) -> Result<(), TicketError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            *nonce = [7; 16];
+            Ok(())
+        }
+    }
+
+    #[test]
+    /// AF-011: concurrent first use shares one process nonce and cannot issue
+    /// duplicate prompt identities.
+    fn synchronized_prompts_receive_distinct_ids() {
+        let source = Arc::new(FixedNonce {
+            calls: AtomicUsize::new(0),
+        });
+        let issuer = Arc::new(OnceLock::<Result<TicketIssuer, TicketError>>::new());
+        let barrier = Arc::new(Barrier::new(16));
+        let mut threads = Vec::new();
+        for _ in 0..16 {
+            let source = Arc::clone(&source);
+            let issuer = Arc::clone(&issuer);
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                issuer
+                    .get_or_init(|| TicketIssuer::initialize(source.as_ref()))
+                    .as_ref()
+                    .expect("fixed nonce succeeds")
+                    .mint()
+                    .expect("counter has capacity")
+            }));
+        }
+        let tickets: std::collections::BTreeSet<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("issuer thread").to_string())
+            .collect();
+        assert_eq!(tickets.len(), 16);
+        assert_eq!(source.calls.load(Ordering::Relaxed), 1);
+    }
+
+    struct FailedNonce;
+
+    impl NonceSource for FailedNonce {
+        fn fill(&self, _nonce: &mut [u8; 16]) -> Result<(), TicketError> {
+            Err(TicketError::EntropyUnavailable)
+        }
+    }
+
+    #[test]
+    fn entropy_failure_and_counter_exhaustion_fail_closed() {
+        assert_eq!(
+            TicketIssuer::initialize(&FailedNonce).err(),
+            Some(TicketError::EntropyUnavailable)
+        );
+        let issuer = TicketIssuer {
+            prefix: Arc::from("a1fixed"),
+            next: AtomicU64::new(u64::MAX),
+        };
+        assert_eq!(issuer.mint(), Err(TicketError::CounterExhausted));
+    }
+
+    #[test]
+    fn ticket_serialization_round_trips_without_case_folding() {
+        let ticket = ApprovalTicket::mint().expect("OS entropy is available");
+        let json = serde_json::to_string(&ticket).expect("ticket serializes");
+        let restored: ApprovalTicket = serde_json::from_str(&json).expect("ticket deserializes");
+        assert_eq!(restored, ticket);
     }
 
     #[test]

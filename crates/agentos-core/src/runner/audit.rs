@@ -7,7 +7,7 @@
 
 use super::RunError;
 use crate::audit::{SafetyEvent, SafetyEventKind, SafetyJournal, SafetyOutcome};
-use agentos_proto::InterruptionId;
+use crate::r#loop::ResumeWitness;
 use std::sync::Arc;
 
 /// Record how a pause ended.
@@ -19,7 +19,7 @@ pub(super) fn record_resolution(
     audit: &SafetyJournal<'_>,
     outcome: SafetyOutcome,
     subject: &Arc<str>,
-    approval_id: &InterruptionId,
+    witness: &ResumeWitness,
     reason: Option<&str>,
 ) {
     let mut event = SafetyEvent::new(
@@ -27,7 +27,12 @@ pub(super) fn record_resolution(
         outcome,
         Arc::clone(subject),
     )
-    .with_interruption(approval_id.clone());
+    .with_interruption(witness.interruption_id.clone())
+    .with_approval_instance(witness.approval_instance_id.clone())
+    .with_approval_actors(
+        witness.prompting_principal.clone().into_principal(),
+        Some(witness.resolver_principal.clone().into_principal()),
+    );
     if let Some(reason) = reason {
         event = event.with_detail(reason);
     }

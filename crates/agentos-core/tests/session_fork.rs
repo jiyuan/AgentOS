@@ -517,7 +517,7 @@ async fn delegate_with_seeding(seed_from_parent: bool) -> (Arc<InMemorySession>,
         cancel: Default::default(),
         steering: None,
         safety_log: None,
-        granted_authority: &[],
+        delegated_authority: None,
     };
 
     let outcome = run_envelope(
