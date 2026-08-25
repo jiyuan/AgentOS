@@ -77,7 +77,7 @@ fn bench_reply_turn(c: &mut Criterion) {
                 cancel: Default::default(),
                 steering: None,
                 audit: SafetyJournal::detached(),
-                granted_authority: &[],
+                delegated_authority: None,
             };
             black_box(runtime.block_on(drive_to_finish(&deps)));
         });

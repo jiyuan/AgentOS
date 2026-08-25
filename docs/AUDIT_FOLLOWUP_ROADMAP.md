@@ -2,7 +2,7 @@
 
 Drafted: 2026-08-23
 
-Status: **R0 implemented; R1 underway with `ID-003`, `AUTH-003`, `AUTH-004`, and `AUTH-005` complete**
+Status: **R0 implemented; R1 underway with `ID-003`, `AUTH-003`, `AUTH-004`, `AUTH-005`, and `AUD-002` complete**
 
 Baseline: branch `docs/audit-remediation-plan`, commit `d4b2e94`
 
@@ -820,7 +820,7 @@ ID sequence, and complete-row artifact resolution.
 | `AF-013` | Bare administrator sender IDs can cross channel namespaces | P1 | `AUTH-003` | Telegram/Feishu selector and migration test | `crates/agentos-core/tests/channel_admin_identity.rs::same_sender_id_on_two_channels_is_not_one_administrator` | `portable` | Complete |
 | `AF-014` | Delegation grants are not actor-bound or mandatorily expiring | P1 | `AUTH-004` | Actor/channel/agent/expiry/non-transitive matrix | `crates/agentos-core/tests/delegation_grants.rs::grant_is_actor_bound_expiring_and_non_transitive` | `portable` | Complete |
 | `AF-015` | Approval resolution audit omits the resolver | P1 | `AUTH-003` | Requested/resolved actor correlation | `crates/agentos-core/tests/safety_events.rs::approval_resolution_records_requester_and_resolver` | `portable` | Complete |
-| `AF-016` | Best-effort journal writes can leave required safety evidence absent | P1 | `AUD-002` | Approval/grant/denial/refusal append failpoints | `crates/agentos-core/tests/audit_failpoints.rs::required_safety_event_failure_aborts_the_action` | `portable` | Open |
+| `AF-016` | Best-effort journal writes can leave required safety evidence absent | P1 | `AUD-002` | Approval/grant/denial/refusal append failpoints | `crates/agentos-core/tests/audit_failpoints.rs::required_safety_event_failure_aborts_the_action` | `portable` | Complete |
 | `AF-017` | Failed/retried provider calls lose attempt manifests | P1 | `REQ-002` | Failure/retry/compaction/cancellation goldens | `crates/agentos-core/tests/request_attempts.rs::every_failed_retried_or_cancelled_attempt_is_durable` | `portable` | Open |
 | `AF-018` | Task/attachment writes and skill traversal bypass rooted I/O | P1 | `FS-002`, `FS-003` | Symlink/race/main-min/outside-canary matrix | `crates/agentos-core/tests/rooted_io.rs::all_model_selected_paths_refuse_symlink_escape_and_swap` | `native-linux+macos` | Open |
 | `AF-019` | Task/session modes rely on umask; fsync errors are ignored | P2 | `FS-002`, `FS-003` | Mode and injected-fsync tests | `crates/agentos-core/tests/state_durability.rs::fsync_failure_aborts_state_commit` | `native-linux+macos` | Open |

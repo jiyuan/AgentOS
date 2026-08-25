@@ -116,15 +116,19 @@ pub(super) async fn execute_delegate(
     // Recorded by the parent, because the parent is the principal the
     // elevation was made against (M6 / `AUD-001`).
     for grant in invocation.grants_relied_on() {
-        deps.audit.record(
-            SafetyEvent::new(
-                SafetyEventKind::DelegationGrantIssued,
-                SafetyOutcome::Issued,
-                spec.agent_id.as_str(),
+        deps.audit
+            .record(
+                SafetyEvent::new(
+                    SafetyEventKind::DelegationGrantIssued,
+                    SafetyOutcome::Issued,
+                    spec.agent_id.as_str(),
+                )
+                .with_detail(grant.reason())
+                .with_delegation_grant(Arc::from(grant.id())),
             )
-            .with_detail(grant.reason())
-            .with_delegation_grant(Arc::from(grant.id())),
-        );
+            .map_err(|source| {
+                RunError::safety_evidence(SafetyEventKind::DelegationGrantIssued, source)
+            })?;
     }
     record_telemetry_event(
         state,

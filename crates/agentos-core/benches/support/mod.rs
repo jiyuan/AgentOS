@@ -155,7 +155,7 @@ pub fn make_deps<'a>(
             .with_sender("bench-user"),
             RunId::new("bench-run"),
         ),
-        granted_authority: &[],
+        delegated_authority: None,
     }
 }
 

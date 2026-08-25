@@ -6,7 +6,7 @@
 //! `RunState.usage` plus the `llm_token_usage` trace event.
 
 use super::telemetry::field_key;
-use super::{FinalOutput, LoopDeps};
+use super::{FinalOutput, LoopDeps, StepFailure};
 use crate::trace;
 use agentos_interfaces::run_state::RunState;
 use agentos_proto::{Message, MessageRole, SpanId, SpanKind, Usage};
@@ -63,15 +63,15 @@ fn budget_exhausted_message(state: &RunState, max_turns: usize) -> Message {
 }
 
 /// Finish a run that exhausted its turn budget. Records a `run_truncated`
-/// trace span/event and runs output guardrails best-effort: the run *must*
-/// terminate here, so a tripped guardrail (or guardrail backend error)
-/// downgrades to a neutral completion notice instead of re-raising — which
-/// would resurrect the hard-failure path this safeguard exists to remove.
+/// trace span/event and runs output guardrails. A tripped guardrail (or
+/// guardrail backend error) downgrades to a neutral completion notice. The
+/// trip's required safety event is not best-effort: if it cannot be persisted,
+/// `AUD-002` stops the run with a typed evidence failure.
 pub(super) async fn budget_exhausted_finish(
     mut state: RunState,
     turns: usize,
     deps: &LoopDeps<'_>,
-) -> FinalOutput {
+) -> Result<FinalOutput, StepFailure> {
     let parent_id = trace::run_span_id(&state);
     let mut fields = BTreeMap::new();
     fields.insert(field_key("turns"), Value::from(turns as u64));
@@ -104,8 +104,11 @@ pub(super) async fn budget_exhausted_finish(
          output here. Please retry with a narrower request.",
         deps.max_turns
     );
-    let message = super::output::gated(&state, deps, message, &fallback).await;
-    FinalOutput { state, message }
+    let message = match super::output::gated(&state, deps, message, &fallback).await {
+        Ok(message) => message,
+        Err(error) => return Err(StepFailure::new(state, error)),
+    };
+    Ok(FinalOutput { state, message })
 }
 
 pub(super) fn record_llm_usage(

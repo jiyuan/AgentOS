@@ -143,7 +143,7 @@ fn purge_one_conversation(
     let removed = store
         .purge_session(&principal)
         .map_err(|err| format!("failed to purge '{conversation}': {err}"))?;
-    record_session_purge(store, &principal, removed, "an operator");
+    record_session_purge(store, &principal, removed, "an operator")?;
     println!("purged {removed} item(s) from {channel} conversation '{conversation}'");
     Ok(())
 }
@@ -228,7 +228,7 @@ fn purge_idle_sessions(
             principal,
             removed,
             &format!("an operator, idle before {before}"),
-        );
+        )?;
         removed_total += removed;
     }
     println!(
@@ -295,17 +295,24 @@ fn purge_audit(
 
 /// The one deletion the runtime performs on purpose, so the one that most
 /// needs a record that it happened (M6 / `AUD-001`).
-fn record_session_purge(store: &SqliteStore, principal: &Principal, removed: usize, by: &str) {
-    SafetyJournal::new(Some(store)).record(
-        SafetyEvent::new(
-            SafetyEventKind::SessionPurged,
-            SafetyOutcome::Purged,
-            principal.conversation_name(),
+fn record_session_purge(
+    store: &SqliteStore,
+    principal: &Principal,
+    removed: usize,
+    by: &str,
+) -> Result<(), String> {
+    SafetyJournal::new(Some(store))
+        .record(
+            SafetyEvent::new(
+                SafetyEventKind::SessionPurged,
+                SafetyOutcome::Purged,
+                principal.conversation_name(),
+            )
+            // The principal is on the event as a `Principal` too; the subject
+            // carries its name so a reader grepping for a conversation finds the
+            // purge without decoding anything.
+            .with_principal(principal.clone().without_sender())
+            .with_detail(format!("{removed} session items deleted by {by}")),
         )
-        // The principal is on the event as a `Principal` too; the subject
-        // carries its name so a reader grepping for a conversation finds the
-        // purge without decoding anything.
-        .with_principal(principal.clone().without_sender())
-        .with_detail(format!("{removed} session items deleted by {by}")),
-    );
+        .map_err(|err| format!("session was purged but its safety event failed: {err}"))
 }

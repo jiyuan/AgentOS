@@ -38,7 +38,7 @@
 //! out.
 
 use super::telemetry::field_key;
-use super::{FinalOutput, LoopDeps};
+use super::{FinalOutput, LoopDeps, RunError, StepFailure};
 use crate::audit::{SafetyEventKind, SafetyOutcome};
 use crate::trace;
 use agentos_interfaces::run_state::RunState;
@@ -88,7 +88,7 @@ pub(super) async fn cancelled_finish(
     mut state: RunState,
     deps: &LoopDeps<'_>,
     at: &'static str,
-) -> FinalOutput {
+) -> Result<FinalOutput, StepFailure> {
     let parent_id = trace::run_span_id(&state);
     let mut fields = BTreeMap::new();
     fields.insert(field_key("reason"), Value::from(at));
@@ -110,21 +110,30 @@ pub(super) async fn cancelled_finish(
     // was authorised for did not happen, and "the tool never ran" and "the
     // tool ran and the answer was dropped" are different facts. `at` says
     // which await lost the race, which is the part that decides that.
-    deps.audit.record_reason(
+    if let Err(source) = deps.audit.record_reason(
         SafetyEventKind::Cancellation,
         SafetyOutcome::Stopped,
         state.active_agent.as_str(),
         at,
-    );
+    ) {
+        return Err(StepFailure::new(
+            state,
+            RunError::safety_evidence(SafetyEventKind::Cancellation, source),
+        ));
+    }
 
-    let message = super::output::gated(
+    let message = match super::output::gated(
         &state,
         deps,
         Message::text(MessageRole::Assistant, CANCELLED_NOTICE),
         WITHHELD_NOTICE,
     )
-    .await;
-    FinalOutput { state, message }
+    .await
+    {
+        Ok(message) => message,
+        Err(error) => return Err(StepFailure::new(state, error)),
+    };
+    Ok(FinalOutput { state, message })
 }
 
 #[cfg(test)]

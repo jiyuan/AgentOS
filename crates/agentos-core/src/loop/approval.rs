@@ -1,12 +1,15 @@
 use crate::approve::{tool_call_approval_id, PolicyDecision};
-use crate::audit::{ArgumentDigest, SafetyEvent, SafetyEventKind, SafetyOutcome};
+use crate::audit::{ArgumentDigest, SafetyEvent, SafetyEventKind, SafetyLogError, SafetyOutcome};
 use agentos_interfaces::orchestrator::{Plan, SubOrchSpec};
 use agentos_interfaces::run_state::{Interruption, InterruptionAction, RunState};
 use agentos_proto::{ApprovalInstanceId, InterruptionId, ToolCall};
 use std::sync::Arc;
 
-use super::ApprovalTicket;
-use super::{plan_subject, ApproveCtx, LoopDeps};
+use super::authorization::AuthorizedPlan;
+use super::{
+    delegation_grant, plan_subject, ActCtx, ApprovalTicket, ApproveCtx, LoopDeps, RunError,
+    RunLoopState, StepFailure,
+};
 
 pub(super) enum ApproveTransition {
     Allow {
@@ -39,6 +42,11 @@ pub(super) enum ApproveTransition {
         state: RunState,
         reason: Arc<str>,
     },
+    EvidenceFailure {
+        state: RunState,
+        kind: SafetyEventKind,
+        source: SafetyLogError,
+    },
 }
 
 pub(super) fn approve_transition(ctx: ApproveCtx, deps: &LoopDeps<'_>) -> ApproveTransition {
@@ -62,6 +70,109 @@ pub(super) fn approve_transition(ctx: ApproveCtx, deps: &LoopDeps<'_>) -> Approv
             },
         },
         PolicyDecision::AskUser { reason } => pause_for_approval(ctx, deps, reason),
+    }
+}
+
+/// Decide one planned action and construct only the next state that decision
+/// permits. Required evidence is persisted before a pause, denial recovery,
+/// or delegated elevation can cross this boundary.
+pub(super) async fn approve(
+    ctx: ApproveCtx,
+    deps: &LoopDeps<'_>,
+) -> Result<RunLoopState, StepFailure> {
+    match approve_transition(ctx, deps) {
+        ApproveTransition::Allow { state, plan, turns } => {
+            if let Err(failure) = delegation_grant::validate(&plan, deps) {
+                match failure {
+                    delegation_grant::ValidationError::Denied(reason) => {
+                        let subject = plan_subject(&plan);
+                        if let Plan::CallTool(call) = plan {
+                            return Ok(RunLoopState::Act(ActCtx {
+                                authorized_plan: AuthorizedPlan::denied_tool(
+                                    Plan::CallTool(call),
+                                    reason,
+                                ),
+                                state,
+                                turns,
+                            }));
+                        }
+                        return Err(StepFailure::new(
+                            state,
+                            RunError::StructuralDenial { subject, reason },
+                        ));
+                    }
+                    delegation_grant::ValidationError::Evidence(error) => {
+                        return Err(StepFailure::new(state, error));
+                    }
+                }
+            }
+            Ok(RunLoopState::Act(ActCtx {
+                authorized_plan: AuthorizedPlan::allowed(plan),
+                state,
+                turns,
+            }))
+        }
+        ApproveTransition::DenyTool {
+            state,
+            call,
+            reason,
+            turns,
+        } => {
+            if let Err(source) = deps.audit.record(
+                SafetyEvent::new(
+                    SafetyEventKind::PolicyDenial,
+                    SafetyOutcome::Denied,
+                    Arc::clone(&call.name),
+                )
+                .with_detail(reason.as_ref())
+                .with_digest(ArgumentDigest::of(call.args.get().as_bytes())),
+            ) {
+                return Err(StepFailure::new(
+                    state,
+                    RunError::safety_evidence(SafetyEventKind::PolicyDenial, source),
+                ));
+            }
+            let plan = Plan::CallTool(call);
+            Ok(RunLoopState::Act(ActCtx {
+                authorized_plan: AuthorizedPlan::denied_tool(plan, reason),
+                state,
+                turns,
+            }))
+        }
+        ApproveTransition::Deny {
+            state,
+            subject,
+            reason,
+        } => {
+            if let Err(source) = deps.audit.record_reason(
+                SafetyEventKind::PolicyDenial,
+                SafetyOutcome::Denied,
+                Arc::clone(&subject),
+                reason.as_ref(),
+            ) {
+                return Err(StepFailure::new(
+                    state,
+                    RunError::safety_evidence(SafetyEventKind::PolicyDenial, source),
+                ));
+            }
+            Err(StepFailure::new(
+                state,
+                RunError::StructuralDenial { subject, reason },
+            ))
+        }
+        ApproveTransition::Pause { state } => Ok(RunLoopState::Paused(state)),
+        ApproveTransition::Unsupported { state, reason } => Err(StepFailure::new(
+            state,
+            RunError::ApprovalUnsupported { reason },
+        )),
+        ApproveTransition::EvidenceFailure {
+            state,
+            kind,
+            source,
+        } => Err(StepFailure::new(
+            state,
+            RunError::safety_evidence(kind, source),
+        )),
     }
 }
 
@@ -134,7 +245,13 @@ fn pause_for_approval(ctx: ApproveCtx, deps: &LoopDeps<'_>, reason: Arc<str>) ->
     if let Some(digest) = digest {
         event = event.with_digest(digest);
     }
-    deps.audit.record(event);
+    if let Err(source) = deps.audit.record(event) {
+        return ApproveTransition::EvidenceFailure {
+            state: ctx.state,
+            kind: SafetyEventKind::ApprovalRequested,
+            source,
+        };
+    }
 
     let mut state = ctx.state;
     state.approvals.push(Interruption::pending(

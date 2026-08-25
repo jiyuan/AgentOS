@@ -80,12 +80,14 @@ reopens the store file before reading so nothing passes on writer-side state.
 
 Two things the decision above did not settle, resolved during implementation:
 
-- **A failed append does not fail the run.** It is logged at `error!` as
-  `safety_log_write_failed`. Every event here records a refusal, a pause, or a
-  stop except approval-approved and grant-used, so failing closed on a write
-  error would turn a full disk into a denial of service without protecting
-  anything. The guarantee is therefore "durably recorded wherever a store is
-  configured".
+- **Superseded by R1 / `AUD-002`: a failed required append fails the affected
+  run closed.** It is still logged at `error!` as
+  `safety_log_write_failed`, but the failure is also returned as the typed
+  `RunError::SafetyEvidence`. Approval requests and resolutions, grant
+  issuance and use, and other protected transitions do not proceed without
+  their evidence. A denial, refusal, or cancellation remains the safer
+  outcome, then the run stops before further mutable work. Database-trigger
+  failpoints in `tests/audit_failpoints.rs` enforce this contract.
 - **A reason is bounded, not banned.** Several guardrails interpolate a
   model-chosen fragment — a program name, a path — into the sentence they
   refuse with, and a log that could not say *why* would not be readable. The

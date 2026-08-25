@@ -96,11 +96,14 @@ impl<'a> SafetyJournal<'a> {
 
     /// Write one event, stamped with this run's identity.
     ///
-    /// Takes the event by value and returns nothing: an event is written once
-    /// and never revised, so there is nothing for a caller to hold on to.
-    pub fn record(&self, event: SafetyEvent) {
+    /// A configured journal is part of the authorization boundary, so an
+    /// append failure is a first-class result. Callers must stop before a
+    /// protected transition, or preserve an already-safer refusal and surface
+    /// the operational failure. A detached journal remains an explicit no-op
+    /// for entrypoints that configured no audit store.
+    pub fn record(&self, event: SafetyEvent) -> Result<(), SafetyLogError> {
         let Some(log) = self.log else {
-            return;
+            return Ok(());
         };
         let mut event = event;
         if event.principal.is_none() {
@@ -128,7 +131,9 @@ impl<'a> SafetyJournal<'a> {
                 error = %err,
                 "safety_log_write_failed"
             );
+            return Err(err);
         }
+        Ok(())
     }
 
     /// Shorthand for the many call sites that record a kind, an outcome, a
@@ -139,10 +144,10 @@ impl<'a> SafetyJournal<'a> {
         outcome: SafetyOutcome,
         subject: impl Into<Arc<str>>,
         reason: impl AsRef<str>,
-    ) {
+    ) -> Result<(), SafetyLogError> {
         if !self.is_attached() {
-            return;
+            return Ok(());
         }
-        self.record(SafetyEvent::new(kind, outcome, subject).with_detail(reason));
+        self.record(SafetyEvent::new(kind, outcome, subject).with_detail(reason))
     }
 }

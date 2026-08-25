@@ -677,3 +677,13 @@
 - **Actual Behavior**: The first run used the managed sandbox and seven egress tests failed to bind loopback sockets; the approved rerun passed those fixtures and reached only the existing native macOS Seatbelt `AF-020` blocker.
 - **Root Cause**: The full-suite command was started before consulting the existing environment-specific remediation in this log.
 - **Suggested Fix**: Run `cargo test -p agentos-core` with the already approved local-test permission when verifying this repository; keep native Seatbelt enforcement assigned to macOS CI until `SBX-002` closes `AF-020`.
+
+## [2026-08-25 00:53] CONSISTENCY [RESOLVED]
+
+- **Agent**: /root
+- **Task**: Run the all-target Clippy gate while implementing AUD-002.
+- **Guideline Violated**: GUIDELINES > Consistency / PR conventions > blocking Clippy gate
+- **Expected Behavior**: The accumulated AUTH-004 field rename should leave benchmark `LoopDeps` literals compiling under the all-target gate.
+- **Actual Behavior**: The first AUD-002 Clippy pass found two benchmark literals still naming removed `granted_authority` instead of `delegated_authority`.
+- **Root Cause**: The earlier mechanical rename covered runtime and tests but omitted benchmark-only literals, which ordinary `cargo check` does not compile.
+- **Suggested Fix**: Update both benchmark literals to `delegated_authority: None` and keep `cargo clippy --workspace --all-targets --locked -- -D warnings` in the completion gate; the corrected workspace now passes it.

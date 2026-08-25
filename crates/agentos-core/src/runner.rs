@@ -10,7 +10,7 @@ use crate::memory::MemoryManager;
 use crate::prompt::Compaction;
 use crate::r#loop::{
     enter_approved, ApprovalOutcome, FinalOutput, InputGuardrailEntry, LoopDeps,
-    OutputGuardrailEntry, ResumeWitness, RunError, RunLoopState, StartCtx, Steering, StepFailure,
+    OutputGuardrailEntry, ResumeWitness, RunError, RunLoopState, StartCtx, Steering,
     ToolGuardrailEntry,
 };
 use crate::spill::ContentLimits;
@@ -25,8 +25,8 @@ use agentos_interfaces::RunState;
 use agentos_proto::{
     AgentId, ChannelId, ConversationId, ConversationPrincipal, Envelope, RunId, SpanKind,
 };
-use audit::{record_resolution, record_terminal_error};
-use episodes::{record_denied_episode, record_error_episode, record_finished_episode, EpisodeSeed};
+use audit::{record_failed_run, record_resolution};
+use episodes::{record_denied_episode, record_finished_episode, EpisodeSeed};
 use prompt::approval_action_label;
 pub use prompt::approval_prompt_envelope;
 use serde::{Deserialize, Serialize};
@@ -365,7 +365,14 @@ pub async fn resume_run(
             // The record that used to be a deletion. `take_approved_action`
             // now marks the interruption rather than removing it, and this is
             // the durable half of the same change (M6 / `AUD-001`).
-            record_resolution(&audit, SafetyOutcome::Approved, &subject, &witness, None);
+            record_resolution(&audit, SafetyOutcome::Approved, &subject, &witness, None).map_err(
+                |source| {
+                    RunError::safety_evidence(
+                        crate::audit::SafetyEventKind::ApprovalResolved,
+                        source,
+                    )
+                },
+            )?;
         }
         ApprovalOutcome::Rejected => {
             let reason = witness
@@ -382,7 +389,10 @@ pub async fn resume_run(
                 &subject,
                 &witness,
                 Some(reason.as_ref()),
-            );
+            )
+            .map_err(|source| {
+                RunError::safety_evidence(crate::audit::SafetyEventKind::ApprovalResolved, source)
+            })?;
             record_denied_episode(
                 &paused.state,
                 &paused.channel_id,
@@ -419,7 +429,10 @@ pub async fn resume_run(
                 &subject,
                 &witness,
                 Some(reason.as_ref()),
-            );
+            )
+            .map_err(|source| {
+                RunError::safety_evidence(crate::audit::SafetyEventKind::ApprovalResolved, source)
+            })?;
             persist_trace_records_with_sink(
                 &paused.state,
                 deps.trace_sink,
@@ -512,36 +525,6 @@ pub async fn resume_run(
             next => current = next,
         }
     }
-}
-
-/// Everything a failed run owes a later reader, in one place.
-///
-/// The safety event, the episode, and — the part that needed
-/// [`StepFailure`] — the trace records the run had accumulated. A trace
-/// persistence failure is logged rather than returned: the run already has an
-/// error worth reporting, and replacing it with an I/O error about the
-/// bookkeeping would hide the thing that actually went wrong.
-async fn record_failed_run(
-    failure: StepFailure,
-    audit: &SafetyJournal<'_>,
-    seed: &EpisodeSeed,
-    deps: &RunnerDeps<'_>,
-    span_start: usize,
-    event_start: usize,
-) -> RunError {
-    let (state, error) = failure.into_parts();
-    record_terminal_error(audit, &error);
-    record_error_episode(seed, &error, deps).await;
-    if let Err(persist) =
-        persist_trace_records_with_sink(&state, deps.trace_sink, span_start, event_start, "failed")
-    {
-        tracing::warn!(
-            run_id = state.run_id.as_str(),
-            error = %persist,
-            "failed run's trace records could not be persisted"
-        );
-    }
-    error
 }
 
 /// Persist the approval record for a paused run.

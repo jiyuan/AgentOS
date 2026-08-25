@@ -22,7 +22,7 @@
 //! A guardrail *backend* error counts as a trip here for the same reason: a
 //! check that could not run has not passed.
 
-use super::LoopDeps;
+use super::{LoopDeps, RunError};
 use crate::audit::{SafetyEventKind, SafetyOutcome};
 use agentos_interfaces::guardrail::GuardrailOutcome;
 use agentos_interfaces::orchestrator::RunContext;
@@ -37,17 +37,21 @@ pub(super) async fn gated(
     deps: &LoopDeps<'_>,
     message: Message,
     fallback: &str,
-) -> Message {
+) -> Result<Message, RunError> {
     let Some(refused_by) = refused_by(state, deps, &message).await else {
-        return message;
+        return Ok(message);
     };
-    deps.audit.record_reason(
-        SafetyEventKind::OutputGuardrailTrip,
-        SafetyOutcome::Tripped,
-        refused_by,
-        "a terminal notice the loop synthesized was withheld",
-    );
-    Message::text(MessageRole::Assistant, fallback)
+    deps.audit
+        .record_reason(
+            SafetyEventKind::OutputGuardrailTrip,
+            SafetyOutcome::Tripped,
+            refused_by,
+            "a terminal notice the loop synthesized was withheld",
+        )
+        .map_err(|source| {
+            RunError::safety_evidence(SafetyEventKind::OutputGuardrailTrip, source)
+        })?;
+    Ok(Message::text(MessageRole::Assistant, fallback))
 }
 
 /// The name of the first guardrail that refuses `message`, if any.

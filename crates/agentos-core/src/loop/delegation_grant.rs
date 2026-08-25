@@ -1,13 +1,18 @@
 //! Per-action validation and evidence for delegated authority.
 
-use super::{plan_subject, LoopDeps};
+use super::{plan_subject, LoopDeps, RunError};
 use crate::audit::{ArgumentDigest, SafetyEvent, SafetyEventKind, SafetyOutcome};
 use agentos_interfaces::orchestrator::Plan;
 use std::sync::Arc;
 
 /// Require a currently live runtime grant whenever the child is more
 /// permissive than its immediate parent for this exact action.
-pub(super) fn validate(plan: &Plan, deps: &LoopDeps<'_>) -> Result<(), Arc<str>> {
+pub(super) enum ValidationError {
+    Denied(Arc<str>),
+    Evidence(RunError),
+}
+
+pub(super) fn validate(plan: &Plan, deps: &LoopDeps<'_>) -> Result<(), ValidationError> {
     let Some(authority) = deps.delegated_authority else {
         return Ok(());
     };
@@ -18,15 +23,22 @@ pub(super) fn validate(plan: &Plan, deps: &LoopDeps<'_>) -> Result<(), Arc<str>>
         .map_or(u64::MAX, |since| since.as_secs());
     match authority.grant_for_action(plan, now) {
         Ok(Some(grant)) => {
-            deps.audit.record(
-                SafetyEvent::new(
-                    SafetyEventKind::DelegationGrantUsed,
-                    SafetyOutcome::Used,
-                    plan_subject(plan),
+            deps.audit
+                .record(
+                    SafetyEvent::new(
+                        SafetyEventKind::DelegationGrantUsed,
+                        SafetyOutcome::Used,
+                        plan_subject(plan),
+                    )
+                    .with_detail(grant.reason())
+                    .with_delegation_grant(Arc::from(grant.id())),
                 )
-                .with_detail(grant.reason())
-                .with_delegation_grant(Arc::from(grant.id())),
-            );
+                .map_err(|source| {
+                    ValidationError::Evidence(RunError::safety_evidence(
+                        SafetyEventKind::DelegationGrantUsed,
+                        source,
+                    ))
+                })?;
             Ok(())
         }
         Ok(None) => Ok(()),
@@ -40,8 +52,13 @@ pub(super) fn validate(plan: &Plan, deps: &LoopDeps<'_>) -> Result<(), Arc<str>>
             if let Plan::CallTool(call) = plan {
                 event = event.with_digest(ArgumentDigest::of(call.args.get().as_bytes()));
             }
-            deps.audit.record(event);
-            Err(reason)
+            deps.audit.record(event).map_err(|source| {
+                ValidationError::Evidence(RunError::safety_evidence(
+                    SafetyEventKind::PolicyDenial,
+                    source,
+                ))
+            })?;
+            Err(ValidationError::Denied(reason))
         }
     }
 }

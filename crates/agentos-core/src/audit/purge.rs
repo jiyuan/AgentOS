@@ -129,7 +129,7 @@ pub fn purge_before(
             "{} safety events and {} memory access rows recorded before {before_unix} deleted",
             counts.safety_events, counts.memory_access_log
         )),
-    );
+    )?;
     Ok(counts)
 }
 

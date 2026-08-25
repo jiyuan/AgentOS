@@ -7,6 +7,7 @@
 
 use agentos_interfaces::run_state::RunState;
 
+use crate::audit::{SafetyEventKind, SafetyLogError};
 use crate::subagents::SubAgentError;
 use crate::task_workspace::TaskWorkspaceError;
 use crate::tools::ToolRegistryError;
@@ -37,6 +38,14 @@ pub enum RunError {
     SubAgent(#[from] SubAgentError),
     #[error("task workspace failed: {0}")]
     TaskWorkspace(#[from] TaskWorkspaceError),
+    /// Required evidence for a safety-boundary decision could not be made
+    /// durable. The protected action must not proceed after this error.
+    #[error("required safety event '{event}' could not be persisted: {source}")]
+    SafetyEvidence {
+        event: &'static str,
+        #[source]
+        source: SafetyLogError,
+    },
     /// A human was asked and said no.
     ///
     /// Distinct from [`Self::StructuralDenial`] because they are different
@@ -72,6 +81,15 @@ pub enum RunError {
     /// path is several frames deep and needs a typed way back up.
     #[error("run cancelled")]
     Cancelled,
+}
+
+impl RunError {
+    pub(crate) fn safety_evidence(kind: SafetyEventKind, source: SafetyLogError) -> Self {
+        Self::SafetyEvidence {
+            event: kind.as_str(),
+            source,
+        }
+    }
 }
 
 /// A step that failed, carrying the state the run had reached when it did.

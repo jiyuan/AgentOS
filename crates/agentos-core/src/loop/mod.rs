@@ -1,5 +1,5 @@
 use crate::approve::{DelegatedAuthority, Policy};
-use crate::audit::{ArgumentDigest, SafetyEvent, SafetyEventKind, SafetyJournal, SafetyOutcome};
+use crate::audit::{SafetyEvent, SafetyEventKind, SafetyJournal, SafetyOutcome};
 use crate::hooks::Hooks;
 use crate::prompt::Compaction;
 use crate::spill::ContentLimits;
@@ -39,7 +39,6 @@ mod steering;
 mod telemetry;
 mod tool_call;
 
-use approval::{approve_transition, ApproveTransition};
 pub use approval_route::{
     parse_action_data, prompt_actions, prompt_interruption, route, ApprovalBinding,
     ApprovalOutcome, ApprovalTicket, ResumeWitness, Routed, TicketError, ACTIONS_KEY, APPROVE,
@@ -138,7 +137,7 @@ impl RunLoopState {
         match self {
             Self::Start(ctx) => start(ctx, deps).await,
             Self::Plan(ctx) => plan(ctx, deps).await,
-            Self::Approve(ctx) => approve(ctx, deps).await,
+            Self::Approve(ctx) => approval::approve(ctx, deps).await,
             Self::Act(ctx) => act(ctx, deps).await,
             Self::Observe(ctx) => Ok(observe(ctx)),
             Self::Paused(state) => Err(StepFailure::new(state, RunError::NotResumable)),
@@ -260,18 +259,18 @@ async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, StepFai
         // finish normally. The run still cannot exceed `max_turns` tool
         // cycles, but the caller (or parent run) gets the best partial
         // result plus a clear truncation notice rather than a hard failure.
-        return Ok(RunLoopState::Finish(
-            budget_exhausted_finish(ctx.state, ctx.turns, deps).await,
-        ));
+        return budget_exhausted_finish(ctx.state, ctx.turns, deps)
+            .await
+            .map(RunLoopState::Finish);
     }
 
     // Beside the turn budget, and for the same reason: a stop condition, not
     // an error. Checked before any work so a run cancelled between turns costs
     // nothing further.
     if deps.cancel.is_cancelled() {
-        return Ok(RunLoopState::Finish(
-            cancelled_finish(ctx.state, deps, "between_turns").await,
-        ));
+        return cancelled_finish(ctx.state, deps, "between_turns")
+            .await
+            .map(RunLoopState::Finish);
     }
 
     let mut state = ctx.state;
@@ -347,9 +346,9 @@ async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, StepFai
         Err(error) => return Err(StepFailure::new(state, error)),
     };
     let Some(plan) = planned else {
-        return Ok(RunLoopState::Finish(
-            cancelled_finish(state, deps, "planning").await,
-        ));
+        return cancelled_finish(state, deps, "planning")
+            .await
+            .map(RunLoopState::Finish);
     };
 
     trace::record_span(
@@ -449,89 +448,6 @@ async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, StepFai
     }
 }
 
-/// Fold one just-completed LLM call's token usage into the run total and emit
-/// a trace event carrying both the per-call breakdown and the running totals,
-/// so the input/output split and cache hit/miss counts are persisted in
-/// `RunState` rather than living only in provider log lines.
-///
-/// One call to this function corresponds to exactly one LLM round-trip. The
-/// orchestrator (which is the only component holding the response `Message`
-/// before it is folded into a `Plan` variant) is responsible for pushing each
-/// call's `Usage` into `RunContext::usage_sink`; the loop drains the sink after
-/// `orchestrator.plan()` returns and calls this for every entry — including
-/// calls whose plan was `Plan::CallTool`, `Plan::Delegate`, etc.
-async fn approve(ctx: ApproveCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, StepFailure> {
-    match approve_transition(ctx, deps) {
-        ApproveTransition::Allow { state, plan, turns } => {
-            // The elevation was recorded when narrowing admitted it; this is
-            // the record that it was exercised. Only on `Allow`: a grant that
-            // covers a call the child was denied anyway granted nothing.
-            if let Err(reason) = delegation_grant::validate(&plan, deps) {
-                let subject = plan_subject(&plan);
-                if let Plan::CallTool(call) = plan {
-                    return Ok(RunLoopState::Act(ActCtx {
-                        authorized_plan: AuthorizedPlan::denied_tool(Plan::CallTool(call), reason),
-                        state,
-                        turns,
-                    }));
-                }
-                return Err(StepFailure::new(
-                    state,
-                    RunError::StructuralDenial { subject, reason },
-                ));
-            }
-            Ok(RunLoopState::Act(ActCtx {
-                authorized_plan: AuthorizedPlan::allowed(plan),
-                state,
-                turns,
-            }))
-        }
-        ApproveTransition::DenyTool {
-            state,
-            call,
-            reason,
-            turns,
-        } => {
-            deps.audit.record(
-                SafetyEvent::new(
-                    SafetyEventKind::PolicyDenial,
-                    SafetyOutcome::Denied,
-                    Arc::clone(&call.name),
-                )
-                .with_detail(reason.as_ref())
-                .with_digest(ArgumentDigest::of(call.args.get().as_bytes())),
-            );
-            let plan = Plan::CallTool(call);
-            Ok(RunLoopState::Act(ActCtx {
-                authorized_plan: AuthorizedPlan::denied_tool(plan, reason),
-                state,
-                turns,
-            }))
-        }
-        ApproveTransition::Deny {
-            state,
-            subject,
-            reason,
-        } => {
-            deps.audit.record_reason(
-                SafetyEventKind::PolicyDenial,
-                SafetyOutcome::Denied,
-                Arc::clone(&subject),
-                reason.as_ref(),
-            );
-            Err(StepFailure::new(
-                state,
-                RunError::StructuralDenial { subject, reason },
-            ))
-        }
-        ApproveTransition::Pause { state } => Ok(RunLoopState::Paused(state)),
-        ApproveTransition::Unsupported { state, reason } => Err(StepFailure::new(
-            state,
-            RunError::ApprovalUnsupported { reason },
-        )),
-    }
-}
-
 async fn act(ctx: ActCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, StepFailure> {
     let ActCtx {
         mut state,
@@ -550,12 +466,17 @@ async fn act(ctx: ActCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, StepFailu
             let plan = *failure.plan;
             let refusal = failure.error;
             let subject = plan_subject(&plan);
-            deps.audit.record_reason(
+            if let Err(source) = deps.audit.record_reason(
                 SafetyEventKind::PolicyDenial,
                 SafetyOutcome::Denied,
                 Arc::clone(&subject),
                 refusal.to_string(),
-            );
+            ) {
+                return Err(StepFailure::new(
+                    state,
+                    RunError::safety_evidence(SafetyEventKind::PolicyDenial, source),
+                ));
+            }
             return Err(StepFailure::new(
                 state,
                 RunError::StructuralDenial {
@@ -583,9 +504,9 @@ async fn act(ctx: ActCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, StepFailu
                 None => match execute_tool(&mut state, deps, call).await {
                     Ok(result) => result,
                     Err(RunError::Cancelled) => {
-                        return Ok(RunLoopState::Finish(
-                            cancelled_finish(state, deps, "tool_call").await,
-                        ))
+                        return cancelled_finish(state, deps, "tool_call")
+                            .await
+                            .map(RunLoopState::Finish)
                     }
                     Err(other) => return Err(StepFailure::new(state, other)),
                 },
@@ -706,7 +627,7 @@ fn pause_for_subagent_approval(
         )
     })?;
     let approval_instance_id = ApprovalInstanceId::new(ticket.as_str());
-    deps.audit.record(
+    if let Err(source) = deps.audit.record(
         SafetyEvent::new(
             SafetyEventKind::ApprovalRequested,
             SafetyOutcome::Requested,
@@ -714,7 +635,12 @@ fn pause_for_subagent_approval(
         )
         .with_interruption(approval_id.clone())
         .with_approval_instance(approval_instance_id.clone()),
-    );
+    ) {
+        return Err(StepFailure::new(
+            state,
+            RunError::safety_evidence(SafetyEventKind::ApprovalRequested, source),
+        ));
+    }
     state.approvals.push(Interruption::pending(
         approval_instance_id,
         ticket.as_str(),
@@ -759,7 +685,8 @@ fn ensure_guardrail_passed(
         GuardrailOutcome::Passed => Ok(()),
         GuardrailOutcome::Tripped(reason) => {
             deps.audit
-                .record_reason(kind, outcome_kind, Arc::clone(name), reason.as_ref());
+                .record_reason(kind, outcome_kind, Arc::clone(name), reason.as_ref())
+                .map_err(|source| RunError::safety_evidence(kind, source))?;
             Err(RunError::GuardrailTripped {
                 guardrail: Arc::clone(name),
                 reason,

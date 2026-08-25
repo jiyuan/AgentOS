@@ -175,7 +175,8 @@ pub(super) async fn record_error_episode(
         // terminal stop notice, so it never propagates this far. Classified
         // rather than `unreachable!()` because an episode record is not worth
         // a panic if a future path ever does surface it.
-        | RunError::Cancelled => EpisodeOutcome::Failed,
+        | RunError::Cancelled
+        | RunError::SafetyEvidence { .. } => EpisodeOutcome::Failed,
     };
     let mut metadata = BTreeMap::new();
     metadata.insert(Arc::from("error"), Value::String(err.to_string()));

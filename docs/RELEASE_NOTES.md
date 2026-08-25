@@ -104,6 +104,15 @@ closed. Paused children retain the original generation and expiry, while grant
 issuance and use events share one stable grant ID. Legacy `expires_at` and
 standing entries now fail load with `lifetime_secs` migration guidance.
 
+**Required safety evidence fails closed** (`AUD-002`). Safety-journal writes
+are now fallible results handled at every event site. Approval prompts and
+resolutions, delegation-grant issuance and use, and protected actions cannot
+proceed when their evidence is unavailable. Denials, guardrail and sandbox
+refusals, cancellation, and terminal errors preserve the safer outcome and
+surface a typed `RunError::SafetyEvidence` instead of logging and continuing.
+SQLite trigger failpoints cover each class and assert that no protected tool
+body runs.
+
 **`Approve` is re-asserted where the action happens** (`STATE-001`, `AUTH-005`).
 `ActCtx` privately owns an immutable plan together with a domain-separated
 commitment to its complete serialized form, including payloads, metadata,

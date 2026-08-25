@@ -5,9 +5,10 @@
 //! boundary the loop cannot see: an approval is *resolved* by whoever answers
 //! the prompt, and a run *ends* only once the error has escaped every state.
 
-use super::RunError;
-use crate::audit::{SafetyEvent, SafetyEventKind, SafetyJournal, SafetyOutcome};
-use crate::r#loop::ResumeWitness;
+use super::episodes::{record_error_episode, EpisodeSeed};
+use super::{persist_trace_records_with_sink, RunError, RunnerDeps};
+use crate::audit::{SafetyEvent, SafetyEventKind, SafetyJournal, SafetyLogError, SafetyOutcome};
+use crate::r#loop::{ResumeWitness, StepFailure};
 use std::sync::Arc;
 
 /// Record how a pause ended.
@@ -21,7 +22,7 @@ pub(super) fn record_resolution(
     subject: &Arc<str>,
     witness: &ResumeWitness,
     reason: Option<&str>,
-) {
+) -> Result<(), SafetyLogError> {
     let mut event = SafetyEvent::new(
         SafetyEventKind::ApprovalResolved,
         outcome,
@@ -36,7 +37,7 @@ pub(super) fn record_resolution(
     if let Some(reason) = reason {
         event = event.with_detail(reason);
     }
-    audit.record(event);
+    audit.record(event)
 }
 
 /// Record that the run ended badly.
@@ -46,7 +47,10 @@ pub(super) fn record_resolution(
 /// decision, with the subject and digest this one cannot reconstruct. This is
 /// the record that the run stopped there, which is a different fact and the
 /// one a reader looking for "why is there no answer" needs.
-pub(super) fn record_terminal_error(audit: &SafetyJournal<'_>, error: &RunError) {
+pub(super) fn record_terminal_error(
+    audit: &SafetyJournal<'_>,
+    error: &RunError,
+) -> Result<(), SafetyLogError> {
     audit.record(
         SafetyEvent::new(
             SafetyEventKind::TerminalError,
@@ -54,7 +58,7 @@ pub(super) fn record_terminal_error(audit: &SafetyJournal<'_>, error: &RunError)
             run_error_kind(error),
         )
         .with_detail(error.to_string()),
-    );
+    )
 }
 
 /// The variant name, as the `subject` of a terminal-error event. Stable enough
@@ -70,10 +74,41 @@ fn run_error_kind(error: &RunError) -> &'static str {
         RunError::Tool(_) => "tool",
         RunError::SubAgent(_) => "subagent",
         RunError::TaskWorkspace(_) => "task_workspace",
+        RunError::SafetyEvidence { .. } => "safety_evidence",
         RunError::ApprovalDenied { .. } => "approval_denied",
         RunError::StructuralDenial { .. } => "structural_denial",
         RunError::ApprovalUnanswered { .. } => "approval_unanswered",
         RunError::ApprovalUnsupported { .. } => "approval_unsupported",
         RunError::Cancelled => "cancelled",
     }
+}
+
+/// Persist everything a failed run owes a later reader.
+pub(super) async fn record_failed_run(
+    failure: StepFailure,
+    audit: &SafetyJournal<'_>,
+    seed: &EpisodeSeed,
+    deps: &RunnerDeps<'_>,
+    span_start: usize,
+    event_start: usize,
+) -> RunError {
+    let (state, error) = failure.into_parts();
+    let evidence_error = if matches!(error, RunError::SafetyEvidence { .. }) {
+        None
+    } else {
+        record_terminal_error(audit, &error)
+            .err()
+            .map(|source| RunError::safety_evidence(SafetyEventKind::TerminalError, source))
+    };
+    record_error_episode(seed, &error, deps).await;
+    if let Err(persist) =
+        persist_trace_records_with_sink(&state, deps.trace_sink, span_start, event_start, "failed")
+    {
+        tracing::warn!(
+            run_id = state.run_id.as_str(),
+            error = %persist,
+            "failed run's trace records could not be persisted"
+        );
+    }
+    evidence_error.unwrap_or(error)
 }

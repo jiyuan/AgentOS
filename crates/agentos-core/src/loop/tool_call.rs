@@ -105,15 +105,19 @@ pub(super) async fn execute_tool(
             if let GuardrailOutcome::Tripped(reason) = outcome {
                 // `Refused`, not `Tripped`: this one stops the call before it
                 // runs. The post-result pass below is the `Tripped` case.
-                deps.audit.record(
-                    SafetyEvent::new(
-                        SafetyEventKind::ToolGuardrailTrip,
-                        SafetyOutcome::Refused,
-                        Arc::clone(&entry.name),
+                deps.audit
+                    .record(
+                        SafetyEvent::new(
+                            SafetyEventKind::ToolGuardrailTrip,
+                            SafetyOutcome::Refused,
+                            Arc::clone(&entry.name),
+                        )
+                        .with_detail(reason.as_ref())
+                        .with_digest(ArgumentDigest::of(call.args.get().as_bytes())),
                     )
-                    .with_detail(reason.as_ref())
-                    .with_digest(ArgumentDigest::of(call.args.get().as_bytes())),
-                );
+                    .map_err(|source| {
+                        RunError::safety_evidence(SafetyEventKind::ToolGuardrailTrip, source)
+                    })?;
                 failure = Some(guardrail_tool_result(&call, &entry.name, reason));
                 break;
             }
@@ -160,15 +164,19 @@ pub(super) async fn execute_tool(
                         | ToolRegistryError::IncompatibleExecutor { .. }
                         | ToolRegistryError::SandboxExecutionFailed { .. }
                 ) {
-                    deps.audit.record(
-                        SafetyEvent::new(
-                            SafetyEventKind::SandboxRefusal,
-                            SafetyOutcome::Refused,
-                            Arc::clone(&call.name),
+                    deps.audit
+                        .record(
+                            SafetyEvent::new(
+                                SafetyEventKind::SandboxRefusal,
+                                SafetyOutcome::Refused,
+                                Arc::clone(&call.name),
+                            )
+                            .with_detail(other.to_string())
+                            .with_digest(ArgumentDigest::of(call.args.get().as_bytes())),
                         )
-                        .with_detail(other.to_string())
-                        .with_digest(ArgumentDigest::of(call.args.get().as_bytes())),
-                    );
+                        .map_err(|source| {
+                            RunError::safety_evidence(SafetyEventKind::SandboxRefusal, source)
+                        })?;
                 }
                 return Err(other.into());
             }

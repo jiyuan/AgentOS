@@ -28,13 +28,12 @@
 //!
 //! # When the store is unreachable
 //!
-//! A failed append is logged at `error!` and the run continues. Every event
-//! here records a refusal, a pause, or a stop except approval-approved and
-//! grant-used, so failing the run closed on a write error would convert a
-//! full disk into a denial of service without protecting anything. The
-//! guarantee this module makes is therefore "durably recorded wherever a
-//! store is configured", and a deployment that needs more should alert on the
-//! `safety_log_write_failed` log line.
+//! A configured journal is part of the authorization boundary. A failed
+//! append is returned to the caller and logged at `error!`; protected work
+//! does not proceed without its required evidence. Refusals and cancellation
+//! remain the safer outcome, but the affected run stops with a typed
+//! operational failure instead of continuing mutable work without a record
+//! (`AUD-002`).
 
 mod event;
 mod journal;
