@@ -5,31 +5,30 @@
 //! `current_thread` runtime, and run one conversation's turns on it while the
 //! router keeps receiving for everyone else.
 
+use super::approval::{restore, PendingApproval};
+use super::delivery::{send_approval_prompt, DurableEgress};
 use super::{
-    build_reflection_cron, channel_display_name, channel_stream_sink, command_reply_envelope,
-    failure_envelope, fire_due_crons, log_line, log_trace, ServiceConfig, CRON_SCAN_INTERVAL_SECS,
-    RETENTION_SWEEP_INTERVAL_SECS,
+    channel_display_name, channel_stream_sink, command_reply_envelope, failure_envelope, log_line,
+    log_trace, ServiceConfig,
 };
-use super::{run_memory_reflection, run_retention_sweep};
 use agentos_cli::slash::{self, Parsed, SessionUsage, SlashCommand, SlashContext};
-use agentos_core::crons::{CronStore, MemoryMaintenanceCron};
+use agentos_core::crons::CronStore;
 use agentos_core::gateway::{
-    run_shard, unix_now, GatewayRun, GatewayService, IngressLedger, Settlement, ShardConfig,
-    ShardInbound, Turn, TurnHandler,
+    run_shard, unix_now, ApprovalStore, DurableApproval, GatewayError, GatewayRun, GatewayService,
+    IngressEventKey, IngressLedger, ShardConfig, ShardInbound, Turn, TurnHandler,
 };
 use agentos_core::r#loop::{
     route, ApprovalBinding, ApprovalOutcome, ApprovalTicket, InputGuardrailEntry,
-    OutputGuardrailEntry, ResumeWitness, Routed, ToolGuardrailEntry,
+    OutputGuardrailEntry, ResumeWitness, Routed, RunError, ToolGuardrailEntry,
 };
-use agentos_core::runner::{PausedRun, RunnerDeps};
+use agentos_core::runner::{RunnerDeps, RunnerError};
 use agentos_core::runtime::{AgentRuntime, RuntimeDepsScope};
 use agentos_interfaces::{Egress, StreamEgress};
 use agentos_proto::{ActorPrincipal, ConversationId, Envelope, InterruptionId, RunId};
 use async_trait::async_trait;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Everything a shard thread needs that it cannot borrow from the router.
 pub(super) struct ShardContext {
@@ -37,9 +36,9 @@ pub(super) struct ShardContext {
     pub(super) config: ServiceConfig,
     pub(super) channel_name: &'static str,
     pub(super) run_id: RunId,
-    /// One runtime for the whole gateway, shared by every shard. Not one per
-    /// shard: separate runtimes would mean separate session stores, separate
-    /// memory, and separate job registries for what is one agent.
+    /// One runtime for the serving process, shared by every channel and shard.
+    /// Separate runtimes would mean separate session pools, memory, jobs, and
+    /// MCP lifecycle registries for what is one agent.
     pub(super) runtime: Arc<AgentRuntime>,
     pub(super) egress: Arc<dyn Egress>,
     /// The channel's edit-in-place streaming handle, if it has one. Taken on
@@ -51,12 +50,15 @@ pub(super) struct ShardContext {
     /// through it; the shard settles into it once the turn is over
     /// (M8 / `GW-001`, deliverable 3).
     pub(super) ledger: Arc<IngressLedger>,
+    pub(super) approval_store: Arc<ApprovalStore>,
+    /// Validated pauses assigned to this shard during startup recovery.
+    pub(super) restored_approvals: Vec<DurableApproval>,
 }
 
 /// Own one shard: a `current_thread` runtime, because the run loop's future is
 /// `!Send` and must never migrate between threads.
 pub(super) fn run_shard_thread(
-    context: ShardContext,
+    mut context: ShardContext,
     inbound: ShardInbound,
     shard_config: ShardConfig,
 ) {
@@ -82,16 +84,7 @@ pub(super) fn run_shard_thread(
         let output_guardrails = deps_scope.output_guardrails();
         let tool_guardrails = deps_scope.tool_guardrails();
         let cron_store = CronStore::new(context.config.home.join("workspace/crons"));
-        let reflection_cron = match build_reflection_cron(&context.runtime, &context.config) {
-            Ok(schedule) => schedule,
-            Err(err) => {
-                let _ = log_line(
-                    &context.config,
-                    &format!("reflection schedule failed: {err}"),
-                );
-                None
-            }
-        };
+        let restored = restore(std::mem::take(&mut context.restored_approvals));
         let handler = ShardTurns {
             context: &context,
             deps_scope: &deps_scope,
@@ -99,10 +92,7 @@ pub(super) fn run_shard_thread(
             output_guardrails: &output_guardrails,
             tool_guardrails: &tool_guardrails,
             cron_store,
-            reflection_cron: RefCell::new(reflection_cron),
-            last_cron_scan: Cell::new(0),
-            last_retention_sweep: Cell::new(0),
-            pending_approvals: RefCell::new(HashMap::new()),
+            pending_approvals: RefCell::new(restored),
             expired: RefCell::new(Vec::new()),
         };
         run_shard(context.shard, inbound, &shard_config, &handler).await;
@@ -130,25 +120,6 @@ struct Resume {
     witness: ResumeWitness,
 }
 
-/// A run parked on an approval, and what it takes to answer it.
-struct PendingApproval {
-    paused: PausedRun,
-    /// Names this asking, and who may answer it. An envelope that does not
-    /// carry the ticket back is ordinary input however affirmative it sounds,
-    /// and one that carries it from a different sender decides nothing — in a
-    /// group conversation the prompt belongs to the person it was put to
-    /// (`AUTH-001`).
-    binding: ApprovalBinding,
-    /// Unix seconds after which the prompt stops counting, if it expires.
-    expires_at: Option<u64>,
-}
-
-impl PendingApproval {
-    fn is_expired(&self, now: u64) -> bool {
-        self.expires_at.is_some_and(|expires_at| now >= expires_at)
-    }
-}
-
 /// Runs one conversation's turns on its shard thread.
 struct ShardTurns<'a> {
     context: &'a ShardContext,
@@ -157,11 +128,6 @@ struct ShardTurns<'a> {
     output_guardrails: &'a [OutputGuardrailEntry<'a>],
     tool_guardrails: &'a [ToolGuardrailEntry<'a>],
     cron_store: CronStore,
-    reflection_cron: RefCell<Option<MemoryMaintenanceCron>>,
-    last_cron_scan: Cell<u64>,
-    /// When the retention sweep last ran, so it keeps its own much slower
-    /// cadence inside the cron scan's.
-    last_retention_sweep: Cell<u64>,
     /// Runs waiting on an approval, keyed by conversation.
     ///
     /// The serial loop used to answer an approval by blocking on
@@ -178,39 +144,30 @@ struct ShardTurns<'a> {
 #[async_trait(?Send)]
 impl TurnHandler for ShardTurns<'_> {
     async fn run(&self, turn: Turn) {
-        // Read before the turn consumes it. Settling names the event, and the
-        // envelope is gone by the time there is anything to settle.
-        let event = turn
-            .input
-            .ingress_id()
-            .map(|event_id| (turn.input.channel_id.clone(), event_id));
+        let primary = match IngressEventKey::from_envelope(&turn.input) {
+            Ok(primary) => primary,
+            Err(err) => {
+                let _ = log_line(
+                    &self.context.config,
+                    &format!(
+                        "{} turn has no durable identity: {err}",
+                        self.context.channel_name
+                    ),
+                );
+                return;
+            }
+        };
+        let durable_egress = DurableEgress::new(
+            &self.context.ledger,
+            self.context.egress.as_ref(),
+            primary,
+            turn.steering.clone(),
+        );
 
-        if let Err(err) = self.handle(turn).await {
+        if let Err(err) = self.handle(turn, &durable_egress).await {
             let _ = log_line(
                 &self.context.config,
                 &format!("{} turn failed: {err}", self.context.channel_name),
-            );
-        }
-
-        // Settled once the turn is over, whatever happened in it. Answered,
-        // refused, paused on an approval and errored are all *settled*: the
-        // sender heard back, so replaying the message on the next restart
-        // would answer them twice. The only unsettled state is the one this
-        // line never reaches — a process that died mid-turn (M8 / `GW-001`).
-        let Some((channel_id, event_id)) = event else {
-            return;
-        };
-        if let Err(err) = self
-            .context
-            .ledger
-            .settle(&channel_id, &event_id, Settlement::Handled)
-        {
-            let _ = log_line(
-                &self.context.config,
-                &format!(
-                    "{} could not settle ingress event {event_id}: {err}",
-                    self.context.channel_name
-                ),
             );
         }
     }
@@ -233,17 +190,7 @@ impl TurnHandler for ShardTurns<'_> {
                 ),
             );
         }
-        // Cron and reflection are process-wide, not per-shard: firing them on
-        // every shard would fire every task N times.
-        if shard != 0 {
-            return;
-        }
-        if let Err(err) = self.maintenance().await {
-            let _ = log_line(
-                &self.context.config,
-                &format!("{} maintenance failed: {err}", self.context.channel_name),
-            );
-        }
+        let _ = shard;
     }
 }
 
@@ -262,15 +209,14 @@ impl ShardTurns<'_> {
             .collect()
     }
 
-    async fn handle(&self, turn: Turn) -> Result<(), String> {
+    async fn handle(&self, turn: Turn, egress: &DurableEgress<'_>) -> Result<(), String> {
         let config = &self.context.config;
         let channel_name = self.context.channel_name;
-        let egress = self.context.egress.as_ref();
         let mut input = turn.input;
 
         match slash::parse(&input.message.content) {
             Parsed::Cmd(SlashCommand::Clear) => {
-                return self.clear_conversation(&input).await;
+                return self.clear_conversation(egress, &input).await;
             }
             Parsed::Cmd(cmd) => {
                 let ctx = SlashContext {
@@ -286,9 +232,9 @@ impl ShardTurns<'_> {
                     conversation_id: &input.conversation_id,
                 };
                 let reply = slash::render(cmd, &ctx).await;
-                return self.reply(&input, &reply).await;
+                return self.reply(egress, &input, &reply).await;
             }
-            Parsed::Usage(hint) => return self.reply(&input, &hint).await,
+            Parsed::Usage(hint) => return self.reply(egress, &input, &hint).await,
             Parsed::NotSlash => {}
         }
 
@@ -302,6 +248,17 @@ impl ShardTurns<'_> {
                 .task_id()),
         );
 
+        let answered = self.decide(&input, egress.primary())?;
+        let resolving_instance = match &answered {
+            Answered::Resume(resume) => Some(Arc::<str>::from(
+                resume.pending.binding.approval_instance_id.as_str(),
+            )),
+            Answered::Stale(_) | Answered::NotYours(_) | Answered::Run => None,
+        };
+        if let Answered::Resume(resume) = &answered {
+            egress.include(&resume.pending.ingress_events);
+        }
+
         // Per-turn deps: this turn's cancellation token (so `/stop` reaches it)
         // and its steering queue (so a message arriving mid-run is claimed at
         // the next `Plan` instead of starting a second, racing run).
@@ -312,6 +269,12 @@ impl ShardTurns<'_> {
         );
         deps.cancel = turn.cancel;
         deps.steering = Some(turn.steering);
+        deps.run_journal = Some(
+            self.context
+                .ledger
+                .run_journal_for(egress.journal_events())
+                .map_err(|err| format!("durable run journal failed: {err}"))?,
+        );
         // Only when the deployment opted in. A chat channel streams
         // edit-in-place, so it *can* revise what it showed — but the bytes
         // were still delivered to a device before any output guardrail ran
@@ -325,7 +288,7 @@ impl ShardTurns<'_> {
 
         // Does this envelope answer the approval this conversation is waiting
         // on? Only an envelope carrying that prompt's ticket does.
-        let outcome = match self.decide(&input)? {
+        let outcome = match answered {
             Answered::Resume(resume) => {
                 let Resume { pending, witness } = *resume;
                 let Some(approval_id) = pending
@@ -349,11 +312,12 @@ impl ShardTurns<'_> {
                         witness.outcome().as_str()
                     ),
                 )?;
-                service.resume(egress, pending.paused, witness).await
+                service.resume_buffered(pending.paused, witness).await
             }
             Answered::NotYours(ticket) => {
                 return self
                     .reply(
+                        egress,
                         &input,
                         &format!(
                             "Approval {ticket} was put to someone else in this conversation, \
@@ -367,6 +331,7 @@ impl ShardTurns<'_> {
                 // running it as a message: the sender pressed a control.
                 return self
                     .reply(
+                        egress,
                         &input,
                         &format!(
                             "That approval ({ticket}) is no longer waiting — it was already \
@@ -377,49 +342,73 @@ impl ShardTurns<'_> {
             }
             Answered::Run => {
                 service
-                    .run_envelope(egress, input.clone(), self.context.run_id.clone())
+                    .run_envelope_buffered(input.clone(), self.context.run_id.clone())
                     .await
             }
         };
 
         match outcome {
-            Ok(GatewayRun::Finished { state, .. }) => {
+            Ok(GatewayRun::Finished { state, output }) => {
+                if let Some(instance) = &resolving_instance {
+                    egress.consume_approval(Arc::clone(instance));
+                }
+                egress
+                    .send(output)
+                    .await
+                    .map_err(|err| format!("terminal delivery failed: {err}"))?;
                 self.context.session_usage.record_run(&state.usage);
                 log_trace(config, &state)?;
             }
             Ok(GatewayRun::Paused {
                 paused,
+                prompt,
                 ticket,
                 expires_at,
                 ..
             }) => {
-                // Park it and go. Only an answer carrying `ticket` resumes it,
-                // and the idle sweep cancels it if nobody ever does.
+                let approval = paused
+                    .state
+                    .pending_approval()
+                    .ok_or_else(|| "paused run had no approval".to_owned())?;
+                let binding = ApprovalBinding::new(
+                    approval.approval_instance_id.clone(),
+                    ticket,
+                    approval.id.clone(),
+                    approval.prompting_principal.clone(),
+                    expires_at,
+                )
+                .ok_or_else(|| "approval instance did not match ticket".to_owned())?
+                .with_administrators(self.approval_administrators());
+                let events = egress
+                    .take_events()
+                    .map_err(|err| format!("approval ingress group failed: {err}"))?;
+                let prompt = prompt.ok_or_else(|| "paused run had no prompt".to_owned())?;
+                let batch = self
+                    .context
+                    .approval_store
+                    .prepare_pause(
+                        &paused,
+                        &binding,
+                        &events,
+                        prompt,
+                        resolving_instance.as_deref(),
+                    )
+                    .map_err(|err| format!("approval persistence failed: {err}"))?;
+                send_approval_prompt(
+                    &self.context.approval_store,
+                    self.context.egress.as_ref(),
+                    binding.approval_instance_id.as_str(),
+                    &batch,
+                )
+                .await
+                .map_err(|err| format!("approval prompt delivery failed: {err}"))?;
+                // Park it and go. Only an answer carrying the persisted ticket
+                // resumes it; restart reconstructs this map from SQLite.
                 self.pending_approvals.borrow_mut().insert(
                     paused.conversation_id.clone(),
                     PendingApproval {
-                        // Bound to the sender whose message caused the pause.
-                        binding: {
-                            let approval = paused
-                                .state
-                                .pending_approval()
-                                .ok_or_else(|| "paused run had no approval".to_owned())?;
-                            let prompting = ActorPrincipal::new(
-                                paused.state.active_agent.clone(),
-                                paused.channel_id.clone(),
-                                paused.conversation_id.clone(),
-                                Arc::clone(&input.sender),
-                            );
-                            ApprovalBinding::new(
-                                approval.approval_instance_id.clone(),
-                                ticket,
-                                approval.id.clone(),
-                                prompting,
-                                expires_at,
-                            )
-                            .ok_or_else(|| "approval instance did not match ticket".to_owned())?
-                            .with_administrators(self.approval_administrators())
-                        },
+                        ingress_events: events,
+                        binding,
                         paused,
                         expires_at,
                     },
@@ -432,6 +421,9 @@ impl ShardTurns<'_> {
                     self.context.runtime.active_agent.as_str(),
                     &err.to_string(),
                 );
+                if let Some(instance) = &resolving_instance {
+                    egress.consume_approval(Arc::clone(instance));
+                }
                 if let Err(send_err) = egress.send(reply).await {
                     log_line(
                         config,
@@ -454,7 +446,7 @@ impl ShardTurns<'_> {
     ///
     /// Expiry is checked first: a prompt whose window has closed is over
     /// before the envelope is even read, so a late answer cannot decide it.
-    fn decide(&self, input: &Envelope) -> Result<Answered, String> {
+    fn decide(&self, input: &Envelope, event: &IngressEventKey) -> Result<Answered, String> {
         let now = unix_now();
         let mut pending = self.pending_approvals.borrow_mut();
         if pending
@@ -486,6 +478,23 @@ impl ShardTurns<'_> {
             Routed::Stale { ticket } => Ok(Answered::Stale(ticket)),
             Routed::NotYours { ticket } => Ok(Answered::NotYours(ticket)),
             Routed::Decides { witness } => {
+                let instance = binding
+                    .as_ref()
+                    .expect("a decision implies a pending binding")
+                    .approval_instance_id
+                    .clone();
+                if !self
+                    .context
+                    .approval_store
+                    .begin_resolution(instance.as_str(), event)
+                    .map_err(|err| format!("approval resolution claim failed: {err}"))?
+                {
+                    return Ok(Answered::Stale(
+                        binding
+                            .expect("a decision implies a pending binding")
+                            .ticket,
+                    ));
+                }
                 let entry = pending
                     .remove(&input.conversation_id)
                     .expect("a decision implies a pending approval");
@@ -513,6 +522,14 @@ impl ShardTurns<'_> {
         else {
             return Ok(());
         };
+        if !self
+            .context
+            .approval_store
+            .begin_unanswered(pending.binding.approval_instance_id.as_str())
+            .map_err(|err| format!("approval expiry claim failed: {err}"))?
+        {
+            return Err("approval expiry was already claimed".to_owned());
+        }
         log_line(
             config,
             &format!(
@@ -555,20 +572,43 @@ impl ShardTurns<'_> {
             };
             let resumed = self
                 .service(&deps)
-                .resume(self.context.egress.as_ref(), pending.paused, witness)
+                .resume(
+                    self.context.egress.as_ref(),
+                    pending.paused.clone(),
+                    witness,
+                )
                 .await;
-            // Cancelling fails the run closed, so an error here is the
-            // expected shape, not a problem: report it and move on.
-            if let Err(err) = resumed {
-                log_line(
-                    &self.context.config,
-                    &format!(
-                        "{} approval {} expired: {err}",
-                        self.context.channel_name,
-                        approval_id.as_str()
-                    ),
-                )?;
+            match resumed {
+                Err(GatewayError::Runner(RunnerError::Run(RunError::ApprovalUnanswered {
+                    ..
+                }))) => {
+                    log_line(
+                        &self.context.config,
+                        &format!(
+                            "{} approval {} expired unanswered",
+                            self.context.channel_name,
+                            approval_id.as_str()
+                        ),
+                    )?;
+                }
+                Ok(_) | Err(_) => {
+                    self.context
+                        .approval_store
+                        .abort_unanswered(pending.binding.approval_instance_id.as_str())
+                        .map_err(|err| format!("approval expiry rollback failed: {err}"))?;
+                    self.pending_approvals
+                        .borrow_mut()
+                        .insert(pending.paused.conversation_id.clone(), pending);
+                    return Err("approval expiry did not record its unanswered outcome".to_owned());
+                }
             }
+            self.context
+                .approval_store
+                .consume_unanswered(
+                    pending.binding.approval_instance_id.as_str(),
+                    &pending.ingress_events,
+                )
+                .map_err(|err| format!("approval expiry completion failed: {err}"))?;
         }
     }
 
@@ -594,7 +634,11 @@ impl ShardTurns<'_> {
     /// `/clear` ends a conversation, which is the moment D3's job registry has
     /// been waiting for: its background jobs belong to a conversation that no
     /// longer exists, so they are cancelled and their entries reclaimed.
-    async fn clear_conversation(&self, input: &Envelope) -> Result<(), String> {
+    async fn clear_conversation(
+        &self,
+        egress: &dyn Egress,
+        input: &Envelope,
+    ) -> Result<(), String> {
         let config = &self.context.config;
         let channel_name = self.context.channel_name;
         // The full principal, sender included: `/clear` moves the epoch of
@@ -629,86 +673,17 @@ impl ShardTurns<'_> {
             ),
         )?;
         let reply = slash::format_clear(removed, channel_display_name(channel_name));
-        self.reply(input, &reply).await
+        self.reply(egress, input, &reply).await
     }
 
-    async fn reply(&self, input: &Envelope, text: &str) -> Result<(), String> {
+    async fn reply(&self, egress: &dyn Egress, input: &Envelope, text: &str) -> Result<(), String> {
         let envelope =
             command_reply_envelope(input, self.context.runtime.active_agent.as_str(), text);
-        if let Err(err) = self.context.egress.send(envelope).await {
-            log_line(
-                &self.context.config,
-                &format!(
-                    "{} gateway failed to send reply: {err}",
-                    self.context.channel_name
-                ),
-            )?;
-        }
-        Ok(())
-    }
-
-    /// The idle phase: cron scan and memory reflection, throttled to
-    /// `CRON_SCAN_INTERVAL_SECS` because cron resolution is one minute.
-    async fn maintenance(&self) -> Result<(), String> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        if now.saturating_sub(self.last_cron_scan.get()) < CRON_SCAN_INTERVAL_SECS {
-            return Ok(());
-        }
-        self.last_cron_scan.set(now);
-
-        // Cron runs go straight through the runner rather than the router.
-        // They are safe off-shard because a cron envelope carries
-        // `session_scope = ephemeral`: it neither loads nor writes back the
-        // conversation transcript, so it cannot race a user's run on the same
-        // conversation for the state that sharding exists to protect.
-        let deps = self.deps_scope.deps_with_guardrails(
-            self.input_guardrails,
-            self.output_guardrails,
-            self.tool_guardrails,
-        );
-        let service = self.service(&deps);
-        fire_due_crons(
-            &self.context.config,
-            self.context.egress.as_ref(),
-            self.context.channel_name,
-            &self.cron_store,
-            &service,
-            &self.context.session_usage,
-            now,
-        )
-        .await?;
-        // Take the schedule out for the call rather than holding the borrow
-        // across the await, and put it back afterwards: the schedule carries
-        // the last-fired bookkeeping, so dropping it would re-fire reflection
-        // on every idle tick.
-        let mut reflection = self.reflection_cron.borrow_mut().take();
-        let reflected = run_memory_reflection(
-            &self.context.config,
-            self.context.channel_name,
-            reflection.as_mut(),
-            &self.context.runtime.memory_manager,
-            &self.context.runtime.session,
-            now,
-        )
-        .await;
-        *self.reflection_cron.borrow_mut() = reflection;
-        reflected?;
-        if now.saturating_sub(self.last_retention_sweep.get()) < RETENTION_SWEEP_INTERVAL_SECS {
-            return Ok(());
-        }
-        self.last_retention_sweep.set(now);
-        // After reflection rather than before: reflection's own retention
-        // budgets can end a record's life, and sweeping the stores first would
-        // leave what it freed until the next tick.
-        run_retention_sweep(
-            &self.context.config,
-            self.context.channel_name,
-            &self.context.runtime,
-            &self.context.ledger,
-        )
-        .await
+        egress.send(envelope).await.map_err(|err| {
+            format!(
+                "{} gateway failed to send reply: {err}",
+                self.context.channel_name
+            )
+        })
     }
 }

@@ -76,6 +76,7 @@ fn bench_reply_turn(c: &mut Criterion) {
                 compaction: Default::default(),
                 cancel: Default::default(),
                 steering: None,
+                run_journal: None,
                 audit: SafetyJournal::detached(),
                 delegated_authority: None,
             };

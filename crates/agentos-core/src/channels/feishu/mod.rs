@@ -1,7 +1,9 @@
 use crate::channels::attachments::{file_size, AttachmentStore};
 use crate::http::shared_client;
-use agentos_interfaces::{Channel, ChannelError, Egress, StreamEgress};
-use agentos_proto::{Attachment, AttachmentKind, ChannelId, Envelope};
+use agentos_interfaces::{
+    Channel, ChannelError, Egress, InboundEvent, IngressReceipt, StreamEgress,
+};
+use agentos_proto::{Attachment, AttachmentKind, ChannelId};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -308,7 +310,7 @@ impl FeishuChannel {
         )
     }
 
-    async fn receive_long_connection(&mut self) -> Result<Option<Envelope>, ChannelError> {
+    async fn receive_long_connection(&mut self) -> Result<Option<InboundEvent>, ChannelError> {
         // Honor an active reconnect backoff window: after a dial failure we wait
         // (with exponential backoff) before re-dialing, so a sustained outage
         // doesn't re-connect and re-log on every one-second poll.
@@ -353,7 +355,7 @@ impl FeishuChannel {
                 return Err(err);
             }
         };
-        let Some(parsed) = parsed else {
+        let Some((parsed, acknowledgement)) = parsed else {
             return Ok(None);
         };
 
@@ -368,7 +370,10 @@ impl FeishuChannel {
                 .await?;
             envelope.message.attachments = attachments;
         }
-        Ok(Some(envelope))
+        Ok(Some(InboundEvent::new(
+            envelope,
+            IngressReceipt::new(None, Some(acknowledgement))?,
+        )))
     }
 
     /// Record a long-connection dial failure: grow the exponential backoff
@@ -409,7 +414,7 @@ impl Channel for FeishuChannel {
         self.id.clone()
     }
 
-    async fn receive(&mut self) -> Option<Envelope> {
+    async fn receive(&mut self) -> Option<InboundEvent> {
         match self.receive_long_connection().await {
             Ok(envelope) => envelope,
             Err(err) => {
@@ -419,6 +424,17 @@ impl Channel for FeishuChannel {
                 None
             }
         }
+    }
+
+    async fn acknowledge(&mut self, receipt: IngressReceipt) -> Result<(), ChannelError> {
+        let Some(token) = receipt.token() else {
+            return Ok(());
+        };
+        self.long_connection
+            .as_mut()
+            .ok_or_else(|| ChannelError::Backend(Arc::from("feishu receipt lost its connection")))?
+            .acknowledge(token)
+            .await
     }
 
     fn egress(&self) -> Arc<dyn Egress> {
@@ -559,7 +575,9 @@ pub(super) async fn post_json(
 /// worth logging. Matches the messages produced by [`websocket`] on a server
 /// Close frame, a stream EOF, and rustls' strict close-without-`close_notify`.
 fn is_expected_disconnect(err: &ChannelError) -> bool {
-    let ChannelError::Backend(message) = err;
+    let ChannelError::Backend(message) = err else {
+        return false;
+    };
     const BENIGN: [&str; 4] = [
         "Feishu WebSocket closed by server",
         "Feishu WebSocket stream ended",

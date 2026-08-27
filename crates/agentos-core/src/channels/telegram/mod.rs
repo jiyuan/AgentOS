@@ -2,7 +2,9 @@ use crate::channels::admission::{env_flag, AdmissionPolicy};
 use crate::channels::attachments::{file_size, AttachmentStore};
 use crate::http::shared_client;
 use crate::r#loop::{parse_action_data, DECISION_KEY, TICKET_KEY};
-use agentos_interfaces::{Channel, ChannelError, Egress, StreamEgress};
+use agentos_interfaces::{
+    Channel, ChannelError, Egress, InboundEvent, IngressReceipt, StreamEgress,
+};
 use agentos_proto::{
     Attachment, AttachmentKind, ChannelId, ConversationId, Envelope, Message, MessageRole,
     INGRESS_ID_KEY,
@@ -333,16 +335,6 @@ impl Channel for TelegramChannel {
         self.id.clone()
     }
 
-    /// Telegram's `getUpdates` offset, as a decimal string.
-    ///
-    /// The gateway persists this after the update it belongs to is in the
-    /// ingress ledger, which is what makes a restart resume from the last
-    /// *recorded* update rather than from wherever the in-memory offset had
-    /// got to.
-    fn cursor(&self) -> Option<Arc<str>> {
-        self.offset.map(|offset| Arc::from(offset.to_string()))
-    }
-
     fn resume_from(&mut self, cursor: &str) {
         match cursor.parse::<i64>() {
             Ok(offset) => self.offset = Some(offset),
@@ -353,7 +345,7 @@ impl Channel for TelegramChannel {
         }
     }
 
-    async fn receive(&mut self) -> Option<Envelope> {
+    async fn receive(&mut self) -> Option<InboundEvent> {
         let response = match self.fetch_updates() {
             Ok(Some(response)) => response,
             // Idle long poll: no updates this cycle. Not an error — poll again.
@@ -387,18 +379,39 @@ impl Channel for TelegramChannel {
             if parsed.envelope.message.content.is_empty() && attachments.is_empty() {
                 continue;
             }
-            self.offset = Some(update_id + 1);
-            if let Some(callback_id) = &parsed.callback_query_id {
-                // Best effort: an unacknowledged press leaves the client's
-                // button spinning, which is cosmetic — the decision is already
-                // in hand and must not be dropped for a failed acknowledgement.
-                tg_answer_callback(&self.api_base, &self.token, callback_id).await;
-            }
             let mut envelope = parsed.envelope;
             envelope.message.attachments = attachments;
-            return Some(envelope);
+            let receipt = IngressReceipt::new(
+                Some(Arc::from((update_id + 1).to_string())),
+                parsed
+                    .callback_query_id
+                    .map(|id| Arc::<[u8]>::from(id.into_bytes())),
+            )
+            .ok()?;
+            return Some(InboundEvent::new(envelope, receipt));
         }
         None
+    }
+
+    async fn acknowledge(&mut self, receipt: IngressReceipt) -> Result<(), ChannelError> {
+        if let Some(checkpoint) = receipt.checkpoint() {
+            self.offset = Some(checkpoint.parse::<i64>().map_err(|err| {
+                ChannelError::Backend(Arc::from(format!(
+                    "telegram receipt has invalid offset '{checkpoint}': {err}"
+                )))
+            })?);
+        }
+        if let Some(token) = receipt.token() {
+            let callback_id = std::str::from_utf8(token).map_err(|err| {
+                ChannelError::Backend(Arc::from(format!(
+                    "telegram receipt has invalid callback id: {err}"
+                )))
+            })?;
+            // Best effort: failure only leaves the client's button spinning;
+            // the durable update remains accepted and replayable.
+            tg_answer_callback(&self.api_base, &self.token, callback_id).await;
+        }
+        Ok(())
     }
 
     fn egress(&self) -> Arc<dyn Egress> {
@@ -847,7 +860,7 @@ mod tests {
     /// only in process memory, so a restart re-read everything Telegram still
     /// held.
     #[test]
-    fn the_offset_round_trips_through_the_channel_cursor() {
+    fn the_offset_resumes_from_a_durable_receipt_checkpoint() {
         let token: Arc<str> = Arc::from("token");
         let api_base: Arc<str> = Arc::from(DEFAULT_API_BASE);
         let mut channel = TelegramChannel {
@@ -865,14 +878,14 @@ mod tests {
                 stream_state: Arc::new(Mutex::new(HashMap::new())),
             }),
         };
-        assert_eq!(channel.cursor(), None, "a fresh channel has no position");
+        assert_eq!(channel.offset, None, "a fresh channel has no position");
         channel.resume_from("4243");
-        assert_eq!(channel.cursor().as_deref(), Some("4243"));
+        assert_eq!(channel.offset, Some(4243));
 
         // A cursor from some other build is ignored rather than fatal: the
         // transport re-sends what it has no acknowledgement for anyway.
         channel.resume_from("not a number");
-        assert_eq!(channel.cursor().as_deref(), Some("4243"));
+        assert_eq!(channel.offset, Some(4243));
     }
 
     /// A press on some other feature's button is not an approval answer.

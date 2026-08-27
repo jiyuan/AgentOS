@@ -277,6 +277,7 @@ fn deps_with_trace<'a>(
         compaction: Default::default(),
         cancel: Default::default(),
         steering: None,
+        run_journal: None,
         safety_log: Some(safety_log),
         delegated_authority: None,
     }

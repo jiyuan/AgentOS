@@ -26,7 +26,11 @@
 //! know which conversations were mid-turn, and the alternative to reporting it
 //! is not knowing.
 
+use agentos_interfaces::{Channel, InboundEvent};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 
 /// Set by the signal handler, read by every loop that can stop.
 ///
@@ -43,6 +47,95 @@ pub fn shutdown_requested() -> bool {
 /// to stop, or a test.
 pub fn request_shutdown() {
     REQUESTED.store(true, Ordering::SeqCst);
+}
+
+/// The single cancellation root and grace deadline for a serving process.
+///
+/// Every participant clones this handle. The first shutdown cause fixes the
+/// deadline; later channel errors and signals observe that same instant rather
+/// than buying their own fresh grace period.
+#[derive(Clone, Debug)]
+pub struct ProcessShutdown {
+    cancellation: CancellationToken,
+    grace: Duration,
+    deadline: Arc<Mutex<Option<Instant>>>,
+}
+
+impl ProcessShutdown {
+    pub fn new(cancellation: CancellationToken, grace: Duration) -> Self {
+        Self {
+            cancellation,
+            grace,
+            deadline: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Begin the process drain, returning the one deadline shared by every
+    /// caller. Cancellation happens after publication of the deadline.
+    pub fn begin(&self) -> Instant {
+        let deadline = {
+            let mut current = self
+                .deadline
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *current.get_or_insert_with(|| Instant::now() + self.grace)
+        };
+        self.cancellation.cancel();
+        deadline
+    }
+
+    /// Turn a process signal/control request into the shared drain boundary.
+    pub fn observe_process_request(&self) -> Option<Instant> {
+        shutdown_requested().then(|| self.begin())
+    }
+
+    pub fn deadline(&self) -> Option<Instant> {
+        *self
+            .deadline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn remaining(&self) -> Option<Duration> {
+        self.deadline()
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
+    pub fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
+
+    pub async fn cancelled(&self) {
+        self.cancellation.cancelled().await;
+    }
+}
+
+/// Why a channel receive future returned.
+#[derive(Debug)]
+pub enum ReceiveOutcome {
+    Cancelled,
+    Closed,
+    Received(Box<InboundEvent>),
+}
+
+/// Await a channel without allowing a transport's indefinitely-blocked
+/// receive future to hold the process past cancellation.
+pub async fn receive_or_cancel<C>(channel: &mut C, shutdown: &ProcessShutdown) -> ReceiveOutcome
+where
+    C: Channel,
+{
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => ReceiveOutcome::Cancelled,
+        inbound = channel.receive() => match inbound {
+            Some(inbound) => ReceiveOutcome::Received(Box::new(inbound)),
+            None => ReceiveOutcome::Closed,
+        },
+    }
 }
 
 /// Clear the flag. For tests; a served process never un-asks.

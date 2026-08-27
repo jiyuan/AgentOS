@@ -516,6 +516,7 @@ async fn delegate_with_seeding(seed_from_parent: bool) -> (Arc<InMemorySession>,
         compaction: Default::default(),
         cancel: Default::default(),
         steering: None,
+        run_journal: None,
         safety_log: None,
         delegated_authority: None,
     };

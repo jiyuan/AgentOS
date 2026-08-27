@@ -1,9 +1,9 @@
-use agentos_cli::slash::{self, Parsed, SessionUsage, SlashCommand};
+use agentos_cli::slash::SessionUsage;
 use agentos_core::channels::{feishu::FeishuChannel, telegram::TelegramChannel};
 use agentos_core::config::{effective, WorkspaceConfig};
 use agentos_core::crons::{CronSchedule, CronStore, MemoryMaintenanceCron};
 use agentos_core::gateway::{
-    self, shard_set, Admission, GatewayRun, GatewayService, IngressLedger, Router, ShardConfig,
+    self, shard_set, ApprovalStore, GatewayRun, GatewayService, IngressLedger, ShardConfig,
     DEFAULT_IDLE_INTERVAL,
 };
 use agentos_core::memory::migrate::{self, MigrationSettings};
@@ -32,11 +32,16 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod approval;
 mod calibrate;
 mod catalog;
+mod delivery;
+mod ingress;
+mod maintenance;
 mod purge;
 mod shard;
 
+use delivery::send_approval_prompt;
 use shard::{run_shard_thread, ShardContext};
 
 const DEFAULT_PID_RELPATH: &str = "workspace/run/agentos-gateway.pid";
@@ -86,9 +91,28 @@ fn build_reflection_cron(
     )))
 }
 
-/// Drive the reflection cron on an idle tick, logging a one-line summary when a
-/// sweep runs. Reflection is best-effort maintenance — a failure is logged, not
-/// propagated, so it never takes the gateway loop down.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MaintenanceRun {
+    Disabled,
+    Standby,
+    Checked,
+    Ran,
+}
+
+impl MaintenanceRun {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Standby => "standby",
+            Self::Checked => "checked",
+            Self::Ran => "ran",
+        }
+    }
+}
+
+/// Drive the reflection cron on its bounded timer, logging a one-line summary
+/// when a sweep runs. Reflection is best-effort maintenance: a failure is
+/// returned to the supervisor for diagnosis and never stops the gateway.
 ///
 /// Guarded by the `memory.reflection` lease (M8 / `GW-001`, deliverable 2).
 /// Shard 0 exists once per *channel*, so a Telegram-and-Feishu deployment used
@@ -102,52 +126,47 @@ async fn run_memory_reflection(
     manager: &MemoryManager,
     session: &SqliteStore,
     now_unix: u64,
-) -> Result<(), String> {
+) -> Result<MaintenanceRun, String> {
     let Some(cron) = cron else {
-        return Ok(());
+        return Ok(MaintenanceRun::Disabled);
     };
-    // Asked on every idle tick rather than once at startup, because this is
-    // also the renewal: a leader that stops asking loses the lease and another
-    // contender picks the sweep up.
+    // Asked on every scheduled scan rather than once at startup, because this
+    // is also the renewal: a leader that stops asking loses the lease and
+    // another contender picks the sweep up.
     let holder = lease_holder_id(channel_name);
     match session.try_acquire_lease(REFLECTION_LEASE, &holder, DEFAULT_LEASE_TTL) {
         Ok(Some(_lease)) => {}
         // Somebody else is the leader. The ordinary answer for every channel
         // but one, and not worth a log line every thirty seconds.
-        Ok(None) => return Ok(()),
-        Err(err) => {
-            return log_line(
-                config,
-                &format!("{channel_name} could not ask for the reflection lease: {err}"),
-            );
-        }
+        Ok(None) => return Ok(MaintenanceRun::Standby),
+        Err(err) => return Err(format!("could not acquire reflection lease: {err}")),
     }
     match cron.run_due(now_unix, manager).await {
-        Ok(Some(report)) => log_line(
-            config,
-            &format!(
+        Ok(Some(report)) => {
+            log_line(
+                config,
+                &format!(
                 "{channel_name} memory reflection: promoted {}, procedural {}, superseded {}, indexed {}",
                 report.promoted_records.len(),
                 report.procedural_candidates.len(),
                 report.superseded_records.len(),
                 report.index.indexed_records,
             ),
-        ),
-        Ok(None) => Ok(()),
-        Err(err) => log_line(
-            config,
-            &format!("{channel_name} memory reflection failed: {err}"),
-        ),
+            )?;
+            Ok(MaintenanceRun::Ran)
+        }
+        Ok(None) => Ok(MaintenanceRun::Checked),
+        Err(err) => Err(format!("memory reflection failed: {err}")),
     }
 }
-/// Apply `[retention]`, `[spill]` and `[jobs].completed_retention_secs` on an
-/// idle tick, logging one line when anything was actually removed
+/// Apply `[retention]`, `[spill]` and `[jobs].completed_retention_secs` on the
+/// slower bounded timer, logging one line when anything was actually removed
 /// (M7 / `QUOTA-001`).
 ///
-/// Guarded by its own lease, for the same reason reflection is: shard 0 exists
-/// once per *channel*, so a Telegram-and-Feishu deployment would otherwise walk
-/// the same trace directory twice at once and race itself over which process
-/// gets to unlink a file. A separate lease from reflection's because the two
+/// Guarded by its own lease because one independent timer runs per enabled
+/// channel, and another serving process may share the database. Without the
+/// lease those contenders would walk the same directories and process-owned
+/// registries concurrently. A separate lease from reflection's because the two
 /// are not one job — reflection is off by default and needs an LLM, retention
 /// is on and needs nothing, and gating one on the other would silently disable
 /// retention on most deployments.
@@ -160,14 +179,14 @@ async fn run_retention_sweep(
     channel_name: &str,
     runtime: &AgentRuntime,
     ledger: &IngressLedger,
-) -> Result<(), String> {
+) -> Result<MaintenanceRun, String> {
     let workspace = &runtime.workspace_config;
     if !workspace.retention.sweeps_anything()
         && workspace.spill.retention_secs().is_none()
         && workspace.spill.max_bytes().is_none()
         && workspace.jobs.completed_job_max_age().is_none()
     {
-        return Ok(());
+        return Ok(MaintenanceRun::Disabled);
     }
     let holder = lease_holder_id(channel_name);
     match runtime
@@ -175,13 +194,8 @@ async fn run_retention_sweep(
         .try_acquire_lease(RETENTION_LEASE, &holder, DEFAULT_LEASE_TTL)
     {
         Ok(Some(_lease)) => {}
-        Ok(None) => return Ok(()),
-        Err(err) => {
-            return log_line(
-                config,
-                &format!("{channel_name} could not ask for the retention lease: {err}"),
-            );
-        }
+        Ok(None) => return Ok(MaintenanceRun::Standby),
+        Err(err) => return Err(format!("could not acquire retention lease: {err}")),
     }
 
     let targets = RetentionTargets {
@@ -202,17 +216,18 @@ async fn run_retention_sweep(
     .await;
 
     if report.is_empty() {
-        return Ok(());
+        return Ok(MaintenanceRun::Checked);
     }
-    log_line(config, &format!("{channel_name} retention: {report}"))
+    log_line(config, &format!("{channel_name} retention: {report}"))?;
+    Ok(MaintenanceRun::Ran)
 }
 
 const DEFAULT_LOG_RELPATH: &str = "logs/agentos-gateway.log";
 const OWNER_TOKEN_ENV: &str = "AGENTOS_GATEWAY_OWNER_TOKEN";
 
-/// How often the channel idle tick scans the cron store. Cron expressions
+/// How often the independent maintenance timer scans the cron store. Cron expressions
 /// have one-minute resolution, so a 30s scan never misses a tick while
-/// avoiding a re-read of every TOML on each one-second idle poll.
+/// avoiding a re-read of every TOML more often than necessary.
 const CRON_SCAN_INTERVAL_SECS: u64 = 30;
 
 /// How often the retention sweep walks the stores.
@@ -258,6 +273,44 @@ impl ServiceConfig {
             env_file: None,
             home,
         }
+    }
+}
+
+/// The resources that exist exactly once in a persistent serving process.
+///
+/// Channel workers receive clones of this handle. Cloning shares each
+/// resource; it cannot construct a second database pool, job registry, MCP
+/// lifecycle, cancellation root, or session-usage accumulator.
+#[derive(Clone)]
+struct ProcessRuntimeAuthority {
+    tokio_runtime: Arc<tokio::runtime::Runtime>,
+    agent_runtime: Arc<AgentRuntime>,
+    session_usage: Arc<SessionUsage>,
+    shutdown: gateway::ProcessShutdown,
+}
+
+impl ProcessRuntimeAuthority {
+    fn build(config: &ServiceConfig) -> Result<Self, String> {
+        let tokio_runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|err| format!("failed to start tokio runtime: {err}"))?,
+        );
+        let agent_runtime = Arc::new(tokio_runtime.block_on(AgentRuntime::build_with(
+            runtime_paths(config),
+            &agentos_cli::semantic_index_factory,
+        ))?);
+        let shutdown = gateway::ProcessShutdown::new(
+            agent_runtime.cancellation().clone(),
+            Duration::from_secs(agent_runtime.workspace_config.gateway.shutdown_grace_secs),
+        );
+        Ok(Self {
+            tokio_runtime,
+            agent_runtime,
+            session_usage: Arc::new(SessionUsage::new()),
+            shutdown,
+        })
     }
 }
 
@@ -353,6 +406,9 @@ Subcommands:
              on, which the old rows do not record; `--agent NAME` likewise.
              `--assume-literal-underscores` accepts the literal reading of ids
              the old encoder made ambiguous — see the report before using it.
+             `--adjudicate-ingress EVENT_ID` durably refuses one quarantined
+             legacy or ambiguous action/delivery row after reconciliation; it
+             also requires `--apply`.
   purge      Irreversibly delete records. Never `/clear`, which hides history
              behind an epoch marker and removes nothing. Three modes, each
              recording a safety event:
@@ -432,7 +488,13 @@ where
             | "--assume-literal-underscores"
             | "--audit"
             | "--sessions" => {}
-            "--channel" | "--agent" | "--backup" | "--conversation" | "--yes" | "--before" => {
+            "--channel"
+            | "--agent"
+            | "--backup"
+            | "--conversation"
+            | "--yes"
+            | "--before"
+            | "--adjudicate-ingress" => {
                 let _ = args.next();
             }
             option
@@ -441,7 +503,8 @@ where
                     || option.starts_with("--backup=")
                     || option.starts_with("--conversation=")
                     || option.starts_with("--yes=")
-                    || option.starts_with("--before=") => {}
+                    || option.starts_with("--before=")
+                    || option.starts_with("--adjudicate-ingress=") => {}
             "-h" | "--help" => {
                 usage();
                 std::process::exit(0);
@@ -621,22 +684,29 @@ fn wait_for_control_file(
 /// `[gateway] shutdown_grace_secs`, so the service gets to finish its drain
 /// and report what it abandoned rather than being killed halfway through
 /// doing so.
-const STOP_TIMEOUT: Duration = Duration::from_secs(45);
+const STOP_SCHEDULER_TOLERANCE: Duration = Duration::from_secs(5);
+
+fn stop_timeout(config: &ServiceConfig) -> Duration {
+    let grace = WorkspaceConfig::load(&agent_config_path(config))
+        .map(|workspace| workspace.gateway.shutdown_grace_secs)
+        .unwrap_or(gateway::DEFAULT_SHUTDOWN_GRACE_SECS);
+    Duration::from_secs(grace).saturating_add(STOP_SCHEDULER_TOLERANCE)
+}
 
 fn stop(config: &ServiceConfig) -> Result<(), String> {
-    // Signalled by lock holder, never by a pid read out of a file (M8 /
-    // `GW-001`, deliverable 5). Pids are recycled: `kill -0` succeeding says a
-    // process exists, not that it is the gateway, and a stale record plus a
-    // busy box is all it takes for `stop` to `SIGTERM` and then `SIGKILL` a
-    // stranger.
-    let signalled = gateway::terminate_holder(&config.pid_path)
-        .map_err(|err| format!("failed to signal the gateway: {err}"))?;
-    let Some(record) = signalled else {
+    // The request captures the locked holder's private token and presents it
+    // to the holder-directed socket. If that holder exits and a replacement
+    // starts in between, the replacement rejects the old token; no numeric pid
+    // is ever signalled.
+    let Some(request) = gateway::ShutdownRequest::capture(&config.pid_path)
+        .map_err(|err| format!("failed to inspect the gateway holder: {err}"))?
+    else {
         match gateway::read_record(&config.pid_path)
             .map_err(|err| format!("failed to read the gateway control file: {err}"))?
         {
             Some(stale) => {
                 let _ = fs::remove_file(&config.pid_path);
+                let _ = fs::remove_file(gateway::control_socket_path(&config.pid_path));
                 println!(
                     "AgentOS gateway was not running; removed the control file left by pid {}",
                     stale.pid
@@ -649,10 +719,14 @@ fn stop(config: &ServiceConfig) -> Result<(), String> {
         }
         return Ok(());
     };
+    let record = request
+        .send()
+        .map_err(|err| format!("failed to request gateway shutdown safely: {err}"))?;
 
     // The lock releasing is the definitive "it exited": the kernel drops it
     // when the process ends, however it ends.
-    let deadline = std::time::Instant::now() + STOP_TIMEOUT;
+    let timeout = stop_timeout(config);
+    let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
         if gateway::holder(&config.pid_path)
             .map_err(|err| format!("failed to read the gateway control file: {err}"))?
@@ -665,16 +739,13 @@ fn stop(config: &ServiceConfig) -> Result<(), String> {
         thread::sleep(Duration::from_millis(100));
     }
 
-    gateway::kill_holder(&config.pid_path)
-        .map_err(|err| format!("failed to kill the gateway: {err}"))?;
-    let _ = fs::remove_file(&config.pid_path);
-    println!(
-        "AgentOS gateway killed after {}s: pid {}. Work in flight was abandoned; the next start \
-         reports it from the ingress ledger.",
-        STOP_TIMEOUT.as_secs(),
-        record.pid
-    );
-    Ok(())
+    Err(format!(
+        "gateway pid {} did not release {} within {}s; refusing a numeric-pid kill because the \
+         holder may have changed",
+        record.pid,
+        config.pid_path.display(),
+        timeout.as_secs()
+    ))
 }
 
 fn stop_if_running(config: &ServiceConfig) -> Result<(), String> {
@@ -777,24 +848,46 @@ fn serve(config: &ServiceConfig) -> Result<(), String> {
     ensure_parent_dir(&config.pid_path)?;
     ensure_parent_dir(&config.log_path)?;
 
-    // Taken here and held for the life of this process (M8 / `GW-001`,
-    // deliverable 5). Not by `start`: a lock the parent held would be released
-    // the moment `start` returned, and the record would be back to being a
-    // number in a file.
+    // A visible lock is the publication point. Everything needed to stop the
+    // process must therefore be ready first: the signal disposition and the
+    // authenticated socket accept loop.
+    gateway::install_shutdown_handler()
+        .map_err(|err| format!("failed to install the shutdown handler: {err}"))?;
+    let owner_token = match env::var(OWNER_TOKEN_ENV) {
+        Ok(token) if !token.is_empty() => token,
+        _ => gateway_owner_token()?,
+    };
+    let control_token = gateway_owner_token()?;
+    let control_endpoint = gateway::ControlEndpoint::bind(&config.pid_path, control_token.clone())
+        .map_err(|err| format!("failed to bind the gateway control endpoint: {err}"))?;
+
+    // A debug-only process fixture holds execution at the final pre-publication
+    // barrier. It lets the lifecycle regression prove the lock remains absent
+    // until shutdown handling is ready.
+    #[cfg(debug_assertions)]
+    if let Ok(delay) = env::var("AGENTOS_TEST_PRE_PUBLICATION_DELAY_MS") {
+        if let Ok(path) = env::var("AGENTOS_TEST_PRE_PUBLICATION_READY_PATH") {
+            fs::write(&path, b"ready\n")
+                .map_err(|err| format!("failed to publish test startup barrier {path}: {err}"))?;
+        }
+        let millis = delay
+            .parse::<u64>()
+            .map_err(|_| "AGENTOS_TEST_PRE_PUBLICATION_DELAY_MS must be an integer".to_owned())?;
+        thread::sleep(Duration::from_millis(millis));
+    }
+
+    // Taken here and held for the life of this process. Not by `start`: a lock
+    // the parent held would be released the moment `start` returned.
     let control = gateway::ControlFile::acquire(
         &config.pid_path,
-        &gateway::ControlRecord::new(
+        &gateway::ControlRecord::with_control_token(
             process::id(),
-            env::var(OWNER_TOKEN_ENV).unwrap_or_default(),
+            owner_token,
+            control_token,
             unix_seconds(),
         ),
     )
     .map_err(|err| format!("failed to take the gateway control file: {err}"))?;
-
-    // Installed before anything is served, so a `SIGTERM` that arrives during
-    // startup is a drain rather than a half-built runtime dying.
-    gateway::install_shutdown_handler()
-        .map_err(|err| format!("failed to install the shutdown handler: {err}"))?;
 
     log_line(config, "AgentOS gateway service starting")?;
     log_line(
@@ -829,6 +922,7 @@ fn serve(config: &ServiceConfig) -> Result<(), String> {
     };
 
     log_line(config, "AgentOS gateway service stopped")?;
+    drop(control_endpoint);
     control.release();
     outcome
 }
@@ -859,24 +953,34 @@ fn run_persistent_gateways(
     config: &ServiceConfig,
     channels: &[&'static str],
 ) -> Result<(), String> {
+    // GW-005: transports are channel-local, but the resources that define one
+    // serving agent are process-wide. In particular, building here (rather
+    // than in `run_channel_gateway`) gives Telegram and Feishu the same SQLite
+    // pool, job registry, MCP lifecycle registry, cancellation root, and
+    // session-usage counter.
+    let authority = ProcessRuntimeAuthority::build(config)?;
+    log_line(config, &authority.agent_runtime.orchestrator.describe_llm())?;
+
     let mut handles = Vec::new();
     for channel in channels {
         let config = config.clone();
         let channel = *channel;
-        let handle = thread::spawn(move || run_persistent_channel(&config, channel));
+        let worker_authority = authority.clone();
+        let handle =
+            thread::spawn(move || run_persistent_channel(&config, channel, worker_authority));
         handles.push((channel, handle));
     }
 
-    // Nothing here polls for the shutdown signal. Each channel's own router
-    // notices it and returns after draining, and the loop below already
-    // reports and removes a finished channel and exits when none are left —
-    // so waiting for them *is* the drain (M8 / `GW-001`, deliverable 5).
     let mut announced = false;
+    let mut first_error = None;
     loop {
-        thread::sleep(Duration::from_secs(1));
-        if gateway::shutdown_requested() && !announced {
+        thread::sleep(Duration::from_millis(25));
+        if authority.shutdown.observe_process_request().is_some() && !announced {
             announced = true;
-            log_line(config, "shutdown requested; waiting for channels to drain")?;
+            log_line(
+                config,
+                "shutdown requested; admission stopped and the process drain deadline started",
+            )?;
         }
         let mut index = 0;
         while index < handles.len() {
@@ -887,13 +991,19 @@ fn run_persistent_gateways(
                         log_line(config, &format!("{channel} gateway loop exited"))?;
                     }
                     Ok(Err(err)) => {
+                        authority.shutdown.begin();
                         log_line(config, &format!("{channel} gateway loop failed: {err}"))?;
-                        return Err(err);
+                        if first_error.is_none() {
+                            first_error = Some(err);
+                        }
                     }
                     Err(_) => {
+                        authority.shutdown.begin();
                         let err = format!("{channel} gateway loop panicked");
                         log_line(config, &err)?;
-                        return Err(err);
+                        if first_error.is_none() {
+                            first_error = Some(err);
+                        }
                     }
                 }
             } else {
@@ -901,19 +1011,56 @@ fn run_persistent_gateways(
             }
         }
         if handles.is_empty() {
-            return Ok(());
+            authority.shutdown.begin();
+            break;
+        }
+        if authority
+            .shutdown
+            .deadline()
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            let abandoned: Vec<_> = handles.iter().map(|(channel, _)| *channel).collect();
+            log_line(
+                config,
+                &format!(
+                    "process shutdown deadline reached; abandoning channel worker(s) {abandoned:?}"
+                ),
+            )?;
+            break;
         }
     }
+
+    // Report from the process-owned store even if a channel worker itself was
+    // what missed the deadline and could not reach its local epilogue.
+    let ledger = IngressLedger::new(Arc::clone(&authority.agent_runtime.session));
+    for channel in channels {
+        ingress::report_unsettled(config, channel, &ledger, &ChannelId::new(*channel))?;
+    }
+    authority.shutdown.begin();
+    if let Some(err) = first_error {
+        return Err(err);
+    }
+    Ok(())
 }
 
-fn run_persistent_channel(config: &ServiceConfig, channel: &'static str) -> Result<(), String> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|err| format!("failed to start tokio runtime: {err}"))?;
+fn run_persistent_channel(
+    config: &ServiceConfig,
+    channel: &'static str,
+    authority: ProcessRuntimeAuthority,
+) -> Result<(), String> {
     match channel {
-        "telegram" => runtime.block_on(run_telegram_gateway(config)),
-        "feishu" => runtime.block_on(run_feishu_gateway(config)),
+        "telegram" => authority.tokio_runtime.block_on(run_telegram_gateway(
+            config,
+            authority.agent_runtime,
+            authority.session_usage,
+            authority.shutdown,
+        )),
+        "feishu" => authority.tokio_runtime.block_on(run_feishu_gateway(
+            config,
+            authority.agent_runtime,
+            authority.session_usage,
+            authority.shutdown,
+        )),
         _ => Err(format!("unknown persistent channel: {channel}")),
     }
 }
@@ -930,7 +1077,12 @@ fn attachment_limits(config: &ServiceConfig) -> (u64, usize) {
     (limits.attachment_bytes, limits.attachments_per_message)
 }
 
-async fn run_telegram_gateway(config: &ServiceConfig) -> Result<(), String> {
+async fn run_telegram_gateway(
+    config: &ServiceConfig,
+    runtime: Arc<AgentRuntime>,
+    session_usage: Arc<SessionUsage>,
+    shutdown: gateway::ProcessShutdown,
+) -> Result<(), String> {
     let attachments_dir = attachments_dir_path(config);
     let (max_bytes, per_message) = attachment_limits(config);
     let channel = TelegramChannel::from_env()
@@ -938,10 +1090,24 @@ async fn run_telegram_gateway(config: &ServiceConfig) -> Result<(), String> {
         .with_attachments_root(attachments_dir)
         .with_attachment_limits(max_bytes, per_message)
         .with_receive_error_logging(true);
-    run_channel_gateway(config, channel, "telegram", RunId::new("telegram-gateway")).await
+    run_channel_gateway(
+        config,
+        channel,
+        "telegram",
+        RunId::new("telegram-gateway"),
+        runtime,
+        session_usage,
+        shutdown,
+    )
+    .await
 }
 
-async fn run_feishu_gateway(config: &ServiceConfig) -> Result<(), String> {
+async fn run_feishu_gateway(
+    config: &ServiceConfig,
+    runtime: Arc<AgentRuntime>,
+    session_usage: Arc<SessionUsage>,
+    shutdown: gateway::ProcessShutdown,
+) -> Result<(), String> {
     let attachments_dir = attachments_dir_path(config);
     let (max_bytes, per_message) = attachment_limits(config);
     let channel = FeishuChannel::from_env()
@@ -949,7 +1115,16 @@ async fn run_feishu_gateway(config: &ServiceConfig) -> Result<(), String> {
         .with_attachments_root(attachments_dir)
         .with_attachment_limits(max_bytes, per_message)
         .with_receive_error_logging(true);
-    run_channel_gateway(config, channel, "feishu", RunId::new("feishu-gateway")).await
+    run_channel_gateway(
+        config,
+        channel,
+        "feishu",
+        RunId::new("feishu-gateway"),
+        runtime,
+        session_usage,
+        shutdown,
+    )
+    .await
 }
 
 /// The gateway loop, as a router (roadmap item G1).
@@ -967,16 +1142,13 @@ async fn run_channel_gateway<C>(
     mut channel: C,
     channel_name: &'static str,
     run_id: RunId,
+    runtime: Arc<AgentRuntime>,
+    session_usage: Arc<SessionUsage>,
+    shutdown: gateway::ProcessShutdown,
 ) -> Result<(), String>
 where
     C: Channel,
 {
-    let runtime = Arc::new(
-        AgentRuntime::build_with(runtime_paths(config), &agentos_cli::semantic_index_factory)
-            .await?,
-    );
-    log_line(config, &runtime.orchestrator.describe_llm())?;
-
     let gateway_config = runtime.workspace_config.gateway;
     let shard_config = ShardConfig {
         shards: gateway_config.shard_count(),
@@ -989,7 +1161,38 @@ where
     // deliverable 3). Built before the shards, because the shards settle into
     // it and the router admits through it.
     let ledger = Arc::new(IngressLedger::new(Arc::clone(&runtime.session)));
-    report_abandoned_work(config, channel_name, &ledger, &channel.id())?;
+    let approval_store = Arc::new(ApprovalStore::new(ledger.as_ref().clone()));
+    let quarantined = ledger
+        .quarantined(&channel.id())
+        .map_err(|err| format!("failed to inspect {channel_name} ingress quarantine: {err}"))?;
+    if !quarantined.is_empty() {
+        return Err(format!(
+            "refusing to serve {channel_name}: {} legacy unsettled ingress row(s) have no \
+             replayable envelope; inspect and adjudicate the ingress quarantine before start",
+            quarantined.len()
+        ));
+    }
+    let recovered = ledger
+        .recover_dispatches(&channel.id())
+        .map_err(|err| format!("failed to recover {channel_name} ingress dispatches: {err}"))?;
+    if recovered > 0 {
+        log_line(
+            config,
+            &format!("{channel_name} recovered {recovered} interrupted ingress dispatch(es)"),
+        )?;
+    }
+    let ambiguous = ledger
+        .ambiguities(&channel.id())
+        .map_err(|err| format!("failed to inspect {channel_name} delivery ambiguity: {err}"))?;
+    if !ambiguous.is_empty() {
+        return Err(format!(
+            "refusing to serve {channel_name}: {} ingress event(s) have ambiguous external \
+             action or delivery outcomes; reconcile them and run migrate \
+             --adjudicate-ingress EVENT_ID --apply before restart",
+            ambiguous.len()
+        ));
+    }
+    ingress::report_unsettled(config, channel_name, &ledger, &channel.id())?;
     if let Some(cursor) = ledger
         .cursor(&channel.id())
         .map_err(|err| format!("failed to read the {channel_name} ingress cursor: {err}"))?
@@ -1002,11 +1205,44 @@ where
     }
 
     let egress = channel.egress();
+    let current_administrators: Vec<ActorPrincipal> = runtime
+        .workspace_config
+        .policy
+        .approval_administrators
+        .iter()
+        .map(|administrator| administrator.actor())
+        .collect();
+    let recovery = approval_store
+        .recover(&channel.id(), &current_administrators)
+        .map_err(|err| format!("failed to recover {channel_name} approvals: {err}"))?;
+    for (instance, batch) in recovery.prompts {
+        send_approval_prompt(&approval_store, egress.as_ref(), &instance, &batch)
+            .await
+            .map_err(|err| {
+                format!("failed to deliver recovered {channel_name} approval prompt: {err}")
+            })?;
+    }
+    let recovered_approvals = approval_store
+        .recover(&channel.id(), &current_administrators)
+        .map_err(|err| format!("failed to validate {channel_name} approvals: {err}"))?
+        .pending;
+    if !recovered_approvals.is_empty() {
+        log_line(
+            config,
+            &format!(
+                "{channel_name} restored {} pending approval(s)",
+                recovered_approvals.len()
+            ),
+        )?;
+    }
+    let mut restored_by_shard: Vec<Vec<_>> = (0..shard_config.shards).map(|_| Vec::new()).collect();
+    for approval in recovered_approvals {
+        let shard = router.shard_of(&approval.paused.conversation_id);
+        restored_by_shard[shard].push(approval);
+    }
     let stream_egress = gateway_streaming_enabled()
         .then(|| channel.stream_egress())
         .flatten();
-    let session_usage = Arc::new(SessionUsage::new());
-
     let mut shards = Vec::with_capacity(inbounds.len());
     for (shard, inbound) in inbounds.into_iter().enumerate() {
         let context = ShardContext {
@@ -1019,6 +1255,8 @@ where
             stream_egress: stream_egress.clone(),
             session_usage: Arc::clone(&session_usage),
             ledger: Arc::clone(&ledger),
+            approval_store: Arc::clone(&approval_store),
+            restored_approvals: std::mem::take(&mut restored_by_shard[shard]),
         };
         let handle = thread::Builder::new()
             .name(format!("agentos-{channel_name}-shard-{shard}"))
@@ -1034,15 +1272,46 @@ where
         ),
     )?;
 
-    let outcome = route_inbound(
-        config,
-        &mut channel,
-        channel_name,
-        &router,
-        egress.as_ref(),
-        &ledger,
-    )
-    .await;
+    let active_channel_id = channel.id();
+    let dispatch_gate = tokio::sync::Mutex::new(());
+    let outcome = {
+        let maintenance = maintenance::run_channel_maintenance(
+            config,
+            channel_name,
+            Arc::clone(&runtime),
+            Arc::clone(&egress),
+            Arc::clone(&ledger),
+            Arc::clone(&session_usage),
+        );
+        let receiver = ingress::receive(
+            config,
+            &mut channel,
+            channel_name,
+            &ledger,
+            &dispatch_gate,
+            &shutdown,
+        );
+        let dispatcher = ingress::dispatch(
+            config,
+            channel_name,
+            &router,
+            egress.as_ref(),
+            &ledger,
+            &active_channel_id,
+            &dispatch_gate,
+        );
+        tokio::pin!(maintenance);
+        tokio::pin!(receiver);
+        tokio::pin!(dispatcher);
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => Ok(()),
+            result = &mut maintenance => result,
+            result = &mut receiver => result,
+            result = &mut dispatcher => result,
+        }
+    };
+    let deadline = shutdown.begin();
 
     // Dropping the router closes every shard queue, which ends each shard once
     // it has drained. The wait is *bounded* (M8 / `GW-001`, deliverable 5): a
@@ -1050,8 +1319,6 @@ where
     // `SIGTERM` into a hang, so past the grace period the gateway says what it
     // is abandoning and exits.
     drop(router);
-    let grace = Duration::from_secs(runtime.workspace_config.gateway.shutdown_grace_secs);
-    let deadline = std::time::Instant::now() + grace;
     let mut wedged = Vec::new();
     for (shard, handle) in shards.into_iter().enumerate() {
         while !handle.is_finished() && std::time::Instant::now() < deadline {
@@ -1071,175 +1338,25 @@ where
             config,
             &format!(
                 "{channel_name} shard(s) {wedged:?} did not drain within {}s; exiting anyway",
-                grace.as_secs()
+                runtime.workspace_config.gateway.shutdown_grace_secs
             ),
         )?;
     }
     // What this process accepted and never settled. The turns that were still
     // running when the deadline passed are in here, which is the "reports
     // abandoned work" half of the shutdown criterion.
-    report_abandoned_work(config, channel_name, &ledger, &channel.id())?;
+    ingress::report_unsettled(config, channel_name, &ledger, &active_channel_id)?;
     outcome
-}
-
-/// Receive and route until the pid file changes hands or the channel closes.
-async fn route_inbound<C>(
-    config: &ServiceConfig,
-    channel: &mut C,
-    channel_name: &str,
-    router: &Router,
-    egress: &dyn Egress,
-    ledger: &IngressLedger,
-) -> Result<(), String>
-where
-    C: Channel,
-{
-    loop {
-        // The one place the router stops accepting (M8 / `GW-001`,
-        // deliverable 5). Everything already queued still runs: the drain is
-        // below, in `run_channel_gateway`.
-        if gateway::shutdown_requested() {
-            log_line(
-                config,
-                &format!("{channel_name} gateway loop draining on shutdown"),
-            )?;
-            return Ok(());
-        }
-        let Some(input) = channel.receive().await else {
-            // Idle. Maintenance used to run here, competing with receiving;
-            // it now runs from a shard's idle phase, so this really is nothing
-            // to do. The pause keeps a channel whose `receive` returns
-            // immediately from spinning.
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            continue;
-        };
-
-        // `/stop` cannot queue behind the run it is trying to cancel.
-        if matches!(
-            slash::parse(&input.message.content),
-            Parsed::Cmd(SlashCommand::Stop)
-        ) {
-            let stopped = match router.stop(&input.conversation_id).await {
-                Ok(stopped) => stopped,
-                Err(err) => {
-                    log_line(config, &format!("{channel_name} stop failed: {err}"))?;
-                    false
-                }
-            };
-            let reply = command_reply_envelope(&input, channel_name, &slash::format_stop(stopped));
-            if let Err(err) = egress.send(reply).await {
-                log_line(
-                    config,
-                    &format!("{channel_name} gateway failed to send stop reply: {err}"),
-                )?;
-            }
-            continue;
-        }
-
-        // Durable acceptance before delivery, and the cursor only after that
-        // (M8 / `GW-001`, deliverable 3). The window between the transport
-        // handing this over and the ledger row existing is the one where a
-        // crash means a replay — which the transport will do anyway, and which
-        // the ledger will then recognise. The reverse ordering is what could
-        // not be recovered from: a cursor advanced past an event nothing
-        // recorded is an accepted message that no longer exists anywhere.
-        match ledger.admit(&input) {
-            Ok(Admission::AlreadySettled) => {
-                log_line(
-                    config,
-                    &format!(
-                        "{channel_name} suppressed a replay of an event already handled                          ({})",
-                        input.conversation_id.as_str()
-                    ),
-                )?;
-                continue;
-            }
-            Ok(Admission::Retry { attempts }) => log_line(
-                config,
-                &format!(
-                    "{channel_name} re-running an event abandoned by an earlier attempt                      ({}, attempt {attempts})",
-                    input.conversation_id.as_str()
-                ),
-            )?,
-            Ok(Admission::Fresh | Admission::Unidentified) => {}
-            Err(err) => {
-                // The ledger is the durability guarantee; a gateway that
-                // cannot write it is a gateway that will replay and lose
-                // messages silently. Better to say so and keep running than to
-                // pretend the guarantee holds.
-                log_line(
-                    config,
-                    &format!("{channel_name} ingress ledger unavailable: {err}"),
-                )?;
-            }
-        }
-        if let Some(cursor) = channel.cursor() {
-            if let Err(err) = ledger.set_cursor(&channel.id(), &cursor) {
-                log_line(
-                    config,
-                    &format!("{channel_name} ingress cursor persist failed: {err}"),
-                )?;
-            }
-        }
-
-        if let Err(err) = router.deliver(input).await {
-            // Every shard is gone; there is nothing left to route to.
-            log_line(config, &format!("{channel_name} routing failed: {err}"))?;
-            return Ok(());
-        }
-    }
-}
-
-/// Say what the last run of this gateway accepted and never finished.
-///
-/// Not replayed from here: the transport re-sends anything it has no
-/// acknowledgement for, and replaying from the ledger as well would be exactly
-/// the duplicate the ledger exists to prevent. This is the reporting half —
-/// an operator reading the log after a crash can see which conversations were
-/// mid-turn.
-fn report_abandoned_work(
-    config: &ServiceConfig,
-    channel_name: &str,
-    ledger: &IngressLedger,
-    channel_id: &ChannelId,
-) -> Result<(), String> {
-    let abandoned = ledger
-        .unsettled(channel_id)
-        .map_err(|err| format!("failed to read the {channel_name} ingress ledger: {err}"))?;
-    if abandoned.is_empty() {
-        return Ok(());
-    }
-    log_line(
-        config,
-        &format!(
-            "{channel_name} has {} accepted event(s) that never finished",
-            abandoned.len()
-        ),
-    )?;
-    for event in abandoned.iter().take(20) {
-        log_line(
-            config,
-            &format!(
-                "{channel_name} abandoned event {} in conversation {} from {} \
-                 (attempt {}, accepted at {})",
-                event.event_id,
-                event.conversation_id.as_str(),
-                event.sender,
-                event.attempts,
-                event.accepted_at
-            ),
-        )?;
-    }
-    Ok(())
 }
 
 /// Replay every cron task that is due and bound to this channel as a synthetic
 /// envelope through the normal run path, then persist the updated fire/retry
 /// bookkeeping so the task does not re-fire on the next scan.
 ///
-/// Cron failures are logged and swallowed — a broken task must never take down
-/// the channel gateway loop. Each channel gateway only fires tasks whose
-/// `channel_id` matches its own, so a multi-channel deployment neither
+/// Cron failures are reported to the maintenance supervisor and swallowed
+/// there — a broken task must never take down the channel gateway loop. Each
+/// channel gateway only fires tasks whose `channel_id` matches its own, so a
+/// multi-channel deployment neither
 /// double-fires a task nor delivers it through the wrong transport. (A task
 /// bound to a channel with no running persistent gateway therefore never
 /// fires.)
@@ -1251,13 +1368,10 @@ async fn fire_due_crons(
     gateway_service: &GatewayService<'_>,
     session_usage: &SessionUsage,
     now: u64,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     let mut scheduler = match cron_store.load_scheduler() {
         Ok(scheduler) => scheduler,
-        Err(err) => {
-            log_line(config, &format!("{channel_name} cron load failed: {err}"))?;
-            return Ok(());
-        }
+        Err(err) => return Err(format!("cron load failed: {err}")),
     };
     // Anchor any task seen for the first time so it fires on its next
     // scheduled instant instead of back-firing on discovery, then persist the
@@ -1280,15 +1394,14 @@ async fn fire_due_crons(
     }
     let due = match scheduler.due_invocations(now) {
         Ok(due) => due,
-        Err(err) => {
-            log_line(config, &format!("{channel_name} cron scan failed: {err}"))?;
-            return Ok(());
-        }
+        Err(err) => return Err(format!("cron scan failed: {err}")),
     };
+    let mut dispatched = 0;
     for invocation in due {
         if invocation.envelope.channel_id.as_str() != channel_name {
             continue;
         }
+        dispatched += 1;
         let task_id = invocation.task_id.clone();
         log_line(
             config,
@@ -1388,7 +1501,7 @@ async fn fire_due_crons(
             )?,
         }
     }
-    Ok(())
+    Ok(dispatched)
 }
 
 fn persistent_channels(config: &WorkspaceConfig) -> Result<Vec<&'static str>, String> {
@@ -1507,8 +1620,11 @@ fn migrate(config: &ServiceConfig) -> Result<(), String> {
         assume_literal_underscores: has("--assume-literal-underscores"),
     };
 
-    let store = SqliteStore::open(&db_path)
-        .map_err(|err| format!("failed to open {}: {err}", db_path.display()))?;
+    let store = Arc::new(
+        SqliteStore::open(&db_path)
+            .map_err(|err| format!("failed to open {}: {err}", db_path.display()))?,
+    );
+    let ingress_ledger = IngressLedger::new(Arc::clone(&store));
     let version = migrate::schema_version(&store)
         .map_err(|err| format!("failed to read the schema version: {err}"))?;
     println!("database: {}", db_path.display());
@@ -1534,12 +1650,55 @@ fn migrate(config: &ServiceConfig) -> Result<(), String> {
         println!();
         print!("{}", child_session_plan.report());
     }
+    let ingress_quarantine = ingress_ledger
+        .quarantined(&settings.channel)
+        .map_err(|err| format!("failed to inspect ingress quarantine: {err}"))?;
+    if !ingress_quarantine.is_empty() {
+        println!(
+            "\n{} quarantined ingress row(s) for channel {}:",
+            ingress_quarantine.len(),
+            settings.channel.as_str()
+        );
+        for event in &ingress_quarantine {
+            println!(
+                "  event {} conversation {} sender {} accepted_at {}",
+                event.event_id,
+                event.conversation_id.as_str(),
+                event.sender,
+                event.accepted_at
+            );
+        }
+    }
+    let ingress_ambiguities = ingress_ledger
+        .ambiguities(&settings.channel)
+        .map_err(|err| format!("failed to inspect ingress ambiguity: {err}"))?;
+    if !ingress_ambiguities.is_empty() {
+        println!(
+            "\n{} ambiguous ingress outcome(s) for channel {}:",
+            ingress_ambiguities.len(),
+            settings.channel.as_str()
+        );
+        for event in &ingress_ambiguities {
+            println!(
+                "  event {} state {} action {} delivery {} reason {}",
+                event.key.event_id,
+                event.state.as_str(),
+                event.action_id.as_deref().unwrap_or("-"),
+                event.delivery_id.as_deref().unwrap_or("-"),
+                event.reason
+            );
+        }
+    }
+    let ingress_adjudication = value("--adjudicate-ingress");
 
     if !has("--apply") {
         println!("\nNothing was changed. Re-run with --apply to perform this migration.");
         return Ok(());
     }
-    if plan.rewrites.is_empty() && session_plan.is_empty() && child_session_plan.rewrites.is_empty()
+    if plan.rewrites.is_empty()
+        && session_plan.is_empty()
+        && child_session_plan.rewrites.is_empty()
+        && ingress_adjudication.is_none()
     {
         println!("\nNothing to apply.");
         return Ok(());
@@ -1593,6 +1752,21 @@ fn migrate(config: &ServiceConfig) -> Result<(), String> {
         .map_err(|err| format!("the child session migration was rolled back: {err}"))?;
     if child_rekeyed > 0 {
         println!("rekeyed {child_rekeyed} legacy child session item(s)");
+    }
+    if let Some(event_id) = ingress_adjudication {
+        let changed = ingress_ledger
+            .adjudicate_quarantined(&settings.channel, &event_id)
+            .map_err(|err| format!("ingress adjudication failed: {err}"))?;
+        if !changed {
+            return Err(format!(
+                "ingress event {event_id} is not quarantined or ambiguous for channel {}",
+                settings.channel.as_str()
+            ));
+        }
+        println!(
+            "adjudicated ingress event {event_id} for channel {} as refused",
+            settings.channel.as_str()
+        );
     }
     if plan.blocked.is_empty() {
         println!(
@@ -1745,11 +1919,16 @@ fn ensure_parent_dir(path: &Path) -> Result<(), String> {
 /// A value naming one particular start, so `start` can tell the gateway it
 /// spawned from one that was already there.
 fn gateway_owner_token() -> Result<String, String> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|err| format!("failed to generate gateway owner token: {err}"))?
-        .as_nanos();
-    Ok(format!("{}-{now}", process::id()))
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|err| format!("failed to generate gateway owner token: {err}"))?;
+    let mut token = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut token, "{byte:02x}")
+            .map_err(|err| format!("failed to encode gateway owner token: {err}"))?;
+    }
+    Ok(token)
 }
 
 fn log_line(config: &ServiceConfig, message: &str) -> Result<(), String> {

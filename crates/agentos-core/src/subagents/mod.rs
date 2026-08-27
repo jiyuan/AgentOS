@@ -4,6 +4,7 @@ use crate::approve::{
 };
 use crate::audit::SafetyLog;
 use crate::config::CompactionConfig;
+use crate::gateway::RunJournal;
 use crate::memory::{InMemorySession, MemoryManager};
 use crate::prompt::Compaction;
 use crate::r#loop::{InputGuardrailEntry, OutputGuardrailEntry, ResumeWitness, ToolGuardrailEntry};
@@ -241,6 +242,9 @@ pub struct SubAgentInvocation {
     /// The parent's safety log, so a child's approvals, denials, and guardrail
     /// trips land in the same durable record as the parent's (M6 / `AUD-001`).
     safety_log: Option<Arc<dyn SafetyLog>>,
+    /// The top-level ingress action boundary. A child tool has the same
+    /// external replay risk as a parent tool, so delegation must not drop it.
+    run_journal: Option<RunJournal>,
 }
 
 mod branch;
@@ -489,6 +493,7 @@ impl SubAgentRegistry {
             cancel: CancellationToken::new(),
             parent_seed: None,
             safety_log: self.safety_log.clone(),
+            run_journal: None,
         })
     }
 }
@@ -519,6 +524,12 @@ impl SubAgentInvocation {
         self
     }
 
+    /// Share the parent turn's exact durable action boundary with child tools.
+    pub fn with_run_journal(mut self, run_journal: Option<RunJournal>) -> Self {
+        self.run_journal = run_journal;
+        self
+    }
+
     pub async fn run(self) -> Result<SubAgentRun, SubAgentError> {
         let (input_tx, mut input_rx) = mpsc::channel(self.channel_capacity);
         let (output_tx, mut output_rx) = mpsc::channel(self.channel_capacity);
@@ -532,6 +543,7 @@ impl SubAgentInvocation {
         let child_policy = self.policy;
         let delegated_authority = self.delegated_authority;
         let safety_log = self.safety_log;
+        let run_journal = self.run_journal;
         let run_id = self.run_id;
         let trace_sink = self.trace_sink;
         let task_workspace = self.task_workspace;
@@ -621,6 +633,7 @@ impl SubAgentInvocation {
                 // A sub-agent is not a conversation: nothing routes user input to
                 // it, so there is nothing to steer it with.
                 steering: None,
+                run_journal: run_journal.clone(),
                 // Sub-agents never stream to the parent's egress.
                 stream_sink: None,
                 safety_log: safety_log.as_deref(),
@@ -670,6 +683,7 @@ impl SubAgentInvocation {
         let child_policy = self.policy;
         let delegated_authority = self.delegated_authority;
         let safety_log = self.safety_log;
+        let run_journal = self.run_journal;
         let trace_sink = self.trace_sink;
         let task_workspace = self.task_workspace;
         let injected_session = self.session;
@@ -741,6 +755,7 @@ impl SubAgentInvocation {
                     },
                     cancel: cancel.clone(),
                     steering: None,
+                    run_journal: run_journal.clone(),
                     safety_log: safety_log.as_deref(),
                     delegated_authority: Some(&delegated_authority),
                 };

@@ -10,7 +10,7 @@ use super::event::{ArgumentDigest, SafetyEvent, SafetyEventKind, SafetyOutcome};
 use super::journal::{SafetyLog, SafetyLogError, StoredSafetyEvent};
 use crate::memory::SqliteStore;
 use agentos_proto::{ApprovalInstanceId, InterruptionId, Principal, RunId};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::sync::Arc;
 
 /// Create the table if it is not there. Called from `SqliteStore::open`.
@@ -69,6 +69,64 @@ fn ensure_column(conn: &Connection, column: &str) -> rusqlite::Result<()> {
 impl SafetyLog for SqliteStore {
     fn append(&self, event: &SafetyEvent) -> Result<(), SafetyLogError> {
         let conn = self.audit_conn()?;
+        // Resolution can be replayed after a crash that happened before any
+        // external action began. Treat the exact same evidence as already
+        // committed, but fail closed if one approval instance appears to have
+        // two different terminal decisions.
+        if event.kind == SafetyEventKind::ApprovalResolved {
+            let instance = event.approval_instance_id.as_ref().ok_or_else(|| {
+                SafetyLogError::Backend(Arc::from("approval resolution has no approval instance"))
+            })?;
+            let existing = conn
+                .query_row(
+                    "SELECT outcome, principal, run_id, subject, detail, interruption_id, \
+                     prompting_principal, resolver_principal FROM safety_events \
+                     WHERE kind = 'approval_resolved' AND approval_instance_id = ?1 \
+                     ORDER BY row_id ASC LIMIT 1",
+                    params![instance.as_str()],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                            row.get::<_, Option<String>>(6)?,
+                            row.get::<_, Option<String>>(7)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(sqlite_error)?;
+            if let Some(existing) = existing {
+                let expected = (
+                    event.outcome.as_str().to_owned(),
+                    event.principal.as_ref().map(Principal::storage_name),
+                    event.run_id.as_ref().map(|run| run.as_str().to_owned()),
+                    event.subject.as_ref().to_owned(),
+                    event.detail.as_deref().map(str::to_owned),
+                    event
+                        .interruption_id
+                        .as_ref()
+                        .map(|id| id.as_str().to_owned()),
+                    event
+                        .prompting_principal
+                        .as_ref()
+                        .map(Principal::storage_name),
+                    event
+                        .resolver_principal
+                        .as_ref()
+                        .map(Principal::storage_name),
+                );
+                if existing == expected {
+                    return Ok(());
+                }
+                return Err(SafetyLogError::Backend(Arc::from(
+                    "conflicting approval resolution already exists",
+                )));
+            }
+        }
         conn.execute(
             "INSERT INTO safety_events \
              (kind, outcome, principal, agent_id, channel_id, conversation_id, sender, \

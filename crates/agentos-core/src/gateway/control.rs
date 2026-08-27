@@ -59,6 +59,8 @@ pub enum ControlError {
     },
     #[error("control file {path} is not readable as a record: {reason}")]
     Malformed { path: PathBuf, reason: Arc<str> },
+    #[error("the gateway holding {path} changed before the shutdown request arrived")]
+    TargetChanged { path: PathBuf },
 }
 
 /// What a serving gateway writes about itself.
@@ -68,6 +70,9 @@ pub struct ControlRecord {
     /// Distinguishes two runs of the gateway that happen to reuse a pid, for
     /// a caller that has a token from a specific start.
     pub token: Arc<str>,
+    /// Per-process control secret. It is distinct from `token`, which only
+    /// correlates a detached `start` parent with its child.
+    pub control_token: Arc<str>,
     /// Unix seconds, for the operator reading `status`.
     pub started_at: u64,
 }
@@ -77,12 +82,30 @@ impl ControlRecord {
         Self {
             pid,
             token: token.into(),
+            control_token: Arc::from(""),
+            started_at,
+        }
+    }
+
+    pub fn with_control_token(
+        pid: u32,
+        token: impl Into<Arc<str>>,
+        control_token: impl Into<Arc<str>>,
+        started_at: u64,
+    ) -> Self {
+        Self {
+            pid,
+            token: token.into(),
+            control_token: control_token.into(),
             started_at,
         }
     }
 
     fn render(&self) -> String {
-        format!("{} {} {}\n", self.pid, self.token, self.started_at)
+        format!(
+            "{} {} {} {}\n",
+            self.pid, self.token, self.started_at, self.control_token
+        )
     }
 
     fn parse(text: &str, path: &Path) -> Result<Self, ControlError> {
@@ -101,9 +124,11 @@ impl ControlRecord {
         // before the gateway will start.
         let token = parts.next().unwrap_or("").to_owned();
         let started_at = parts.next().and_then(|at| at.parse().ok()).unwrap_or(0);
+        let control_token = Arc::from(parts.next().unwrap_or(""));
         Ok(Self {
             pid,
             token: Arc::from(token.as_str()),
+            control_token,
             started_at,
         })
     }
@@ -200,6 +225,23 @@ pub fn holder(path: &Path) -> Result<Option<ControlRecord>, ControlError> {
         unlock(&file).map_err(io)?;
         return Ok(None);
     }
+    // The holder takes the lock before rewriting the in-place record. A reader
+    // can observe that lock in the few instructions between `set_len(0)` and
+    // `write_all`; retry only that publication state, and keep verifying that
+    // the holder has not exited in between.
+    for _ in 0..100 {
+        match read_locked(&mut file, path) {
+            Ok(record) => return Ok(Some(record)),
+            Err(ControlError::Malformed { ref reason, .. }) if reason.as_ref() == "empty" => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                if try_lock(&file).map_err(io)? {
+                    unlock(&file).map_err(io)?;
+                    return Ok(None);
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
     read_locked(&mut file, path).map(Some)
 }
 
@@ -272,43 +314,6 @@ fn try_lock(_file: &File) -> std::io::Result<bool> {
 #[cfg(not(unix))]
 fn unlock(_file: &File) -> std::io::Result<()> {
     Ok(())
-}
-
-/// Ask the process holding the control file to stop, by pid, without a shell.
-///
-/// Verified against the lock first: a pid read out of a file names whatever
-/// currently has that pid, and signalling it on the strength of the file alone
-/// is how a stale record turns into a `SIGKILL` for an unrelated process.
-#[cfg(unix)]
-pub fn signal_holder(path: &Path, signal: i32) -> Result<Option<ControlRecord>, ControlError> {
-    let Some(record) = holder(path)? else {
-        return Ok(None);
-    };
-    // SAFETY: `kill` with a pid and a signal number has no memory-safety
-    // precondition. The pid is the one currently holding the lock, so it names
-    // a live process.
-    let sent = unsafe { libc::kill(record.pid as libc::pid_t, signal) };
-    if sent != 0 {
-        return Err(ControlError::Io {
-            path: path.to_path_buf(),
-            source: std::io::Error::last_os_error(),
-        });
-    }
-    Ok(Some(record))
-}
-
-/// Ask the running gateway to drain and exit.
-#[cfg(unix)]
-pub fn terminate_holder(path: &Path) -> Result<Option<ControlRecord>, ControlError> {
-    signal_holder(path, libc::SIGTERM)
-}
-
-/// End the running gateway without a drain, for a caller whose own deadline
-/// has passed. Whatever was in flight is abandoned; the ingress ledger is what
-/// says which conversations those were.
-#[cfg(unix)]
-pub fn kill_holder(path: &Path) -> Result<Option<ControlRecord>, ControlError> {
-    signal_holder(path, libc::SIGKILL)
 }
 
 #[cfg(test)]
@@ -436,33 +441,6 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Signalling goes to the lock holder or to nobody. A stale record names a
-    /// pid the kernel may since have handed to something else.
-    #[cfg(unix)]
-    #[test]
-    fn signalling_a_stale_record_signals_nothing() {
-        let dir = temp_dir("signal");
-        let path = dir.join("gateway.pid");
-        std::fs::create_dir_all(&dir).expect("the directory is creatable");
-        // A pid that is almost certainly not ours, in an unlocked file.
-        std::fs::write(&path, "999999 tok 0\n").expect("the file is writable");
-        assert_eq!(
-            signal_holder(&path, 0).expect("the query runs"),
-            None,
-            "an unlocked record must not be signalled"
-        );
-
-        // With the lock held, signal 0 reaches this very process.
-        let _held = ControlFile::acquire(&path, &record()).expect("the file is acquirable");
-        assert_eq!(
-            signal_holder(&path, 0)
-                .expect("the signal is sent")
-                .map(|record| record.pid),
-            Some(std::process::id())
-        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

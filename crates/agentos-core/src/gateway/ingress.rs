@@ -22,19 +22,20 @@
 //! At-least-once is what these transports offer, and it is not negotiable:
 //! there is no acknowledgement a client can send that makes a redelivery
 //! impossible. So the redelivery has to be *recognised*, which needs a durable
-//! record of what has been seen and how far it got. Three answers:
+//! record of what has been seen and how far it got. Admission has three
+//! answers:
 //!
 //! - **[`Admission::Fresh`]** — never seen. Run it.
-//! - **[`Admission::Retry`]** — seen, accepted, and never settled. The process
-//!   died mid-run, so run it again. Losing this message is the worse outcome:
-//!   the user asked and got no answer, and a duplicate answer at least tells
-//!   them the agent is alive.
+//! - **[`Admission::Retry`]** — seen, accepted, and never settled. Recover its
+//!   durable stage; this does not imply rerunning it.
 //! - **[`Admission::AlreadySettled`]** — seen, and the run reached an end. Drop
 //!   it. This is the one that suppresses the replayed side effect.
 //!
-//! The ledger is written *before* the envelope reaches a shard and settled
-//! *after* the run ends, which is what makes the crash window fall inside
-//! `Retry` rather than between the two.
+//! The delivery state then says which recovery is safe. `accepted`/`running`
+//! may return to routing; `reply_pending` may resume delivery; `paused` waits
+//! for approval recovery; `action_started` and `delivery_started` become
+//! explicit ambiguity after restart. Only a successful terminal transport
+//! call moves a row to `handled` or `rejected`.
 //!
 //! # The cursor
 //!
@@ -55,6 +56,10 @@ use thiserror::Error;
 pub enum IngressError {
     #[error("ingress ledger failed: {0}")]
     Backend(Arc<str>),
+    #[error("ingress envelope codec failed: {0}")]
+    Codec(Arc<str>),
+    #[error("invalid ingress state transition: {0}")]
+    InvalidTransition(Arc<str>),
 }
 
 fn backend(err: rusqlite::Error) -> IngressError {
@@ -66,9 +71,8 @@ fn backend(err: rusqlite::Error) -> IngressError {
 pub enum Admission {
     /// Never seen. Deliver it.
     Fresh,
-    /// Accepted before and never settled, so the previous attempt did not
-    /// finish. Deliver it again; `attempts` counts the deliveries including
-    /// this one.
+    /// Accepted before and never settled. Recover the row's durable stage;
+    /// `attempts` counts transport admissions, not action executions.
     Retry { attempts: u32 },
     /// Accepted before and settled. Suppress it.
     AlreadySettled,
@@ -76,12 +80,14 @@ pub enum Admission {
     /// indistinguishable from a new message. Deliver it, and record nothing —
     /// see [`INGRESS_ID_KEY`](agentos_proto::INGRESS_ID_KEY).
     Unidentified,
+    /// A pre-replay-schema row cannot be reconstructed safely.
+    Quarantined,
 }
 
 impl Admission {
     /// Whether the envelope should reach a shard.
     pub fn deliver(self) -> bool {
-        !matches!(self, Self::AlreadySettled)
+        !matches!(self, Self::AlreadySettled | Self::Quarantined)
     }
 }
 
@@ -98,15 +104,37 @@ pub enum Settlement {
 }
 
 impl Settlement {
-    fn as_str(self) -> &'static str {
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::Handled => "handled",
             Self::Refused => "refused",
         }
     }
+
+    pub(super) fn parse(value: &str) -> Result<Self, IngressError> {
+        match value {
+            "handled" => Ok(Self::Handled),
+            "refused" => Ok(Self::Refused),
+            other => Err(IngressError::InvalidTransition(Arc::from(format!(
+                "unknown pending settlement '{other}'"
+            )))),
+        }
+    }
+
+    fn delivery_state(self) -> &'static str {
+        match self {
+            Self::Handled => "handled",
+            Self::Refused => "rejected",
+        }
+    }
 }
 
 pub(super) const CREATE_TABLES: &str = r#"
+CREATE TABLE IF NOT EXISTS ingress_schema (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    version INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS ingress_events (
     row_id INTEGER PRIMARY KEY AUTOINCREMENT,
     channel_id TEXT NOT NULL,
@@ -115,6 +143,17 @@ CREATE TABLE IF NOT EXISTS ingress_events (
     sender TEXT NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 1,
     settlement TEXT,
+    envelope_json TEXT,
+    checkpoint TEXT,
+    dispatch_state TEXT NOT NULL DEFAULT 'awaiting_ack',
+    delivery_state TEXT NOT NULL DEFAULT 'accepted',
+    reply_json TEXT,
+    delivery_id TEXT,
+    pending_settlement TEXT,
+    action_id TEXT,
+    state_reason TEXT,
+    state_updated_at INTEGER,
+    quarantine_reason TEXT,
     accepted_at INTEGER NOT NULL,
     settled_at INTEGER,
     UNIQUE(channel_id, event_id)
@@ -128,20 +167,122 @@ CREATE TABLE IF NOT EXISTS ingress_cursors (
     cursor TEXT NOT NULL,
     updated_at INTEGER NOT NULL
 );
+
+-- Active approval pauses only. A row is removed after its one terminal
+-- resolution has been delivered; the append-only interruption and safety
+-- event remain the durable record of that outcome.
+CREATE TABLE IF NOT EXISTS pending_approvals (
+    approval_instance_id TEXT PRIMARY KEY,
+    record_version INTEGER NOT NULL,
+    channel_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    ticket TEXT NOT NULL,
+    interruption_id TEXT NOT NULL,
+    prompting_principal_json TEXT NOT NULL,
+    paused_run_json TEXT NOT NULL,
+    approval_scope_json TEXT NOT NULL,
+    administrators_json TEXT NOT NULL,
+    ingress_events_json TEXT NOT NULL,
+    prompt_json TEXT NOT NULL,
+    delivery_id TEXT NOT NULL,
+    expires_at INTEGER,
+    status TEXT NOT NULL,
+    resolution_channel_id TEXT,
+    resolution_event_id TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(channel_id, conversation_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_approvals_channel_status
+    ON pending_approvals(channel_id, status);
 "#;
 
 pub(crate) fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch(CREATE_TABLES)
+    conn.execute_batch(CREATE_TABLES)?;
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let migration = (|| {
+        let mut statement = conn.prepare("PRAGMA table_info(ingress_events)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        let had_delivery_state = columns.iter().any(|column| column == "delivery_state");
+        for (name, declaration) in [
+            ("envelope_json", "TEXT"),
+            ("checkpoint", "TEXT"),
+            ("dispatch_state", "TEXT NOT NULL DEFAULT 'awaiting_ack'"),
+            ("delivery_state", "TEXT NOT NULL DEFAULT 'accepted'"),
+            ("reply_json", "TEXT"),
+            ("delivery_id", "TEXT"),
+            ("pending_settlement", "TEXT"),
+            ("action_id", "TEXT"),
+            ("state_reason", "TEXT"),
+            ("state_updated_at", "INTEGER"),
+            ("quarantine_reason", "TEXT"),
+        ] {
+            if !columns.iter().any(|column| column == name) {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE ingress_events ADD COLUMN {name} {declaration};"
+                ))?;
+            }
+        }
+        conn.execute_batch(
+            r#"
+            UPDATE ingress_events
+               SET dispatch_state = 'settled'
+             WHERE settlement IS NOT NULL;
+            UPDATE ingress_events
+               SET delivery_state = CASE settlement
+                   WHEN 'handled' THEN 'handled'
+                   WHEN 'refused' THEN 'rejected'
+                   ELSE delivery_state
+               END
+             WHERE settlement IS NOT NULL;
+            UPDATE ingress_events
+               SET dispatch_state = 'quarantined',
+                   quarantine_reason = 'legacy row has no replayable envelope'
+             WHERE settlement IS NULL AND envelope_json IS NULL;
+            CREATE INDEX IF NOT EXISTS idx_ingress_events_dispatch
+                ON ingress_events(channel_id, dispatch_state, row_id);
+            CREATE INDEX IF NOT EXISTS idx_ingress_events_delivery
+                ON ingress_events(channel_id, delivery_state, row_id);
+            INSERT INTO ingress_schema(singleton, version) VALUES (1, 4)
+            ON CONFLICT(singleton) DO UPDATE SET version = excluded.version;
+            "#,
+        )?;
+        if !had_delivery_state {
+            conn.execute_batch(
+                r#"
+                UPDATE ingress_events
+                   SET delivery_state = 'action_ambiguous',
+                       dispatch_state = 'quarantined',
+                       state_reason = 'pre-GW-004 in-flight row has unknown action boundary',
+                       state_updated_at = strftime('%s','now')
+                 WHERE settlement IS NULL AND dispatch_state = 'in_flight';
+                "#,
+            )?;
+        }
+        Ok(())
+    })();
+    match migration {
+        Ok(()) => conn.execute_batch("COMMIT"),
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(err)
+        }
+    }
 }
 
 /// The gateway's ingress ledger, backed by the same database as everything
 /// else — deliberately, so "the message is recorded" and "the transcript is
 /// written" cannot disagree across a crash.
+#[derive(Clone)]
 pub struct IngressLedger {
-    store: Arc<SqliteStore>,
+    pub(super) store: Arc<SqliteStore>,
 }
 
-fn unix_now() -> u64 {
+pub(super) fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|since| since.as_secs())
@@ -159,55 +300,68 @@ impl IngressLedger {
     /// makes the acceptance durable, so a channel may acknowledge to its
     /// transport as soon as this returns and not before.
     pub fn admit(&self, envelope: &Envelope) -> Result<Admission, IngressError> {
+        self.admit_with_checkpoint(envelope, None)
+    }
+
+    /// Atomically persist a replayable envelope and its transport checkpoint.
+    pub fn admit_with_checkpoint(
+        &self,
+        envelope: &Envelope,
+        checkpoint: Option<&str>,
+    ) -> Result<Admission, IngressError> {
         let Some(event_id) = envelope.ingress_id() else {
             return Ok(Admission::Unidentified);
         };
-        self.admit_event(
-            &envelope.channel_id,
-            &event_id,
-            &envelope.conversation_id,
-            &envelope.sender,
-        )
-    }
-
-    /// [`admit`](Self::admit) for a caller that has the parts but not an
-    /// `Envelope` — a channel deduplicating before it builds one.
-    pub fn admit_event(
-        &self,
-        channel_id: &ChannelId,
-        event_id: &str,
-        conversation_id: &ConversationId,
-        sender: &str,
-    ) -> Result<Admission, IngressError> {
+        let envelope_json = serde_json::to_string(envelope)
+            .map_err(|err| IngressError::Codec(Arc::from(err.to_string())))?;
         let now = unix_now();
-        let conn = self
+        let mut conn = self
             .store
             .ingress_conn()
             .map_err(|err| IngressError::Backend(Arc::from(err.to_string())))?;
-        // One statement again, so two shard sets racing on the same redelivery
-        // cannot both read "absent" and both insert. `RETURNING` gives back the
-        // row as it now stands, which is what distinguishes the three answers.
-        let (attempts, settlement): (i64, Option<String>) = conn
+        let transaction = conn.transaction().map_err(backend)?;
+        let (attempts, settlement, dispatch_state): (i64, Option<String>, String) = transaction
             .query_row(
                 r#"
                 INSERT INTO ingress_events
-                    (channel_id, event_id, conversation_id, sender, attempts, accepted_at)
-                VALUES (?1, ?2, ?3, ?4, 1, ?5)
+                    (channel_id, event_id, conversation_id, sender, attempts,
+                     envelope_json, checkpoint, dispatch_state, accepted_at)
+                VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, 'awaiting_ack', ?7)
                 ON CONFLICT(channel_id, event_id) DO UPDATE SET
                     attempts = ingress_events.attempts + 1
-                RETURNING attempts, settlement
+                RETURNING attempts, settlement, dispatch_state
                 "#,
                 params![
-                    channel_id.as_str(),
+                    envelope.channel_id.as_str(),
                     event_id,
-                    conversation_id.as_str(),
-                    sender,
+                    envelope.conversation_id.as_str(),
+                    envelope.sender.as_ref(),
+                    envelope_json,
+                    checkpoint,
                     now as i64
                 ],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .map_err(backend)?;
+        if let Some(checkpoint) = checkpoint {
+            transaction
+                .execute(
+                    r#"
+                    INSERT INTO ingress_cursors (channel_id, cursor, updated_at)
+                    VALUES (?1, ?2, ?3)
+                    ON CONFLICT(channel_id) DO UPDATE SET
+                        cursor = excluded.cursor,
+                        updated_at = excluded.updated_at
+                    "#,
+                    params![envelope.channel_id.as_str(), checkpoint, now as i64],
+                )
+                .map_err(backend)?;
+        }
+        transaction.commit().map_err(backend)?;
 
+        if dispatch_state == "quarantined" {
+            return Ok(Admission::Quarantined);
+        }
         if settlement.is_some() {
             return Ok(Admission::AlreadySettled);
         }
@@ -239,13 +393,16 @@ impl IngressLedger {
             r#"
             UPDATE ingress_events
                SET settlement = ?3, settled_at = ?4
+                 , dispatch_state = 'settled', delivery_state = ?5
+                 , state_updated_at = ?4
              WHERE channel_id = ?1 AND event_id = ?2
             "#,
             params![
                 channel_id.as_str(),
                 event_id,
                 settlement.as_str(),
-                unix_now() as i64
+                unix_now() as i64,
+                settlement.delivery_state()
             ],
         )
         .map_err(backend)?;
@@ -286,6 +443,212 @@ impl IngressLedger {
             })
             .map_err(backend)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(backend)
+    }
+
+    /// Reset work a dead process had claimed so the new dispatcher can replay it.
+    pub fn recover_dispatches(&self, channel_id: &ChannelId) -> Result<usize, IngressError> {
+        let mut conn = self
+            .store
+            .ingress_conn()
+            .map_err(|err| IngressError::Backend(Arc::from(err.to_string())))?;
+        let transaction = conn.transaction().map_err(backend)?;
+        let now = unix_now() as i64;
+        transaction
+            .execute(
+                "UPDATE ingress_events \
+                 SET delivery_state = 'action_ambiguous', \
+                     dispatch_state = 'quarantined', \
+                     state_reason = 'process stopped after action start and before terminal reply', \
+                     state_updated_at = ?2 \
+                 WHERE channel_id = ?1 AND settlement IS NULL \
+                   AND delivery_state IN ('action_started', 'action_completed')",
+                params![channel_id.as_str(), now],
+            )
+            .map_err(backend)?;
+        transaction
+            .execute(
+                "UPDATE ingress_events \
+                 SET delivery_state = 'delivery_ambiguous', \
+                     dispatch_state = 'quarantined', \
+                     state_reason = 'process stopped after delivery started and before settlement', \
+                     state_updated_at = ?2 \
+                 WHERE channel_id = ?1 AND settlement IS NULL \
+                   AND delivery_state = 'delivery_started'",
+                params![channel_id.as_str(), now],
+            )
+            .map_err(backend)?;
+        transaction
+            .execute(
+                "UPDATE ingress_events SET dispatch_state = 'reply_pending' \
+                 WHERE channel_id = ?1 AND settlement IS NULL \
+                   AND delivery_state = 'reply_pending'",
+                params![channel_id.as_str()],
+            )
+            .map_err(backend)?;
+        transaction
+            .execute(
+                "UPDATE ingress_events SET dispatch_state = 'paused' \
+                 WHERE channel_id = ?1 AND settlement IS NULL \
+                   AND delivery_state = 'paused'",
+                params![channel_id.as_str()],
+            )
+            .map_err(backend)?;
+        let recovered = transaction
+            .execute(
+                "UPDATE ingress_events \
+                 SET dispatch_state = 'accepted', delivery_state = 'accepted', \
+                     state_updated_at = ?2 \
+                 WHERE channel_id = ?1 AND settlement IS NULL \
+                   AND dispatch_state IN ('in_flight', 'awaiting_ack') \
+                   AND delivery_state IN ('accepted', 'running')",
+                params![channel_id.as_str(), now],
+            )
+            .map_err(backend)?;
+        transaction.commit().map_err(backend)?;
+        Ok(recovered)
+    }
+
+    /// Make one durably persisted event visible to the dispatcher after ACK.
+    pub fn mark_acknowledged(
+        &self,
+        channel_id: &ChannelId,
+        event_id: &str,
+    ) -> Result<(), IngressError> {
+        let conn = self
+            .store
+            .ingress_conn()
+            .map_err(|err| IngressError::Backend(Arc::from(err.to_string())))?;
+        conn.execute(
+            "UPDATE ingress_events SET dispatch_state = 'accepted' \
+             WHERE channel_id = ?1 AND event_id = ?2 AND settlement IS NULL \
+               AND dispatch_state = 'awaiting_ack'",
+            params![channel_id.as_str(), event_id],
+        )
+        .map_err(backend)?;
+        Ok(())
+    }
+
+    /// Claim the oldest durable event for dispatch.
+    pub fn claim_next(
+        &self,
+        channel_id: &ChannelId,
+    ) -> Result<Option<ReplayableEvent>, IngressError> {
+        let mut conn = self
+            .store
+            .ingress_conn()
+            .map_err(|err| IngressError::Backend(Arc::from(err.to_string())))?;
+        let transaction = conn.transaction().map_err(backend)?;
+        let row = transaction
+            .query_row(
+                "SELECT row_id, event_id, envelope_json FROM ingress_events \
+                 WHERE channel_id = ?1 AND settlement IS NULL \
+                   AND dispatch_state = 'accepted' ORDER BY row_id ASC LIMIT 1",
+                params![channel_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(backend)?;
+        let Some((row_id, event_id, envelope_json)) = row else {
+            transaction.commit().map_err(backend)?;
+            return Ok(None);
+        };
+        let envelope = serde_json::from_str(&envelope_json)
+            .map_err(|err| IngressError::Codec(Arc::from(err.to_string())))?;
+        transaction
+            .execute(
+                "UPDATE ingress_events \
+                 SET dispatch_state = 'in_flight', delivery_state = 'running', \
+                     state_updated_at = ?2 \
+                 WHERE row_id = ?1 AND dispatch_state = 'accepted'",
+                params![row_id, unix_now() as i64],
+            )
+            .map_err(backend)?;
+        transaction.commit().map_err(backend)?;
+        Ok(Some(ReplayableEvent {
+            event_id: Arc::from(event_id),
+            envelope,
+        }))
+    }
+
+    /// Return a failed dispatch claim to the durable queue.
+    pub fn release(&self, channel_id: &ChannelId, event_id: &str) -> Result<(), IngressError> {
+        let conn = self
+            .store
+            .ingress_conn()
+            .map_err(|err| IngressError::Backend(Arc::from(err.to_string())))?;
+        conn.execute(
+            "UPDATE ingress_events \
+             SET dispatch_state = 'accepted', delivery_state = 'accepted', \
+                 state_updated_at = ?3 \
+             WHERE channel_id = ?1 AND event_id = ?2 \
+               AND settlement IS NULL AND dispatch_state = 'in_flight' \
+               AND delivery_state IN ('accepted', 'running')",
+            params![channel_id.as_str(), event_id, unix_now() as i64],
+        )
+        .map_err(backend)?;
+        Ok(())
+    }
+
+    /// Legacy unsettled rows which cannot be reconstructed safely.
+    pub fn quarantined(&self, channel_id: &ChannelId) -> Result<Vec<AbandonedEvent>, IngressError> {
+        let conn = self
+            .store
+            .ingress_conn()
+            .map_err(|err| IngressError::Backend(Arc::from(err.to_string())))?;
+        let mut statement = conn
+            .prepare(
+                "SELECT event_id, conversation_id, sender, attempts, accepted_at \
+                 FROM ingress_events WHERE channel_id = ?1 \
+                   AND dispatch_state = 'quarantined' \
+                   AND quarantine_reason IS NOT NULL ORDER BY row_id ASC",
+            )
+            .map_err(backend)?;
+        let rows = statement
+            .query_map(params![channel_id.as_str()], |row| {
+                Ok(AbandonedEvent {
+                    event_id: Arc::from(row.get::<_, String>(0)?),
+                    conversation_id: ConversationId::new(row.get::<_, String>(1)?),
+                    sender: Arc::from(row.get::<_, String>(2)?),
+                    attempts: row.get::<_, i64>(3)?.clamp(0, i64::from(u32::MAX)) as u32,
+                    accepted_at: row.get::<_, i64>(4)? as u64,
+                })
+            })
+            .map_err(backend)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(backend)
+    }
+
+    /// Preserve and settle one quarantined or ambiguous row after operator
+    /// reconciliation. Refusal is the conservative decision: never rerun an
+    /// action or delivery whose external outcome is unknown.
+    pub fn adjudicate_quarantined(
+        &self,
+        channel_id: &ChannelId,
+        event_id: &str,
+    ) -> Result<bool, IngressError> {
+        let conn = self
+            .store
+            .ingress_conn()
+            .map_err(|err| IngressError::Backend(Arc::from(err.to_string())))?;
+        let changed = conn
+            .execute(
+                "UPDATE ingress_events \
+                 SET settlement = 'refused', settled_at = ?3, \
+                     dispatch_state = 'settled', \
+                     delivery_state = 'rejected', state_updated_at = ?3, \
+                     quarantine_reason = 'operator adjudicated as refused' \
+                 WHERE channel_id = ?1 AND event_id = ?2 \
+                   AND (dispatch_state = 'quarantined' OR delivery_state IN \
+                       ('action_ambiguous', 'delivery_ambiguous'))",
+                params![channel_id.as_str(), event_id, unix_now() as i64],
+            )
+            .map_err(backend)?;
+        Ok(changed == 1)
     }
 
     /// Where this channel should resume asking its transport, if it recorded
@@ -365,6 +728,13 @@ pub struct AbandonedEvent {
     pub sender: Arc<str>,
     pub attempts: u32,
     pub accepted_at: u64,
+}
+
+/// A durable envelope claimed by the live dispatcher.
+#[derive(Clone, Debug)]
+pub struct ReplayableEvent {
+    pub event_id: Arc<str>,
+    pub envelope: Envelope,
 }
 
 #[cfg(test)]

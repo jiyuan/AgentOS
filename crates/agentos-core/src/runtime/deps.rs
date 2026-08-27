@@ -42,6 +42,7 @@ impl<'a> RuntimeDepsScope<'a> {
             // gateway that multiplexes conversations has anywhere for
             // mid-run input to arrive from.
             steering: None,
+            run_journal: None,
             safety_log: Some(self.runtime.session.as_ref()),
             // The top-level run is nobody's delegatee, so it holds no granted
             // authority. Only a sub-agent's `RunnerDeps` carries any.
@@ -99,6 +100,7 @@ impl<'a> RuntimeDepsScope<'a> {
             // gateway that multiplexes conversations has anywhere for
             // mid-run input to arrive from.
             steering: None,
+            run_journal: None,
             safety_log: Some(self.runtime.session.as_ref()),
             // The top-level run is nobody's delegatee, so it holds no granted
             // authority. Only a sub-agent's `RunnerDeps` carries any.

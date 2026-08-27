@@ -220,6 +220,7 @@ fn deps<'a>(
         compaction: Default::default(),
         cancel,
         steering: None,
+        run_journal: None,
         safety_log: Some(store),
         delegated_authority: None,
     }

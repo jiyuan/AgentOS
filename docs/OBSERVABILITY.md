@@ -25,30 +25,25 @@ signal is weak or missing, saying so plainly rather than describing an intent.
   Everything in the core emits here; the gateway log is the operator-facing
   subset.
 
-## The seven conditions
+## Alertable conditions
 
 | Condition | Signal | Strength |
 |---|---|---|
-| Queue saturation | `tracing` warn `inbox full; message refused`, with `conversation_id` and `inbox_capacity` | **Partial.** The event fires, but the sender is not told — see below |
+| Queue saturation | `tracing` warn `inbox full; message refused`, with `conversation_id`, `ingress_id`, and `inbox_capacity`; the gateway sends a terminal refusal before settling that exact event | Good |
 | Sandbox denial | `safety_events` where `kind = 'sandbox_refusal'` | Good |
 | Approval failure | `safety_events` where `kind = 'approval_resolved'` and `outcome` in (`rejected`, `unanswered`, `unavailable`) | Good |
+| Approval recovery | Gateway log `restored N pending approval(s)`; startup refuses corrupt approval identity/scope or ambiguous prompt/action delivery | Good |
 | DB contention | Errors carrying `database is locked`; the `sqlite refused WAL` warn at startup | **Weak.** No counter — see below |
 | Retention backlog | The gateway log's `retention: …` line, which names what each sweep removed | **Partial.** It reports what went, not what is still there |
-| Process leaks | The `wedged` shard report on a `SIGTERM` that outran `[gateway] shutdown_grace_secs`; `JobRegistry::len` | **Partial** |
+| Maintenance lag | Gateway log `maintenance sequence=… started_at=… completed_at=… lag_ms=… duration_ms=…`, with separate cron/reflection/retention/ingress/job status | Good |
+| Process leaks | Gateway log `process shutdown deadline reached; abandoning channel worker(s) …`, per-channel `shard(s) … did not drain`, and `JobRegistry::len` | **Partial** |
 | Delivery lag | `report_abandoned_work` at startup and shutdown, naming every accepted-and-unsettled ingress event with its `attempts` and `accepted_at` | Good |
+| Ambiguous external outcome | Gateway startup refusal plus `agentos-gateway migrate` rows naming `event`, `action`, `delivery`, state, and bounded reason | Good |
 
-## The four gaps, named
+## The three gaps, named
 
 These are real and are not closed by M9. Each is written here rather than left
 for an operator to discover by not being paged.
-
-**A refused message is not answered.** `Admitted::Full`'s own documentation says
-"the caller must tell the user — a silently dropped message is
-indistinguishable from an ignored one", and the shard loop that admits has no
-egress to answer on. It now logs the refusal, so the condition is visible in
-aggregate; the individual sender still hears nothing. Closing this means giving
-the admission path a way back to the channel, which is a G1 change rather than
-a CI one.
 
 **Contention has no counter.** A statement that waits out `busy_timeout`
 succeeds and says nothing, and one that exceeds it fails with `database is
@@ -85,11 +80,20 @@ SELECT recorded_at, principal, subject
  WHERE kind = 'approval_resolved' AND outcome = 'unanswered'
  ORDER BY row_id DESC LIMIT 50;
 
--- Accepted messages that never settled: the crash-window backlog.
-SELECT channel_id, event_id, conversation_id, attempts, accepted_at
+-- Accepted messages that never settled: safe pending stages and explicit
+-- action/delivery ambiguity are distinguishable.
+SELECT channel_id, event_id, conversation_id, attempts, accepted_at,
+       delivery_state, action_id, delivery_id, state_reason
   FROM ingress_events
  WHERE settlement IS NULL
  ORDER BY accepted_at ASC;
+
+-- Active approval pauses and their restart stage. `delivery_started` or
+-- `delivery_ambiguous` requires operator reconciliation rather than resend.
+SELECT approval_instance_id, channel_id, conversation_id, status, expires_at,
+       resolution_event_id, updated_at
+  FROM pending_approvals
+ ORDER BY updated_at ASC;
 ```
 
 `agentos-gateway status` answers whether a gateway is serving, by holding a

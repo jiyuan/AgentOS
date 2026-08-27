@@ -1,5 +1,6 @@
 use crate::approve::{DelegatedAuthority, Policy};
 use crate::audit::{SafetyJournal, SafetyLog, SafetyOutcome};
+use crate::gateway::RunJournal;
 use crate::hooks::Hooks;
 mod audit;
 mod episodes;
@@ -123,6 +124,9 @@ pub struct RunnerDeps<'a> {
     /// the running turn instead of starting a second, racing run on the same
     /// conversation; a one-shot entrypoint leaves it `None`.
     pub steering: Option<Steering>,
+    /// Durable top-level action boundary. Gateways install it for accepted
+    /// transport events; one-shot and child runs leave it detached.
+    pub run_journal: Option<RunJournal>,
     /// The append-only store this run's safety-boundary decisions go to
     /// (M6 / `AUD-001`). `None` records nothing, which is what an entrypoint
     /// with no store configured gets.
@@ -172,7 +176,7 @@ pub enum RunOutcome {
     Paused(RunState),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PausedRun {
     pub channel_id: ChannelId,
     pub conversation_id: ConversationId,
@@ -258,6 +262,7 @@ pub async fn run_envelope(
         compaction: deps.compaction,
         cancel: deps.cancel.clone(),
         steering: deps.steering.clone(),
+        run_journal: deps.run_journal.clone(),
         audit: audit.clone(),
         delegated_authority: deps.delegated_authority,
     };
@@ -462,6 +467,7 @@ pub async fn resume_run(
         compaction: deps.compaction,
         cancel: deps.cancel.clone(),
         steering: deps.steering.clone(),
+        run_journal: deps.run_journal.clone(),
         audit: audit.clone(),
         delegated_authority: deps.delegated_authority,
     };
@@ -855,6 +861,7 @@ mod tests {
             compaction: Default::default(),
             cancel: Default::default(),
             steering: None,
+            run_journal: None,
             safety_log: None,
             delegated_authority: None,
         };
@@ -1004,6 +1011,7 @@ mod tests {
             compaction: Default::default(),
             cancel: Default::default(),
             steering: None,
+            run_journal: None,
             safety_log: Some(session.as_ref()),
             delegated_authority: None,
         };
@@ -1077,6 +1085,7 @@ mod tests {
             compaction: Default::default(),
             cancel: Default::default(),
             steering: None,
+            run_journal: None,
             safety_log: None,
             delegated_authority: None,
         };
@@ -1133,6 +1142,7 @@ mod tests {
             compaction: Default::default(),
             cancel: Default::default(),
             steering: None,
+            run_journal: None,
             safety_log: None,
             delegated_authority: None,
         };
@@ -1202,6 +1212,7 @@ mod tests {
             compaction: Default::default(),
             cancel: Default::default(),
             steering: None,
+            run_journal: None,
             safety_log: None,
             delegated_authority: None,
         };
@@ -1289,6 +1300,7 @@ mod tests {
             compaction: Default::default(),
             cancel: Default::default(),
             steering: None,
+            run_journal: None,
             safety_log: None,
             delegated_authority: None,
         };
@@ -1582,6 +1594,7 @@ mod tests {
             compaction: Default::default(),
             cancel: Default::default(),
             steering: None,
+            run_journal: None,
             safety_log: None,
             delegated_authority: None,
         };

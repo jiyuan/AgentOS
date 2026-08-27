@@ -38,6 +38,10 @@ pub enum RunError {
     SubAgent(#[from] SubAgentError),
     #[error("task workspace failed: {0}")]
     TaskWorkspace(#[from] TaskWorkspaceError),
+    /// A required durable action/delivery transition failed. The action must
+    /// not start, or the run must stop at the ambiguous boundary.
+    #[error("durable run state failed: {reason}")]
+    DurableState { reason: Arc<str> },
     /// Required evidence for a safety-boundary decision could not be made
     /// durable. The protected action must not proceed after this error.
     #[error("required safety event '{event}' could not be persisted: {source}")]

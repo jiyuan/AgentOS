@@ -111,7 +111,7 @@ impl Tool for SlowTool {
 
     async fn call(&self, call: &ToolCall, _args: &RawValue) -> Result<ToolResult, ToolError> {
         if let Some((steering, text)) = &self.steer {
-            steering.push(Message::text(MessageRole::User, text.as_str()));
+            steering.push(envelope_in("conv-a", text));
         }
         tokio::time::sleep(self.delay).await;
         Ok(ToolResult {
@@ -264,6 +264,7 @@ fn clone_deps<'a>(deps: &RunnerDeps<'a>) -> RunnerDeps<'a> {
         compaction: deps.compaction,
         cancel: deps.cancel.clone(),
         steering: deps.steering.clone(),
+        run_journal: deps.run_journal.clone(),
         safety_log: deps.safety_log,
         delegated_authority: deps.delegated_authority,
     }

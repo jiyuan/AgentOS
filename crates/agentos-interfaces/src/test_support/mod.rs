@@ -119,7 +119,7 @@ impl Channel for MockChannel {
         self.id.clone()
     }
 
-    async fn receive(&mut self) -> Option<Envelope> {
+    async fn receive(&mut self) -> Option<crate::InboundEvent> {
         let mut inbound = self
             .inbound
             .lock()
@@ -127,7 +127,7 @@ impl Channel for MockChannel {
         if inbound.is_empty() {
             None
         } else {
-            Some(inbound.remove(0))
+            Some(crate::InboundEvent::without_receipt(inbound.remove(0)))
         }
     }
 
@@ -654,7 +654,7 @@ mod tests {
         };
         let mut channel = MockChannel::new("test").with_inbound([envelope.clone()]);
         let received = channel.receive().await.expect("inbound queue had one item");
-        assert_eq!(received.message.content.as_ref(), "hi");
+        assert_eq!(received.envelope.message.content.as_ref(), "hi");
         assert!(channel.receive().await.is_none());
         channel.send(envelope.clone()).await.expect("send ok");
         assert_eq!(channel.sent().len(), 1);

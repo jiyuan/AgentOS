@@ -29,7 +29,7 @@
 
 use super::inbox::{Admitted, Inbox, DEFAULT_INBOX_CAPACITY};
 use crate::r#loop::Steering;
-use agentos_proto::{ConversationId, Envelope, Message};
+use agentos_proto::{ConversationId, Envelope};
 use async_trait::async_trait;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use std::collections::HashMap;
@@ -39,10 +39,10 @@ use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-/// How long a shard sits quiet before it runs maintenance work.
+/// How often a shard runs its local housekeeping callback.
 ///
-/// Matches the old serial loop's one-second idle tick, so cron resolution is
-/// unchanged by sharding.
+/// The callback is periodic even while turns are running. Process maintenance
+/// such as cron, reflection, and retention is driven outside shards entirely.
 pub const DEFAULT_IDLE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Dispatches one shard may have queued before the router feels backpressure.
@@ -56,7 +56,7 @@ pub struct ShardConfig {
     pub shards: usize,
     /// Envelopes one conversation may have waiting for a run of their own.
     pub inbox_capacity: usize,
-    /// How long a shard must be quiet before [`TurnHandler::idle`] runs.
+    /// How often [`TurnHandler::idle`] runs for shard-local housekeeping.
     pub idle_interval: Duration,
 }
 
@@ -76,11 +76,24 @@ pub enum RouteError {
     ShardGone { shard: usize },
 }
 
+/// The shard's explicit admission result for one exact envelope.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DeliveryOutcome {
+    /// Queued for a turn of its own.
+    Queued,
+    /// Added to the active run's steering queue.
+    Steered,
+    /// The new envelope was steered, displacing this older exact envelope.
+    Displaced(Envelope),
+    /// The conversation's turn queue was full; this exact envelope was refused.
+    Refused(Envelope),
+}
+
 /// What the router hands a shard.
 #[derive(Debug)]
 enum Dispatch {
     /// Ordinary inbound input.
-    Input(Envelope),
+    Input(Envelope, oneshot::Sender<DeliveryOutcome>),
     /// Cancel whatever this conversation is running, and report whether there
     /// was anything to cancel.
     Stop(ConversationId, oneshot::Sender<bool>),
@@ -111,13 +124,11 @@ pub trait TurnHandler {
     /// other conversations on it are unaffected.
     async fn run(&self, turn: Turn);
 
-    /// Called when this shard has been quiet for
-    /// [`ShardConfig::idle_interval`] — nothing running, nothing queued.
-    ///
-    /// This is where the cron scan and memory reflection belong, so maintenance
-    /// competes with nothing. It is called on *every* shard, so work that must
-    /// happen once per process (firing a due cron) has to be guarded on
-    /// `shard`; work that is per-shard state needs no guard.
+    /// Called every [`ShardConfig::idle_interval`], including while turns are
+    /// running. The historical method name is retained for source stability;
+    /// this hook is only for shard-local state such as approval expiry.
+    /// Process-owned cron, reflection, retention, ingress, and job maintenance
+    /// must not be wired here because shard traffic could delay it.
     async fn idle(&self, shard: usize) {
         let _ = shard;
     }
@@ -150,9 +161,11 @@ impl Router {
     /// straight-line code — claiming work never blocks its loop, because turns
     /// are polled alongside it rather than awaited by it — so a full queue
     /// means genuine saturation and the backpressure is the correct answer.
-    pub async fn deliver(&self, envelope: Envelope) -> Result<(), RouteError> {
+    pub async fn deliver(&self, envelope: Envelope) -> Result<DeliveryOutcome, RouteError> {
         let shard = self.shard_of(&envelope.conversation_id);
-        self.send(shard, Dispatch::Input(envelope)).await
+        let (answer, admitted) = oneshot::channel();
+        self.send(shard, Dispatch::Input(envelope, answer)).await?;
+        admitted.await.map_err(|_| RouteError::ShardGone { shard })
     }
 
     /// Cancel whatever `conversation` is running.
@@ -220,6 +233,12 @@ pub async fn run_shard<H: TurnHandler>(
     // become claimable are an arrival and a completion.
     let mut ready: Vec<ConversationId> = Vec::new();
     let mut open = true;
+    let mut housekeeping =
+        tokio::time::interval(config.idle_interval.max(Duration::from_millis(1)));
+    housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // `interval` ticks immediately once. Consume that startup tick so the
+    // configured duration means "after one interval", like the old sleep.
+    housekeeping.tick().await;
 
     loop {
         // Start every turn that can start before parking.
@@ -234,13 +253,13 @@ pub async fn run_shard<H: TurnHandler>(
             let cancel = CancellationToken::new();
             inbox.begin(steering.clone(), cancel.clone());
             let turn = Turn {
-                input: input.clone(),
+                input,
                 steering,
                 cancel,
             };
             running.push(async move {
                 handler.run(turn).await;
-                (conversation, input)
+                conversation
             });
         }
 
@@ -250,30 +269,42 @@ pub async fn run_shard<H: TurnHandler>(
 
         tokio::select! {
             biased;
+            _ = housekeeping.tick(), if open => {
+                handler.idle(shard).await;
+            }
             dispatch = inbound.recv(), if open => match dispatch {
-                Some(Dispatch::Input(envelope)) => {
+                Some(Dispatch::Input(envelope, answer)) => {
                     let conversation = envelope.conversation_id.clone();
                     let inbox = conversations
                         .entry(conversation.clone())
                         .or_insert_with(|| Inbox::bounded(config.inbox_capacity));
-                    match inbox.admit(envelope) {
-                        Admitted::NextTurn => ready.push(conversation),
-                        Admitted::NextStep | Admitted::NextStepDisplacing => {}
-                        // The refusal was decided in `Inbox::admit` and then
-                        // discarded here, so a conversation that outran its
-                        // `[gateway] inbox_capacity` lost the message with no
-                        // trace anywhere — the one thing `Admitted::Full`'s own
-                        // documentation says must not happen. Saturation is now
-                        // at least *observable*; telling the sender needs an
-                        // egress this loop does not have, and is recorded as
-                        // the remaining gap in `docs/OBSERVABILITY.md`
-                        // (M9 / `CI-002`).
-                        Admitted::Full => tracing::warn!(
-                            conversation_id = conversation.as_str(),
-                            inbox_capacity = config.inbox_capacity,
-                            "inbox full; message refused"
-                        ),
-                    }
+                    let outcome = match inbox.admit(envelope) {
+                        Admitted::NextTurn => {
+                            ready.push(conversation);
+                            DeliveryOutcome::Queued
+                        }
+                        Admitted::NextStep => DeliveryOutcome::Steered,
+                        Admitted::NextStepDisplacing { displaced } => {
+                            tracing::warn!(
+                                conversation_id = conversation.as_str(),
+                                ingress_id = displaced.ingress_id().as_deref(),
+                                "steering queue full; oldest message displaced"
+                            );
+                            DeliveryOutcome::Displaced(displaced)
+                        }
+                        Admitted::Full { refused } => {
+                            tracing::warn!(
+                                conversation_id = conversation.as_str(),
+                                ingress_id = refused.ingress_id().as_deref(),
+                                inbox_capacity = config.inbox_capacity,
+                                "inbox full; message refused"
+                            );
+                            DeliveryOutcome::Refused(refused)
+                        }
+                    };
+                    // The dispatcher may have stopped while the shard admitted
+                    // this event. The durable ingress row remains the authority.
+                    let _ = answer.send(outcome);
                 }
                 Some(Dispatch::Stop(conversation, answer)) => {
                     let stopped = conversations
@@ -285,13 +316,8 @@ pub async fn run_shard<H: TurnHandler>(
                 // The router is gone: finish what is in flight, then stop.
                 None => open = false,
             },
-            Some((conversation, input)) = running.next() => {
-                finish_turn(&mut conversations, &conversation, input, &mut ready);
-            }
-            () = tokio::time::sleep(config.idle_interval),
-                if open && running.is_empty() && ready.is_empty() =>
-            {
-                handler.idle(shard).await;
+            Some(conversation) = running.next() => {
+                finish_turn(&mut conversations, &conversation, &mut ready);
             }
         }
     }
@@ -302,7 +328,6 @@ pub async fn run_shard<H: TurnHandler>(
 fn finish_turn(
     conversations: &mut HashMap<ConversationId, Inbox>,
     conversation: &ConversationId,
-    input: Envelope,
     ready: &mut Vec<ConversationId>,
 ) {
     let Some(inbox) = conversations.get_mut(conversation) else {
@@ -313,8 +338,8 @@ fn finish_turn(
     // it becomes the next turn rather than being dropped. Oldest first, and
     // each pushed to the front, so the original order survives.
     if let Some(steering) = inbox.end() {
-        for message in steering.take().into_iter().rev() {
-            inbox.requeue(unanswered(&input, message));
+        for envelope in steering.take_unclaimed().into_iter().rev() {
+            inbox.requeue(envelope);
         }
     }
     if inbox.is_idle() {
@@ -326,22 +351,10 @@ fn finish_turn(
     }
 }
 
-/// Re-envelope a steer the finished run never got to, addressed like the turn
-/// it arrived during.
-fn unanswered(input: &Envelope, message: Message) -> Envelope {
-    Envelope {
-        channel_id: input.channel_id.clone(),
-        conversation_id: input.conversation_id.clone(),
-        sender: input.sender.clone(),
-        message,
-        metadata: input.metadata.clone(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentos_proto::{ChannelId, MessageRole};
+    use agentos_proto::{ChannelId, Message, MessageRole};
     use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::rc::Rc;
@@ -389,10 +402,10 @@ mod tests {
             }
             // Claim whatever steered in, so the test can see it was delivered
             // to the running turn rather than queued as a second one.
-            for message in turn.steering.take() {
+            for envelope in turn.steering.claim_all() {
                 self.finished
                     .borrow_mut()
-                    .push(format!("{conversation}:steer:{}", message.content));
+                    .push(format!("{conversation}:steer:{}", envelope.message.content));
             }
             self.finished
                 .borrow_mut()
@@ -429,10 +442,12 @@ mod tests {
         };
         let (tx, rx) = mpsc::channel(8);
         let rx = ShardInbound(rx);
-        tx.send(Dispatch::Input(envelope("slow", "grind")))
+        let (slow_answer, _slow_outcome) = oneshot::channel();
+        tx.send(Dispatch::Input(envelope("slow", "grind"), slow_answer))
             .await
             .expect("queued");
-        tx.send(Dispatch::Input(envelope("quick", "hello")))
+        let (quick_answer, _quick_outcome) = oneshot::channel();
+        tx.send(Dispatch::Input(envelope("quick", "hello"), quick_answer))
             .await
             .expect("queued");
         drop(tx);
@@ -460,7 +475,8 @@ mod tests {
         };
         let (tx, rx) = mpsc::channel(8);
         let rx = ShardInbound(rx);
-        tx.send(Dispatch::Input(envelope("conv", "first")))
+        let (first_answer, _first_outcome) = oneshot::channel();
+        tx.send(Dispatch::Input(envelope("conv", "first"), first_answer))
             .await
             .expect("queued");
 
@@ -468,7 +484,8 @@ mod tests {
             while !*started.borrow() {
                 tokio::task::yield_now().await;
             }
-            tx.send(Dispatch::Input(envelope("conv", "second")))
+            let (second_answer, _second_outcome) = oneshot::channel();
+            tx.send(Dispatch::Input(envelope("conv", "second"), second_answer))
                 .await
                 .expect("queued");
             drop(tx);
@@ -483,9 +500,54 @@ mod tests {
         );
     }
 
-    /// Maintenance runs when the shard has nothing else to do.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn an_idle_shard_runs_maintenance() {
+    async fn router_returns_the_exact_displaced_envelope() {
+        let finished = Rc::new(RefCell::new(Vec::new()));
+        let started = Rc::new(RefCell::new(false));
+        let handler = Recorder {
+            finished,
+            stall: Some(("conv".to_owned(), Duration::from_secs(5))),
+            idle_ticks: Rc::new(RefCell::new(0)),
+            started: Rc::clone(&started),
+        };
+        let shard_config = ShardConfig {
+            inbox_capacity: 1,
+            ..config(1)
+        };
+        let (router, mut inbounds) = shard_set(&shard_config);
+        let inbound = inbounds.pop().expect("one shard");
+        let first = envelope("conv", "first");
+        let second = envelope("conv", "second");
+        let third = envelope("conv", "third");
+
+        let driver = async {
+            assert_eq!(
+                router.deliver(first).await.expect("first is admitted"),
+                DeliveryOutcome::Queued
+            );
+            while !*started.borrow() {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                router
+                    .deliver(second.clone())
+                    .await
+                    .expect("second is admitted"),
+                DeliveryOutcome::Steered
+            );
+            assert_eq!(
+                router.deliver(third).await.expect("third is admitted"),
+                DeliveryOutcome::Displaced(second)
+            );
+            drop(router);
+        };
+
+        tokio::join!(run_shard(0, inbound, &shard_config, &handler), driver);
+    }
+
+    /// Shard-local housekeeping follows its own periodic tick.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_shard_runs_periodic_housekeeping() {
         let idle_ticks = Rc::new(RefCell::new(0));
         let handler = Recorder {
             finished: Rc::new(RefCell::new(Vec::new())),

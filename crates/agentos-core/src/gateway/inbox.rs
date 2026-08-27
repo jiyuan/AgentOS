@@ -34,32 +34,31 @@ use tokio_util::sync::CancellationToken;
 pub const DEFAULT_INBOX_CAPACITY: usize = 32;
 
 /// Where an admitted envelope went.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Admitted {
     /// Queued for a run of its own; nothing is in flight.
     NextTurn,
     /// Handed to the in-flight run, which will claim it at its next `Plan`.
     NextStep,
     /// Handed to the in-flight run, displacing the oldest un-claimed steer.
-    NextStepDisplacing,
+    NextStepDisplacing { displaced: Envelope },
     /// Refused: the turn queue is full.
     ///
-    /// The caller *should* tell the user — a silently dropped message is
-    /// indistinguishable from an ignored one — and today it does not. The
-    /// shard loop logs `inbox full; message refused` and drops it, because the
-    /// loop that admits has no egress to answer on. See
-    /// `docs/OBSERVABILITY.md`, which names this as the open gap rather than
-    /// leaving this comment describing behaviour the tree does not have
-    /// (M9 / `CI-002`).
-    Full,
+    /// Carries the exact envelope so durable ingress can tell its sender and
+    /// settle that event only after the terminal refusal is delivered.
+    Full { refused: Envelope },
 }
 
 impl Admitted {
     /// Whether the envelope was taken at all.
-    pub fn accepted(self) -> bool {
-        !matches!(self, Self::Full)
+    pub fn accepted(&self) -> bool {
+        !matches!(self, Self::Full { .. })
     }
 }
+
+/// Confirmation that an exact unclaimed envelope returned to the turn queue.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Requeued;
 
 /// One conversation's mailbox plus a handle on its active run.
 ///
@@ -95,13 +94,13 @@ impl Inbox {
     /// Take `envelope`, routing it to the in-flight run if there is one.
     pub fn admit(&mut self, envelope: Envelope) -> Admitted {
         if let Some(active) = self.active.as_ref() {
-            return match active.steering.push(envelope.message) {
+            return match active.steering.push(envelope) {
                 Steered::Queued => Admitted::NextStep,
-                Steered::Displaced => Admitted::NextStepDisplacing,
+                Steered::Displaced(displaced) => Admitted::NextStepDisplacing { displaced },
             };
         }
         if self.next_turn.len() >= self.capacity {
-            return Admitted::Full;
+            return Admitted::Full { refused: envelope };
         }
         self.next_turn.push_back(envelope);
         Admitted::NextTurn
@@ -137,8 +136,9 @@ impl Inbox {
     ///
     /// Used for input a finished run never claimed. It jumps the queue because
     /// it is older than everything already waiting.
-    pub fn requeue(&mut self, envelope: Envelope) {
+    pub fn requeue(&mut self, envelope: Envelope) -> Requeued {
         self.next_turn.push_front(envelope);
+        Requeued
     }
 
     /// Cancel the active run, if any. Returns whether there was one — the
@@ -222,9 +222,9 @@ mod tests {
         assert_eq!(inbox.waiting(), 0, "no second run was queued");
         assert_eq!(
             steering
-                .take()
+                .take_unclaimed()
                 .iter()
-                .map(|m| m.content.as_ref())
+                .map(|e| e.message.content.as_ref())
                 .collect::<Vec<_>>(),
             vec!["actually, stop"]
         );
@@ -240,13 +240,21 @@ mod tests {
         assert_eq!(steering_inbox.admit(envelope("a")), Admitted::NextStep);
         assert_eq!(
             steering_inbox.admit(envelope("b")),
-            Admitted::NextStepDisplacing
+            Admitted::NextStepDisplacing {
+                displaced: envelope("a")
+            }
         );
 
         let mut turn_inbox = Inbox::bounded(1);
         assert_eq!(turn_inbox.admit(envelope("a")), Admitted::NextTurn);
-        assert_eq!(turn_inbox.admit(envelope("b")), Admitted::Full);
-        assert!(!Admitted::Full.accepted());
+        let full = turn_inbox.admit(envelope("b"));
+        assert_eq!(
+            full,
+            Admitted::Full {
+                refused: envelope("b")
+            }
+        );
+        assert!(!full.accepted());
         assert_eq!(turn_inbox.waiting(), 1);
     }
 

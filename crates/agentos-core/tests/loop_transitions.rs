@@ -140,6 +140,7 @@ fn deps<'a>(
         compaction: Default::default(),
         cancel: Default::default(),
         steering: None,
+        run_journal: None,
         audit: SafetyJournal::detached().for_run(
             Principal::conversation(
                 AgentId::new("agent"),

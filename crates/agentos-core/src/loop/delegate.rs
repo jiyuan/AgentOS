@@ -103,8 +103,12 @@ pub(super) async fn execute_delegate(
             input,
             run_id,
         )
-        .map(|invocation| invocation.with_cancel(&deps.cancel).with_parent_seed(seed))
-    {
+        .map(|invocation| {
+            invocation
+                .with_cancel(&deps.cancel)
+                .with_parent_seed(seed)
+                .with_run_journal(deps.run_journal.clone())
+        }) {
         Ok(invocation) => invocation,
         Err(error) => {
             record_subagent_failure(state, deps, span_id, spec, "subagent_create_failed", &error);
@@ -233,7 +237,8 @@ pub(super) async fn execute_resume_delegate(
             paused.state.run_id.clone(),
             &paused.state,
         )?
-        .with_cancel(&deps.cancel);
+        .with_cancel(&deps.cancel)
+        .with_run_journal(deps.run_journal.clone());
     let witness = paused
         .state
         .pending_approval()

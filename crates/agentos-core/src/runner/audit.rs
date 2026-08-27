@@ -74,6 +74,7 @@ fn run_error_kind(error: &RunError) -> &'static str {
         RunError::Tool(_) => "tool",
         RunError::SubAgent(_) => "subagent",
         RunError::TaskWorkspace(_) => "task_workspace",
+        RunError::DurableState { .. } => "durable_state",
         RunError::SafetyEvidence { .. } => "safety_evidence",
         RunError::ApprovalDenied { .. } => "approval_denied",
         RunError::StructuralDenial { .. } => "structural_denial",

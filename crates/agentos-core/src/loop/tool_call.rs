@@ -131,6 +131,21 @@ pub(super) async fn execute_tool(
         let tools = deps
             .tools
             .ok_or_else(|| ToolRegistryError::UnknownTool(Arc::clone(&call.name)))?;
+        let action = if let Some(journal) = &deps.run_journal {
+            let claimed = deps
+                .steering
+                .as_ref()
+                .map_or_else(Vec::new, |steering| steering.claimed_snapshot());
+            Some(
+                journal
+                    .start_action(call.id.as_str(), &claimed)
+                    .map_err(|err| RunError::DurableState {
+                        reason: Arc::from(err.to_string()),
+                    })?,
+            )
+        } else {
+            None
+        };
         // Tool failures (bad path, missing file, malformed args) become a Failed
         // `ToolResult` rather than aborting the run, so the model can read the
         // error in the next turn and self-correct (e.g. create the missing dir
@@ -142,8 +157,22 @@ pub(super) async fn execute_tool(
         // A tool that blocks the thread is not — see `cancel`'s module docs.
         let called = unless_cancelled(&deps.cancel, tools.call_with_context(&call, &run_ctx)).await;
         let Some(called) = called else {
+            if let (Some(journal), Some(action)) = (&deps.run_journal, &action) {
+                journal
+                    .ambiguous_action(action, "tool future was cancelled after invocation began")
+                    .map_err(|err| RunError::DurableState {
+                        reason: Arc::from(err.to_string()),
+                    })?;
+            }
             return Err(RunError::Cancelled);
         };
+        if let (Some(journal), Some(action)) = (&deps.run_journal, &action) {
+            journal
+                .complete_action(action)
+                .map_err(|err| RunError::DurableState {
+                    reason: Arc::from(err.to_string()),
+                })?;
+        }
         match called {
             Ok(result) => result,
             Err(ToolRegistryError::Tool(tool_err)) => ToolResult {

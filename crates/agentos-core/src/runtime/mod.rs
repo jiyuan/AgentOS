@@ -471,11 +471,11 @@ fn absolutise(path: &Path) -> PathBuf {
 fn probe_skills_root(root: &Path) -> Result<(), String> {
     std::fs::create_dir_all(root)
         .map_err(|err| format!("cannot create skills root '{}': {err}", root.display()))?;
-    // The filename must be unique per probe call, not just per process: the
-    // gateway runs one `AgentRuntime::build` per channel concurrently in the
-    // same process, so a process-id-only name lets one thread's `remove_file`
-    // delete another thread's probe and the loser fails with ENOENT. Mix in a
-    // monotonic counter so concurrent builds never collide.
+    // The filename must be unique per probe call, not just per process. Tests
+    // and independent entrypoints can still build concurrently, so a
+    // process-id-only name lets one caller's `remove_file` delete another's
+    // probe and the loser fail with ENOENT. Mix in a monotonic counter so
+    // concurrent builds never collide.
     static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
     let probe = root.join(format!(
         ".agentos-probe-{}-{}",

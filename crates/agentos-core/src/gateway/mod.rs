@@ -11,25 +11,37 @@
 //! lock rather than by a pid in a file, and how a `SIGTERM` becomes a bounded
 //! drain instead of a turn that ends between two instructions.
 
+mod approval_store;
 mod control;
+mod control_socket;
+mod delivery;
 mod inbox;
 mod ingress;
+mod maintenance;
 mod shard;
 mod shutdown;
 
-pub use control::{
-    holder, kill_holder, read_record, signal_holder, terminate_holder, ControlError, ControlFile,
-    ControlRecord,
+pub use approval_store::{ApprovalStore, DurableApproval, RecoveredApprovals};
+pub use control::{holder, read_record, ControlError, ControlFile, ControlRecord};
+pub use control_socket::{control_socket_path, ControlEndpoint, ShutdownRequest};
+pub use delivery::{
+    AmbiguousEvent, DeliveryBatch, DeliveryState, IngressEventKey, RunJournal, DELIVERY_ID_KEY,
 };
-pub use inbox::{Admitted, Inbox, DEFAULT_INBOX_CAPACITY};
+pub use inbox::{Admitted, Inbox, Requeued, DEFAULT_INBOX_CAPACITY};
 pub(crate) use ingress::init_schema as init_ingress_schema;
-pub use ingress::{AbandonedEvent, Admission, IngressError, IngressLedger, Settlement};
+pub use ingress::{
+    AbandonedEvent, Admission, IngressError, IngressLedger, ReplayableEvent, Settlement,
+};
+pub use maintenance::{
+    MaintenanceCadence, MaintenanceScheduleError, MaintenanceTick, MaintenanceTicker,
+};
 pub use shard::{
-    run_shard, shard_set, RouteError, Router, ShardConfig, ShardInbound, Turn, TurnHandler,
-    DEFAULT_IDLE_INTERVAL,
+    run_shard, shard_set, DeliveryOutcome, RouteError, Router, ShardConfig, ShardInbound, Turn,
+    TurnHandler, DEFAULT_IDLE_INTERVAL,
 };
 pub use shutdown::{
-    install_shutdown_handler, request_shutdown, shutdown_requested, DEFAULT_SHUTDOWN_GRACE_SECS,
+    install_shutdown_handler, receive_or_cancel, request_shutdown, shutdown_requested,
+    ProcessShutdown, ReceiveOutcome, DEFAULT_SHUTDOWN_GRACE_SECS,
 };
 
 use crate::r#loop::{ApprovalTicket, ResumeWitness, RunError};
@@ -110,11 +122,12 @@ impl<'a> GatewayService<'a> {
     where
         C: Channel,
     {
-        let Some(input) = channel.receive().await else {
+        let Some(inbound) = channel.receive().await else {
             return Ok(None);
         };
+        channel.acknowledge(inbound.receipt).await?;
         let egress = channel.egress();
-        self.run_envelope(egress.as_ref(), input, run_id)
+        self.run_envelope(egress.as_ref(), inbound.envelope, run_id)
             .await
             .map(Some)
     }
@@ -130,20 +143,28 @@ impl<'a> GatewayService<'a> {
         input: Envelope,
         run_id: RunId,
     ) -> Result<GatewayRun, GatewayError> {
+        let outcome = self.run_envelope_buffered(input, run_id).await?;
+        self.deliver(egress, outcome).await
+    }
+
+    /// Run without sending terminal output. A durable gateway uses this so it
+    /// can commit `reply_pending` before the first transport byte is attempted.
+    pub async fn run_envelope_buffered(
+        &self,
+        input: Envelope,
+        run_id: RunId,
+    ) -> Result<GatewayRun, GatewayError> {
         let channel_id = input.channel_id.clone();
         let conversation_id = input.conversation_id.clone();
         match run_envelope(input, run_id, self.deps).await? {
-            RunOutcome::Finished { state, output } => {
-                egress.send(output.clone()).await?;
-                Ok(GatewayRun::Finished { state, output })
-            }
+            RunOutcome::Finished { state, output } => Ok(GatewayRun::Finished { state, output }),
             RunOutcome::Paused(state) => {
                 let paused = PausedRun {
                     channel_id,
                     conversation_id,
                     state,
                 };
-                self.send_approval_prompt(egress, paused).await
+                self.approval_prompt(paused)
             }
         }
     }
@@ -154,29 +175,32 @@ impl<'a> GatewayService<'a> {
         paused: PausedRun,
         witness: ResumeWitness,
     ) -> Result<GatewayRun, GatewayError> {
+        let outcome = self.resume_buffered(paused, witness).await?;
+        self.deliver(egress, outcome).await
+    }
+
+    /// Resume without sending terminal output; see [`Self::run_envelope_buffered`].
+    pub async fn resume_buffered(
+        &self,
+        paused: PausedRun,
+        witness: ResumeWitness,
+    ) -> Result<GatewayRun, GatewayError> {
         let channel_id = paused.channel_id.clone();
         let conversation_id = paused.conversation_id.clone();
         match resume_run(paused, witness, self.deps).await? {
-            RunOutcome::Finished { state, output } => {
-                egress.send(output.clone()).await?;
-                Ok(GatewayRun::Finished { state, output })
-            }
+            RunOutcome::Finished { state, output } => Ok(GatewayRun::Finished { state, output }),
             RunOutcome::Paused(state) => {
                 let paused = PausedRun {
                     channel_id,
                     conversation_id,
                     state,
                 };
-                self.send_approval_prompt(egress, paused).await
+                self.approval_prompt(paused)
             }
         }
     }
 
-    async fn send_approval_prompt(
-        &self,
-        egress: &dyn Egress,
-        paused: PausedRun,
-    ) -> Result<GatewayRun, GatewayError> {
+    fn approval_prompt(&self, paused: PausedRun) -> Result<GatewayRun, GatewayError> {
         let Some(ticket) = paused
             .state
             .pending_approval()
@@ -188,15 +212,28 @@ impl<'a> GatewayService<'a> {
             .approval_expiry
             .map(|expiry| unix_now() + expiry.as_secs());
         let prompt = approval_prompt_envelope(&paused, Arc::clone(&self.sender), expires_at);
-        if let Some(prompt) = &prompt {
-            egress.send(prompt.clone()).await?;
-        }
         Ok(GatewayRun::Paused {
             paused,
             prompt,
             ticket,
             expires_at,
         })
+    }
+
+    async fn deliver(
+        &self,
+        egress: &dyn Egress,
+        outcome: GatewayRun,
+    ) -> Result<GatewayRun, GatewayError> {
+        match &outcome {
+            GatewayRun::Finished { output, .. } => egress.send(output.clone()).await?,
+            GatewayRun::Paused { prompt, .. } => {
+                if let Some(prompt) = prompt {
+                    egress.send(prompt.clone()).await?;
+                }
+            }
+        }
+        Ok(outcome)
     }
 }
 

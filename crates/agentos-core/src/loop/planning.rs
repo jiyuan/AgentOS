@@ -410,6 +410,7 @@ mod tests {
             content_limits: Default::default(),
             cancel: Default::default(),
             steering: None,
+            run_journal: None,
             audit: crate::audit::SafetyJournal::detached(),
             delegated_authority: None,
             compaction: Compaction {

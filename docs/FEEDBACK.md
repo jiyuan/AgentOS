@@ -687,3 +687,183 @@
 - **Actual Behavior**: The first AUD-002 Clippy pass found two benchmark literals still naming removed `granted_authority` instead of `delegated_authority`.
 - **Root Cause**: The earlier mechanical rename covered runtime and tests but omitted benchmark-only literals, which ordinary `cargo check` does not compile.
 - **Suggested Fix**: Update both benchmark literals to `delegated_authority: None` and keep `cargo clippy --workspace --all-targets --locked -- -D warnings` in the completion gate; the corrected workspace now passes it.
+
+## [2026-08-25 22:36] CONSISTENCY [RESOLVED]
+
+- **Agent**: /root
+- **Task**: Implement GW-002 durable ingress and update its audit finding evidence.
+- **Guideline Violated**: Delivery rules > keep new behavior in new modules; TEST-002 finding marker contract
+- **Expected Behavior**: New ingress protocol logic should begin in a dedicated module, and completed finding regressions should carry their stable `AF-*` markers.
+- **Actual Behavior**: The first implementation placed the receive/dispatch loop in the already oversized gateway entry point, and the first audit-register pass found AF-002 through AF-006 missing from their named tests.
+- **Root Cause**: The behavior was initially changed in place to preserve call-site context, and the roadmap statuses were updated before running the audit marker ratchet.
+- **Suggested Fix**: Move the protocol loop into `agentos-gateway/ingress.rs`, leaving the gateway entry point smaller than its baseline, and annotate each named regression before marking its finding complete; module-size and audit-register gates now pass.
+
+## [2026-08-25 22:36] TOOL [RESOLVED]
+
+- **Agent**: /root
+- **Task**: Validate the completed GW-002 audit finding rows.
+- **Guideline Violated**: GUIDELINES > Efficiency
+- **Expected Behavior**: Invoke the repository audit-ratchet script with its documented argument surface.
+- **Actual Behavior**: The first invocation guessed a `--check` flag that the script does not accept; argparse rejected it without changing files.
+- **Root Cause**: The audit script was treated like the catalog checker instead of inspecting its local CLI shape first.
+- **Suggested Fix**: Run `python3 scripts/check_audit_findings.py` without `--check`; the corrected invocation passes with all 40 stable IDs.
+
+## [2026-08-25 22:36] TOOL [ESCALATE]
+
+- **Agent**: /root
+- **Task**: Run the complete `agentos-core` suite after GW-002.
+- **Guideline Violated**: FEEDBACK > Review Cycle > Per-session
+- **Expected Behavior**: Consult the existing loopback-fixture remediation before launching the full suite and use the approved local-test permission immediately.
+- **Actual Behavior**: The first full-core run again used the managed sandbox, so seven egress fixtures failed to bind loopback before the approved rerun reached the known AF-020 Seatbelt failures.
+- **Root Cause**: The feedback scan happened at the end of implementation instead of before selecting the full-suite execution context.
+- **Suggested Fix**: Treat the feedback scan as a pre-gate check for this repository; the approved rerun proved all non-Seatbelt core tests pass, and future full-core invocations should use the existing permission on the first attempt.
+
+## [2026-08-25 23:09] CONSISTENCY [RESOLVED]
+
+- **Agent**: /root
+- **Task**: Implement complete envelope identity through GW-003 steering and requeue.
+- **Guideline Violated**: PR conventions > blocking Clippy gate
+- **Expected Behavior**: The new AF-007 regression should satisfy the workspace warnings-as-errors policy on its first all-target pass.
+- **Actual Behavior**: Clippy rejected an assertion that cloned an envelope solely to build a one-element expected slice.
+- **Root Cause**: The regression used an owned array for concise equality instead of comparing the actual slice with `std::slice::from_ref`.
+- **Suggested Fix**: Compare the unclaimed envelope slice with `std::slice::from_ref(&second_steer)`; the corrected all-target workspace Clippy gate passes.
+
+## [2026-08-25 23:09] TOOL [RESOLVED]
+
+- **Agent**: /root
+- **Task**: Run targeted steering, inbox, and shard tests for GW-003.
+- **Guideline Violated**: GUIDELINES > Efficiency
+- **Expected Behavior**: Run one valid Cargo filter per invocation, or restrict filters to `--lib` when selecting unit-test paths.
+- **Actual Behavior**: The first command passed three positional filters to one `cargo test` invocation; Cargo rejected the extra arguments before running tests.
+- **Root Cause**: Independent Rust test paths were combined as though Cargo accepted multiple filter operands.
+- **Suggested Fix**: Run the three `--lib` filters as separate commands and run the integration target explicitly; all corrected targeted suites pass.
+
+## [2026-08-25 23:53] CORRECTNESS [RESOLVED]
+
+- **Agent**: /root
+- **Task**: Implement GW-004 crash-conservative action and delivery boundaries.
+- **Guideline Violated**: GUIDELINES > Correctness; GW-004 > action boundary applies to every accepted input in the run
+- **Expected Behavior**: Every exact ingress row consumed by a parent, steer, live approval resolution, or child-agent tool should enter one atomic action and terminal-delivery group.
+- **Actual Behavior**: The first working action journal covered the primary event and claimed steers but did not propagate into child-agent tool runs or carry the original paused rows into a live approval resolution.
+- **Root Cause**: The initial boundary was modeled around the immediate runner invocation instead of the complete set of external inputs whose outcome the final reply represents.
+- **Suggested Fix**: Make `RunJournal` bind an event group, propagate it into sub-agent invocations, retain prompt delivery groups in live pending approvals, and include them in resumed journals and terminal egress; the grouped approval regression and full non-Seatbelt core suite now pass.
+
+## [2026-08-25 23:53] CONSISTENCY [RESOLVED]
+
+- **Agent**: /root
+- **Task**: Add GW-004 durable terminal egress to the gateway shard.
+- **Guideline Violated**: Delivery rules > keep new behavior in new modules; module-size ceiling
+- **Expected Behavior**: The new egress protocol should live in a focused module and leave `shard.rs` below the 800-LOC ceiling.
+- **Actual Behavior**: The first integrated version grew `shard.rs` to 829 non-test lines, and the module-size ratchet rejected it.
+- **Root Cause**: The durable egress adapter was initially kept beside its call site while its approval-group responsibilities were still evolving.
+- **Suggested Fix**: Move the adapter into `agentos-gateway/delivery.rs`; the corrected module-size gate passes.
+
+## [2026-08-25 23:53] TOOL [RESOLVED]
+
+- **Agent**: /root
+- **Task**: Convert the GW-004 action journal from a single event to an event group and split durable egress into its own module.
+- **Guideline Violated**: GUIDELINES > Efficiency
+- **Expected Behavior**: Scoped patches should use exact current context and apply once.
+- **Actual Behavior**: Two compound `apply_patch` attempts used stale surrounding lines and were rejected before changing files.
+- **Root Cause**: The patches combined distant hunks after formatting and prior edits had shifted their context.
+- **Suggested Fix**: Re-read the narrow target ranges and apply smaller independent patches; the corrected edits applied cleanly and all targeted gates pass.
+
+## [2026-08-26 00:31] CORRECTNESS [RESOLVED]
+
+- **Agent**: /root
+- **Task**: Implement STATE-002 restart-safe remote approvals.
+- **Guideline Violated**: GUIDELINES > Correctness; STATE-002 > consume each resolution once
+- **Expected Behavior**: Terminal ingress settlement and removal of the active approval lifecycle must be one crash-atomic transition.
+- **Actual Behavior**: The first integrated path settled the terminal reply and then deleted the approval row in a second transaction, leaving a crash window that could suppress the already-delivered resolution input while restoring the old prompt.
+- **Root Cause**: Approval consumption was initially attached to the in-memory handler outcome rather than to GW-004's durable terminal-delivery boundary.
+- **Suggested Fix**: Add `delivery_succeeded_consuming` and commit ingress settlement plus approval consumption in one SQLite transaction; the restart regression now exercises this boundary.
+
+## [2026-08-26 00:31] TOOL [RESOLVED]
+
+- **Agent**: /root
+- **Task**: Add the STATE-002 durable approval store and tests.
+- **Guideline Violated**: GUIDELINES > Efficiency
+- **Expected Behavior**: Compound patches should use valid, current hunk boundaries.
+- **Actual Behavior**: Two multi-file `apply_patch` calls were rejected before changing files because a new `Update File` marker followed an unterminated hunk.
+- **Root Cause**: The patch combined generated long-file additions and follow-up edits without closing each hunk cleanly.
+- **Suggested Fix**: Split structural and test edits into smaller valid patches; all subsequent changes applied and the targeted gates pass.
+
+## [2026-08-26 00:52] CORRECTNESS [RESOLVED]
+
+- **Agent**: /root
+- **Task**: Validate STATE-002 recovery against the one-connection in-memory SQLite fixture.
+- **Guideline Violated**: GUIDELINES > Correctness; MEMORY > SQLite connection-pool behavior
+- **Expected Behavior**: Approval recovery must release its migration/read transaction before reacquiring a connection for per-ingress validation.
+- **Actual Behavior**: The first validation pass retained the sole pooled in-memory connection and then waited indefinitely while validating the recovered event set.
+- **Root Cause**: Committing the transaction did not drop the outer pooled-connection guard before the validation helper requested another connection.
+- **Suggested Fix**: Explicitly release the connection before record validation; the five-test approval recovery target and full non-AF-020 suite now complete without a hang.
+
+## [2026-08-26 00:52] CONSISTENCY [RESOLVED]
+
+- **Agent**: /root
+- **Task**: Run STATE-002 warnings-as-errors and full migration gates.
+- **Guideline Violated**: PR conventions > Clippy and migration regression gates
+- **Expected Behavior**: New regressions should use `std::slice::from_ref` for borrowed singleton slices, and schema-version fixtures should advance with the migration.
+- **Actual Behavior**: The first Clippy pass rejected four cloned singleton slices, and the first full-core pass found the legacy ingress fixture still expected schema version 3 after STATE-002 introduced version 4.
+- **Root Cause**: The implementation and named STATE-002 tests were updated before running the all-target lint and legacy-migration target.
+- **Suggested Fix**: Replace the cloned slices, advance the fixture to version 4, and retain both checks in the final gate; Clippy and the corrected migration target pass.
+
+## [2026-08-26 01:06] ORCHESTRATION [ESCALATE]
+
+- **Agent**: /root
+- **Task**: Implement and verify GW-005 process-wide gateway runtime authority.
+- **Guideline Violated**: ORCHESTRATION > Subagent Delegation & Creation
+- **Expected Behavior**: Delegate implementation work exceeding the sequential tool-call threshold to a registered or built-in Subagent.
+- **Actual Behavior**: The work was completed locally because the active runtime instructions prohibit spawning Subagents without an explicit user request.
+- **Root Cause**: The repository's mandatory delegation threshold conflicts with the higher-priority runtime consent gate; this same conflict has recurred more than three times.
+- **Suggested Fix**: Amend the repository guideline, with human approval, so automatic delegation thresholds defer explicitly to environments that require user consent for Subagent creation.
+
+## [2026-08-26 01:09] TOOL [RESOLVED]
+
+- **Agent**: /root
+- **Task**: Make the GW-005 process authority explicit as one cloneable production handle.
+- **Guideline Violated**: GUIDELINES > Efficiency
+- **Expected Behavior**: Apply the ownership refactor with current, narrowly scoped patch context.
+- **Actual Behavior**: The first compound patch was rejected before changing files because formatting had changed one of its expected match arms.
+- **Root Cause**: The patch combined the new authority type with distant call-site rewrites after `cargo fmt` had changed the exact surrounding lines.
+- **Suggested Fix**: Apply the type declaration, construction loop, and worker signature as separate patches; the corrected implementation passes the targeted tests, Clippy, and both-channel pipeline.
+
+## [2026-08-26 22:55] ORCHESTRATION [ESCALATE]
+
+- **Agent**: /root
+- **Task**: Implement and verify MAINT-002 traffic-independent gateway maintenance.
+- **Guideline Violated**: ORCHESTRATION > Subagent Delegation & Creation
+- **Expected Behavior**: Delegate implementation work exceeding the sequential tool-call threshold to a registered or built-in Subagent.
+- **Actual Behavior**: The work was completed locally because the active runtime instructions prohibit spawning Subagents without an explicit user request.
+- **Root Cause**: The repository's mandatory delegation threshold conflicts with the higher-priority runtime consent gate; this recurring conflict remains unresolved.
+- **Suggested Fix**: Amend the repository guideline, with human approval, so automatic delegation thresholds defer explicitly to environments that require user consent for Subagent creation.
+
+## [2026-08-26 23:32] CORRECTNESS [RESOLVED]
+
+- **Agent**: /root
+- **Task**: Implement CTRL-002 authenticated holder-directed shutdown.
+- **Guideline Violated**: GUIDELINES > Correctness; CTRL-002 > replacement-process safety
+- **Expected Behavior**: Every serving process must mint a distinct control credential even when an operator-supplied detached-start correlation token is reused.
+- **Actual Behavior**: The first control protocol reused the detached-start owner token as its authenticator, and the replacement regression showed that two direct `serve` processes given the same environment token would accept an old request.
+- **Root Cause**: Startup correlation and holder authentication were represented by one field despite having different uniqueness and trust requirements.
+- **Suggested Fix**: Store a separately generated per-process `control_token`, keep the owner token only for parent/child startup correlation, and authenticate the socket with the control token; the replacement lifecycle regression now passes.
+
+## [2026-08-26 23:32] CORRECTNESS [RESOLVED]
+
+- **Agent**: /root
+- **Task**: Verify CTRL-002 startup publication under concurrent holder queries.
+- **Guideline Violated**: GUIDELINES > Correctness; gateway control-file publication contract
+- **Expected Behavior**: A reader that observes the held serving lock must obtain the complete record or safely observe that the holder disappeared.
+- **Actual Behavior**: The replacement lifecycle fixture caught a reader between the holder's in-place truncate and write and received a transient malformed-empty record.
+- **Root Cause**: The lock is intentionally acquired before the in-place record rewrite, while readers cannot share that exclusive lock and previously parsed the transient empty buffer immediately.
+- **Suggested Fix**: Retry only the bounded empty-publication state while rechecking the lock on every retry; return `None` if the holder exits and propagate every other malformed record.
+
+## [2026-08-26 23:32] ORCHESTRATION [ESCALATE]
+
+- **Agent**: /root
+- **Task**: Implement and verify CTRL-002 race-free gateway control and shutdown.
+- **Guideline Violated**: ORCHESTRATION > Subagent Delegation & Creation
+- **Expected Behavior**: Delegate implementation work exceeding the sequential tool-call threshold to a registered or built-in Subagent.
+- **Actual Behavior**: The work was completed locally because the active runtime instructions prohibit spawning Subagents without an explicit user request.
+- **Root Cause**: The repository's mandatory delegation threshold conflicts with the higher-priority runtime consent gate; this recurring conflict remains unresolved.
+- **Suggested Fix**: Amend the repository guideline, with human approval, so automatic delegation thresholds defer explicitly to environments that require user consent for Subagent creation.

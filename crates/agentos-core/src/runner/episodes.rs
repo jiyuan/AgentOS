@@ -171,6 +171,7 @@ pub(super) async fn record_error_episode(
         | RunError::GuardrailTripped { .. }
         | RunError::TaskWorkspace(_)
         | RunError::SubAgent(_)
+        | RunError::DurableState { .. }
         // Unreachable by construction: `act` turns cancellation into a
         // terminal stop notice, so it never propagates this far. Classified
         // rather than `unreachable!()` because an episode record is not worth

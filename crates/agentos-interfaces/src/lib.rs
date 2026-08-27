@@ -19,7 +19,10 @@ pub mod tool;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
-pub use channel::{Channel, ChannelError, Egress, StreamEgress};
+pub use channel::{
+    Channel, ChannelError, Egress, InboundEvent, IngressReceipt, StreamEgress,
+    MAX_INGRESS_RECEIPT_BYTES,
+};
 pub use guardrail::{
     GuardrailError, GuardrailOutcome, Input, InputGuardrail, OutputGuardrail, ToolGuardrail,
 };

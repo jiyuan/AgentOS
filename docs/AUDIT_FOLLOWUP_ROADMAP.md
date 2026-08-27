@@ -2,7 +2,7 @@
 
 Drafted: 2026-08-23
 
-Status: **R0 implemented; R1 underway with `ID-003`, `AUTH-003`, `AUTH-004`, `AUTH-005`, and `AUD-002` complete**
+Status: **R0 implemented; R1 underway with `ID-003`, `AUTH-003`, `AUTH-004`, `AUTH-005`, and `AUD-002` complete; R2 underway with `GW-002`, `GW-003`, `GW-004`, `GW-005`, `STATE-002`, and `MAINT-002` complete, and `CTRL-002` underway (`AF-025`/`AF-027` complete; `AF-026` awaits `PROC-002`)**
 
 Baseline: branch `docs/audit-remediation-plan`, commit `d4b2e94`
 
@@ -390,6 +390,7 @@ Implementation order inside the phase is `GW-002 → GW-003/GW-004 → STATE-002
 ### `STATE-002` — Persist restart-safe remote approvals
 
 - Priority: P1.
+- Status: Complete (2026-08-26).
 - Depends on: `AUTH-003`, `GW-002`, and the action/delivery-state contract in
   `GW-004`.
 - Files: gateway shard/main, runner pause/resume code, durable path or database
@@ -453,6 +454,10 @@ Implementation order inside the phase is `GW-002 → GW-003/GW-004 → STATE-002
 ### `CTRL-002` — Make control signalling and shutdown race-free
 
 - Priority: P1.
+- Status: Underway (2026-08-26). Startup publication, exact-holder control,
+  shared-deadline cancellation, and process lifecycle regressions are complete;
+  the real process-backed Telegram proof remains gated on `PROC-002`, and the
+  final active-MCP drain matrix remains gated on `MCP-004`.
 - Depends on: `GW-005`; real Telegram/process-backed cancellation also depends on
   `PROC-002`; final MCP drain proof depends on `MCP-004`.
 - Files: gateway control/supervisor, channel receive loops, process/runtime
@@ -806,13 +811,13 @@ ID sequence, and complete-row artifact resolution.
 | ID | Finding | Priority | Corrective slice | Acceptance evidence | Regression artifact | Execution | Status |
 |---|---|---:|---|---|---|---|---|
 | `AF-001` | Child session namespace omits parent channel/agent/policy | P0 | `ID-003` | Cross-channel, cross-agent, cross-policy fork/memory isolation | `crates/agentos-core/tests/subagent_identity.rs::colliding_legacy_sources_do_not_share_transcript_or_memory` | `portable` | Complete |
-| `AF-002` | Feishu ACK precedes durable ingress | P0 | `GW-002` | ACK-order crash fixture | `crates/agentos-core/tests/gateway_ingress_crash.rs::feishu_ack_follows_durable_ingress_commit` | `native-linux+macos` | Open |
-| `AF-003` | Telegram checkpoint advances without recoverable replay | P0 | `GW-002` | Cursor/restart/replay fixture | `crates/agentos-core/tests/gateway_ingress_crash.rs::telegram_cursor_never_advances_past_unrecoverable_input` | `native-linux+macos` | Open |
-| `AF-004` | Ingress ledger error logs and continues | P0 | `GW-002` | SQLite failpoint proves no ACK or execution | `crates/agentos-core/tests/gateway_ingress_crash.rs::ledger_failure_prevents_ack_and_execution` | `portable` | Open |
-| `AF-005` | ACKed rows can strand until restart; `/stop` bypasses admission | P0 | `GW-002` | Live dispatcher, saturation, and `/stop` ordering | `crates/agentos-core/tests/gateway_ingress_crash.rs::live_dispatcher_drains_acked_rows_and_stop_obeys_admission` | `native-linux+macos` | Open |
-| `AF-006` | Legacy unsettled rows lack replay payload behind an advanced cursor | P0 | `GW-002` | Pre-roadmap migration quarantine fixture | `crates/agentos-core/tests/gateway_ingress_crash.rs::legacy_unsettled_rows_are_quarantined_before_cursor_advance` | `portable` | Open |
-| `AF-007` | Steering/requeue loses envelope metadata and ingress ID | P1 | `GW-003` | Multi-sender steering/displacement | `crates/agentos-core/tests/gateway_steering.rs::displaced_envelope_preserves_principal_and_ingress_id` | `portable` | Open |
-| `AF-008` | Remote paused approvals exist only in memory | P1 | `STATE-002` | Pause/restart/policy-change/resolve matrix | `crates/agentos-core/tests/approval_recovery.rs::paused_approval_survives_restart_and_policy_change` | `native-linux+macos` | Open |
+| `AF-002` | Feishu ACK precedes durable ingress | P0 | `GW-002` | ACK-order crash fixture | `crates/agentos-core/tests/gateway_ingress_crash.rs::feishu_ack_follows_durable_ingress_commit` | `native-linux+macos` | Complete |
+| `AF-003` | Telegram checkpoint advances without recoverable replay | P0 | `GW-002` | Cursor/restart/replay fixture | `crates/agentos-core/tests/gateway_ingress_crash.rs::telegram_cursor_never_advances_past_unrecoverable_input` | `native-linux+macos` | Complete |
+| `AF-004` | Ingress ledger error logs and continues | P0 | `GW-002` | SQLite failpoint proves no ACK or execution | `crates/agentos-core/tests/gateway_ingress_crash.rs::ledger_failure_prevents_ack_and_execution` | `portable` | Complete |
+| `AF-005` | ACKed rows can strand until restart; `/stop` bypasses admission | P0 | `GW-002` | Live dispatcher, saturation, and `/stop` ordering | `crates/agentos-core/tests/gateway_ingress_crash.rs::live_dispatcher_drains_acked_rows_and_stop_obeys_admission` | `native-linux+macos` | Complete |
+| `AF-006` | Legacy unsettled rows lack replay payload behind an advanced cursor | P0 | `GW-002` | Pre-roadmap migration quarantine fixture | `crates/agentos-core/tests/gateway_ingress_crash.rs::legacy_unsettled_rows_are_quarantined_before_cursor_advance` | `portable` | Complete |
+| `AF-007` | Steering/requeue loses envelope metadata and ingress ID | P1 | `GW-003` | Multi-sender steering/displacement | `crates/agentos-core/tests/gateway_steering.rs::displaced_envelope_preserves_principal_and_ingress_id` | `portable` | Complete |
+| `AF-008` | Remote paused approvals exist only in memory | P1 | `STATE-002` | Pause/restart/policy-change/resolve matrix | `crates/agentos-core/tests/approval_recovery.rs::paused_approval_survives_restart_and_policy_change` | `native-linux+macos` | Complete |
 | `AF-009` | Authorization commitment omits plan fields; plan is swappable | P1 | `AUTH-005` | Per-field mutation and compile-fail tests | `crates/agentos-core/src/loop/authorization.rs::mutating_any_plan_field_invalidates_authorization` | `portable` | Complete |
 | `AF-010` | Public resume path accepts bare interruption/decision identifiers | P1 | `AUTH-003` | Opaque actor-bound witness negative tests | `crates/agentos-core/tests/approval_witness.rs::resume_rejects_bare_or_wrong_actor_witness` | `portable` | Complete |
 | `AF-011` | Approval ticket initialization can collide and lacks one prompt ID | P1 | `AUTH-003` | Deterministic synchronized initialization test | `crates/agentos-core/src/loop/approval_route.rs::synchronized_prompts_receive_distinct_ids` | `portable` | Complete |
@@ -829,12 +834,12 @@ ID sequence, and complete-row artifact resolution.
 | `AF-022` | MCP cancellation leaks pending slots/notification | P1 | `MCP-003` | Observed cancellation storm beyond limit | `crates/agentos-core/tests/mcp_interop.rs::cancellation_storm_releases_slots_and_notifies_server` | `native-linux+macos` | Open |
 | `AF-023` | MCP group shutdown, stderr, and restart accounting are incomplete | P1 | `MCP-004` | Descendant/flood/failed-open/active-drain tests | `crates/agentos-core/tests/mcp_process_lifecycle.rs::shutdown_drains_active_calls_and_kills_the_process_group` | `native-linux+macos` | Open |
 | `AF-024` | MCP tool-page count sizes allocation before the cumulative cap | P1 | `MCP-004` | Oversized compact `tools/list` page | `crates/agentos-core/tests/mcp_interop.rs::oversized_compact_tool_page_is_refused_before_allocation` | `portable` | Open |
-| `AF-025` | Gateway lock is visible before shutdown handling is ready | P1 | `CTRL-002` | Process-level startup/SIGTERM barrier | `crates/agentos-cli/tests/gateway_lifecycle.rs::startup_lock_is_published_after_signal_handlers_are_ready` | `native-linux+macos` | Open |
+| `AF-025` | Gateway lock is visible before shutdown handling is ready | P1 | `CTRL-002` | Process-level startup/SIGTERM barrier | `crates/agentos-cli/tests/gateway_lifecycle.rs::startup_lock_is_published_after_signal_handlers_are_ready` | `native-linux+macos` | Complete |
 | `AF-026` | Channel receive can block shutdown indefinitely | P1 | `CTRL-002`, `PROC-002` | Forever-blocked receiver | `crates/agentos-core/tests/gateway_shutdown.rs::forever_blocked_channel_is_abandoned_at_shutdown_deadline` | `native-linux+macos` | Open |
-| `AF-027` | Numeric PID holder lookup can signal a replacement process | P1 | `CTRL-002` | Barrier-controlled PID-reuse regression | `crates/agentos-cli/tests/gateway_lifecycle.rs::stop_never_signals_a_reused_pid` | `native-linux+macos` | Open |
-| `AF-028` | Channels construct independent runtime authorities | P1 | `GW-005` | Two-channel shared-authority test | `crates/agentos-core/tests/runtime_authority.rs::two_channels_share_one_runtime_authority` | `native-linux+macos` | Open |
-| `AF-029` | Maintenance depends on shard-0 idle time | P1 | `MAINT-002` | Saturated-shard deterministic-clock test | `crates/agentos-core/tests/maintenance.rs::maintenance_runs_while_shard_zero_is_saturated` | `portable` | Open |
-| `AF-030` | Failed/ambiguous egress is settled as handled or blindly retried | P1 | `GW-004` | Delivery/action crash-state matrix | `crates/agentos-core/tests/delivery_crash.rs::ambiguous_delivery_is_neither_silently_settled_nor_blindly_retried` | `native-linux+macos` | Open |
+| `AF-027` | Numeric PID holder lookup can signal a replacement process | P1 | `CTRL-002` | Barrier-controlled PID-reuse regression | `crates/agentos-cli/tests/gateway_lifecycle.rs::stop_never_signals_a_reused_pid` | `native-linux+macos` | Complete |
+| `AF-028` | Channels construct independent runtime authorities | P1 | `GW-005` | Two-channel shared-authority test | `crates/agentos-core/tests/runtime_authority.rs::two_channels_share_one_runtime_authority` | `native-linux+macos` | Complete |
+| `AF-029` | Maintenance depends on shard-0 idle time | P1 | `MAINT-002` | Saturated-shard deterministic-clock test | `crates/agentos-core/tests/maintenance.rs::maintenance_runs_while_shard_zero_is_saturated` | `portable` | Complete |
+| `AF-030` | Failed/ambiguous egress is settled as handled or blindly retried | P1 | `GW-004` | Delivery/action crash-state matrix | `crates/agentos-core/tests/delivery_crash.rs::ambiguous_delivery_is_neither_silently_settled_nor_blindly_retried` | `native-linux+macos` | Complete |
 | `AF-031` | Shipped cron mutations are blanket-allowed | P1 | `CFG-002` | Metadata-driven mutation policy ratchet | `crates/agentos-core/tests/shipped_config_policy.rs::metadata_drives_the_blanket_allow_ratchet_for_every_shipped_tool` | `portable` | Open |
 | `AF-032` | Reinstall deletes operator configuration and extensions | P1 | `REL-003` | Modify-and-reinstall preservation | `scripts/check-install-preservation.sh` | `native-linux+macos` | Open |
 | `AF-033` | Purge commits before best-effort audit marker/count recheck | P1 | `AUD-003` | Transaction count-race/failpoint rollback | `crates/agentos-core/tests/audit_purge.rs::purge_count_race_or_marker_failure_rolls_back_everything` | `portable` | Open |

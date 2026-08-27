@@ -15,7 +15,7 @@ use agentos_core::skills::{
     create_skill, validate_skill_dir, SkillCreation, SkillResourceKind, WorkspaceSkillCatalog,
 };
 use agentos_interfaces::orchestrator::StreamSink;
-use agentos_interfaces::{Channel, ChannelError, Egress};
+use agentos_interfaces::{Channel, ChannelError, Egress, InboundEvent};
 use agentos_llm::{env as agentos_env, LlmModelController};
 use agentos_proto::{
     AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole, Principal, RunId, SpanKind,
@@ -452,7 +452,10 @@ where
     )?;
     loop {
         let answer = channel.receive().await?;
-        match route(Some(&binding), &answer) {
+        if channel.acknowledge(answer.receipt).await.is_err() {
+            return None;
+        }
+        match route(Some(&binding), &answer.envelope) {
             Routed::Decides { witness } => return Some(witness),
             Routed::Stale { ticket: named } => {
                 println!("That approval ({named}) is not the one waiting. Answer {ticket}.");
@@ -909,8 +912,10 @@ impl Channel for TuiChannel {
         self.id.clone()
     }
 
-    async fn receive(&mut self) -> Option<Envelope> {
-        self.read_line().await.map(|input| self.envelope(input))
+    async fn receive(&mut self) -> Option<InboundEvent> {
+        self.read_line()
+            .await
+            .map(|input| InboundEvent::without_receipt(self.envelope(input)))
     }
 
     fn egress(&self) -> Arc<dyn Egress> {

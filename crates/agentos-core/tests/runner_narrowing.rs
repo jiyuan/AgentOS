@@ -222,6 +222,7 @@ fn runner_deps<'a>(
         compaction: Default::default(),
         cancel: Default::default(),
         steering: None,
+        run_journal: None,
         safety_log: None,
         delegated_authority: None,
     }

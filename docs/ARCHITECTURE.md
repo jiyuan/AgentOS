@@ -494,6 +494,17 @@ Roadmap D1–D3 and G1–G2. All of this sits around the loop, not inside it.
   conversations. A finished job is held for `[jobs].completed_retention_secs`
   and then forgotten. Surfaced by the `job_status`, `job_output`, and
   `job_kill` tools.
+- **Process runtime authority.** A persistent gateway builds one multi-thread
+  Tokio runtime and one `AgentRuntime` before starting channel workers. Telegram
+  and Feishu keep distinct transports, ingress ledgers, approval stores, and
+  egress handles, but share that runtime's SQLite pool, memory manager,
+  `JobRegistry`, MCP lifecycle registry, cancellation root, and one session-usage
+  counter. The authority is cancelled once after all channel workers drain; a
+  second enabled channel therefore does not double configured resource limits or
+  create a second lifecycle boundary. Each channel supervisor polls a bounded
+  maintenance timer alongside ingress rather than inside a shard; channel-bound
+  crons stay distinct, while SQLite leases elect one reflection and retention
+  leader across channels and processes.
 - **Conversations as actors.** The gateway no longer runs one serial
   receive → run → send loop. Each conversation has an `Inbox` and is assigned by
   stable hash to one of `[gateway].shards` OS threads, each with its own
@@ -509,37 +520,66 @@ Roadmap D1–D3 and G1–G2. All of this sits around the loop, not inside it.
   (*next-turn*) or steers the run in flight (*next-step*). Both lists are
   bounded by `[gateway].inbox_capacity`: the steer queue drops its oldest entry
   (the newest instruction is what the user means), the turn queue refuses the
-  newest (queued work is work the user asked for).
+  newest (queued work is work the user asked for). Both queues retain the full
+  envelope, including principal and transport ingress identity. Displacement
+  and refusal return that exact envelope to durable ingress, which sends a
+  terminal disposition before settling its row; unclaimed steers are requeued
+  unchanged.
 - **Correlated approvals.** An approval answer must name what it answers. An
   `ApprovalTicket` is minted per *prompt*; the `InterruptionId` (derived as
   `approval-<tool call id>`) still travels with it to say *what* was approved.
   Anything that is not an answer stays ordinary input. Prompts expire after
   `[approval].expiry_seconds` (default 900) and an expired prompt records
   `ApprovalStatus::Unanswered` — cancelled, not rejected.
+- **Restart-safe approval pauses.** Before a remote prompt reaches its
+  transport, `pending_approvals` commits a versioned `PausedRun`, ticket,
+  interruption and exact action scope, prompting principal, administrator
+  scope, expiry, ingress identities, and prompt in the same SQLite transaction
+  that moves those inputs to `paused`. Prompt delivery then crosses explicit
+  `prompt_pending → delivery_started → pending` states: only the first is safe
+  to send after restart, while an interrupted delivery is ambiguous. Startup
+  validates every identity and restores each conversation to its owning shard.
+  Persisted administrators are intersected with current configuration, and
+  `Act` re-decides against live policy, so removals revoke authority while
+  additions cannot authorize an old prompt. A resolution is claimed once;
+  terminal ingress settlement and lifecycle consumption are one transaction.
+  A crash before action start may replay the exact resolution, with identical
+  audit evidence treated idempotently; an `action_ambiguous` boundary refuses
+  automatic recovery.
 - **Durable ingress.** The transports AgentOS speaks are at-least-once, and no
   acknowledgement a client can send makes a redelivery impossible — so the
   redelivery has to be *recognised*. `gateway/ingress.rs` keys on
-  `(channel_id, transport event id)` and answers three ways: fresh (run it),
-  accepted-but-never-settled (run it again — the user asked and nobody
-  answered), and settled (suppress it). The row is written before the envelope
-  reaches a shard and settled once the turn ends, whatever the turn's outcome,
-  which is what puts the crash window inside the retry case rather than between
-  the two. A channel publishes its transport's own id under `INGRESS_ID_KEY`;
+  `(channel_id, transport event id)` and answers three ways: fresh, unsettled,
+  and settled. An unsettled row is recovered by its semantic stage, not blindly
+  rerun: `accepted`/`running` may route again, `reply_pending` may deliver its
+  already-persisted envelope, `paused` waits for approval recovery, and a
+  restart at `action_started`/`action_completed` or `delivery_started` becomes
+  `action_ambiguous` or `delivery_ambiguous`. Those states require operator
+  reconciliation and are excluded from both the input and reply queues. Tool
+  calls commit `action_started` before invocation; child-agent tools share the
+  parent ingress journal. Terminal envelopes commit as `reply_pending` with a
+  stable delivery id before egress, and only successful egress can commit
+  `handled` or `rejected`. A channel publishes its transport's own id under `INGRESS_ID_KEY`;
   one that publishes none is delivered and not recorded, because the gateway
   cannot dedupe what it cannot recognise and an invented id would either merge
   two identical messages or call every redelivery new. A resumable cursor —
   Telegram's `getUpdates` offset — is persisted only after the event at that
   position is in the ledger; the reverse ordering is the one that cannot be
   recovered from.
-- **One serving process, one sweeper.** Which process is the gateway is
-  established by `flock` on the control file, held for the life of that
-  process: locked means it is alive, unlocked means nobody is. There is no
-  `kill -0` liveness guess, because a pid is recycled and a stale record then
-  names a stranger. `SIGTERM` sets a flag — the only work safe inside a signal
-  handler — the router stops accepting, in-flight turns drain within
-  `[gateway] shutdown_grace_secs`, and past that the gateway reports the shards
-  that would not drain and every accepted-but-unsettled event rather than
-  hanging. Separately, memory reflection runs under a `memory.reflection` lease
+- **One serving process, one shutdown boundary, one sweeper.** Which process is
+  the gateway is established by `flock` on the control file, held for the life
+  of that process: locked means it is alive, unlocked means nobody is. Shutdown
+  handlers and a private authenticated Unix control endpoint are ready before
+  that lock is published. `stop` captures the exact holder's per-process token
+  and sends it to the endpoint; a replacement rejects the stale token, so no
+  numeric-pid signal or escalation can reach a reused pid. `SIGTERM` sets only
+  an async-signal-safe flag. The supervisor converts either path into one
+  process-wide cancellation root and one `[gateway] shutdown_grace_secs`
+  deadline. Blocking channel receives are selected against that root, admission
+  stops, maintenance and dispatch futures are dropped, and every channel drains
+  its shards against the same deadline. Past it the process reports wedged
+  workers and every accepted-but-unsettled ingress ID rather than hanging.
+  Separately, memory reflection runs under a `memory.reflection` lease
   and the store retention sweep under a `gateway.retention` lease, so the one
   database and the one set of directories get one sweep each, across every
   channel's shard set and every process on the file. Two leases rather than
@@ -574,8 +614,9 @@ Eight things this runtime writes grow with use, and they split on one question
 — is this store the *record*, or a by-product of work recorded elsewhere?
 
 Six are by-products, and `crates/agentos-core/src/retention/` sweeps them from
-the gateway's idle phase: run traces, inbound attachments, the gateway log,
-spill artifacts, settled ingress rows, and finished background jobs. Where the
+the gateway's independent bounded maintenance timer: run traces, inbound
+attachments, the gateway log, spill artifacts, settled ingress rows, and
+finished background jobs. Where the
 store is a directory this runtime owns outright, it takes an age ceiling *and*
 a byte quota, applied in that order — age is what the operator reasoned about,
 and applying the quota first would evict something they had said to keep. Age
@@ -970,9 +1011,9 @@ Skip trivial one-turn replies unless the user explicitly asks to remember.
 ### Reflection, Retention, and Indexing
 
 Reflection runs outside the hot path, driven by `[memory.reflection]` from the
-gateway's idle tick (a whole-memory `reflect_all` sweep over conversations), and
-also on task-completion thresholds, contradiction detection, or an
-administrative path.
+gateway's independent maintenance timer (a whole-memory `reflect_all` sweep
+over conversations), and also on task-completion thresholds, contradiction
+detection, or an administrative path.
 
 Reflection can:
 

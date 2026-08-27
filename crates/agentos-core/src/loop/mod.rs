@@ -1,5 +1,6 @@
 use crate::approve::{DelegatedAuthority, Policy};
 use crate::audit::{SafetyEvent, SafetyEventKind, SafetyJournal, SafetyOutcome};
+use crate::gateway::RunJournal;
 use crate::hooks::Hooks;
 use crate::prompt::Compaction;
 use crate::spill::ContentLimits;
@@ -90,6 +91,8 @@ pub struct LoopDeps<'a> {
     /// `None` means nothing can steer this run, which is every entrypoint that
     /// does not multiplex a conversation.
     pub steering: Option<Steering>,
+    /// Durable action boundary for the accepted top-level ingress event.
+    pub run_journal: Option<RunJournal>,
     /// Where this run's safety-boundary decisions are recorded (M6 /
     /// `AUD-001`). A detached journal writes nowhere, which is what an
     /// entrypoint with no store configured gets.

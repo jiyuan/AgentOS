@@ -7,7 +7,6 @@ use agentos_interfaces::ChannelError;
 use agentos_proto::ChannelId;
 use serde_json::Value;
 use std::sync::Arc;
-use std::time::Instant;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct FeishuEndpoint {
@@ -33,7 +32,7 @@ impl FeishuLongConnection {
         admission: &AdmissionPolicy,
         receive_id_type: &str,
         log_receive_errors: bool,
-    ) -> Result<Option<ParsedFeishuEvent>, ChannelError> {
+    ) -> Result<Option<(ParsedFeishuEvent, Arc<[u8]>)>, ChannelError> {
         loop {
             let payload = self.socket.read_frame().await?;
             let frame = FeishuFrame::decode(&payload)
@@ -65,10 +64,9 @@ impl FeishuLongConnection {
                         frame.payload_encoding, frame.payload_type
                     )))
                 })?;
-            let started = Instant::now();
-            self.ack_event(&frame, started).await?;
             if let Some(parsed) = parse_event(&payload, channel_id, admission, receive_id_type) {
-                return Ok(Some(parsed));
+                let acknowledgement = Arc::<[u8]>::from(success_frame(&frame, 0).encode());
+                return Ok(Some((parsed, acknowledgement)));
             }
             if log_receive_errors {
                 if let Some(reason) = feishu_drop_reason(&payload, admission) {
@@ -78,13 +76,8 @@ impl FeishuLongConnection {
         }
     }
 
-    async fn ack_event(
-        &mut self,
-        frame: &FeishuFrame,
-        started: Instant,
-    ) -> Result<(), ChannelError> {
-        let ack = success_frame(frame, started.elapsed().as_millis() as u64);
-        self.socket.write_frame(&ack.encode()).await
+    pub(super) async fn acknowledge(&mut self, token: &[u8]) -> Result<(), ChannelError> {
+        self.socket.write_frame(token).await
     }
 
     fn event_payload(&mut self, frame: &FeishuFrame) -> Result<Option<Vec<u8>>, ChannelError> {

@@ -121,6 +121,7 @@ fn deps<'a>(
         compaction: Default::default(),
         cancel: CancellationToken::new(),
         steering: None,
+        run_journal: None,
         audit: Default::default(),
         delegated_authority: None,
     }
