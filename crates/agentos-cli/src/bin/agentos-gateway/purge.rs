@@ -35,7 +35,7 @@
 //! destroy.
 
 use super::{session_path, ServiceConfig};
-use agentos_core::audit::{self, SafetyEvent, SafetyEventKind, SafetyJournal, SafetyOutcome};
+use agentos_core::audit;
 use agentos_core::memory::SqliteStore;
 use agentos_core::retention::cutoff_from_date;
 use agentos_proto::{AgentId, ChannelId, ConversationId, Principal};
@@ -140,10 +140,13 @@ fn purge_one_conversation(
         ChannelId::new(channel.clone()),
         ConversationId::new(conversation.clone()),
     );
+    let expected = store
+        .session_log(&principal)
+        .map_err(|err| format!("failed to survey '{conversation}': {err}"))?
+        .len();
     let removed = store
-        .purge_session(&principal)
+        .purge_session(&principal, expected, "an operator")
         .map_err(|err| format!("failed to purge '{conversation}': {err}"))?;
-    record_session_purge(store, &principal, removed, "an operator")?;
     println!("purged {removed} item(s) from {channel} conversation '{conversation}'");
     Ok(())
 }
@@ -219,16 +222,14 @@ fn purge_idle_sessions(
     // one, and an operator reading the events later wants to see which
     // conversations went, not that some number of them did.
     let mut removed_total = 0;
-    for (principal, _) in &idle {
+    for (principal, expected) in &idle {
         let removed = store
-            .purge_session(principal)
+            .purge_session(
+                principal,
+                *expected,
+                &format!("an operator, idle before {before}"),
+            )
             .map_err(|err| format!("failed to purge '{}': {err}", principal.conversation_name()))?;
-        record_session_purge(
-            store,
-            principal,
-            removed,
-            &format!("an operator, idle before {before}"),
-        )?;
         removed_total += removed;
     }
     println!(
@@ -284,35 +285,11 @@ fn purge_audit(
             counts.total()
         ));
     }
-    let purged = audit::purge_before(store, cutoff, "an operator")
+    let purged = audit::purge_before(store, cutoff, counts, "an operator")
         .map_err(|err| format!("failed to purge audit rows: {err}"))?;
     println!(
         "\npurged {} safety event(s) and {} memory access row(s); the purge itself is recorded",
         purged.safety_events, purged.memory_access_log
     );
     Ok(())
-}
-
-/// The one deletion the runtime performs on purpose, so the one that most
-/// needs a record that it happened (M6 / `AUD-001`).
-fn record_session_purge(
-    store: &SqliteStore,
-    principal: &Principal,
-    removed: usize,
-    by: &str,
-) -> Result<(), String> {
-    SafetyJournal::new(Some(store))
-        .record(
-            SafetyEvent::new(
-                SafetyEventKind::SessionPurged,
-                SafetyOutcome::Purged,
-                principal.conversation_name(),
-            )
-            // The principal is on the event as a `Principal` too; the subject
-            // carries its name so a reader grepping for a conversation finds the
-            // purge without decoding anything.
-            .with_principal(principal.clone().without_sender())
-            .with_detail(format!("{removed} session items deleted by {by}")),
-        )
-        .map_err(|err| format!("session was purged but its safety event failed: {err}"))
 }

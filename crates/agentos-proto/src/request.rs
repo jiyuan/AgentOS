@@ -1,6 +1,35 @@
-use crate::ids::Namespace;
+use crate::ids::{AgentId, Namespace, RunId};
+use crate::Usage;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+
+/// Durable lifecycle record for one physical provider invocation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RequestAttempt {
+    /// Stable across transport retries of the same logical request.
+    pub logical_request_id: Arc<str>,
+    /// One-based physical invocation number within the logical request.
+    pub attempt: u32,
+    pub run_id: RunId,
+    pub active_agent: AgentId,
+    pub header: RequestHeader,
+    pub status: RequestAttemptStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+    /// Bounded classification/detail for failed or cancelled attempts. Never
+    /// contains request content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<Arc<str>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestAttemptStatus {
+    Started,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
 
 /// What one assembled provider request was made of.
 ///

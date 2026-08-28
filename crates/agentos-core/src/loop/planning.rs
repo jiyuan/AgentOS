@@ -97,7 +97,7 @@ pub(super) async fn compact_under_pressure(
     // in flight must drop it rather than pay for a summary nobody will read.
     let compacted = super::unless_cancelled(
         &deps.cancel,
-        crate::prompt::compact(state, &deps.compaction),
+        crate::prompt::compact(state, &deps.compaction, deps.request_attempt_sink),
     )
     .await
     .flatten();
@@ -123,7 +123,7 @@ async fn compact_now(
 ) -> bool {
     let compacted = super::unless_cancelled(
         &deps.cancel,
-        crate::prompt::compact_now(state, &deps.compaction),
+        crate::prompt::compact_now(state, &deps.compaction, deps.request_attempt_sink),
     )
     .await
     .flatten();
@@ -207,6 +207,7 @@ async fn attempt(
 
     let mut run_ctx = RunContext::from_state(state);
     run_ctx.stream_sink = deps.stream_sink.clone();
+    run_ctx.request_attempt_sink = deps.request_attempt_sink;
     run_ctx.cancel = deps.cancel.clone();
     let hydrated = deps.orchestrator.hydrate(&mut run_ctx).await;
 
@@ -407,6 +408,7 @@ mod tests {
             output_guardrails: &[],
             tool_guardrails: &[],
             stream_sink: None,
+            request_attempt_sink: None,
             content_limits: Default::default(),
             cancel: Default::default(),
             steering: None,

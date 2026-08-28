@@ -398,13 +398,13 @@ telemetry, and silently never sent.
   intention. See
   [`ADR-0004`](adr/0004-REQUEST_KINDS.md).
 - **Gateway.** `prompt::gateway` is the only path from a built `Request` to a
-  provider, and it is what attaches the header and the usage record.
-  `prompt::call_with_context` records onto the run context's sinks;
-  `prompt::call_detached` hands the record back to a caller that has no context
-  — compaction holds `&mut RunState`, which is why its tokens went uncounted
-  for as long as they did. `scripts/check-provider-calls.sh` fails CI when a
-  direct provider call is added outside the gateway, because the rule is only
-  as good as the thing that notices it being broken.
+  provider. Before each physical invocation it durably appends the header,
+  stable logical request ID, and one-based attempt number; only then may
+  provider I/O begin. Success, failure, usage, and cancellation append a second
+  lifecycle record. A streamed transport fallback is therefore attempt 2 of
+  the same logical request rather than an invisible retry. The lexical syntax
+  checker behind `scripts/check-provider-calls.sh` rejects method and UFCS calls
+  across line breaks outside this gateway.
 - **Manifest.** Each call returns a `PromptManifest`, recorded as a
   `RequestHeader` in the trace, so "what did the model see" is answered from the
   trace rather than by re-reading the code. `RequestBuilder` is the single path
@@ -632,8 +632,10 @@ authorized operation rather than a background cleanup". Both are served by
 `agentos-gateway purge`: `--sessions --before DATE` for whole idle
 conversations, `--audit --before DATE` for `safety_events` and
 `memory_access_log`. Each reports first and applies only when the operator
-types the printed count back, and each writes a safety event — the audit purge
-writing its own record into the store it just shortened.
+types the printed count back. The storage transaction re-counts that exact
+scope, aborts if the report is stale, deletes, and inserts `audit_purged` or
+`session_purged` before commit. A marker failure therefore leaves the records
+untouched.
 
 ### 9.2 What a running deployment emits
 
@@ -1181,8 +1183,9 @@ Trace spans and audit logs cover:
 - run start/finish;
 - planning and LLM calls, with per-call and per-run token usage
   (`call_*_tokens`, `run_*_tokens`);
-- the request header for every provider call: sections included, estimated
-  tokens, context budget, pressure percent, elided messages and characters;
+- the request header and lifecycle for every provider attempt: logical request
+  ID, attempt number, sections included, estimated tokens, context budget,
+  outcome, usage, elided messages and characters;
 - tool start/end, including spill locators and truncation counts;
 - approval decisions, prompts, tickets, and pauses;
 - guardrail trips;

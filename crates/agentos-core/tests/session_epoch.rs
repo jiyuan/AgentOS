@@ -148,7 +148,12 @@ async fn purge_is_the_operation_that_actually_deletes() {
     seeded(&store, &conv, &["first", "second"]).await;
     store.clear_session(&conv).expect("clear works");
 
-    assert_eq!(store.purge_session(&conv).expect("purge works"), 2);
+    assert_eq!(
+        store
+            .purge_session(&conv, 2, "test operator")
+            .expect("purge works"),
+        2
+    );
     assert!(contents(&store).is_empty(), "the rows are gone");
 
     // The epoch went with them, so a conversation that starts again under the

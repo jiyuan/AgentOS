@@ -43,4 +43,4 @@ mod sqlite;
 pub use event::{ArgumentDigest, SafetyEvent, SafetyEventKind, SafetyOutcome};
 pub use journal::{SafetyJournal, SafetyLog, SafetyLogError, StoredSafetyEvent};
 pub use purge::{count_before, purge_before, AuditPurgeCounts};
-pub(crate) use sqlite::init_schema;
+pub(crate) use sqlite::{init_schema, insert_event};

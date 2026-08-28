@@ -67,10 +67,9 @@ pub enum SafetyEventKind {
     /// [ADR-0005](../../../../docs/adr/0005-SAFETY_EVENTS.md) accepts that
     /// `safety_events` and `memory_access_log` grow monotonically and asks that
     /// what bounds them be "an explicit, authorized operation rather than a
-    /// background cleanup". This is the record of one such operation, written
-    /// *after* the delete and therefore into the store it just shortened: the
-    /// first row of the new history says how the old one ended
-    /// (M7 / `QUOTA-001`).
+    /// background cleanup". This is the record of one such operation, inserted
+    /// after the deletes but before their shared transaction commits, so a
+    /// marker failure cannot leave an unrecorded deletion (R5 / `AUD-003`).
     AuditPurged,
 }
 

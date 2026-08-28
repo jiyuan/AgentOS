@@ -2,7 +2,7 @@
 
 Drafted: 2026-08-23
 
-Status: **R0 implemented; R1 underway with `ID-003`, `AUTH-003`, `AUTH-004`, `AUTH-005`, and `AUD-002` complete; R2 complete with `GW-002`, `GW-003`, `GW-004`, `GW-005`, `STATE-002`, `MAINT-002`, and `CTRL-002` complete; R3 complete with `FS-002`, `FS-003`, `PROC-002`, `SBX-002`, `ING-002`, and `NET-002` complete; R4 complete with `MCP-002`, `MCP-003`, and `MCP-004` complete**
+Status: **R0 implemented; R1 underway with `ID-003`, `AUTH-003`, `AUTH-004`, `AUTH-005`, and `AUD-002` complete; R2 complete with `GW-002`, `GW-003`, `GW-004`, `GW-005`, `STATE-002`, `MAINT-002`, and `CTRL-002` complete; R3 complete with `FS-002`, `FS-003`, `PROC-002`, `SBX-002`, `ING-002`, and `NET-002` complete; R4 complete with `MCP-002`, `MCP-003`, and `MCP-004` complete; R5 complete with `REQ-002`, `OUT-001`, and `AUD-003` complete**
 
 Baseline: branch `docs/audit-remediation-plan`, commit `d4b2e94`
 
@@ -689,6 +689,9 @@ and no fallback path bypasses the policy it is meant to enforce.
 ### `REQ-002` — Record one manifest per provider attempt
 
 - Priority: P1.
+- Status: Complete (2026-08-28). The provider gateway journals a numbered
+  attempt start before I/O and a success, failure, or cancellation outcome
+  afterward; stream retry retains one logical request identity.
 - Files: prompt request builder/gateway, loop/orchestrator/compaction call sites,
   provider-call enforcement script, request-header persistence, and golden tests.
 - Deliver:
@@ -712,6 +715,9 @@ and no fallback path bypasses the policy it is meant to enforce.
 ### `OUT-001` — Keep every terminal byte behind output policy
 
 - Priority: P1.
+- Status: Complete (2026-08-28). Synthesized fallbacks cross the output policy
+  and a double refusal records bounded evidence while emitting no terminal
+  bytes.
 - Files: `crates/agentos-core/src/loop/output.rs`, terminal error/cancellation
   paths, and output-policy tests.
 - Deliver:
@@ -730,6 +736,9 @@ and no fallback path bypasses the policy it is meant to enforce.
 ### `AUD-003` — Make purge evidence transactional
 
 - Priority: P1.
+- Status: Complete (2026-08-28). Audit and session purges re-count confirmed
+  scope and insert their marker inside the deletion transaction; stale counts
+  and marker failures roll back.
 - Files: `crates/agentos-core/src/audit/purge.rs`, session purge/store code, CLI
   purge flow, and SQLite failpoint tests.
 - Deliver:
@@ -849,7 +858,7 @@ ID sequence, and complete-row artifact resolution.
 | `AF-014` | Delegation grants are not actor-bound or mandatorily expiring | P1 | `AUTH-004` | Actor/channel/agent/expiry/non-transitive matrix | `crates/agentos-core/tests/delegation_grants.rs::grant_is_actor_bound_expiring_and_non_transitive` | `portable` | Complete |
 | `AF-015` | Approval resolution audit omits the resolver | P1 | `AUTH-003` | Requested/resolved actor correlation | `crates/agentos-core/tests/safety_events.rs::approval_resolution_records_requester_and_resolver` | `portable` | Complete |
 | `AF-016` | Best-effort journal writes can leave required safety evidence absent | P1 | `AUD-002` | Approval/grant/denial/refusal append failpoints | `crates/agentos-core/tests/audit_failpoints.rs::required_safety_event_failure_aborts_the_action` | `portable` | Complete |
-| `AF-017` | Failed/retried provider calls lose attempt manifests | P1 | `REQ-002` | Failure/retry/compaction/cancellation goldens | `crates/agentos-core/tests/request_attempts.rs::every_failed_retried_or_cancelled_attempt_is_durable` | `portable` | Open |
+| `AF-017` | Failed/retried provider calls lose attempt manifests | P1 | `REQ-002` | Failure/retry/compaction/cancellation goldens | `crates/agentos-core/tests/request_attempts.rs::every_failed_retried_or_cancelled_attempt_is_durable` | `portable` | Complete |
 | `AF-018` | Task/attachment writes and skill traversal bypass rooted I/O | P1 | `FS-002`, `FS-003` | Symlink/race/main-min/outside-canary matrix | `crates/agentos-core/tests/rooted_io.rs::all_model_selected_paths_refuse_symlink_escape_and_swap` | `native-linux+macos` | Complete |
 | `AF-019` | Task/session modes rely on umask; fsync errors are ignored | P2 | `FS-002`, `FS-003` | Mode and injected-fsync tests | `crates/agentos-core/tests/state_durability.rs::fsync_failure_aborts_state_commit` | `native-linux+macos` | Complete |
 | `AF-020` | Native macOS workspace-write/setup semantics are wrong | P1 | `SBX-002` | Enforcing Seatbelt tests on macOS | `crates/agentos-core/tests/sandbox.rs::a_workspace_write_child_writes_inside_and_not_outside`, `crates/agentos-core/tests/sandbox.rs::an_unbuildable_sandbox_fails_the_call` | `native-macos` | Complete |
@@ -865,10 +874,10 @@ ID sequence, and complete-row artifact resolution.
 | `AF-030` | Failed/ambiguous egress is settled as handled or blindly retried | P1 | `GW-004` | Delivery/action crash-state matrix | `crates/agentos-core/tests/delivery_crash.rs::ambiguous_delivery_is_neither_silently_settled_nor_blindly_retried` | `native-linux+macos` | Complete |
 | `AF-031` | Shipped cron mutations are blanket-allowed | P1 | `CFG-002` | Metadata-driven mutation policy ratchet | `crates/agentos-core/tests/shipped_config_policy.rs::metadata_drives_the_blanket_allow_ratchet_for_every_shipped_tool` | `portable` | Open |
 | `AF-032` | Reinstall deletes operator configuration and extensions | P1 | `REL-003` | Modify-and-reinstall preservation | `scripts/check-install-preservation.sh` | `native-linux+macos` | Open |
-| `AF-033` | Purge commits before best-effort audit marker/count recheck | P1 | `AUD-003` | Transaction count-race/failpoint rollback | `crates/agentos-core/tests/audit_purge.rs::purge_count_race_or_marker_failure_rolls_back_everything` | `portable` | Open |
+| `AF-033` | Purge commits before best-effort audit marker/count recheck | P1 | `AUD-003` | Transaction count-race/failpoint rollback | `crates/agentos-core/tests/audit_purge.rs::purge_count_race_or_marker_failure_rolls_back_everything` | `portable` | Complete |
 | `AF-034` | Feishu single-part and other protocol bodies allocate before caps | P1 | `ING-002` | Oversize/malformed input matrix | `crates/agentos-core/tests/ingress_limits.rs::all_protocol_bodies_are_bounded_before_allocation` | `portable` | Complete |
-| `AF-035` | Terminal fallback bypasses output policy | P1 | `OUT-001` | Deny-all terminal-path matrix | `crates/agentos-core/tests/output_gate.rs::every_terminal_fallback_crosses_the_output_policy` | `portable` | Open |
-| `AF-036` | Provider-call checker is grep-bypassable | P2 | `REQ-002`, `CI-003` | Compile-time or AST negative fixture | `tests/test_provider_call_checker.py::test_syntactic_bypasses_are_rejected` | `portable` | Open |
+| `AF-035` | Terminal fallback bypasses output policy | P1 | `OUT-001` | Deny-all terminal-path matrix | `crates/agentos-core/tests/output_gate.rs::every_terminal_fallback_crosses_the_output_policy` | `portable` | Complete |
+| `AF-036` | Provider-call checker is grep-bypassable | P2 | `REQ-002`, `CI-003` | Compile-time or AST negative fixture | `tests/test_provider_call_checker.py::test_syntactic_bypasses_are_rejected` | `portable` | Complete |
 | `AF-037` | Release/catalog/source builds are unlocked; tool versions float | P2 | `REL-004` | Static gate and clean input-manifest test | `scripts/check-release-locking.sh` | `native-linux+macos` | Open |
 | `AF-038` | IPv6 site-local egress remains allowed | P2 | `NET-002` | Literal/DNS-resolved policy tests | `crates/agentos-core/tests/egress.rs::ipv6_site_local_is_refused_by_literal_and_resolution` | `portable` | Complete |
 | `AF-039` | Telegram child bypasses common env/group/output controls | P2 | `PROC-002`, `ING-002` | No-child source ratchet and shared response cap | `crates/agentos-core/tests/subprocess_boundaries.rs::telegram_transport_has_no_child_and_uses_bounded_http` | `portable` | Complete |

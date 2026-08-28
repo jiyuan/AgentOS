@@ -52,6 +52,7 @@ pub use tokens::{estimate_message, estimate_text, estimate_tool_specs};
 use agentos_interfaces::orchestrator::RunContext;
 use agentos_interfaces::tool::ToolSpec;
 use agentos_proto::{Message, RequestHeader, RequestSection, RequestSource};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::info;
 
@@ -64,6 +65,8 @@ use tracing::info;
 /// remembers to do.
 #[derive(Clone, Debug)]
 pub struct Request {
+    /// Stable identity shared by every physical retry of this request.
+    pub logical_request_id: Arc<str>,
     /// What sort of request this is, and therefore which sections it may
     /// carry.
     pub kind: RequestKind,
@@ -280,7 +283,12 @@ impl RequestBuilder {
     }
 
     pub fn finish(self) -> Request {
+        static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
         Request {
+            logical_request_id: Arc::from(format!(
+                "request-{}",
+                NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+            )),
             kind: self.kind,
             messages: self.messages,
             manifest: self.manifest,

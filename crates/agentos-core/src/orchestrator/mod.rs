@@ -2,7 +2,6 @@ mod commands;
 mod max;
 mod min;
 mod routing;
-pub(crate) mod streaming;
 
 pub use max::{MaxOrchestrator, MemoryHydrationSettings};
 pub use min::{EchoOrchestrator, MinOrchestrator};

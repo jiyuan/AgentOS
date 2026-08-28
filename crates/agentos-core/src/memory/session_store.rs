@@ -11,6 +11,7 @@
 //! ([ADR-0006](../../../../docs/adr/0006-CLEAR_EPOCH.md)).
 
 use super::sqlite::{session_json_error, session_sqlite_error, SqliteStore};
+use crate::audit::{SafetyEvent, SafetyEventKind, SafetyOutcome};
 use agentos_interfaces::session::{Item, Session, SessionError, Transcript};
 use agentos_proto::Principal;
 use async_trait::async_trait;
@@ -147,13 +148,32 @@ impl SqliteStore {
     ///
     /// The legitimate requirement `/clear` does not serve: somebody asking to
     /// be forgotten is not asking for a projection. Deliberately a separate
-    /// method with a separate name, so nothing reaches it by the casual path,
-    /// and callers are expected to confirm explicitly and record a safety
-    /// event ([ADR-0006](../../../../docs/adr/0006-CLEAR_EPOCH.md)).
-    pub fn purge_session(&self, principal: &Principal) -> Result<usize, SessionError> {
+    /// method with a separate name, so nothing reaches it by the casual path.
+    /// The operator-confirmed count is checked and the safety marker is written
+    /// in the deletion transaction
+    /// ([ADR-0006](../../../../docs/adr/0006-CLEAR_EPOCH.md)).
+    pub fn purge_session(
+        &self,
+        principal: &Principal,
+        expected: usize,
+        by: &str,
+    ) -> Result<usize, SessionError> {
         let conversation = principal.conversation_name();
         let mut conn = self.session_conn()?;
         let tx = conn.transaction().map_err(session_sqlite_error)?;
+        let actual = tx
+            .query_row(
+                "SELECT COUNT(*) FROM session_items WHERE conversation_key = ?1",
+                params![conversation],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(session_sqlite_error)?
+            .max(0) as usize;
+        if actual != expected {
+            return Err(SessionError::Backend(Arc::from(format!(
+                "session purge confirmation is stale: expected {expected} item(s), found {actual}"
+            ))));
+        }
         let removed = tx
             .execute(
                 "DELETE FROM session_items WHERE conversation_key = ?1",
@@ -169,6 +189,17 @@ impl SqliteStore {
             params![conversation],
         )
         .map_err(session_sqlite_error)?;
+        crate::audit::insert_event(
+            &tx,
+            &SafetyEvent::new(
+                SafetyEventKind::SessionPurged,
+                SafetyOutcome::Purged,
+                principal.conversation_name(),
+            )
+            .with_principal(principal.clone().without_sender())
+            .with_detail(format!("{removed} session items deleted by {by}")),
+        )
+        .map_err(|err| SessionError::Backend(Arc::from(err.to_string())))?;
         tx.commit().map_err(session_sqlite_error)?;
         Ok(removed)
     }

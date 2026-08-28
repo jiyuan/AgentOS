@@ -142,6 +142,7 @@ pub fn make_deps<'a>(
         output_guardrails: &[],
         tool_guardrails: &[],
         stream_sink: None,
+        request_attempt_sink: None,
         content_limits: Default::default(),
         compaction: Default::default(),
         cancel: Default::default(),

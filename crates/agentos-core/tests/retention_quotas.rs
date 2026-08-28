@@ -467,7 +467,8 @@ async fn the_audit_purge_is_authorized_reported_and_recorded() {
         "the report counts before deleting"
     );
 
-    let purged = audit::purge_before(&store, cutoff, "an operator").expect("purged");
+    let expected = audit::count_before(&store, cutoff).expect("counted");
+    let purged = audit::purge_before(&store, cutoff, expected, "an operator").expect("purged");
     assert_eq!(purged.safety_events, 3);
 
     // The store now holds the recent event and, newest of all, the record that
@@ -533,7 +534,9 @@ async fn idle_conversations_are_surveyed_without_being_touched() {
     }
 
     // And the purge, once authorized, removes the conversation whole.
-    let removed = store.purge_session(&principal("stale-1")).expect("purged");
+    let removed = store
+        .purge_session(&principal("stale-1"), 1, "test operator")
+        .expect("purged");
     assert_eq!(removed, 1);
     assert_eq!(store.idle_conversations(cutoff).expect("surveyed").len(), 1);
 }

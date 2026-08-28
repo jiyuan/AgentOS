@@ -11,7 +11,9 @@ use crate::trace;
 use agentos_interfaces::guardrail::{
     GuardrailOutcome, Input, InputGuardrail, OutputGuardrail, ToolGuardrail,
 };
-use agentos_interfaces::orchestrator::{Orchestrator, Plan, RunContext, StreamSink};
+use agentos_interfaces::orchestrator::{
+    Orchestrator, Plan, RequestAttemptSink, RunContext, StreamSink,
+};
 use agentos_interfaces::run_state::{Interruption, InterruptionAction, RunState};
 use agentos_proto::{ApprovalInstanceId, InterruptionId, Message, SpanKind};
 use serde_json::Value;
@@ -79,6 +81,8 @@ pub struct LoopDeps<'a> {
     /// it on each plan's [`RunContext`] so a streaming-capable orchestrator can
     /// emit tokens as they arrive. `None` keeps planning buffered.
     pub stream_sink: Option<StreamSink>,
+    /// Fail-closed durable journal for every physical provider invocation.
+    pub request_attempt_sink: Option<&'a RequestAttemptSink<'a>>,
     /// Inline cap for tool output and where the overflow is persisted.
     pub content_limits: ContentLimits<'a>,
     /// Who summarizes this run's history when it outgrows the window, and at

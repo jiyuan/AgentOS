@@ -6,6 +6,7 @@ mod audit;
 mod episodes;
 mod prompt;
 mod task_session;
+mod trace_sink;
 
 use crate::memory::MemoryManager;
 use crate::prompt::Compaction;
@@ -19,12 +20,13 @@ use crate::subagents::SubAgentRegistry;
 use crate::task_workspace::{TaskWorkspace, TaskWorkspaceError};
 use crate::tools::ToolRegistry;
 use crate::trace;
-use agentos_interfaces::orchestrator::{Orchestrator, StreamSink};
+use agentos_interfaces::orchestrator::{Orchestrator, RequestAttemptSink, StreamSink};
 use agentos_interfaces::run_state::ApprovalStatus;
 use agentos_interfaces::session::{Item, Session, SessionError, Transcript};
 use agentos_interfaces::RunState;
 use agentos_proto::{
-    AgentId, ChannelId, ConversationId, ConversationPrincipal, Envelope, RunId, SpanKind,
+    AgentId, ChannelId, ConversationId, ConversationPrincipal, Envelope, RequestAttempt, RunId,
+    SpanKind,
 };
 use audit::{record_failed_run, record_resolution};
 use episodes::{record_denied_episode, record_finished_episode, EpisodeSeed};
@@ -145,6 +147,9 @@ pub trait TraceSink: Send + Sync {
         event_start: usize,
         phase: &'static str,
     ) -> Result<(), RunnerError>;
+
+    /// Append one provider-attempt transition immediately and fail closed.
+    fn persist_request_attempt(&self, attempt: &RequestAttempt) -> Result<(), RunnerError>;
 }
 
 #[derive(Clone, Debug)]
@@ -167,6 +172,10 @@ impl TraceSink for JsonlTraceSink {
         phase: &'static str,
     ) -> Result<(), RunnerError> {
         persist_trace_records(state, &self.dir, span_start, event_start, phase)
+    }
+
+    fn persist_request_attempt(&self, attempt: &RequestAttempt) -> Result<(), RunnerError> {
+        trace_sink::persist_request_attempt(&self.dir, attempt)
     }
 }
 
@@ -246,6 +255,11 @@ pub async fn run_envelope(
     let audit = SafetyJournal::new(deps.safety_log)
         .for_run(principal.clone().into_principal(), run_id.clone());
 
+    let request_attempt_sink = |attempt: &RequestAttempt| {
+        deps.trace_sink
+            .map_or(Ok(()), |sink| sink.persist_request_attempt(attempt))
+            .map_err(|error| Arc::from(error.to_string()))
+    };
     let loop_deps = LoopDeps {
         orchestrator: deps.orchestrator,
         max_turns: deps.max_turns,
@@ -258,6 +272,7 @@ pub async fn run_envelope(
         output_guardrails: deps.output_guardrails,
         tool_guardrails: deps.tool_guardrails,
         stream_sink: deps.stream_sink.clone(),
+        request_attempt_sink: Some(&request_attempt_sink as &RequestAttemptSink<'_>),
         content_limits: deps.content_limits,
         compaction: deps.compaction,
         cancel: deps.cancel.clone(),
@@ -451,6 +466,11 @@ pub async fn resume_run(
     let episode_seed =
         EpisodeSeed::from_state(&paused.state, &paused.channel_id, &paused.conversation_id);
 
+    let request_attempt_sink = |attempt: &RequestAttempt| {
+        deps.trace_sink
+            .map_or(Ok(()), |sink| sink.persist_request_attempt(attempt))
+            .map_err(|error| Arc::from(error.to_string()))
+    };
     let loop_deps = LoopDeps {
         orchestrator: deps.orchestrator,
         max_turns: deps.max_turns,
@@ -463,6 +483,7 @@ pub async fn resume_run(
         output_guardrails: deps.output_guardrails,
         tool_guardrails: deps.tool_guardrails,
         stream_sink: deps.stream_sink.clone(),
+        request_attempt_sink: Some(&request_attempt_sink as &RequestAttemptSink<'_>),
         content_limits: deps.content_limits,
         compaction: deps.compaction,
         cancel: deps.cancel.clone(),
@@ -589,7 +610,10 @@ fn persist_trace_records(
         path: err.path().to_path_buf(),
         source: err.into_io(),
     })?;
-    let path = trace_dir.join(format!("{}.jsonl", trace_file_stem(&state.run_id)));
+    let path = trace_dir.join(format!(
+        "{}.jsonl",
+        trace_sink::trace_file_stem(&state.run_id)
+    ));
     let mut options = OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
@@ -666,17 +690,6 @@ fn write_trace_record(
         path: path.to_path_buf(),
         source,
     })
-}
-
-fn trace_file_stem(run_id: &RunId) -> String {
-    run_id
-        .as_str()
-        .chars()
-        .map(|ch| match ch {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '.' | '_' | '-' | ':' => ch,
-            _ => '_',
-        })
-        .collect()
 }
 
 async fn finish(

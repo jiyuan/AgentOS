@@ -19,7 +19,9 @@ pub use principal::{
     base64url, base64url_decode, decode_component, encode_component, ActorPrincipal,
     ConversationPrincipal, Principal, PrincipalKindError, PRINCIPAL_VERSION,
 };
-pub use request::{RequestHeader, RequestSection, RequestSource};
+pub use request::{
+    RequestAttempt, RequestAttemptStatus, RequestHeader, RequestSection, RequestSource,
+};
 pub use tool::{ToolCall, ToolResult, ToolStatus};
 pub use trace::{SpanKind, TraceEvent, TraceSpan};
 pub use usage::{Usage, TOKEN_USAGE_METADATA_KEY};

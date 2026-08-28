@@ -127,54 +127,7 @@ impl SafetyLog for SqliteStore {
                 )));
             }
         }
-        conn.execute(
-            "INSERT INTO safety_events \
-             (kind, outcome, principal, agent_id, channel_id, conversation_id, sender, \
-              run_id, subject, detail, argument_digest, interruption_id, approval_instance_id, \
-              delegation_grant_id, prompting_principal, resolver_principal) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-            params![
-                event.kind.as_str(),
-                event.outcome.as_str(),
-                event.principal.as_ref().map(Principal::storage_name),
-                event
-                    .principal
-                    .as_ref()
-                    .map(|principal| principal.agent.as_str()),
-                event
-                    .principal
-                    .as_ref()
-                    .map(|principal| principal.channel.as_str()),
-                event
-                    .principal
-                    .as_ref()
-                    .map(|principal| principal.conversation.as_str()),
-                event
-                    .principal
-                    .as_ref()
-                    .and_then(|principal| principal.sender.as_deref()),
-                event.run_id.as_ref().map(RunId::as_str),
-                event.subject.as_ref(),
-                event.detail.as_deref(),
-                event.argument_digest.as_ref().map(ArgumentDigest::as_str),
-                event.interruption_id.as_ref().map(InterruptionId::as_str),
-                event
-                    .approval_instance_id
-                    .as_ref()
-                    .map(ApprovalInstanceId::as_str),
-                event.delegation_grant_id.as_deref(),
-                event
-                    .prompting_principal
-                    .as_ref()
-                    .map(Principal::storage_name),
-                event
-                    .resolver_principal
-                    .as_ref()
-                    .map(Principal::storage_name),
-            ],
-        )
-        .map_err(sqlite_error)?;
-        Ok(())
+        insert_event(&conn, event)
     }
 
     fn recent(&self, limit: usize) -> Result<Vec<StoredSafetyEvent>, SafetyLogError> {
@@ -235,6 +188,62 @@ impl SafetyLog for SqliteStore {
         }
         Ok(events)
     }
+}
+
+/// Insert one already-stamped event on the caller's connection.
+///
+/// Purge operations call this inside their deletion transaction. A marker
+/// failure therefore rolls the deletion back instead of leaving an
+/// unrecorded hole in the history.
+pub(crate) fn insert_event(conn: &Connection, event: &SafetyEvent) -> Result<(), SafetyLogError> {
+    conn.execute(
+        "INSERT INTO safety_events \
+         (kind, outcome, principal, agent_id, channel_id, conversation_id, sender, \
+          run_id, subject, detail, argument_digest, interruption_id, approval_instance_id, \
+          delegation_grant_id, prompting_principal, resolver_principal) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        params![
+            event.kind.as_str(),
+            event.outcome.as_str(),
+            event.principal.as_ref().map(Principal::storage_name),
+            event
+                .principal
+                .as_ref()
+                .map(|principal| principal.agent.as_str()),
+            event
+                .principal
+                .as_ref()
+                .map(|principal| principal.channel.as_str()),
+            event
+                .principal
+                .as_ref()
+                .map(|principal| principal.conversation.as_str()),
+            event
+                .principal
+                .as_ref()
+                .and_then(|principal| principal.sender.as_deref()),
+            event.run_id.as_ref().map(RunId::as_str),
+            event.subject.as_ref(),
+            event.detail.as_deref(),
+            event.argument_digest.as_ref().map(ArgumentDigest::as_str),
+            event.interruption_id.as_ref().map(InterruptionId::as_str),
+            event
+                .approval_instance_id
+                .as_ref()
+                .map(ApprovalInstanceId::as_str),
+            event.delegation_grant_id.as_deref(),
+            event
+                .prompting_principal
+                .as_ref()
+                .map(Principal::storage_name),
+            event
+                .resolver_principal
+                .as_ref()
+                .map(Principal::storage_name),
+        ],
+    )
+    .map_err(sqlite_error)?;
+    Ok(())
 }
 
 /// Names that are not in the enum come from a newer writer against the same

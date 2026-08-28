@@ -49,6 +49,7 @@
 
 use super::{gateway, projection, prune, tokens, RequestKind};
 use crate::config::CompactionConfig;
+use agentos_interfaces::orchestrator::RequestAttemptSink;
 use agentos_interfaces::run_state::RunState;
 use agentos_interfaces::session::{Item, Transcript};
 use agentos_llm::Llm;
@@ -132,13 +133,17 @@ pub struct Compacted {
 /// measured pressure, pressure under the trigger, no balanced span, or a failed
 /// summarizer call. A compaction failure must never fail a run: the turn then
 /// proceeds at its original pressure, which is where it would have been anyway.
-pub async fn compact(state: &mut RunState, compaction: &Compaction<'_>) -> Option<Compacted> {
+pub async fn compact(
+    state: &mut RunState,
+    compaction: &Compaction<'_>,
+    attempt_sink: Option<&RequestAttemptSink<'_>>,
+) -> Option<Compacted> {
     let summarizer = enabled_summarizer(compaction)?;
     let window = summarizer.context_budget_tokens()?;
     if pressure_percent(state, window) < compaction.config.pressure_percent {
         return None;
     }
-    compact_now(state, compaction).await
+    compact_now(state, compaction, attempt_sink).await
 }
 
 /// Summarize regardless of the measured pressure.
@@ -149,7 +154,11 @@ pub async fn compact(state: &mut RunState, compaction: &Compaction<'_>) -> Optio
 /// still suppresses it — an operator who turned summarization off did not ask
 /// for it back on a bad turn — in which case the loop answers with a
 /// truncation notice instead.
-pub async fn compact_now(state: &mut RunState, compaction: &Compaction<'_>) -> Option<Compacted> {
+pub async fn compact_now(
+    state: &mut RunState,
+    compaction: &Compaction<'_>,
+    attempt_sink: Option<&RequestAttemptSink<'_>>,
+) -> Option<Compacted> {
     let summarizer = enabled_summarizer(compaction)?;
     // Without a resolved window there is no budget to size the span against.
     let window = summarizer.context_budget_tokens()?;
@@ -167,7 +176,16 @@ pub async fn compact_now(state: &mut RunState, compaction: &Compaction<'_>) -> O
         Message::text(MessageRole::User, rendered.text),
     );
 
-    let exchange = match gateway::call_detached(summarizer, &request, &[]).await {
+    let exchange = match gateway::call_detached(
+        summarizer,
+        &request,
+        &[],
+        &state.run_id,
+        &state.active_agent,
+        attempt_sink,
+    )
+    .await
+    {
         Ok(exchange) => exchange,
         Err(error) => {
             warn!(

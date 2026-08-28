@@ -18,10 +18,9 @@
 //! direction.
 //!
 //! So deletion here is a thing a person does, on purpose, having been shown
-//! what it would remove. And it leaves a row saying so: [`purge_before`]
-//! writes an `audit_purged` event *after* the delete, into the store it just
-//! shortened, so the first line of the remaining history says how the
-//! preceding history ended.
+//! what it would remove. [`purge_before`] rechecks that report inside the
+//! deletion transaction and writes the `audit_purged` marker in that same
+//! transaction. A changed count or failed marker leaves every row intact.
 
 use super::event::{SafetyEvent, SafetyEventKind, SafetyOutcome};
 use super::journal::SafetyLogError;
@@ -79,27 +78,50 @@ pub fn count_before(
     Ok(counts)
 }
 
-/// Delete rows older than `before_unix` from both audit stores, then record
-/// that it happened.
+/// Delete rows older than `before_unix` from both audit stores and record that
+/// it happened in one transaction.
 ///
 /// `operator` is whatever identifies the person doing this — it lands in the
 /// event's subject, unredacted, because an audit purge with no attribution is
 /// the deletion this whole module exists to make impossible.
 ///
-/// The event is written last and deliberately: writing it first would leave a
-/// claim that a purge happened if the delete then failed, and writing it
-/// inside the transaction would make it a row the purge could itself remove on
-/// a later run with a cutoff far enough forward. Written after and outside,
-/// it is the newest row in the store and survives.
+/// `expected` is the report the operator confirmed. It is re-counted after the
+/// transaction begins, before deletion. The event insert follows the deletes
+/// in that transaction, after the cutoff deletes have already run; any insert
+/// failure rolls every deletion back.
 pub fn purge_before(
     store: &SqliteStore,
     before_unix: u64,
+    expected: AuditPurgeCounts,
     operator: &str,
 ) -> Result<AuditPurgeCounts, SafetyLogError> {
     let mut conn = store
         .audit_conn()
         .map_err(|err| SafetyLogError::Backend(Arc::from(err.to_string())))?;
     let transaction = conn.transaction().map_err(sqlite_error)?;
+    let count = |sql: &str| -> Result<usize, SafetyLogError> {
+        transaction
+            .query_row(sql, params![before_unix as i64], |row| row.get::<_, i64>(0))
+            .map_err(sqlite_error)
+            .map(|count| count.max(0) as usize)
+    };
+    let actual = AuditPurgeCounts {
+        safety_events: count(
+            "SELECT COUNT(*) FROM safety_events WHERE recorded_at < datetime(?1, 'unixepoch')",
+        )?,
+        memory_access_log: count(
+            "SELECT COUNT(*) FROM memory_access_log WHERE created_at < datetime(?1, 'unixepoch')",
+        )?,
+    };
+    if actual != expected {
+        return Err(SafetyLogError::Backend(Arc::from(format!(
+            "audit purge confirmation is stale: expected {} safety event(s) and {} memory access row(s), found {} and {}",
+            expected.safety_events,
+            expected.memory_access_log,
+            actual.safety_events,
+            actual.memory_access_log
+        ))));
+    }
     let safety_events = transaction
         .execute(
             "DELETE FROM safety_events WHERE recorded_at < datetime(?1, 'unixepoch')",
@@ -112,15 +134,13 @@ pub fn purge_before(
             params![before_unix as i64],
         )
         .map_err(sqlite_error)?;
-    transaction.commit().map_err(sqlite_error)?;
-    drop(conn);
-
     let counts = AuditPurgeCounts {
         safety_events,
         memory_access_log,
     };
-    super::journal::SafetyJournal::new(Some(store)).record(
-        SafetyEvent::new(
+    super::sqlite::insert_event(
+        &transaction,
+        &SafetyEvent::new(
             SafetyEventKind::AuditPurged,
             SafetyOutcome::Purged,
             format!("audit stores purged by {operator}"),
@@ -130,6 +150,7 @@ pub fn purge_before(
             counts.safety_events, counts.memory_access_log
         )),
     )?;
+    transaction.commit().map_err(sqlite_error)?;
     Ok(counts)
 }
 

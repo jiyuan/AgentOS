@@ -117,6 +117,7 @@ fn deps<'a>(
         output_guardrails,
         tool_guardrails: &[],
         stream_sink,
+        request_attempt_sink: None,
         content_limits: Default::default(),
         compaction: Default::default(),
         cancel: CancellationToken::new(),
@@ -224,7 +225,7 @@ impl Orchestrator for NeverFinishes {
 }
 
 #[tokio::test]
-async fn a_cancelled_run_routes_its_notice_through_the_output_policy() {
+async fn every_terminal_fallback_crosses_the_output_policy() {
     // Deliverable 6. Cancellation used to emit a constant without the policy
     // seeing it, on the argument that a constant carries no model content —
     // true of that constant, and not the property the invariant needs. A
@@ -236,15 +237,20 @@ async fn a_cancelled_run_routes_its_notice_through_the_output_policy() {
         name: Arc::from("RefuseEverything"),
         guardrail: &RefuseEverything,
     }];
-    let deps = deps(&orchestrator, &policy, &tools, &guardrails, None);
-    deps.cancel.cancel();
+    let cancellation_deps = deps(&orchestrator, &policy, &tools, &guardrails, None);
+    cancellation_deps.cancel.cancel();
 
-    let RunLoopState::Finish(output) = drive(&deps).await.expect("cancellation finishes the run")
-    else {
-        panic!("a cancelled run finishes rather than pausing");
-    };
-    // The normal notice mentions the saved work; the withheld one does not.
-    assert_eq!(output.message.content.as_ref(), "Stopped.");
+    let failure = drive(&cancellation_deps)
+        .await
+        .expect_err("a policy that refuses both notices suppresses the terminal output");
+    assert!(matches!(failure.error(), RunError::GuardrailTripped { .. }));
+
+    let mut budget_deps = deps(&orchestrator, &policy, &tools, &guardrails, None);
+    budget_deps.max_turns = 0;
+    let failure = drive(&budget_deps)
+        .await
+        .expect_err("a deny-all policy suppresses the budget notice and its fallback");
+    assert!(matches!(failure.error(), RunError::GuardrailTripped { .. }));
 }
 
 #[tokio::test]

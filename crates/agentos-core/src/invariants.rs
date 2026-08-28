@@ -310,6 +310,7 @@ mod tests {
             sources: Vec::new(),
         });
         Request {
+            logical_request_id: Arc::from("test-request"),
             kind: RequestKind::Turn,
             messages,
             manifest,

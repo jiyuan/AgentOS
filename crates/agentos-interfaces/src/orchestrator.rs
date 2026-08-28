@@ -1,7 +1,7 @@
 use crate::run_state::RunState;
 use crate::session::Transcript;
 use agentos_proto::{
-    AgentId, Message, Namespace, RecordId, RequestHeader, TaskId, ToolCall, Usage,
+    AgentId, Message, Namespace, RecordId, RequestAttempt, RequestHeader, TaskId, ToolCall, Usage,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -194,6 +194,13 @@ pub enum DispatchTarget {
 /// already seen the tokens, so the run errors instead of committing a reply.
 pub type StreamSink = Arc<dyn Fn(&str) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
+/// Synchronous, fail-closed journal for provider-attempt lifecycle records.
+/// The start record is appended before provider I/O; returning an error stops
+/// the call. Synchronous by design so dropping a cancelled provider future can
+/// append its terminal record from `Drop`.
+pub type RequestAttemptSink<'a> =
+    dyn Fn(&RequestAttempt) -> Result<(), Arc<str>> + Send + Sync + 'a;
+
 pub struct RunContext<'a> {
     pub state: &'a RunState,
     pub system: SystemContext,
@@ -217,6 +224,11 @@ pub struct RunContext<'a> {
     /// and for the same reason: a request assembled inside `plan()` never
     /// otherwise reaches the loop.
     pub request_sink: Arc<Mutex<Vec<RequestHeader>>>,
+    /// Durable provider-attempt journal installed by the runner. This is
+    /// separate from `request_sink`: the latter is an in-memory trace summary
+    /// drained after planning, while this sink must succeed before I/O and
+    /// survives failure, retry, or cancellation of the planning future.
+    pub request_attempt_sink: Option<&'a RequestAttemptSink<'a>>,
     /// Optional sink for incremental assistant text (see [`StreamSink`]). The
     /// loop installs it on the context before `plan()`; an orchestrator that
     /// supports streaming pushes each text chunk through
@@ -250,6 +262,7 @@ impl std::fmt::Debug for RunContext<'_> {
             .field("resource_index", &self.resource_index)
             .field("usage_sink", &self.usage_sink)
             .field("request_sink", &self.request_sink)
+            .field("request_attempt_sink", &self.request_attempt_sink.is_some())
             // `StreamSink` is a closure (no Debug); report only its presence.
             .field("stream_sink", &self.stream_sink.is_some())
             .field("cancelled", &self.cancel.is_cancelled())
@@ -282,6 +295,7 @@ impl<'a> RunContext<'a> {
             resource_index: ResourceIndex::default(),
             usage_sink: Arc::new(Mutex::new(Vec::new())),
             request_sink: Arc::new(Mutex::new(Vec::new())),
+            request_attempt_sink: None,
             stream_sink: None,
             // A fresh token is never cancelled, so a context built outside a
             // run behaves exactly as it did before this field existed.

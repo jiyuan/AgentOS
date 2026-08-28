@@ -8,7 +8,7 @@
 //! path around the check the first path takes
 //! ([ADR-0007](../../../../docs/adr/0007-BUFFERED_OUTPUT.md)).
 //!
-//! # Why a synthesized reply substitutes rather than fails
+//! # Why a synthesized reply may substitute
 //!
 //! A model reply that trips an output guardrail fails the run: the answer was
 //! not fit to send, and there is nothing else to say. The loop's own notices
@@ -20,7 +20,9 @@
 //! object to.
 //!
 //! A guardrail *backend* error counts as a trip here for the same reason: a
-//! check that could not run has not passed.
+//! check that could not run has not passed. The substitute is not privileged:
+//! it crosses the same policy, and if that is refused too the run fails with
+//! no terminal bytes.
 
 use super::{LoopDeps, RunError};
 use crate::audit::{SafetyEventKind, SafetyOutcome};
@@ -31,27 +33,44 @@ use agentos_proto::{Message, MessageRole};
 use std::sync::Arc;
 
 /// Put `message` to the declared output policy, substituting `fallback` if any
-/// guardrail refuses it.
+/// guardrail refuses it. The fallback crosses the policy too.
 pub(super) async fn gated(
     state: &RunState,
     deps: &LoopDeps<'_>,
     message: Message,
     fallback: &str,
 ) -> Result<Message, RunError> {
-    let Some(refused_by) = refused_by(state, deps, &message).await else {
+    let Some(original_refused_by) = refused_by(state, deps, &message).await else {
         return Ok(message);
     };
     deps.audit
         .record_reason(
             SafetyEventKind::OutputGuardrailTrip,
             SafetyOutcome::Tripped,
-            refused_by,
+            original_refused_by,
             "a terminal notice the loop synthesized was withheld",
         )
         .map_err(|source| {
             RunError::safety_evidence(SafetyEventKind::OutputGuardrailTrip, source)
         })?;
-    Ok(Message::text(MessageRole::Assistant, fallback))
+    let fallback = Message::text(MessageRole::Assistant, fallback);
+    let Some(fallback_refused_by) = refused_by(state, deps, &fallback).await else {
+        return Ok(fallback);
+    };
+    deps.audit
+        .record_reason(
+            SafetyEventKind::OutputGuardrailTrip,
+            SafetyOutcome::Tripped,
+            Arc::clone(&fallback_refused_by),
+            "the bounded terminal fallback was withheld; no output was emitted",
+        )
+        .map_err(|source| {
+            RunError::safety_evidence(SafetyEventKind::OutputGuardrailTrip, source)
+        })?;
+    Err(RunError::GuardrailTripped {
+        guardrail: fallback_refused_by,
+        reason: Arc::from("terminal reply and bounded fallback were both refused"),
+    })
 }
 
 /// The name of the first guardrail that refuses `message`, if any.
