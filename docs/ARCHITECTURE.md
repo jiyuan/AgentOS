@@ -670,8 +670,9 @@ AgentOS uses nine independent safety rings:
    the tools it can execute and the modes its machine can enforce — asked, not
    assumed, because the executor is a separate binary that may be older or on a
    different kernel. Or the tool spawns and hardens its own child, declared as
-   `Isolation::SelfHardened`; `shell` is the only shipped instance. A tool that
-   declares a mode and offers neither is refused when the runtime starts and
+   `Isolation::SelfHardened`; `shell` and a dynamic stdio MCP tool whose
+   retained client owns the matching server sandbox are the shipped instances.
+   A tool that declares a mode and offers neither is refused when the runtime starts and
    again on every call, with a typed error naming which of the three
    conditions applies: no executor, an incompatible one, or an isolated run
    that failed. See
@@ -873,9 +874,14 @@ Every bound is named in `tools/mcp/connection.rs`: frame bytes, in-flight
 requests, stderr retained, pages walked, tools per server, restarts per window.
 The server process itself runs under `[[mcp_servers]] sandbox` — the child that
 touches the filesystem is the one restricted, rather than a shell-only worker
-in front of it that could not run MCP calls at all. Interoperability is tested
-against `tests/fixtures/mcp_server.py`, which imports nothing from this
-repository.
+in front of it that could not run MCP calls at all. Pending requests have a
+drop guard and share one bounded writer with their cancellation notices, so an
+outer deadline releases the slot and a late response cannot shift a later
+answer. The process runtime retains every live stdio client: gateway drain
+closes stdin, then signals and reaps the whole process group by the shared
+deadline even while an active call still holds the connection. Interoperability
+is tested against `tests/fixtures/mcp_server.py`, which imports nothing from
+this repository.
 
 Workspace skills are loaded from the configured `skills_dir` and filtered by
 `[resources.skills].enabled`. Built-in deterministic planners can short-circuit

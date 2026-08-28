@@ -188,13 +188,47 @@ impl ToolRegistry {
         client: Arc<dyn McpClient>,
         enabled: impl Fn(&ToolSpec) -> bool,
     ) -> Result<Vec<ToolSpec>, ToolRegistryError> {
+        self.register_mcp_server_with_isolation(
+            server,
+            client,
+            Isolation::RequiresExecutor,
+            enabled,
+        )
+        .await
+    }
+
+    pub(crate) async fn register_self_hardened_mcp_server_filtered(
+        &mut self,
+        server: McpServer,
+        client: Arc<dyn McpClient>,
+        enabled: impl Fn(&ToolSpec) -> bool,
+    ) -> Result<Vec<ToolSpec>, ToolRegistryError> {
+        self.register_mcp_server_with_isolation(server, client, Isolation::SelfHardened, enabled)
+            .await
+    }
+
+    async fn register_mcp_server_with_isolation(
+        &mut self,
+        server: McpServer,
+        client: Arc<dyn McpClient>,
+        isolation: Isolation,
+        enabled: impl Fn(&ToolSpec) -> bool,
+    ) -> Result<Vec<ToolSpec>, ToolRegistryError> {
         let specs = client.list_tools(&server).await?;
         let specs = specs
             .into_iter()
             .filter(|spec| enabled(spec))
             .collect::<Vec<_>>();
         for spec in specs.iter().cloned() {
-            self.register(McpTool::new(server.clone(), Arc::clone(&client), spec));
+            let tool = match isolation {
+                Isolation::RequiresExecutor => {
+                    McpTool::new(server.clone(), Arc::clone(&client), spec)
+                }
+                Isolation::SelfHardened => {
+                    McpTool::self_hardened(server.clone(), Arc::clone(&client), spec)
+                }
+            };
+            self.register(tool);
         }
         Ok(specs)
     }

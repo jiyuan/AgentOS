@@ -173,6 +173,7 @@ pub struct AgentRuntime {
     summarizer: Arc<dyn Llm>,
     cancel: CancellationToken,
     jobs: Arc<JobRegistry>,
+    mcp: mcp_config::ConfiguredMcp,
 }
 
 impl AgentRuntime {
@@ -223,6 +224,12 @@ impl AgentRuntime {
     /// token before starting it and keep the handle.
     pub fn cancellation(&self) -> &CancellationToken {
         &self.cancel
+    }
+
+    /// Stop every retained stdio MCP server, including connections still held
+    /// by active calls. Gateway shutdown invokes this inside its drain bound.
+    pub async fn shutdown_mcp(&self, deadline: std::time::Instant) {
+        self.mcp.shutdown_by(deadline).await;
     }
 
     /// The summarizer and trigger every run in this runtime compacts with.
@@ -311,9 +318,8 @@ impl AgentRuntime {
                 .with_subprocess_isolation(path)
                 .with_env_passthrough(workspace_config.isolation.env_passthrough.iter().cloned());
         }
-        let mcp_specs =
-            register_configured_mcp(&mut tools, &workspace_config, &resolved_workspace_root)
-                .await?;
+        let mcp = register_configured_mcp(&mut tools, &workspace_config, &resolved_workspace_root)
+            .await?;
         refuse_unenforceable_isolation(&tools).await?;
         let model_controller = LlmModelController::new();
         // Pin `AGENTOS_HOME` to the absolute resolved workspace root so every
@@ -353,7 +359,7 @@ impl AgentRuntime {
             &policy,
         )?;
         let resource_index =
-            workspace_config.resource_index(&tool_specs, &mcp_specs, &skill_catalog.metadata());
+            workspace_config.resource_index(&tool_specs, &mcp.specs, &skill_catalog.metadata());
         let routing_table = workspace_config.routing_table()?;
         let high_llm = Arc::new(EnvLlm::new(LlmModelTier::High, model_controller.clone())?);
         let summarizer = summarizer_for(
@@ -421,6 +427,7 @@ impl AgentRuntime {
             summarizer,
             cancel: CancellationToken::new(),
             jobs,
+            mcp,
         })
     }
 
@@ -813,7 +820,7 @@ mod tests {
             .await
             .expect("MCP registers");
 
-        assert_eq!(specs.len(), 1);
+        assert_eq!(specs.specs.len(), 1);
         assert!(tools.contains("enabled_mcp"));
         assert!(!tools.contains("disabled_mcp"));
     }

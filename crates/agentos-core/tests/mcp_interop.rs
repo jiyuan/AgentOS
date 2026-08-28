@@ -44,6 +44,18 @@ fn server(mode: &str) -> McpServer {
     }
 }
 
+fn server_with_arg(mode: &str, argument: &std::path::Path) -> McpServer {
+    McpServer {
+        id: Arc::from(format!("interop-{mode}")),
+        endpoint: Arc::from(format!(
+            "stdio:{} {} {mode} {}",
+            python3(),
+            fixture_path().display(),
+            argument.display()
+        )),
+    }
+}
+
 fn python3() -> String {
     for candidate in [
         "/usr/bin/python3",
@@ -247,6 +259,72 @@ async fn a_timeout_gives_up_on_the_call_and_keeps_the_server() {
     client.shutdown().await;
 }
 
+/// AF-022: dropping more calls than the in-flight ceiling must release every
+/// slot and notify the independent server exactly once for every request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancellation_storm_releases_slots_and_notifies_server() {
+    let tree = support::temp_tree("mcp-cancellation-storm");
+    let observed = tree.path().join("cancelled.txt");
+    let client = Arc::new(client(Duration::from_secs(20)));
+    let server = Arc::new(server_with_arg("cancellation-storm", &observed));
+    client.list_tools(&server).await.expect("tools list");
+
+    const CANCELLED: usize = 80;
+    for batch in 0..8 {
+        let mut calls = Vec::new();
+        for item in 0..10 {
+            let client = Arc::clone(&client);
+            let server = Arc::clone(&server);
+            calls.push(tokio::spawn(async move {
+                tokio::time::timeout(
+                    Duration::from_millis(100),
+                    client.call_tool(
+                        &server,
+                        &call(
+                            "echo",
+                            serde_json::json!({"text": format!("abandon-{batch}-{item}")}),
+                        ),
+                    ),
+                )
+                .await
+            }));
+        }
+        for abandoned in calls {
+            assert!(
+                abandoned.await.expect("joined").is_err(),
+                "the outer deadline should abandon the MCP call"
+            );
+        }
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let lines = loop {
+        let text = std::fs::read_to_string(&observed).unwrap_or_default();
+        let lines: Vec<_> = text.lines().map(ToOwned::to_owned).collect();
+        if lines.len() == CANCELLED {
+            break lines;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fixture observed {} of {CANCELLED} cancellation notices",
+            lines.len()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    let unique: std::collections::BTreeSet<_> = lines.iter().cloned().collect();
+    assert_eq!(unique.len(), CANCELLED, "a request was cancelled twice");
+
+    let normal = client
+        .call_tool(
+            &server,
+            &call("echo", serde_json::json!({"text": "normal"})),
+        )
+        .await
+        .expect("a later normal call succeeds after late replies");
+    assert_eq!(normal.content.as_ref(), "normal");
+    client.shutdown().await;
+}
+
 /// A crash is reported, and the *next* call restarts the server rather than
 /// failing forever.
 #[tokio::test]
@@ -302,6 +380,22 @@ async fn an_oversized_message_is_refused_rather_than_allocated() {
         .await
         .expect_err("an eight-megabyte line is past the four-megabyte frame limit");
     assert!(err.to_string().contains("closed"), "got: {err}");
+    client.shutdown().await;
+}
+
+/// AF-024: the cumulative count is checked before allocating and cloning a
+/// page-sized `Vec<ToolSpec>`.
+#[tokio::test]
+async fn oversized_compact_tool_page_is_refused_before_allocation() {
+    let client = client(Duration::from_secs(20));
+    let err = client
+        .list_tools(&server("oversized-tools"))
+        .await
+        .expect_err("257 tools exceed the per-server budget of 256");
+    assert!(
+        err.to_string().contains("remaining server tool budget"),
+        "got: {err}"
+    );
     client.shutdown().await;
 }
 

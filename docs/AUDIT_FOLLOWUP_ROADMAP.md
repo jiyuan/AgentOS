@@ -2,7 +2,7 @@
 
 Drafted: 2026-08-23
 
-Status: **R0 implemented; R1 underway with `ID-003`, `AUTH-003`, `AUTH-004`, `AUTH-005`, and `AUD-002` complete; R2 underway with `GW-002`, `GW-003`, `GW-004`, `GW-005`, `STATE-002`, and `MAINT-002` complete, and `CTRL-002` underway (`AF-025`–`AF-027` complete; the final active-MCP drain matrix remains in `MCP-004`); R3 complete with `FS-002`, `FS-003`, `PROC-002`, `SBX-002`, `ING-002`, and `NET-002` complete**
+Status: **R0 implemented; R1 underway with `ID-003`, `AUTH-003`, `AUTH-004`, `AUTH-005`, and `AUD-002` complete; R2 complete with `GW-002`, `GW-003`, `GW-004`, `GW-005`, `STATE-002`, `MAINT-002`, and `CTRL-002` complete; R3 complete with `FS-002`, `FS-003`, `PROC-002`, `SBX-002`, `ING-002`, and `NET-002` complete; R4 complete with `MCP-002`, `MCP-003`, and `MCP-004` complete**
 
 Baseline: branch `docs/audit-remediation-plan`, commit `d4b2e94`
 
@@ -454,10 +454,9 @@ Implementation order inside the phase is `GW-002 → GW-003/GW-004 → STATE-002
 ### `CTRL-002` — Make control signalling and shutdown race-free
 
 - Priority: P1.
-- Status: Underway (2026-08-26). Startup publication, exact-holder control,
-  shared-deadline cancellation, process lifecycle regressions, and bounded
-  async Telegram transport are complete; the final active-MCP drain matrix
-  remains gated on `MCP-004`.
+- Status: Complete (2026-08-28). Startup publication, exact-holder control,
+  shared-deadline cancellation, bounded async Telegram transport, and retained
+  active-MCP group shutdown all use the process-wide drain authority.
 - Depends on: `GW-005`; real Telegram/process-backed cancellation also depends on
   `PROC-002`; final MCP drain proof depends on `MCP-004`.
 - Files: gateway control/supervisor, channel receive loops, process/runtime
@@ -605,6 +604,8 @@ behind at shutdown.
 ### `MCP-002` — Bind tool registration to the server sandbox witness
 
 - Priority: P1.
+- Status: Complete (2026-08-28). Dynamic stdio tools register as self-hardened
+  only through the retained client that constructs their server sandbox.
 - Depends on: R0 for implementation; `PROC-002` only for native end-to-end proof.
 - Files: MCP protocol/tool modules, tool registry, runtime isolation wiring, and
   runtime startup integration tests.
@@ -624,6 +625,8 @@ behind at shutdown.
 ### `MCP-003` — Make requests cancellation- and drop-safe
 
 - Priority: P1.
+- Status: Complete (2026-08-28). A drop guard releases pending IDs and the
+  bounded connection writer orders one cancellation notice per abandoned call.
 - Files: `crates/agentos-core/src/tools/mcp/connection.rs`, loop tool-call
   cancellation, and MCP interoperability fixtures.
 - Deliver:
@@ -644,6 +647,9 @@ behind at shutdown.
 ### `MCP-004` — Bound process, restart, stderr, and shutdown lifecycle
 
 - Priority: P1.
+- Status: Complete (2026-08-28). Runtime-retained clients shut down active
+  process groups by the gateway deadline; failed opens, stderr, and tool pages
+  consume their named bounds before further work or allocation.
 - Depends on: `PROC-002` and `GW-005`; acceptance joins `CTRL-002` for final
   deadline/drain integration.
 - Files: MCP connection/process modules and runtime lifecycle registry.
@@ -847,10 +853,10 @@ ID sequence, and complete-row artifact resolution.
 | `AF-018` | Task/attachment writes and skill traversal bypass rooted I/O | P1 | `FS-002`, `FS-003` | Symlink/race/main-min/outside-canary matrix | `crates/agentos-core/tests/rooted_io.rs::all_model_selected_paths_refuse_symlink_escape_and_swap` | `native-linux+macos` | Complete |
 | `AF-019` | Task/session modes rely on umask; fsync errors are ignored | P2 | `FS-002`, `FS-003` | Mode and injected-fsync tests | `crates/agentos-core/tests/state_durability.rs::fsync_failure_aborts_state_commit` | `native-linux+macos` | Complete |
 | `AF-020` | Native macOS workspace-write/setup semantics are wrong | P1 | `SBX-002` | Enforcing Seatbelt tests on macOS | `crates/agentos-core/tests/sandbox.rs::a_workspace_write_child_writes_inside_and_not_outside`, `crates/agentos-core/tests/sandbox.rs::an_unbuildable_sandbox_fails_the_call` | `native-macos` | Complete |
-| `AF-021` | Sandboxed MCP tools cannot register/invoke correctly | P1 | `MCP-002` | Full-runtime sandboxed MCP call | `crates/agentos-core/tests/mcp_runtime.rs::sandboxed_mcp_tool_registers_and_runs_through_runtime` | `native-linux+macos` | Open |
-| `AF-022` | MCP cancellation leaks pending slots/notification | P1 | `MCP-003` | Observed cancellation storm beyond limit | `crates/agentos-core/tests/mcp_interop.rs::cancellation_storm_releases_slots_and_notifies_server` | `native-linux+macos` | Open |
-| `AF-023` | MCP group shutdown, stderr, and restart accounting are incomplete | P1 | `MCP-004` | Descendant/flood/failed-open/active-drain tests | `crates/agentos-core/tests/mcp_process_lifecycle.rs::shutdown_drains_active_calls_and_kills_the_process_group` | `native-linux+macos` | Open |
-| `AF-024` | MCP tool-page count sizes allocation before the cumulative cap | P1 | `MCP-004` | Oversized compact `tools/list` page | `crates/agentos-core/tests/mcp_interop.rs::oversized_compact_tool_page_is_refused_before_allocation` | `portable` | Open |
+| `AF-021` | Sandboxed MCP tools cannot register/invoke correctly | P1 | `MCP-002` | Full-runtime sandboxed MCP call | `crates/agentos-core/tests/mcp_runtime.rs::sandboxed_mcp_tool_registers_and_runs_through_runtime` | `native-linux+macos` | Complete |
+| `AF-022` | MCP cancellation leaks pending slots/notification | P1 | `MCP-003` | Observed cancellation storm beyond limit | `crates/agentos-core/tests/mcp_interop.rs::cancellation_storm_releases_slots_and_notifies_server` | `native-linux+macos` | Complete |
+| `AF-023` | MCP group shutdown, stderr, and restart accounting are incomplete | P1 | `MCP-004` | Descendant/flood/failed-open/active-drain tests | `crates/agentos-core/tests/mcp_process_lifecycle.rs::shutdown_drains_active_calls_and_kills_the_process_group` | `native-linux+macos` | Complete |
+| `AF-024` | MCP tool-page count sizes allocation before the cumulative cap | P1 | `MCP-004` | Oversized compact `tools/list` page | `crates/agentos-core/tests/mcp_interop.rs::oversized_compact_tool_page_is_refused_before_allocation` | `portable` | Complete |
 | `AF-025` | Gateway lock is visible before shutdown handling is ready | P1 | `CTRL-002` | Process-level startup/SIGTERM barrier | `crates/agentos-cli/tests/gateway_lifecycle.rs::startup_lock_is_published_after_signal_handlers_are_ready` | `native-linux+macos` | Complete |
 | `AF-026` | Channel receive can block shutdown indefinitely | P1 | `CTRL-002`, `PROC-002` | Forever-blocked receiver | `crates/agentos-core/tests/gateway_shutdown.rs::forever_blocked_channel_is_abandoned_at_shutdown_deadline` | `native-linux+macos` | Complete |
 | `AF-027` | Numeric PID holder lookup can signal a replacement process | P1 | `CTRL-002` | Barrier-controlled PID-reuse regression | `crates/agentos-cli/tests/gateway_lifecycle.rs::stop_never_signals_a_reused_pid` | `native-linux+macos` | Complete |

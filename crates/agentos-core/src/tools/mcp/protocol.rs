@@ -328,7 +328,11 @@ pub struct ToolPage {
 /// `sandbox` is applied here rather than read from the server: what a tool may
 /// do to *this* filesystem is the deployment's decision, and a server that
 /// could name its own sandbox mode would be choosing its own restrictions.
-pub fn parse_tool_page(result: &Value, sandbox: SandboxMode) -> Result<ToolPage, ProtocolError> {
+pub fn parse_tool_page(
+    result: &Value,
+    sandbox: SandboxMode,
+    remaining_tools: usize,
+) -> Result<ToolPage, ProtocolError> {
     let unexpected = |reason: &str| ProtocolError::Unexpected {
         method: "tools/list",
         reason: Arc::from(reason),
@@ -337,6 +341,11 @@ pub fn parse_tool_page(result: &Value, sandbox: SandboxMode) -> Result<ToolPage,
         .get("tools")
         .and_then(Value::as_array)
         .ok_or_else(|| unexpected("no tools array"))?;
+    if listed.len() > remaining_tools {
+        return Err(unexpected(
+            "tool page exceeds the remaining server tool budget",
+        ));
+    }
     let mut tools = Vec::with_capacity(listed.len());
     for descriptor in listed {
         let name = descriptor
@@ -647,6 +656,7 @@ mod tests {
                 "nextCursor": "page-2",
             }),
             SandboxMode::ReadOnly,
+            2,
         )
         .expect("the page reads");
         assert_eq!(page.tools.len(), 2);
@@ -658,7 +668,7 @@ mod tests {
             .iter()
             .all(|tool| tool.sandbox == SandboxMode::ReadOnly));
 
-        let last = parse_tool_page(&json!({ "tools": [] }), SandboxMode::ReadOnly)
+        let last = parse_tool_page(&json!({ "tools": [] }), SandboxMode::ReadOnly, 0)
             .expect("the page reads");
         assert_eq!(last.next_cursor, None);
     }

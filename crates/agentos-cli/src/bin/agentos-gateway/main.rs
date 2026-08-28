@@ -973,6 +973,7 @@ fn run_persistent_gateways(
 
     let mut announced = false;
     let mut first_error = None;
+    let mut mcp_shutdown = None;
     loop {
         thread::sleep(Duration::from_millis(25));
         if authority.shutdown.observe_process_request().is_some() && !announced {
@@ -981,6 +982,14 @@ fn run_persistent_gateways(
                 config,
                 "shutdown requested; admission stopped and the process drain deadline started",
             )?;
+        }
+        if mcp_shutdown.is_none() {
+            if let Some(deadline) = authority.shutdown.deadline() {
+                let runtime = Arc::clone(&authority.agent_runtime);
+                mcp_shutdown = Some(authority.tokio_runtime.spawn(async move {
+                    runtime.shutdown_mcp(deadline).await;
+                }));
+            }
         }
         let mut index = 0;
         while index < handles.len() {
@@ -1030,13 +1039,24 @@ fn run_persistent_gateways(
         }
     }
 
+    let deadline = authority.shutdown.begin();
+    let shutdown = mcp_shutdown.unwrap_or_else(|| {
+        let runtime = Arc::clone(&authority.agent_runtime);
+        authority.tokio_runtime.spawn(async move {
+            runtime.shutdown_mcp(deadline).await;
+        })
+    });
+    authority
+        .tokio_runtime
+        .block_on(shutdown)
+        .map_err(|err| format!("MCP shutdown task failed: {err}"))?;
+
     // Report from the process-owned store even if a channel worker itself was
     // what missed the deadline and could not reach its local epilogue.
     let ledger = IngressLedger::new(Arc::clone(&authority.agent_runtime.session));
     for channel in channels {
         ingress::report_unsettled(config, channel, &ledger, &ChannelId::new(*channel))?;
     }
-    authority.shutdown.begin();
     if let Some(err) = first_error {
         return Err(err);
     }

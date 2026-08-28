@@ -23,16 +23,23 @@ Usage: mcp_server.py [MODE]
   oversized      answers tools/call with a line past any sane frame limit
   silent         accepts tools/call and never answers it
   demanding      sends the client a request it does not implement
+  cancellation-storm records cancellation notices and sends late replies
+  oversized-tools returns more tools than the cumulative catalog budget
+  process-lifecycle forks a descendant and leaves tool calls active
+  stderr-flood    emits bounded-diagnostic stress without a newline
 """
 
 import json
 import os
+import signal
+import subprocess
 import sys
 import time
 
 PROTOCOL_VERSION = "2025-06-18"
 
 MODE = sys.argv[1] if len(sys.argv) > 1 else "well-behaved"
+MODE_ARG = sys.argv[2] if len(sys.argv) > 2 else None
 
 # Three pages, so the client has to follow `nextCursor` twice to see them all.
 PAGES = {
@@ -132,8 +139,19 @@ def main():
     if MODE == "stderr-then-exit":
         note("configuration error: MCP_TOKEN is not set")
         sys.exit(3)
+    if MODE == "stderr-flood":
+        sys.stderr.write("x" * (2 * 1024 * 1024) + "stderr-flood-tail")
+        sys.stderr.flush()
+        sys.exit(3)
+
+    if MODE == "process-lifecycle":
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        descendant = subprocess.Popen(["/bin/sleep", "300"])
+        with open(MODE_ARG, "w", encoding="utf-8") as handle:
+            handle.write(f"{os.getpid()} {descendant.pid}\n")
 
     deferred = []
+    abandoned = {}
     calls_served = 0
     for line in sys.stdin:
         line = line.strip()
@@ -148,7 +166,15 @@ def main():
             continue
         if method.startswith("notifications/"):
             if method == "notifications/cancelled":
-                note(f"cancelled {message.get('params', {}).get('requestId')}")
+                cancelled_id = message.get("params", {}).get("requestId")
+                note(f"cancelled {cancelled_id}")
+                if MODE == "cancellation-storm":
+                    with open(MODE_ARG, "a", encoding="utf-8") as handle:
+                        handle.write(f"{cancelled_id}\n")
+                    pending = abandoned.pop(cancelled_id, None)
+                    if pending is not None:
+                        name, arguments = pending
+                        send(result(cancelled_id, call_result(name, arguments)))
             continue
 
         if method == "initialize":
@@ -178,6 +204,10 @@ def main():
             continue
 
         if method == "tools/list":
+            if MODE == "oversized-tools":
+                tools = [{"name": f"tool-{index}"} for index in range(257)]
+                send(result(request_id, {"tools": tools}))
+                continue
             cursor = (message.get("params") or {}).get("cursor")
             tools, next_cursor = PAGES.get(cursor, ([], None))
             body = {"tools": tools}
@@ -193,6 +223,11 @@ def main():
             calls_served += 1
 
             if MODE == "silent":
+                continue
+            if MODE == "process-lifecycle":
+                continue
+            if MODE == "cancellation-storm" and arguments.get("text") != "normal":
+                abandoned[request_id] = (name, arguments)
                 continue
             if MODE == "crash":
                 note("crashing after one call, as asked")

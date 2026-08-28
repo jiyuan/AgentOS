@@ -35,7 +35,7 @@ pub use protocol::{PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS};
 
 use crate::sandbox::Sandbox;
 use agentos_interfaces::mcp::{McpClient, McpError, McpServer};
-use agentos_interfaces::tool::{SandboxMode, Tool, ToolError, ToolSpec};
+use agentos_interfaces::tool::{Isolation, SandboxMode, Tool, ToolError, ToolSpec};
 use agentos_proto::{ToolCall, ToolResult, ToolStatus};
 use async_trait::async_trait;
 use connection::{Connection, RestartBudget};
@@ -43,13 +43,14 @@ use serde_json::{value::RawValue, Value};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 pub struct McpTool {
     server: McpServer,
     client: Arc<dyn McpClient>,
     spec: ToolSpec,
+    isolation: Isolation,
 }
 
 #[derive(Clone)]
@@ -127,6 +128,7 @@ pub struct StdioMcpClient {
 struct ServerSlot {
     connection: Option<Arc<Connection>>,
     restarts: RestartBudget,
+    attempted: bool,
 }
 
 impl Default for StdioMcpClient {
@@ -181,6 +183,7 @@ impl StdioMcpClient {
             .or_insert_with(|| ServerSlot {
                 connection: None,
                 restarts: RestartBudget::default(),
+                attempted: false,
             });
 
         if let Some(existing) = slot.connection.as_ref() {
@@ -191,13 +194,19 @@ impl StdioMcpClient {
             // Restarting is bounded: a server that dies on every call must not
             // be restarted on every call.
             slot.connection = None;
+        }
+
+        if slot.attempted {
             let attempt = slot.restarts.take()?;
             tracing::warn!(
                 server = %server.id,
                 attempt,
-                "MCP server exited; restarting"
+                "MCP server connection unavailable; restarting"
             );
         }
+        // Failed opens intentionally leave this set: every post-crash attempt
+        // consumes the budget, not only attempts after a live slot existed.
+        slot.attempted = true;
 
         let (program, args) = parse_endpoint(&server.endpoint)?;
         let sandbox = Sandbox::new(self.sandbox, self.workspace_root.clone());
@@ -217,16 +226,23 @@ impl StdioMcpClient {
 
     /// Close every connection: stdin, then `SIGTERM`, then `SIGKILL`.
     pub async fn shutdown(&self) {
+        self.shutdown_by(Instant::now() + Duration::from_secs(6))
+            .await;
+    }
+
+    /// Close every connection within the process-wide drain deadline.
+    pub async fn shutdown_by(&self, deadline: Instant) {
         let mut servers = self.servers.lock().await;
+        let mut connections = Vec::new();
         for slot in servers.values_mut() {
             let Some(connection) = slot.connection.take() else {
                 continue;
             };
-            // Only shut down a connection nothing else holds. One still in use
-            // by an in-flight call is left to `kill_on_drop`.
-            if let Some(owned) = Arc::into_inner(connection) {
-                owned.shutdown().await;
-            }
+            connections.push(connection);
+        }
+        drop(servers);
+        for connection in connections {
+            connection.shutdown_by(deadline).await;
         }
     }
 }
@@ -299,6 +315,20 @@ impl McpTool {
             server,
             client,
             spec,
+            isolation: Isolation::RequiresExecutor,
+        }
+    }
+
+    pub(crate) fn self_hardened(
+        server: McpServer,
+        client: Arc<dyn McpClient>,
+        spec: ToolSpec,
+    ) -> Self {
+        Self {
+            server,
+            client,
+            spec,
+            isolation: Isolation::SelfHardened,
         }
     }
 }
@@ -307,6 +337,10 @@ impl McpTool {
 impl Tool for McpTool {
     fn spec(&self) -> ToolSpec {
         self.spec.clone()
+    }
+
+    fn isolation(&self) -> Isolation {
+        self.isolation
     }
 
     async fn call(&self, call: &ToolCall, _args: &RawValue) -> Result<ToolResult, ToolError> {

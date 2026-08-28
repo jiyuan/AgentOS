@@ -87,7 +87,7 @@ something that no longer exists — the two-way ratchet
 | Registry enforcement of `SandboxMode` | Stable | all | — | A declared mode is carried by an isolated executor or by the tool's own `Isolation::SelfHardened` child; anything else is refused at startup and at every call | unit, integration |
 | Isolation worker subprocess | Stable | Linux, macOS | `[isolation]` | Carries `shell` only; the `--capabilities` handshake reports that, so an unsupported tool is refused before dispatch rather than after a non-zero exit | unit, integration |
 | Minimal subprocess environment | Stable | all | `[isolation].env_passthrough` | Every child starts from `env_clear` and an allowlist. Proxy variables are kept, so a proxy URL carrying userinfo credentials still reaches tools | unit, integration |
-| Process-group termination | Stable | Unix | — | The group is signalled on deadline and cancellation only; a command that exits cleanly leaves its deliberate background children running | unit |
+| Process-group termination | Stable | Unix | — | The group is signalled on deadline and cancellation; one-shot commands that exit cleanly may leave deliberate background children, while runtime-owned MCP shutdown always sweeps the server group, including descendants | unit, integration |
 | Network egress policy | **Deferred** | — | — | Not implemented; no SSRF protection anywhere (M4) | none |
 
 ## Memory

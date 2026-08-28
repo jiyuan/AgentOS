@@ -38,13 +38,13 @@ use crate::tools::exec::{self, ManagedChild, Spawn};
 use agentos_interfaces::mcp::McpError;
 use agentos_interfaces::tool::{SandboxMode, ToolSpec};
 use serde_json::Value;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::ChildStdin;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 /// The largest single JSON-RPC message this client will read.
 ///
@@ -91,6 +91,11 @@ pub const RESTART_WINDOW: Duration = Duration::from_secs(60);
 /// `SIGTERM`, then `SIGKILL`.
 const SHUTDOWN_STEP: Duration = Duration::from_secs(2);
 
+/// Calls and their cancellation notices share one ordered writer. The extra
+/// room lets every admitted request enqueue both messages without creating an
+/// unbounded channel.
+const WRITER_QUEUE_CAPACITY: usize = MAX_PENDING_REQUESTS * 2 + 16;
+
 /// Requests waiting for a reply, keyed by the id they were sent with. The
 /// reader task is the only thing that removes an entry on the happy path.
 type Pending = Arc<Mutex<HashMap<RequestId, oneshot::Sender<Result<Value, ProtocolError>>>>>;
@@ -100,34 +105,77 @@ pub struct Connection {
     /// Shared with the reader task, which answers a server-initiated request
     /// with a structured `method not found` rather than leaving the server
     /// waiting on a reply that will never come.
-    stdin: Arc<tokio::sync::Mutex<ChildStdin>>,
+    writer: mpsc::Sender<WriterCommand>,
     child: tokio::sync::Mutex<ManagedChild>,
     pending: Pending,
     next_id: AtomicU64,
     stderr: Arc<Mutex<StderrTail>>,
     handshake: ServerHandshake,
     reader: tokio::task::JoinHandle<()>,
+    writer_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    shutting_down: AtomicBool,
+}
+
+enum WriterCommand {
+    Write {
+        line: String,
+        acknowledged: Option<oneshot::Sender<Result<(), String>>>,
+    },
+    Close(oneshot::Sender<()>),
+}
+
+/// Removes one pending request on every exit path. If the reader has not
+/// already claimed its reply, dropping the caller also queues exactly one MCP
+/// cancellation notification behind the original request.
+struct PendingGuard {
+    id: RequestId,
+    pending: Pending,
+    writer: mpsc::Sender<WriterCommand>,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        let removed = self
+            .pending
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.remove(&self.id));
+        if removed.is_none() {
+            return;
+        }
+        let notification = Request::notify(
+            "notifications/cancelled",
+            protocol::cancelled_params(self.id, "client stopped waiting"),
+        );
+        let Ok(line) = notification.encode() else {
+            return;
+        };
+        let _ = self.writer.try_send(WriterCommand::Write {
+            line,
+            acknowledged: None,
+        });
+    }
 }
 
 /// The last [`MAX_STDERR_BYTES`] a server wrote to stderr.
 #[derive(Default)]
 pub struct StderrTail {
-    bytes: Vec<u8>,
+    bytes: VecDeque<u8>,
 }
 
 impl StderrTail {
-    fn push(&mut self, line: &str) {
-        self.bytes.extend_from_slice(line.as_bytes());
-        self.bytes.push(b'\n');
-        if self.bytes.len() > MAX_STDERR_BYTES {
-            // Drop from the front: the tail is what says why it died.
-            let excess = self.bytes.len() - MAX_STDERR_BYTES;
-            self.bytes.drain(..excess);
+    fn push(&mut self, chunk: &[u8]) {
+        for byte in chunk {
+            if self.bytes.len() == MAX_STDERR_BYTES {
+                self.bytes.pop_front();
+            }
+            self.bytes.push_back(*byte);
         }
     }
 
     pub fn text(&self) -> String {
-        String::from_utf8_lossy(&self.bytes).into_owned()
+        let bytes: Vec<u8> = self.bytes.iter().copied().collect();
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 }
 
@@ -170,16 +218,13 @@ impl Connection {
 
         let pending: Pending = Arc::default();
         let tail = Arc::new(Mutex::new(StderrTail::default()));
-        let stdin = Arc::new(tokio::sync::Mutex::new(stdin));
+        let (writer, writer_rx) = mpsc::channel(WRITER_QUEUE_CAPACITY);
+        let writer_task = tokio::spawn(write_stdin(stdin, writer_rx));
         tokio::spawn(read_stderr(stderr, Arc::clone(&tail)));
-        let reader = tokio::spawn(read_stdout(
-            stdout,
-            Arc::clone(&pending),
-            Arc::clone(&stdin),
-        ));
+        let reader = tokio::spawn(read_stdout(stdout, Arc::clone(&pending), writer.clone()));
 
         let connection = Self {
-            stdin,
+            writer,
             child: tokio::sync::Mutex::new(child),
             pending,
             next_id: AtomicU64::new(1),
@@ -193,6 +238,8 @@ impl Connection {
                 tools_list_changed: false,
             },
             reader,
+            writer_task: tokio::sync::Mutex::new(Some(writer_task)),
+            shutting_down: AtomicBool::new(false),
         };
 
         let result = connection
@@ -258,14 +305,13 @@ impl Connection {
             let ToolPage {
                 tools: page,
                 next_cursor,
-            } = protocol::parse_tool_page(&result, sandbox)
-                .map_err(|err| failed(format!("MCP tools/list failed: {err}")))?;
+            } = protocol::parse_tool_page(
+                &result,
+                sandbox,
+                MAX_TOOLS_PER_SERVER.saturating_sub(tools.len()),
+            )
+            .map_err(|err| failed(format!("MCP tools/list failed: {err}")))?;
             tools.extend(page);
-            if tools.len() > MAX_TOOLS_PER_SERVER {
-                return Err(failed(format!(
-                    "MCP server offered more than {MAX_TOOLS_PER_SERVER} tools"
-                )));
-            }
             let Some(next) = next_cursor else {
                 return Ok(tools);
             };
@@ -318,11 +364,13 @@ impl Connection {
             }
             pending.insert(id, tx);
         }
+        let _guard = PendingGuard {
+            id,
+            pending: Arc::clone(&self.pending),
+            writer: self.writer.clone(),
+        };
 
-        if let Err(err) = self.write(&Request::call(id, method, params)).await {
-            self.forget(id);
-            return Err(err);
-        }
+        self.write(&Request::call(id, method, params)).await?;
 
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(Ok(result))) => Ok(result),
@@ -336,23 +384,10 @@ impl Connection {
                 "MCP server closed while answering {method}{}",
                 self.stderr_context()
             ))),
-            Err(_) => {
-                self.forget(id);
-                // Tell the server to stop working on it, rather than killing
-                // the server. A timeout is one slow call; the old code took
-                // the whole connection down with it, so every *other*
-                // conversation using that server lost its tools too.
-                let _ = self
-                    .write(&Request::notify(
-                        "notifications/cancelled",
-                        protocol::cancelled_params(id, "client deadline exceeded"),
-                    ))
-                    .await;
-                Err(failed(format!(
-                    "MCP {method} timed out after {} ms",
-                    timeout.as_millis()
-                )))
-            }
+            Err(_) => Err(failed(format!(
+                "MCP {method} timed out after {} ms",
+                timeout.as_millis()
+            ))),
         }
     }
 
@@ -364,50 +399,98 @@ impl Connection {
         let line = request
             .encode()
             .map_err(|err| failed(format!("MCP request could not be encoded: {err}")))?;
-        let mut stdin = self.stdin.lock().await;
-        stdin
-            .write_all(line.as_bytes())
-            .await
-            .map_err(|err| failed(format!("MCP server stdin write failed: {err}")))?;
-        stdin
-            .flush()
-            .await
-            .map_err(|err| failed(format!("MCP server stdin flush failed: {err}")))
+        let (acknowledged, ack) = oneshot::channel();
+        self.writer
+            .try_send(WriterCommand::Write {
+                line,
+                acknowledged: Some(acknowledged),
+            })
+            .map_err(|_| failed("MCP server writer queue is unavailable"))?;
+        ack.await
+            .map_err(|_| failed("MCP server writer stopped"))?
+            .map_err(failed)
     }
 
-    fn forget(&self, id: RequestId) {
-        if let Ok(mut pending) = self.pending.lock() {
-            pending.remove(&id);
+    /// Shut down before the process-wide drain deadline. A deadline already
+    /// reached skips straight to group kill and reap.
+    pub async fn shutdown_by(&self, deadline: Instant) {
+        if self.shutting_down.swap(true, Ordering::SeqCst) {
+            return;
         }
-    }
-
-    /// Close the server down: stdin, then `SIGTERM`, then `SIGKILL`, each with
-    /// its own deadline.
-    ///
-    /// MCP's stdio transport has no `shutdown` method — closing stdin *is* the
-    /// request to exit, and a well-behaved server exits on EOF. The signals
-    /// are for the ones that do not.
-    pub async fn shutdown(self) {
         self.reader.abort();
-        drop(self.stdin);
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.clear();
+        }
+        let (closed, ack) = oneshot::channel();
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if !remaining.is_zero()
+            && tokio::time::timeout(
+                remaining.min(SHUTDOWN_STEP),
+                self.writer.send(WriterCommand::Close(closed)),
+            )
+            .await
+            .is_ok_and(|sent| sent.is_ok())
+        {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if !remaining.is_zero() {
+                let _ = tokio::time::timeout(remaining.min(SHUTDOWN_STEP), ack).await;
+            }
+        }
+        if let Some(writer_task) = self.writer_task.lock().await.take() {
+            writer_task.abort();
+        }
         let mut child = self.child.lock().await;
-        if wait_briefly(&mut child).await {
+        if wait_briefly(&mut child, deadline).await {
+            // The direct server may exit on stdin EOF while a descendant it
+            // forked remains in the process group. Shutdown owns the whole
+            // group even on that graceful-parent path.
             child.signal_group(libc::SIGKILL);
             return;
         }
         #[cfg(unix)]
         child.signal_group(libc::SIGTERM);
-        if wait_briefly(&mut child).await {
+        if wait_briefly(&mut child, deadline).await {
+            child.signal_group(libc::SIGKILL);
             return;
         }
         child.kill_and_reap().await;
     }
 }
 
-async fn wait_briefly(child: &mut ManagedChild) -> bool {
-    tokio::time::timeout(SHUTDOWN_STEP, child.wait())
+async fn wait_briefly(child: &mut ManagedChild, deadline: Instant) -> bool {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return false;
+    }
+    tokio::time::timeout(remaining.min(SHUTDOWN_STEP), child.wait())
         .await
         .is_ok()
+}
+
+async fn write_stdin(mut stdin: ChildStdin, mut commands: mpsc::Receiver<WriterCommand>) {
+    while let Some(command) = commands.recv().await {
+        match command {
+            WriterCommand::Write { line, acknowledged } => {
+                let outcome = async {
+                    stdin.write_all(line.as_bytes()).await?;
+                    stdin.flush().await
+                }
+                .await
+                .map_err(|err| err.to_string());
+                if let Some(acknowledged) = acknowledged {
+                    let _ = acknowledged.send(outcome.clone());
+                }
+                if outcome.is_err() {
+                    break;
+                }
+            }
+            WriterCommand::Close(closed) => {
+                drop(stdin);
+                let _ = closed.send(());
+                return;
+            }
+        }
+    }
 }
 
 /// Own stdout and hand each reply to whoever is waiting for it.
@@ -419,7 +502,7 @@ async fn wait_briefly(child: &mut ManagedChild) -> bool {
 async fn read_stdout(
     stdout: tokio::process::ChildStdout,
     pending: Pending,
-    stdin: Arc<tokio::sync::Mutex<ChildStdin>>,
+    writer: mpsc::Sender<WriterCommand>,
 ) {
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
@@ -477,9 +560,12 @@ async fn read_stdout(
                 // *us*.
                 tracing::warn!(method = %method, "MCP server called an unimplemented client method");
                 let reply = protocol::method_not_found(&id, &method);
-                let mut stdin = stdin.lock().await;
-                let _ = stdin.write_all(reply.as_bytes()).await;
-                let _ = stdin.flush().await;
+                let _ = writer
+                    .send(WriterCommand::Write {
+                        line: reply,
+                        acknowledged: None,
+                    })
+                    .await;
             }
             Err(err) => {
                 // One bad line is not a broken connection any more. It used to
@@ -497,11 +583,15 @@ async fn read_stdout(
 }
 
 async fn read_stderr(stderr: tokio::process::ChildStderr, tail: Arc<Mutex<StderrTail>>) {
-    let mut lines = BufReader::new(stderr).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        tracing::debug!(line = %line, "MCP server stderr");
+    let mut stderr = BufReader::new(stderr);
+    let mut chunk = [0_u8; 4096];
+    while let Ok(read) = stderr.read(&mut chunk).await {
+        if read == 0 {
+            break;
+        }
+        tracing::debug!(bytes = read, "MCP server stderr chunk");
         if let Ok(mut tail) = tail.lock() {
-            tail.push(&line);
+            tail.push(&chunk[..read]);
         }
     }
 }
@@ -550,7 +640,7 @@ mod tests {
     fn the_stderr_tail_keeps_the_end_and_stays_bounded() {
         let mut tail = StderrTail::default();
         for index in 0..10_000 {
-            tail.push(&format!("line {index}"));
+            tail.push(format!("line {index}\n").as_bytes());
         }
         let text = tail.text();
         assert!(

@@ -153,6 +153,16 @@ reassembly bounds fragments per event, partially-received events and total
 bytes; attachment downloads stream to `[limits].attachment_bytes` and stop;
 provider response bodies are capped rather than read to end.
 
+**Dynamic MCP isolation and lifecycle are end to end** (`MCP-002`, `MCP-003`,
+`MCP-004`). A stdio MCP tool is self-hardened only when its retained client
+owns the matching server sandbox, so it no longer depends on a generic worker
+that cannot invoke it. Dropped calls release their pending slots and send one
+ordered cancellation notification; late replies remain harmless by request
+ID. The process runtime retains live clients and gateway drain closes, signals,
+and reaps each server process group by the shared deadline, including active
+calls and forked descendants. Restart attempts, stderr tails, and cumulative
+tool pages are bounded before repeated spawning or page-sized allocation.
+
 ### The record
 
 **Safety decisions are events, never absences** (`AUD-001`). Approval requested

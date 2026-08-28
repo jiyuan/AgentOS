@@ -927,3 +927,23 @@
 - **Actual Behavior**: The work was completed locally because the active runtime instructions prohibit spawning Subagents without an explicit user request.
 - **Root Cause**: The repository's mandatory delegation threshold conflicts with the higher-priority runtime consent gate; this recurring conflict remains unresolved.
 - **Suggested Fix**: Amend the repository guideline, with human approval, so automatic delegation thresholds defer explicitly to environments that require user consent for Subagent creation.
+
+## [2026-08-28 18:40] ORCHESTRATION [ESCALATE]
+
+- **Agent**: /root
+- **Task**: Implement and verify R4 MCP isolation, cancellation, and process lifecycle closure.
+- **Guideline Violated**: ORCHESTRATION > Subagent Delegation & Creation
+- **Expected Behavior**: Delegate implementation work exceeding the sequential tool-call threshold to a registered or built-in Subagent.
+- **Actual Behavior**: The work was completed locally because the active runtime instructions prohibit spawning Subagents without an explicit user request.
+- **Root Cause**: The repository's mandatory delegation threshold conflicts with the higher-priority runtime consent gate; this recurring conflict remains unresolved.
+- **Suggested Fix**: Amend the repository guideline, with human approval, so automatic delegation thresholds defer explicitly to environments that require user consent for Subagent creation.
+
+## [2026-08-28 18:40] TOOL [ESCALATE]
+
+- **Agent**: /root
+- **Task**: Run the complete workspace test gate after R4.
+- **Guideline Violated**: FEEDBACK > Review Cycle > Per-session
+- **Expected Behavior**: Use the already-known native-test permission before launching the full suite because gateway control sockets cannot bind inside the managed sandbox.
+- **Actual Behavior**: The first full-workspace run used the managed sandbox and all five gateway lifecycle tests timed out after their control sockets were refused; the approved native rerun passed.
+- **Root Cause**: The targeted suites had happened to pass in the current environment, and the existing pre-gate feedback about the complete suite was not applied when selecting the full gate's execution context.
+- **Suggested Fix**: Encode the native execution requirement into a repository test wrapper or make the full-suite command use the approved native permission by default in this environment.
