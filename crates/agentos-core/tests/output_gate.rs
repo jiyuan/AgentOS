@@ -225,6 +225,7 @@ impl Orchestrator for NeverFinishes {
 }
 
 #[tokio::test]
+/// AF-035: terminal fallbacks never bypass the output policy gate.
 async fn every_terminal_fallback_crosses_the_output_policy() {
     // Deliverable 6. Cancellation used to emit a constant without the policy
     // seeing it, on the argument that a constant carries no model content —

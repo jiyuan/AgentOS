@@ -14,6 +14,8 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 policy="$root/deny.toml"
+# shellcheck source=release-versions.env
+source "$root/scripts/release-versions.env"
 
 usage() {
   cat <<'USAGE'
@@ -26,7 +28,7 @@ Options:
                   Useful when the crates.io advisory database is unreachable.
   -h, --help      Show this help.
 
-Requires cargo-deny: cargo install cargo-deny --locked
+Requires the exact cargo-deny version pinned in scripts/release-versions.env.
 USAGE
 }
 
@@ -106,15 +108,23 @@ if [[ "$expiry_only" == "1" ]]; then
   exit 0
 fi
 
-if ! command -v cargo-deny >/dev/null 2>&1; then
-  echo "cargo-deny is not installed: cargo install cargo-deny --locked" >&2
+cargo_deny_bin="$(command -v cargo-deny || true)"
+if [[ -z "$cargo_deny_bin" && -x "${CARGO_HOME:-$HOME/.cargo}/bin/cargo-deny" ]]; then
+  cargo_deny_bin="${CARGO_HOME:-$HOME/.cargo}/bin/cargo-deny"
+fi
+if [[ -z "$cargo_deny_bin" ]]; then
+  echo "cargo-deny is not installed: scripts/install-toolchain.sh" >&2
+  exit 1
+fi
+if [[ "$($cargo_deny_bin --version)" != "cargo-deny $AGENTOS_CARGO_DENY_VERSION" ]]; then
+  echo "cargo-deny version does not match scripts/release-versions.env" >&2
   exit 1
 fi
 
 echo "== cargo deny check"
 # `--locked` so the audit describes the committed lockfile rather than whatever
 # resolution today's index happens to produce.
-if ( cd "$root" && cargo deny --locked check ); then
+if ( cd "$root" && "$cargo_deny_bin" --locked check ); then
   echo "  ok    advisories, licences, bans, sources"
 else
   failures=$((failures + 1))

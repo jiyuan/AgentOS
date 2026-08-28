@@ -242,6 +242,28 @@ client declines `roots`, `sampling` and `elicitation`.
 
 ### Release qualification
 
+**Ordinary upgrades preserve operator state** (`REL-003`). Source and archive
+installs seed the four shipped workspace entries only when absent. Each
+release's defaults are available under `dist/<version>/workspace` for review;
+replacement requires `--replace-workspace` and first creates a recoverable
+backup. The required preservation rehearsal modifies configuration, adds a
+custom skill and sentinel, then reinstalls, upgrades, and resets both layouts.
+
+**Release inputs are exact and reviewable** (`REL-004`). Artifact and catalog
+commands resolve with `--locked`; Rust, Miri, `cargo-deny`, and
+`cargo-semver-checks` have exact versions; third-party actions remain pinned by
+digest. [`RELEASE_INPUTS.json`](RELEASE_INPUTS.json) commits the Cargo lockfile
+digest and reviewed tool inputs. The gate includes negative fixtures for an
+unlocked build, lockfile drift, and a floating tool version. This is an input
+reproducibility claim, not a bit-for-bit output claim.
+
+**Every corrective regression is release-blocking** (`CI-003`). The required
+Linux/macOS matrix now names the gateway crash states, source/archive reinstall
+preservation, and native sandbox/MCP process tests, while the complete workspace
+suite executes every R1–R5 targeted regression. One aggregate `ci` job depends
+on all of them; only the long property search, Miri interpretation, soak, and
+loop timing remain nightly.
+
 **The archive is self-contained and the install path is one path** (`REL-001`,
 `REL-002`). `scripts/check-release-archive.sh` packages an archive, installs it
 into a temporary prefix under a redirected HOME, validates every packaged

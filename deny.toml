@@ -84,6 +84,10 @@ wildcards = "deny"
 allow-wildcard-paths = true
 
 skip = [
+    # expires: 2027-02-28 — `ring` and the current `rand` use getrandom 0.2,
+    # while AgentOS uses getrandom 0.3's fallible `fill` API directly. Remove
+    # once the rustls/ring side and the runtime can share one major.
+    { crate = "getrandom@0.2.17" },
     # expires: 2027-02-28 — `criterion` (dev-only) pins hashbrown 0.14 through
     # `plotters`; the runtime graph is on 0.17. Revisit when criterion 0.6 is
     # adopted.

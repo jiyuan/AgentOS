@@ -122,7 +122,9 @@ for arg in "$@"; do
 done
 load_env_file "$env_file"
 
-rust_toolchain="${AGENTOS_RUST_TOOLCHAIN:-stable}"
+# shellcheck source=release-versions.env
+source "$root/scripts/release-versions.env"
+rust_toolchain="${AGENTOS_RUST_TOOLCHAIN}"
 mode="tui"
 build_first=1
 gateway_command="${AGENTOS_GATEWAY_COMMAND:-}"
@@ -140,6 +142,7 @@ cargo_for_toolchain() {
 run_agentos() {
   if [[ ${#cli_args[@]} -gt 0 ]]; then
     rustup run "$rust_toolchain" cargo run \
+      --locked \
       --manifest-path "$root/Cargo.toml" \
       -p agentos-cli \
       -- "$@" "${cli_args[@]}"
@@ -147,6 +150,7 @@ run_agentos() {
   fi
 
   rustup run "$rust_toolchain" cargo run \
+    --locked \
     --manifest-path "$root/Cargo.toml" \
     -p agentos-cli \
     -- "$@"
@@ -384,7 +388,7 @@ Options:
 Environment:
   AGENTOS_ENV_FILE            Local environment file path. Default: .env
   AGENTOS_NO_ENV_OVERRIDE     Set to 1 to keep shell variables over .env values.
-  AGENTOS_RUST_TOOLCHAIN      Rust toolchain to use. Default: stable
+  AGENTOS_RUST_TOOLCHAIN      Exact Rust toolchain to use.
   AGENTOS_AGENT_CONFIG_PATH   Workspace config path. Default: workspace/agent.toml
   AGENTOS_SESSION_DB_PATH     Session SQLite path. Default: workspace/agentos.sqlite
   AGENTOS_RUN_STATE_PATH      Paused run path. Default: workspace/runs/cli-run-1.json

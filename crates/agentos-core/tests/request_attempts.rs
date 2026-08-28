@@ -116,6 +116,7 @@ impl Llm for Counted<'_> {
 }
 
 #[tokio::test]
+/// AF-017: each provider attempt is journaled even when it does not complete.
 async fn every_failed_retried_or_cancelled_attempt_is_durable() {
     let state = state();
     let records = Mutex::new(Vec::<RequestAttempt>::new());
@@ -175,33 +176,34 @@ async fn every_failed_retried_or_cancelled_attempt_is_durable() {
     .await
     .expect_err("timeout drops the pending provider future");
 
-    let records = records.lock().expect("record mutex is healthy");
-    assert_eq!(records.len(), 12);
-    assert_eq!(records[0].status, RequestAttemptStatus::Started);
-    assert_eq!(records[1].status, RequestAttemptStatus::Failed);
-    assert_eq!(records[2].status, RequestAttemptStatus::Started);
-    assert_eq!(records[3].status, RequestAttemptStatus::Failed);
-    assert_eq!(records[4].status, RequestAttemptStatus::Started);
-    assert_eq!(records[5].status, RequestAttemptStatus::Failed);
-    assert_eq!(records[6].status, RequestAttemptStatus::Started);
-    assert_eq!(records[7].status, RequestAttemptStatus::Failed);
-    assert_eq!(records[8].status, RequestAttemptStatus::Started);
-    assert_eq!(records[9].status, RequestAttemptStatus::Succeeded);
-    assert_eq!(records[8].attempt, 2);
-    assert_eq!(records[6].logical_request_id, records[8].logical_request_id);
-    assert_eq!(
-        records[9].usage,
-        Some(Usage {
-            input_tokens: 7,
-            output_tokens: 3,
-            total_tokens: 10,
-            ..Usage::default()
-        })
-    );
-    assert_eq!(records[10].status, RequestAttemptStatus::Started);
-    assert_eq!(records[11].status, RequestAttemptStatus::Cancelled);
+    {
+        let records = records.lock().expect("record mutex is healthy");
+        assert_eq!(records.len(), 12);
+        assert_eq!(records[0].status, RequestAttemptStatus::Started);
+        assert_eq!(records[1].status, RequestAttemptStatus::Failed);
+        assert_eq!(records[2].status, RequestAttemptStatus::Started);
+        assert_eq!(records[3].status, RequestAttemptStatus::Failed);
+        assert_eq!(records[4].status, RequestAttemptStatus::Started);
+        assert_eq!(records[5].status, RequestAttemptStatus::Failed);
+        assert_eq!(records[6].status, RequestAttemptStatus::Started);
+        assert_eq!(records[7].status, RequestAttemptStatus::Failed);
+        assert_eq!(records[8].status, RequestAttemptStatus::Started);
+        assert_eq!(records[9].status, RequestAttemptStatus::Succeeded);
+        assert_eq!(records[8].attempt, 2);
+        assert_eq!(records[6].logical_request_id, records[8].logical_request_id);
+        assert_eq!(
+            records[9].usage,
+            Some(Usage {
+                input_tokens: 7,
+                output_tokens: 3,
+                total_tokens: 10,
+                ..Usage::default()
+            })
+        );
+        assert_eq!(records[10].status, RequestAttemptStatus::Started);
+        assert_eq!(records[11].status, RequestAttemptStatus::Cancelled);
+    }
 
-    drop(records);
     let calls = AtomicUsize::new(0);
     let refusing_sink = |_record: &RequestAttempt| Err(Arc::from("disk unavailable"));
     let mut refused_ctx = RunContext::from_state(&state);

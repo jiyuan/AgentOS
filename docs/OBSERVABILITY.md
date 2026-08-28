@@ -25,6 +25,15 @@ signal is weak or missing, saying so plainly rather than describing an intent.
   Everything in the core emits here; the gateway log is the operator-facing
   subset.
 
+Release qualification is intentionally separate from runtime telemetry. The
+single required `ci` result aggregates Linux/macOS workspace tests, native
+sandbox and MCP lifecycle checks, gateway crash and two-channel pipeline
+rehearsals, install preservation, clean-room packaging, dependency policy, and
+semver. Failed jobs retain their environment and pipeline artifacts for seven
+days. `docs/RELEASE_INPUTS.json` records the exact dependency/toolchain/tool
+inputs used to reproduce an artifact build; it is evidence about the build,
+not a health signal from a running gateway.
+
 ## Alertable conditions
 
 | Condition | Signal | Strength |

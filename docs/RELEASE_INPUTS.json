@@ -1,0 +1,7 @@
+{
+  "cargo_deny": "0.20.2",
+  "cargo_lock_sha256": "61e98d316201bb120e2e8926c5cddb660f7c6564e3a38e62408381066df1b7e9",
+  "cargo_semver_checks": "0.47.0",
+  "miri_toolchain": "nightly-2026-08-01",
+  "rust_toolchain": "1.94.1"
+}

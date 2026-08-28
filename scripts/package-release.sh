@@ -3,7 +3,9 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 dist_dir="${DIST_DIR:-$root/dist}"
-rust_toolchain="${AGENTOS_RUST_TOOLCHAIN:-stable}"
+# shellcheck source=release-versions.env
+source "$root/scripts/release-versions.env"
+rust_toolchain="${AGENTOS_RUST_TOOLCHAIN}"
 
 version="$(awk -F'"' '/^version = / { print $2; exit }' "$root/Cargo.toml")"
 platform="$(uname -s | tr '[:upper:]' '[:lower:]')"
@@ -29,6 +31,7 @@ mkdir -p "$dist_dir"
 rm -rf "$stage_dir" "$archive_path" "$checksum_path"
 
 rustup run "$rust_toolchain" cargo build \
+  --locked \
   --release \
   --manifest-path "$root/Cargo.toml" \
   -p agentos-cli \
@@ -43,9 +46,11 @@ done
 
 install -m 755 "$root/scripts/install-agentos.sh" "$stage_dir/scripts/install-agentos.sh"
 install -m 755 "$root/scripts/start-agentos.sh" "$stage_dir/scripts/start-agentos.sh"
+install -m 644 "$root/scripts/release-versions.env" "$stage_dir/scripts/release-versions.env"
 install -m 644 "$root/.env.example" "$stage_dir/.env.example"
 install -m 644 "$root/README.md" "$stage_dir/README.md"
 install -m 644 "$root/LICENSE" "$stage_dir/LICENSE"
+install -m 644 "$root/docs/RELEASE_INPUTS.json" "$stage_dir/docs/RELEASE_INPUTS.json"
 
 # Documentation: the transitive closure of relative Markdown links reachable
 # from what the bundle already ships, rather than a hand-listed three. The
@@ -106,7 +111,8 @@ while [[ ${#doc_queue[@]} -gt 0 ]]; do
 done
 
 for doc in "${doc_seen[@]}"; do
-  install -D -m 644 "$root/$doc" "$stage_dir/$doc"
+  install -d "$stage_dir/$(dirname "$doc")"
+  install -m 644 "$root/$doc" "$stage_dir/$doc"
 done
 
 # The runtime workspace, by allowlist. An allowlist rather than "copy the

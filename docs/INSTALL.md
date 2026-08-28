@@ -34,12 +34,41 @@ cd agentos-v<version>-<platform>-<arch>
 scripts/install-agentos.sh
 ```
 
-## Configuration
+## Reinstall and upgrade safely
 
-After install, copy and edit:
+The runtime home separates operator-owned state from versioned distribution
+defaults:
+
+- `workspace/` is mutable operator state. A normal install seeds
+  `agent.toml`, `skills/`, `subagents/`, and `suborchs/` only when each entry is
+  absent. Reinstall and upgrade never merge, delete, or overwrite them.
+- `dist/<version>/workspace/` contains the immutable defaults shipped by that
+  release. Compare these files with the live workspace before adopting a new
+  default.
+
+The same rule applies to source and release-bundle installs. To deliberately
+replace the four shipped workspace entries, request it explicitly:
 
 ```sh
-cp ~/.local/share/agentos/.env.example ~/.local/share/agentos/.env
+scripts/install-agentos.sh --replace-workspace
+```
+
+Before replacement, the installer copies the existing entries to
+`backups/workspace-<UTC timestamp>-<process id>/` and prints that recovery
+path. Runtime databases, traces, logs, and other workspace files are not part
+of the replacement allowlist. `--reset-workspace` is an alias.
+
+Release builds use the exact Rust/tool versions in
+`scripts/release-versions.env`, the committed `Cargo.lock`, and the input
+fingerprints in `RELEASE_INPUTS.json`. These are input-reproducibility controls;
+the project does not yet claim byte-for-byte identical binaries or archives.
+
+## Configuration
+
+After install, edit the seeded environment file:
+
+```sh
+$EDITOR ~/.local/share/agentos/.env
 ```
 
 Minimum TUI setup (OpenAI):

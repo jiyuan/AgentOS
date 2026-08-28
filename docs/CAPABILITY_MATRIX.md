@@ -164,10 +164,12 @@ parsing, streaming assembly, and retry behavior.
 | Capability | Status | Platforms | Required config | Limitations | Test level |
 |---|---|---|---|---|---|
 | Release archive | Stable | Linux, macOS | — | — | script (`check-release-archive.sh`), CI |
+| Non-destructive install and upgrade | Stable | Linux, macOS | — | Live workspace entries are seeded only when absent; new defaults are versioned under `dist/<version>/workspace`. Explicit `--replace-workspace` replaces the shipped allowlist after creating a recoverable backup | script (`check-install-preservation.sh`), CI |
+| Locked release inputs | Stable | Linux, macOS | — | Pins dependency graph, Rust, Miri, cargo-deny, cargo-semver-checks, and action digests. This is input reproducibility, not a bit-for-bit binary/archive claim | script (`check-release-locking.sh`), CI |
 | Generated catalogs | Stable | all | — | — | integration |
 | Import-boundary check | Stable | all | — | Self-testing (`--self-test`) | script, integration |
 | Module-size check | Stable | all | — | Two allowlisted files exceed the 800-LOC budget | script |
-| One required CI check | Stable | Linux, macOS | — | Every job feeds a single `ci` job, so protection needs one entry and a later job is required automatically. Enabling protection on `main` is a repository setting and cannot be committed | workflow |
+| One required CI check | Stable | Linux, macOS | — | Every job, including the corrective crash/reinstall matrix and native sandbox/MCP suites, feeds a single `ci` job. Protection needs one entry and a later job is required automatically. Enabling protection on `main` is a repository setting and cannot be committed | workflow |
 | Dependency policy | Stable | all | — | Advisories, licences, duplicate versions and allowed sources over the four supported targets. Suppressions carry an `# expires:` date and `check-dependencies.sh` fails on an expired one. Needs `cargo-deny` | script (`check-dependencies.sh`), CI |
 | Upgrade, restart and rollback rehearsal | Stable | Linux, macOS | — | Exercises the transitions an existing deployment performs, including starting the current binary on a database restored from a pre-migration backup | script (`rehearse-upgrade.sh`), CI |
 | Channel pipeline rehearsal | Stable | Linux, macOS | — | Mock Telegram and Feishu on loopback with `builtin.echo` as the provider. Five tasks per push, the full fifty nightly. It exercises the adapters and the gateway, not a real transport's behaviour | script (`check-gateway-pipeline.sh`), CI |

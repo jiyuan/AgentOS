@@ -872,16 +872,16 @@ ID sequence, and complete-row artifact resolution.
 | `AF-028` | Channels construct independent runtime authorities | P1 | `GW-005` | Two-channel shared-authority test | `crates/agentos-core/tests/runtime_authority.rs::two_channels_share_one_runtime_authority` | `native-linux+macos` | Complete |
 | `AF-029` | Maintenance depends on shard-0 idle time | P1 | `MAINT-002` | Saturated-shard deterministic-clock test | `crates/agentos-core/tests/maintenance.rs::maintenance_runs_while_shard_zero_is_saturated` | `portable` | Complete |
 | `AF-030` | Failed/ambiguous egress is settled as handled or blindly retried | P1 | `GW-004` | Delivery/action crash-state matrix | `crates/agentos-core/tests/delivery_crash.rs::ambiguous_delivery_is_neither_silently_settled_nor_blindly_retried` | `native-linux+macos` | Complete |
-| `AF-031` | Shipped cron mutations are blanket-allowed | P1 | `CFG-002` | Metadata-driven mutation policy ratchet | `crates/agentos-core/tests/shipped_config_policy.rs::metadata_drives_the_blanket_allow_ratchet_for_every_shipped_tool` | `portable` | Open |
-| `AF-032` | Reinstall deletes operator configuration and extensions | P1 | `REL-003` | Modify-and-reinstall preservation | `scripts/check-install-preservation.sh` | `native-linux+macos` | Open |
+| `AF-031` | Shipped cron mutations are blanket-allowed | P1 | `CFG-002` | Metadata-driven mutation policy ratchet | `crates/agentos-core/tests/shipped_config_policy.rs::metadata_drives_the_blanket_allow_ratchet_for_every_shipped_tool` | `portable` | Complete |
+| `AF-032` | Reinstall deletes operator configuration and extensions | P1 | `REL-003` | Modify-and-reinstall preservation | `scripts/check-install-preservation.sh` | `native-linux+macos` | Complete |
 | `AF-033` | Purge commits before best-effort audit marker/count recheck | P1 | `AUD-003` | Transaction count-race/failpoint rollback | `crates/agentos-core/tests/audit_purge.rs::purge_count_race_or_marker_failure_rolls_back_everything` | `portable` | Complete |
 | `AF-034` | Feishu single-part and other protocol bodies allocate before caps | P1 | `ING-002` | Oversize/malformed input matrix | `crates/agentos-core/tests/ingress_limits.rs::all_protocol_bodies_are_bounded_before_allocation` | `portable` | Complete |
 | `AF-035` | Terminal fallback bypasses output policy | P1 | `OUT-001` | Deny-all terminal-path matrix | `crates/agentos-core/tests/output_gate.rs::every_terminal_fallback_crosses_the_output_policy` | `portable` | Complete |
 | `AF-036` | Provider-call checker is grep-bypassable | P2 | `REQ-002`, `CI-003` | Compile-time or AST negative fixture | `tests/test_provider_call_checker.py::test_syntactic_bypasses_are_rejected` | `portable` | Complete |
-| `AF-037` | Release/catalog/source builds are unlocked; tool versions float | P2 | `REL-004` | Static gate and clean input-manifest test | `scripts/check-release-locking.sh` | `native-linux+macos` | Open |
+| `AF-037` | Release/catalog/source builds are unlocked; tool versions float | P2 | `REL-004` | Static gate and clean input-manifest test | `scripts/check-release-locking.sh` | `native-linux+macos` | Complete |
 | `AF-038` | IPv6 site-local egress remains allowed | P2 | `NET-002` | Literal/DNS-resolved policy tests | `crates/agentos-core/tests/egress.rs::ipv6_site_local_is_refused_by_literal_and_resolution` | `portable` | Complete |
 | `AF-039` | Telegram child bypasses common env/group/output controls | P2 | `PROC-002`, `ING-002` | No-child source ratchet and shared response cap | `crates/agentos-core/tests/subprocess_boundaries.rs::telegram_transport_has_no_child_and_uses_bounded_http` | `portable` | Complete |
-| `AF-040` | Current all-target Clippy gate fails | P1 | `BASE-001` | Required command green on both platforms | `scripts/check-baseline-gates.sh` | `native-linux+macos` | Open |
+| `AF-040` | Current all-target Clippy gate fails | P1 | `BASE-001` | Required command green on both platforms | `scripts/check-baseline-gates.sh` | `native-linux+macos` | Complete |
 
 ## Final release gate
 

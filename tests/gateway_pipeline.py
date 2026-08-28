@@ -477,7 +477,10 @@ class FeishuMock:
         }
         frame = _encode_feishu_frame(
             method=1,
-            headers=[("type", "event"), ("message_id", message_id)],
+            # This is one complete event. `message_id` is fragment metadata in
+            # the Feishu frame protocol and is valid only alongside `sum`;
+            # the application-level message id remains in the JSON payload.
+            headers=[("type", "event")],
             payload=json.dumps(event_payload).encode("utf-8"),
         )
         event = threading.Event()

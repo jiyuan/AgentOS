@@ -12,7 +12,10 @@ bindir="${BINDIR:-$prefix/bin}"
 agentos_home="${AGENTOS_HOME:-$xdg_data_home/agentos}"
 from_source=0
 skip_build=0
-rust_toolchain="${AGENTOS_RUST_TOOLCHAIN:-stable}"
+replace_workspace=0
+# shellcheck source=release-versions.env
+source "$root/scripts/release-versions.env"
+rust_toolchain="${AGENTOS_RUST_TOOLCHAIN}"
 
 usage() {
   cat <<'USAGE'
@@ -23,6 +26,8 @@ Install AgentOS from a source checkout or a packaged release bundle.
 Options:
   --from-source       Build binaries from the current source checkout.
   --skip-build        Do not build source binaries; require existing artifacts.
+  --replace-workspace Replace shipped workspace entries after making a backup.
+  --reset-workspace   Alias for --replace-workspace.
   --prefix PATH       Installation prefix. Default: ~/.local
   --bindir PATH       Binary install directory. Default: <prefix>/bin
   --home PATH         AgentOS runtime home. Default: $XDG_DATA_HOME/agentos
@@ -34,7 +39,7 @@ Environment:
   BINDIR              Binary install directory override.
   XDG_DATA_HOME       Base for the runtime home. Default: ~/.local/share
   AGENTOS_HOME        AgentOS runtime home override.
-  AGENTOS_RUST_TOOLCHAIN  Rust toolchain for source builds. Default: stable
+  AGENTOS_RUST_TOOLCHAIN  Exact Rust toolchain for source builds.
 USAGE
 }
 
@@ -46,6 +51,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-build)
       skip_build=1
+      shift
+      ;;
+    --replace-workspace|--reset-workspace)
+      replace_workspace=1
       shift
       ;;
     --prefix)
@@ -99,8 +108,9 @@ RUSTUP_HOME and CARGO_HOME pointing at it.
 ERROR
     exit 1
   fi
-  "$root/scripts/install-toolchain.sh"
+  "$root/scripts/install-toolchain.sh" --skip-semver-checks --skip-cargo-deny
   rustup run "$rust_toolchain" cargo build \
+    --locked \
     --release \
     --manifest-path "$root/Cargo.toml" \
     -p agentos-cli \
@@ -140,6 +150,11 @@ install -m 755 "$root/scripts/start-agentos.sh" "$agentos_home/scripts/start-age
 install -m 644 "$root/.env.example" "$agentos_home/.env.example"
 install -m 644 "$root/README.md" "$agentos_home/README.md"
 install -m 644 "$root/LICENSE" "$agentos_home/LICENSE"
+if [[ -f "$root/docs/RELEASE_INPUTS.json" ]]; then
+  install -m 644 "$root/docs/RELEASE_INPUTS.json" "$agentos_home/RELEASE_INPUTS.json"
+elif [[ -f "$root/RELEASE_INPUTS.json" ]]; then
+  install -m 644 "$root/RELEASE_INPUTS.json" "$agentos_home/RELEASE_INPUTS.json"
+fi
 
 # Whatever documentation the source is carrying. From a release bundle this is
 # the closure package-release.sh computed; from a source checkout it is docs/.
@@ -153,24 +168,57 @@ if [[ ! -f "$agentos_home/.env" ]]; then
   cp "$agentos_home/.env.example" "$agentos_home/.env"
 fi
 
-# The workspace, by the same allowlist package-release.sh uses. This was
-# `cp -r "$root/workspace"`, which from a source checkout copied the
-# developer's runtime state — a multi-hundred-megabyte agentos.sqlite, traces/,
-# runs/, task directories and their session logs — into the install, and from a
-# bundle copied a workspace holding nothing but agent.toml, leaving
-# WorkspaceSkillCatalog::load_enabled to fail at startup on a missing skill
-# (M2 deliverable 1).
+# Distribution defaults and operator state have different owners. Every
+# release installs its declarative workspace into a versioned, immutable
+# review location. The live workspace is seeded only when an entry is absent.
+# An explicit reset replaces only these four declarative entries and first
+# copies their current contents to a recoverable backup; runtime databases,
+# traces, logs, and unrecognised workspace sentinels are never touched.
+if [[ -f "$root/VERSION" ]]; then
+  version="$(tr -d '[:space:]' < "$root/VERSION")"
+else
+  version="$(awk -F'"' '/^version = / { print $2; exit }' "$root/Cargo.toml")"
+fi
+if [[ -z "$version" || ! "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  echo "invalid release version: $version" >&2
+  exit 1
+fi
+
+defaults_root="$agentos_home/dist/$version/workspace"
+install -d "$defaults_root"
+
+backup_root=""
+if [[ "$replace_workspace" == "1" ]]; then
+  backup_root="$agentos_home/backups/workspace-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  install -d "$backup_root"
+fi
+
 for entry in agent.toml skills subagents suborchs; do
   source_path="$root/workspace/$entry"
   if [[ ! -e "$source_path" ]]; then
     echo "workspace entry is missing from the source tree: workspace/$entry" >&2
     exit 1
   fi
-  rm -rf "${agentos_home:?}/workspace/$entry"
-  if [[ -d "$source_path" ]]; then
-    cp -RL "$source_path" "$agentos_home/workspace/$entry"
-  else
-    install -m 644 "$source_path" "$agentos_home/workspace/$entry"
+  default_path="$defaults_root/$entry"
+  if [[ ! -e "$default_path" ]]; then
+    if [[ -d "$source_path" ]]; then
+      cp -RL "$source_path" "$default_path"
+    else
+      install -m 644 "$source_path" "$default_path"
+    fi
+  fi
+
+  live_path="$agentos_home/workspace/$entry"
+  if [[ "$replace_workspace" == "1" && ( -e "$live_path" || -L "$live_path" ) ]]; then
+    cp -Rp "$live_path" "$backup_root/$entry"
+    rm -rf "$live_path"
+  fi
+  if [[ ! -e "$live_path" && ! -L "$live_path" ]]; then
+    if [[ -d "$default_path" ]]; then
+      cp -Rp "$default_path" "$live_path"
+    else
+      install -m 644 "$default_path" "$live_path"
+    fi
   fi
 done
 
@@ -183,6 +231,10 @@ chmod 755 "$bindir/agentos"
 echo "Installed AgentOS"
 echo "  home:    $agentos_home"
 echo "  command: $bindir/agentos"
+echo "  defaults: $defaults_root"
+if [[ -n "$backup_root" ]]; then
+  echo "  backup:  $backup_root"
+fi
 echo "Next steps:"
 echo "  1. Edit $agentos_home/.env"
 echo "  2. Run $bindir/agentos tui"

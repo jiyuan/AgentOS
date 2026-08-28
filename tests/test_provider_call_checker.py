@@ -9,6 +9,7 @@ assert SPEC.loader is not None
 SPEC.loader.exec_module(CHECKER)
 
 
+# AF-036: syntactic aliases and split call expressions remain rejected.
 def test_syntactic_bypasses_are_rejected():
     source = r'''
         // llm.complete_messages(&messages, tools)

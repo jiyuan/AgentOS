@@ -15,13 +15,13 @@ cd "$root"
 
 # `--check` renders and compares without writing, so this is safe to run on a
 # clean tree and in CI.
-if cargo run --quiet -p agentos-cli --bin agentos-gateway -- catalog --check --root="$root"; then
+if cargo run --locked --quiet -p agentos-cli --bin agentos-gateway -- catalog --check --root="$root"; then
   echo "catalogs ok"
   exit 0
 fi
 
 echo
 echo "The generated catalogs are out of date."
-echo "Run: cargo run -p agentos-cli --bin agentos-gateway -- catalog"
+echo "Run: cargo run --locked -p agentos-cli --bin agentos-gateway -- catalog"
 echo "and commit docs/CONFIG_CATALOG.md and docs/TOOL_CATALOG.md."
 exit 1

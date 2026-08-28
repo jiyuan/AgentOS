@@ -33,6 +33,7 @@ fn old_event(store: &SqliteStore, path: &PathBuf, subject: &str) {
 }
 
 #[tokio::test]
+/// AF-033: count drift or marker failure rolls back the purge transaction.
 async fn purge_count_race_or_marker_failure_rolls_back_everything() {
     let path = database("audit-purge-race");
     let store = SqliteStore::open(&path).expect("store opens");

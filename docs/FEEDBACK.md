@@ -957,3 +957,33 @@
 - **Actual Behavior**: The work was completed locally because the active runtime instructions prohibit spawning Subagents without an explicit user request.
 - **Root Cause**: The repository's mandatory delegation threshold conflicts with the higher-priority runtime consent gate; this recurring conflict remains unresolved.
 - **Suggested Fix**: Amend the repository guideline, with human approval, so automatic delegation thresholds defer explicitly to environments that require user consent for Subagent creation.
+
+## [2026-08-28 17:23] ORCHESTRATION [ESCALATE]
+
+- **Agent**: /root
+- **Task**: Implement and verify R6 non-destructive installation, exact release inputs, and the required corrective CI matrix.
+- **Guideline Violated**: ORCHESTRATION > Subagent Delegation & Creation
+- **Expected Behavior**: Delegate implementation work exceeding the sequential tool-call threshold to a registered or built-in Subagent.
+- **Actual Behavior**: The work was completed locally because the active runtime instructions prohibit spawning Subagents without an explicit user request.
+- **Root Cause**: The repository's mandatory delegation threshold conflicts with the higher-priority runtime consent gate; this recurring conflict remains unresolved.
+- **Suggested Fix**: Amend the repository guideline, with human approval, so automatic delegation thresholds defer explicitly to environments that require user consent for Subagent creation.
+
+## [2026-08-28 17:23] TOOL [RESOLVED]
+
+- **Agent**: /root
+- **Task**: Run the new native gateway crash matrix during R6 verification.
+- **Guideline Violated**: FEEDBACK > Review Cycle > Per-session
+- **Expected Behavior**: Apply the existing native-test feedback before launching a process-level gateway suite whose own comments require native sockets and signals.
+- **Actual Behavior**: The first run used the managed sandbox; the gateway control socket was refused and the lifecycle test stalled until interrupted. The approved native rerun passed.
+- **Root Cause**: The new wrapper had not yet acquired an approved native execution prefix, and the known requirement was applied only after the predictable sandbox refusal.
+- **Suggested Fix**: Treat `scripts/check-gateway-crash-matrix.sh` as native by default in supported execution environments; its approved prefix now permits that path here.
+
+## [2026-08-28 17:28] TOOL [RESOLVED]
+
+- **Agent**: /root
+- **Task**: Run the exact-version dependency policy gate for R6.
+- **Guideline Violated**: GUIDELINES > Consistency
+- **Expected Behavior**: A tool installed by the repository's toolchain script is discoverable by the repository's dependency gate.
+- **Actual Behavior**: `cargo-deny` installed into Cargo's standard bin directory, but `check-dependencies.sh` reported it missing because that directory was not present on the managed process PATH.
+- **Root Cause**: The gate relied solely on `command -v` even though `cargo install` has a deterministic fallback location under `CARGO_HOME`.
+- **Suggested Fix**: Resolve `cargo-deny` from PATH or `${CARGO_HOME:-$HOME/.cargo}/bin`, and reject a binary whose version differs from `release-versions.env`; implemented and the dependency policy now passes.

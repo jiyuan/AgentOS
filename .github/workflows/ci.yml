@@ -57,6 +57,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable @ 2026-08
         with:
+          toolchain: 1.94.1
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Record baseline environment
@@ -69,12 +70,8 @@ jobs:
             rustup show active-toolchain
             uname -a
           } > tests/_artifacts/baseline-environment.txt
-      - name: Format check
-        run: cargo fmt --all -- --check
-      - name: Type check
-        run: cargo check --workspace --locked
-      - name: Clippy (warnings are errors)
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Format, type and all-target Clippy baseline
+        run: bash scripts/check-baseline-gates.sh
       - name: Import boundaries
         run: bash scripts/check-import-boundaries.sh
       - name: Module size ceiling
@@ -83,6 +80,8 @@ jobs:
         run: bash scripts/check-provider-calls.sh
       - name: Runtime children use the common subprocess boundary
         run: bash scripts/check-subprocess-boundaries.sh
+      - name: Release inputs are exact and locked
+        run: bash scripts/check-release-locking.sh
       - name: Generated catalogs are current
         run: bash scripts/check-catalogs.sh
       # The catalogs, the capability matrix and the release notes are each
@@ -114,6 +113,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable @ 2026-08
+        with:
+          toolchain: 1.94.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Record native-platform test environment
         run: |
@@ -132,6 +133,10 @@ jobs:
       # mechanism was in force rather than leaving it to be inferred.
       - name: Report the sandbox mechanism
         run: cargo test -p agentos-core --locked --test sandbox -- --nocapture
+      - name: Exercise native MCP isolation and process lifecycle
+        run: |
+          cargo test -p agentos-core --locked --test mcp_runtime -- --nocapture
+          cargo test -p agentos-core --locked --test mcp_process_lifecycle -- --nocapture
       - name: Upload native-platform failure environment
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -154,6 +159,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable @ 2026-08
+        with:
+          toolchain: 1.94.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Build the gateway
         run: cargo build --locked -p agentos-cli --bin agentos-gateway
@@ -174,6 +181,24 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  corrective-matrix:
+    name: corrective crash and reinstall gates (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable @ 2026-08
+        with:
+          toolchain: 1.94.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Gateway crash-state matrix
+        run: bash scripts/check-gateway-crash-matrix.sh
+      - name: Source and archive reinstall preservation
+        run: bash scripts/check-install-preservation.sh
+
   bench-smoke:
     name: bench compile + smoke (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -184,6 +209,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable @ 2026-08
+        with:
+          toolchain: 1.94.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # Smoke mode only: CI runners are too noisy to gate on timings, so this
       # proves every bench (criterion and custom harnesses) still compiles
@@ -202,6 +229,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable @ 2026-08
+        with:
+          toolchain: 1.94.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # Packages an archive, extracts it, installs from both the archive and
       # the source checkout into isolated prefixes under a redirected HOME,
@@ -218,11 +247,13 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable @ 2026-08
+        with:
+          toolchain: 1.94.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install cargo-deny
         uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
         with:
-          tool: cargo-deny
+          tool: cargo-deny@0.20.2
       # Blocking. An advisory against a dependency is the one class of finding
       # nobody in this repository was looking at, and it costs a lockfile bump
       # to fix. Suppressions live in deny.toml and expire; the script fails on
@@ -239,11 +270,13 @@ jobs:
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable @ 2026-08
+        with:
+          toolchain: 1.94.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install cargo-semver-checks
         uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
         with:
-          tool: cargo-semver-checks
+          tool: cargo-semver-checks@0.47.0
       # Blocking, and no `|| echo`. It was advisory "while interface evolution
       # policy settles", which is a state that never ends on its own.
       #
@@ -276,6 +309,7 @@ jobs:
       - checks
       - test
       - rehearsals
+      - corrective-matrix
       - bench-smoke
       - release-smoke
       - dependencies
