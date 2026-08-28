@@ -36,8 +36,9 @@
 
 use super::segment::{path_segment, PathSegmentError};
 use std::fs::File;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -183,6 +184,86 @@ impl RootDir {
             .map_err(|failure| self.leaf_error(path, leaf, failure))
     }
 
+    /// Create a new private file, refusing any pre-existing leaf.
+    pub fn create_new_file(&self, path: impl AsRef<Path>) -> Result<File, ContainmentError> {
+        let path = path.as_ref();
+        let names = self.components(path)?;
+        let (leaf, parents) = names
+            .split_last()
+            .expect("components() rejects the empty path");
+        let parent = self.descend(path, parents, Descend::Create)?;
+        open_leaf_at(&parent, leaf, LeafMode::CreateNew)
+            .map_err(|failure| self.leaf_error(path, leaf, failure))
+    }
+
+    /// Open a private file for append, creating its descriptor-walked parents.
+    ///
+    /// The returned descriptor carries `O_APPEND`, so concurrent writers do
+    /// not race a userspace seek with their write. A pre-existing symlink at
+    /// the leaf is refused exactly like one in an intermediate component.
+    pub fn append_file(&self, path: impl AsRef<Path>) -> Result<File, ContainmentError> {
+        let path = path.as_ref();
+        let names = self.components(path)?;
+        let (leaf, parents) = names
+            .split_last()
+            .expect("components() rejects the empty path");
+        let parent = self.descend(path, parents, Descend::Create)?;
+        open_leaf_at(&parent, leaf, LeafMode::Append)
+            .map_err(|failure| self.leaf_error(path, leaf, failure))
+    }
+
+    /// Atomically publish `bytes` beneath this root and make that publication
+    /// durable before reporting success.
+    ///
+    /// The temporary file, rename, cleanup and parent-directory `fsync` are all
+    /// descriptor-relative. No model-selected component is resolved again by
+    /// host path after the no-follow walk.
+    pub fn write_file_atomic(
+        &self,
+        path: impl AsRef<Path>,
+        bytes: &[u8],
+    ) -> Result<(), ContainmentError> {
+        self.write_file_atomic_using(path.as_ref(), bytes, sync_dir)
+    }
+
+    fn write_file_atomic_using(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        sync_parent: impl FnOnce(&DirFd) -> io::Result<()>,
+    ) -> Result<(), ContainmentError> {
+        let names = self.components(path)?;
+        let (leaf, parents) = names
+            .split_last()
+            .expect("components() rejects the empty path");
+        let parent = self.descend(path, parents, Descend::Create)?;
+        let temporary = temporary_leaf();
+        let mut file = open_leaf_at(&parent, &temporary, LeafMode::CreateNew)
+            .map_err(|failure| self.leaf_error(path, &temporary, failure))?;
+        if let Err(source) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+            let _ = remove_leaf_at(&parent, &temporary);
+            return Err(ContainmentError::Io {
+                root: self.root.clone(),
+                path: path.to_owned(),
+                source,
+            });
+        }
+        drop(file);
+        if let Err(source) = rename_leaf_at(&parent, &temporary, leaf) {
+            let _ = remove_leaf_at(&parent, &temporary);
+            return Err(ContainmentError::Io {
+                root: self.root.clone(),
+                path: path.to_owned(),
+                source,
+            });
+        }
+        sync_parent(&parent).map_err(|source| ContainmentError::Io {
+            root: self.root.clone(),
+            path: path.to_owned(),
+            source,
+        })
+    }
+
     /// Create a directory beneath the root, and every directory leading to it.
     pub fn create_dir_all(&self, path: impl AsRef<Path>) -> Result<(), ContainmentError> {
         let path = path.as_ref();
@@ -206,6 +287,33 @@ impl RootDir {
             path: path.to_owned(),
             source,
         })
+    }
+
+    /// What is directly inside the retained root descriptor.
+    ///
+    /// This is separate from [`Self::read_dir`] because an empty relative path
+    /// is intentionally not a valid model-selected target. Inventory code
+    /// still needs to enumerate a configured root without resolving its host
+    /// path a second time.
+    pub fn read_root_dir(&self) -> Result<Vec<DirEntry>, ContainmentError> {
+        #[cfg(unix)]
+        {
+            let dir = self
+                .fd
+                .try_clone()
+                .map_err(|source| ContainmentError::Root {
+                    root: self.root.clone(),
+                    source,
+                })?;
+            list_dir(dir).map_err(|source| ContainmentError::Root {
+                root: self.root.clone(),
+                source,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Err(ContainmentError::Unsupported)
+        }
     }
 
     /// Whether a path beneath the root is a directory.
@@ -281,9 +389,20 @@ pub(crate) enum Descend {
 pub(crate) enum LeafMode {
     Read,
     Write,
+    Append,
+    CreateNew,
 }
 
-use super::nofollow::{list_dir, open_leaf_at};
+fn temporary_leaf() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    format!(
+        ".agentos-tmp-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+use super::nofollow::{list_dir, open_leaf_at, remove_leaf_at, rename_leaf_at, sync_dir, DirFd};
 
 #[cfg(all(test, unix))]
 mod tests {
@@ -407,6 +526,109 @@ mod tests {
         assert!(
             !outside.join("planted.txt").exists(),
             "nothing may be created outside the root"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn append_and_atomic_publication_refuse_every_symlink_position() {
+        let dir = scratch("rooted-write-links");
+        let outside = scratch("rooted-write-links-target");
+        let canary = outside.join("canary.txt");
+        std::fs::write(&canary, b"untouched").expect("canary");
+        std::os::unix::fs::symlink(&outside, dir.join("linked-dir")).expect("directory link");
+        std::os::unix::fs::symlink(&canary, dir.join("linked-file")).expect("file link");
+        let root = RootDir::open(&dir).expect("root opens");
+
+        assert!(matches!(
+            root.append_file("linked-dir/append.txt"),
+            Err(ContainmentError::Symlink { .. })
+        ));
+        assert!(matches!(
+            root.append_file("linked-file"),
+            Err(ContainmentError::Symlink { .. })
+        ));
+        assert!(matches!(
+            root.write_file_atomic("linked-dir/state.txt", b"outside"),
+            Err(ContainmentError::Symlink { .. })
+        ));
+        root.write_file_atomic("linked-file", b"inside")
+            .expect("atomic publication replaces a leaf link without following it");
+        assert_eq!(
+            std::fs::read(&canary).expect("canary readable"),
+            b"untouched"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("linked-file")).expect("replacement readable"),
+            b"inside"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn fsync_failure_aborts_state_commit() {
+        let dir = scratch("sync-failure");
+        let root = RootDir::open(&dir).expect("root opens");
+        let error = root
+            .write_file_atomic_using("state.json".as_ref(), b"new", |_| {
+                Err(io::Error::other("injected directory fsync failure"))
+            })
+            .expect_err("unknown directory durability must not report success");
+        assert!(
+            matches!(error, ContainmentError::Io { ref source, .. } if source.to_string().contains("injected directory fsync failure")),
+            "{error:?}"
+        );
+        assert!(
+            std::fs::read_dir(&dir)
+                .expect("root lists")
+                .all(|entry| !entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".agentos-tmp-")),
+            "an fsync failure must not leak the temporary file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_symlink_swaps_cannot_redirect_atomic_publication() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let dir = scratch("atomic-race");
+        let outside = scratch("atomic-race-target");
+        let canary = outside.join("state.txt");
+        std::fs::write(&canary, b"outside-canary").expect("canary");
+        std::fs::create_dir(dir.join("live")).expect("live directory");
+        let stop = Arc::new(AtomicBool::new(false));
+        let swapper = {
+            let live = dir.join("live");
+            let outside = outside.clone();
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = std::fs::remove_dir_all(&live);
+                    let _ = std::os::unix::fs::symlink(&outside, &live);
+                    let _ = std::fs::remove_file(&live);
+                    let _ = std::fs::create_dir(&live);
+                }
+            })
+        };
+        let root = RootDir::open(&dir).expect("root opens");
+        for _ in 0..2_000 {
+            let _ = root.write_file_atomic("live/state.txt", b"inside");
+        }
+        stop.store(true, Ordering::Relaxed);
+        swapper.join().expect("swapper finishes");
+        assert_eq!(
+            std::fs::read(&canary).expect("canary readable"),
+            b"outside-canary",
+            "descriptor-relative publication escaped through a symlink swap"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

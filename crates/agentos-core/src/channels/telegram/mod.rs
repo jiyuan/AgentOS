@@ -1,5 +1,5 @@
 use crate::channels::admission::{env_flag, AdmissionPolicy};
-use crate::channels::attachments::{file_size, AttachmentStore};
+use crate::channels::attachments::AttachmentStore;
 use crate::http::shared_client;
 use crate::r#loop::{parse_action_data, DECISION_KEY, TICKET_KEY};
 use agentos_interfaces::{
@@ -13,8 +13,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::env;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -188,59 +187,36 @@ impl TelegramChannel {
     /// Long-poll `getUpdates`. `Ok(None)` means the long poll elapsed with no
     /// new updates (or curl hit its own deadline waiting on an idle socket) —
     /// that is the steady state, not a failure, so the caller must not log it.
-    fn fetch_updates(&self) -> Result<Option<Value>, ChannelError> {
-        let mut command = Command::new("curl");
-        // The server long-polls for `LONG_POLL_SECS`; curl's own `--max-time`
-        // is kept comfortably above it so a slow TLS handshake on top of a
-        // full-length poll never trips curl mid-poll and looks like an error.
-        command.args([
-            "--silent",
-            "--show-error",
-            "--connect-timeout",
-            "10",
-            "--max-time",
-            CURL_MAX_TIME_SECS,
-            "-X",
-            "POST",
-        ]);
-        command.arg(self.api_url("getUpdates"));
-        command.args(["-d", concat!("timeout=", "25")]);
+    async fn fetch_updates(&self) -> Result<Option<Value>, ChannelError> {
+        let mut form = vec![("timeout", "25".to_owned())];
         if let Some(offset) = self.offset {
-            command.args(["-d", &format!("offset={offset}")]);
+            form.push(("offset", offset.to_string()));
         }
-
-        let output = command
-            .output()
-            .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
-        if !output.status.success() {
-            // curl exit 28 == operation timed out. An idle long poll legitimately
-            // ends this way; treat it as "no updates" so the receive loop just
-            // polls again instead of logging a backend failure every cycle.
-            if output.status.code() == Some(28) {
+        let response = match shared_client()
+            .post(self.api_url("getUpdates"))
+            .timeout(Duration::from_secs(40))
+            .form(&form)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) if error.is_timeout() => {
                 return Ok(None);
             }
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(ChannelError::Backend(Arc::from(stderr.trim().to_owned())));
-        }
-        serde_json::from_slice(&output.stdout)
-            .map(Some)
-            .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))
+            Err(error) => return Err(channel_http_error(error)),
+        };
+        telegram_json(response).await.map(Some)
     }
 
-    fn get_file_path(&self, file_id: &str) -> Result<String, ChannelError> {
-        let body = format!("file_id={file_id}");
-        let output = Command::new("curl")
-            .args(["--silent", "--show-error", "--max-time", "10", "-X", "POST"])
-            .arg(self.api_url("getFile"))
-            .args(["--data-urlencode", &body])
-            .output()
-            .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(ChannelError::Backend(Arc::from(stderr.trim().to_owned())));
-        }
-        let response: Value = serde_json::from_slice(&output.stdout)
-            .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
+    async fn get_file_path(&self, file_id: &str) -> Result<String, ChannelError> {
+        let response = shared_client()
+            .post(self.api_url("getFile"))
+            .timeout(Duration::from_secs(10))
+            .form(&[("file_id", file_id)])
+            .send()
+            .await
+            .map_err(channel_http_error)?;
+        let response = telegram_json(response).await?;
         if response.get("ok").and_then(Value::as_bool) != Some(true) {
             return Err(ChannelError::Backend(Arc::from(response.to_string())));
         }
@@ -254,47 +230,30 @@ impl TelegramChannel {
             })
     }
 
-    fn download_to(&self, file_id: &str, target: &Path) -> Result<(), ChannelError> {
-        let file_path = self.get_file_path(file_id)?;
+    async fn download(&self, file_id: &str) -> Result<Vec<u8>, ChannelError> {
+        let file_path = self.get_file_path(file_id).await?;
         let url = self.file_url(&file_path);
-        // `--max-filesize` aborts on the declared length, which a sender
-        // controls, so the write is checked afterwards as well: between them,
-        // a header that lies in either direction still costs at most
-        // `max_bytes` on disk (M4 / `ING-001`).
         let max_bytes = self.attachments.max_bytes();
-        let output = Command::new("curl")
-            .args([
-                "--silent",
-                "--show-error",
-                "--fail",
-                "--max-time",
-                "60",
-                "--max-filesize",
-                &max_bytes.to_string(),
-            ])
-            .arg("-o")
-            .arg(target)
-            .arg(url)
-            .output()
-            .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
-        if !output.status.success() {
-            let _ = std::fs::remove_file(target);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(ChannelError::Backend(Arc::from(format!(
-                "Telegram file download failed: {}",
-                stderr.trim()
-            ))));
+        let mut response = shared_client()
+            .get(url)
+            .timeout(Duration::from_secs(60))
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(channel_http_error)?;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(channel_http_error)? {
+            if bytes.len() as u64 + chunk.len() as u64 > max_bytes {
+                return Err(ChannelError::Backend(Arc::from(format!(
+                    "Telegram attachment exceeds the {max_bytes}-byte limit"
+                ))));
+            }
+            bytes.extend_from_slice(&chunk);
         }
-        if file_size(target).is_some_and(|size| size > max_bytes) {
-            let _ = std::fs::remove_file(target);
-            return Err(ChannelError::Backend(Arc::from(format!(
-                "Telegram attachment exceeds the {max_bytes}-byte limit"
-            ))));
-        }
-        Ok(())
+        Ok(bytes)
     }
 
-    fn download_attachments(
+    async fn download_attachments(
         &self,
         descriptors: &[AttachmentDescriptor],
         conversation: &str,
@@ -311,11 +270,11 @@ impl TelegramChannel {
         }
         let mut out = Vec::with_capacity(accepted);
         for desc in descriptors.iter().take(accepted) {
+            let bytes = self.download(&desc.file_id).await?;
+            let size = desc.size.or(Some(bytes.len() as u64));
             let path = self
                 .attachments
-                .target_path(conversation, message_id, &desc.name)?;
-            self.download_to(&desc.file_id, &path)?;
-            let size = desc.size.or_else(|| file_size(&path));
+                .publish(conversation, message_id, &desc.name, &bytes)?;
             out.push(Attachment {
                 kind: desc.kind.clone(),
                 name: Arc::from(desc.name.as_str()),
@@ -346,7 +305,7 @@ impl Channel for TelegramChannel {
     }
 
     async fn receive(&mut self) -> Option<InboundEvent> {
-        let response = match self.fetch_updates() {
+        let response = match self.fetch_updates().await {
             Ok(Some(response)) => response,
             // Idle long poll: no updates this cycle. Not an error — poll again.
             Ok(None) => return None,
@@ -363,11 +322,14 @@ impl Channel for TelegramChannel {
             let Some(parsed) = parse_update(update, &self.id, &self.admission) else {
                 continue;
             };
-            let attachments = match self.download_attachments(
-                &parsed.attachments,
-                parsed.envelope.conversation_id.as_str(),
-                &parsed.message_id_str,
-            ) {
+            let attachments = match self
+                .download_attachments(
+                    &parsed.attachments,
+                    parsed.envelope.conversation_id.as_str(),
+                    &parsed.message_id_str,
+                )
+                .await
+            {
                 Ok(a) => a,
                 Err(err) => {
                     if self.log_receive_errors {
@@ -430,7 +392,7 @@ impl Channel for TelegramChannel {
 /// curl `--max-time` for the `getUpdates` long poll. Must stay well above the
 /// server-side `timeout=25` so a full-length poll plus connect/TLS setup never
 /// trips curl's own deadline and surfaces as a spurious backend error.
-const CURL_MAX_TIME_SECS: &str = "40";
+const TELEGRAM_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Telegram sendMessage hard limit: 4096 characters per message body.
 const TELEGRAM_TEXT_LIMIT: usize = 4096;
@@ -465,15 +427,13 @@ async fn tg_answer_callback(api_base: &str, token: &str, callback_query_id: &str
 }
 
 async fn tg_send_message(api_base: &str, token: &str, chat_id: &str, text: &str) -> Option<String> {
-    let response: Value = shared_client()
+    let response = shared_client()
         .post(format!("{api_base}/bot{token}/sendMessage"))
         .form(&[("chat_id", chat_id), ("text", text)])
         .send()
         .await
-        .ok()?
-        .json()
-        .await
         .ok()?;
+    let response = telegram_json(response).await.ok()?;
     response
         .get("result")?
         .get("message_id")?
@@ -495,7 +455,7 @@ async fn tg_edit_message(
     // per-delta streaming edit and must not spawn a process or re-handshake TLS.
     // A 4xx (e.g. "message is not modified") still returns a JSON body, so parse
     // the response regardless of status — matching the prior `curl` behavior.
-    let response: Value = shared_client()
+    let response = shared_client()
         .post(format!("{api_base}/bot{token}/editMessageText"))
         .form(&[
             ("chat_id", chat_id),
@@ -504,10 +464,8 @@ async fn tg_edit_message(
         ])
         .send()
         .await
-        .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?
-        .json()
-        .await
-        .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
+        .map_err(channel_http_error)?;
+    let response = telegram_json(response).await?;
     if response.get("ok").and_then(Value::as_bool) == Some(true) {
         return Ok(());
     }
@@ -521,22 +479,20 @@ async fn tg_edit_message(
     Err(ChannelError::Backend(Arc::from(response.to_string())))
 }
 
-fn check_send_response(
-    status: &std::process::ExitStatus,
-    stdout: &[u8],
-    stderr: &[u8],
-) -> Result<(), ChannelError> {
-    if !status.success() {
-        let stderr = String::from_utf8_lossy(stderr);
-        return Err(ChannelError::Backend(Arc::from(stderr.trim().to_owned())));
-    }
-    let response: Value = serde_json::from_slice(stdout)
-        .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
+fn check_send_response(response: &Value) -> Result<(), ChannelError> {
     if response.get("ok").and_then(Value::as_bool) == Some(true) {
         Ok(())
     } else {
         Err(ChannelError::Backend(Arc::from(response.to_string())))
     }
+}
+
+fn channel_http_error(error: reqwest::Error) -> ChannelError {
+    ChannelError::Backend(Arc::from(error.to_string()))
+}
+
+async fn telegram_json(response: reqwest::Response) -> Result<Value, ChannelError> {
+    crate::channels::bounded_response::json(response, "Telegram", TELEGRAM_RESPONSE_BYTES).await
 }
 
 #[derive(Debug)]

@@ -1,3 +1,5 @@
+use super::limits::{MAX_EVENT_BYTES, MAX_FRAME_BYTES, MAX_HEADERS, MAX_HEADER_BYTES};
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(super) struct FeishuFrame {
     pub(super) seq_id: u64,
@@ -54,6 +56,11 @@ impl FeishuFrame {
     }
 
     pub(super) fn decode(input: &[u8]) -> Result<Self, String> {
+        if input.len() > MAX_FRAME_BYTES {
+            return Err(format!(
+                "Feishu frame exceeds the {MAX_FRAME_BYTES}-byte limit"
+            ));
+        }
         let mut frame = Self::default();
         let mut cursor = 0;
         while cursor < input.len() {
@@ -66,13 +73,30 @@ impl FeishuFrame {
                 (3, 0) => frame.service = read_varint(input, &mut cursor)? as i32,
                 (4, 0) => frame.method = read_varint(input, &mut cursor)? as i32,
                 (5, 2) => {
+                    if frame.headers.len() >= MAX_HEADERS {
+                        return Err(format!(
+                            "Feishu frame carries more than {MAX_HEADERS} headers"
+                        ));
+                    }
                     let bytes = read_bytes(input, &mut cursor)?;
                     frame.headers.push(decode_header(bytes)?);
                 }
-                (6, 2) => frame.payload_encoding = decode_string(read_bytes(input, &mut cursor)?)?,
-                (7, 2) => frame.payload_type = decode_string(read_bytes(input, &mut cursor)?)?,
-                (8, 2) => frame.payload = read_bytes(input, &mut cursor)?.to_vec(),
-                (9, 2) => frame.log_id_new = decode_string(read_bytes(input, &mut cursor)?)?,
+                (6, 2) => {
+                    frame.payload_encoding = decode_header_string(read_bytes(input, &mut cursor)?)?
+                }
+                (7, 2) => {
+                    frame.payload_type = decode_header_string(read_bytes(input, &mut cursor)?)?
+                }
+                (8, 2) => {
+                    let payload = read_bytes(input, &mut cursor)?;
+                    if payload.len() > MAX_EVENT_BYTES {
+                        return Err(format!(
+                            "Feishu event payload exceeds the {MAX_EVENT_BYTES}-byte limit"
+                        ));
+                    }
+                    frame.payload = payload.to_vec();
+                }
+                (9, 2) => frame.log_id_new = decode_header_string(read_bytes(input, &mut cursor)?)?,
                 (_, _) => skip_proto_field(input, &mut cursor, wire)?,
             }
         }
@@ -124,6 +148,12 @@ pub(super) fn header_value<'a>(headers: &'a [FeishuHeader], key: &str) -> Option
 }
 
 fn decode_header(input: &[u8]) -> Result<FeishuHeader, String> {
+    if input.len() > MAX_HEADER_BYTES * 2 {
+        return Err(format!(
+            "Feishu header exceeds the {}-byte limit",
+            MAX_HEADER_BYTES * 2
+        ));
+    }
     let mut cursor = 0;
     let mut key = String::new();
     let mut value = String::new();
@@ -132,8 +162,8 @@ fn decode_header(input: &[u8]) -> Result<FeishuHeader, String> {
         let field = field_key >> 3;
         let wire = field_key & 0x07;
         match (field, wire) {
-            (1, 2) => key = decode_string(read_bytes(input, &mut cursor)?)?,
-            (2, 2) => value = decode_string(read_bytes(input, &mut cursor)?)?,
+            (1, 2) => key = decode_header_string(read_bytes(input, &mut cursor)?)?,
+            (2, 2) => value = decode_header_string(read_bytes(input, &mut cursor)?)?,
             (_, _) => skip_proto_field(input, &mut cursor, wire)?,
         }
     }
@@ -175,7 +205,8 @@ fn read_varint(input: &[u8], cursor: &mut usize) -> Result<u64, String> {
 }
 
 fn read_bytes<'a>(input: &'a [u8], cursor: &mut usize) -> Result<&'a [u8], String> {
-    let len = read_varint(input, cursor)? as usize;
+    let len = usize::try_from(read_varint(input, cursor)?)
+        .map_err(|_| "protobuf length does not fit this platform".to_owned())?;
     let end = cursor
         .checked_add(len)
         .ok_or_else(|| "protobuf length overflow".to_owned())?;
@@ -185,6 +216,15 @@ fn read_bytes<'a>(input: &'a [u8], cursor: &mut usize) -> Result<&'a [u8], Strin
     let bytes = &input[*cursor..end];
     *cursor = end;
     Ok(bytes)
+}
+
+fn decode_header_string(input: &[u8]) -> Result<String, String> {
+    if input.len() > MAX_HEADER_BYTES {
+        return Err(format!(
+            "Feishu header field exceeds the {MAX_HEADER_BYTES}-byte limit"
+        ));
+    }
+    decode_string(input)
 }
 
 fn decode_string(input: &[u8]) -> Result<String, String> {

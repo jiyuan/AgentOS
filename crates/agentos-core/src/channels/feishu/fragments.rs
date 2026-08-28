@@ -26,6 +26,8 @@ use agentos_interfaces::ChannelError;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::limits::MAX_EVENT_BYTES;
+
 /// Fragments one event may be split into.
 ///
 /// Feishu splits at a few hundred kilobytes, so a genuine event needs a
@@ -38,9 +40,6 @@ const MAX_FRAGMENTS: usize = 64;
 /// Nothing ever arrives to say an incomplete event will never be finished, so
 /// without a bound the map only grows.
 const MAX_PENDING_EVENTS: usize = 16;
-
-/// Bytes one reassembled event may total.
-const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
 
 /// Fragments waiting for the rest of themselves.
 #[derive(Debug, Default)]
@@ -68,13 +67,29 @@ impl FragmentBuffer {
         sum: Option<&str>,
         seq: Option<&str>,
         message_id: Option<&str>,
-        payload: &[u8],
+        payload: Vec<u8>,
     ) -> Result<Option<Vec<u8>>, ChannelError> {
-        let sum = sum
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(1);
+        if payload.len() > MAX_EVENT_BYTES {
+            return Err(backend(format!(
+                "Feishu event exceeds the {MAX_EVENT_BYTES}-byte limit"
+            )));
+        }
+        if sum.is_none() && (seq.is_some() || message_id.is_some()) {
+            return Err(backend(
+                "Feishu fragment metadata carries seq/message_id without sum",
+            ));
+        }
+        let sum = match sum {
+            Some(value) => value
+                .parse::<usize>()
+                .map_err(|_| backend("Feishu fragment sum header is not a valid number"))?,
+            None => 1,
+        };
+        if sum == 0 {
+            return Err(backend("Feishu fragment sum header must be at least 1"));
+        }
         if sum <= 1 {
-            return Ok(Some(payload.to_vec()));
+            return Ok(Some(payload));
         }
         // Before it is used to size anything.
         if sum > MAX_FRAGMENTS {
@@ -94,7 +109,7 @@ impl FragmentBuffer {
             )));
         }
 
-        self.received += 1;
+        self.received = self.received.saturating_add(1);
         let arrived = self.received;
         if !self.pending.contains_key(&message_id) {
             self.evict_oldest();
@@ -112,13 +127,15 @@ impl FragmentBuffer {
             entry.chunks = vec![None; sum];
         }
         entry.last_touched = arrived;
-        entry.chunks[seq] = Some(payload.to_vec());
+        entry.chunks[seq] = Some(payload);
 
-        let total: usize = entry
-            .chunks
-            .iter()
-            .map(|chunk| chunk.as_ref().map_or(0, Vec::len))
-            .sum();
+        let total = entry.chunks.iter().try_fold(0usize, |total, chunk| {
+            total.checked_add(chunk.as_ref().map_or(0, Vec::len))
+        });
+        let Some(total) = total else {
+            self.pending.remove(&message_id);
+            return Err(backend("Feishu fragmented event byte count overflow"));
+        };
         if total > MAX_EVENT_BYTES {
             // Dropped, not truncated: half an event is not an event, and
             // keeping the fragments would leave the peer holding the memory by
@@ -180,7 +197,7 @@ mod tests {
     fn an_unfragmented_event_passes_straight_through() {
         let mut buffer = FragmentBuffer::default();
         let whole = buffer
-            .accept(None, None, None, b"hello")
+            .accept(None, None, None, b"hello".to_vec())
             .expect("no headers means one piece");
         assert_eq!(whole, Some(b"hello".to_vec()));
         assert_eq!(buffer.pending_count(), 0);
@@ -192,18 +209,18 @@ mod tests {
         // Out of order on purpose: `seq` decides the position, not arrival.
         assert_eq!(
             buffer
-                .accept(Some("3"), Some("2"), Some("m1"), b"c")
+                .accept(Some("3"), Some("2"), Some("m1"), b"c".to_vec())
                 .expect("a partial event is not an error"),
             None
         );
         assert_eq!(
             buffer
-                .accept(Some("3"), Some("0"), Some("m1"), b"a")
+                .accept(Some("3"), Some("0"), Some("m1"), b"a".to_vec())
                 .expect("a partial event is not an error"),
             None
         );
         let whole = buffer
-            .accept(Some("3"), Some("1"), Some("m1"), b"b")
+            .accept(Some("3"), Some("1"), Some("m1"), b"b".to_vec())
             .expect("the last fragment completes it");
         assert_eq!(whole, Some(b"abc".to_vec()));
         assert_eq!(buffer.pending_count(), 0);
@@ -214,7 +231,12 @@ mod tests {
     fn a_fragment_count_a_peer_invented_does_not_allocate() {
         let mut buffer = FragmentBuffer::default();
         let error = buffer
-            .accept(Some(&usize::MAX.to_string()), Some("0"), Some("m1"), b"x")
+            .accept(
+                Some(&usize::MAX.to_string()),
+                Some("0"),
+                Some("m1"),
+                b"x".to_vec(),
+            )
             .expect_err("a peer does not get to choose an allocation size");
         assert!(error.to_string().contains("at most"), "{error}");
         assert_eq!(buffer.pending_count(), 0);
@@ -224,7 +246,7 @@ mod tests {
     fn a_sequence_number_past_the_end_is_refused_rather_than_indexed() {
         let mut buffer = FragmentBuffer::default();
         assert!(buffer
-            .accept(Some("2"), Some("5"), Some("m1"), b"x")
+            .accept(Some("2"), Some("5"), Some("m1"), b"x".to_vec())
             .is_err());
     }
 
@@ -235,13 +257,13 @@ mod tests {
         let mut buffer = FragmentBuffer::default();
         assert_eq!(
             buffer
-                .accept(Some("2"), Some("0"), Some("m1"), b"a")
+                .accept(Some("2"), Some("0"), Some("m1"), b"a".to_vec())
                 .expect("a partial event is not an error"),
             None
         );
         assert_eq!(
             buffer
-                .accept(Some("4"), Some("3"), Some("m1"), b"d")
+                .accept(Some("4"), Some("3"), Some("m1"), b"d".to_vec())
                 .expect("a partial event is not an error"),
             None
         );
@@ -255,7 +277,12 @@ mod tests {
         for index in 0..MAX_PENDING_EVENTS * 4 {
             assert_eq!(
                 buffer
-                    .accept(Some("2"), Some("0"), Some(&format!("m{index}")), b"x")
+                    .accept(
+                        Some("2"),
+                        Some("0"),
+                        Some(&format!("m{index}")),
+                        b"x".to_vec(),
+                    )
                     .expect("a partial event is not an error"),
                 None
             );
@@ -274,17 +301,22 @@ mod tests {
         let mut buffer = FragmentBuffer::default();
         assert_eq!(
             buffer
-                .accept(Some("2"), Some("0"), Some("live"), b"a")
+                .accept(Some("2"), Some("0"), Some("live"), b"a".to_vec())
                 .expect("a partial event is not an error"),
             None
         );
         for index in 0..MAX_PENDING_EVENTS - 1 {
-            let _ = buffer.accept(Some("2"), Some("0"), Some(&format!("junk{index}")), b"x");
+            let _ = buffer.accept(
+                Some("2"),
+                Some("0"),
+                Some(&format!("junk{index}")),
+                b"x".to_vec(),
+            );
             // Touch the live event so it stays the most recent.
-            let _ = buffer.accept(Some("2"), Some("0"), Some("live"), b"a");
+            let _ = buffer.accept(Some("2"), Some("0"), Some("live"), b"a".to_vec());
         }
         let whole = buffer
-            .accept(Some("2"), Some("1"), Some("live"), b"b")
+            .accept(Some("2"), Some("1"), Some("live"), b"b".to_vec())
             .expect("the live event completes");
         assert_eq!(whole, Some(b"ab".to_vec()));
     }
@@ -296,12 +328,12 @@ mod tests {
         let chunk = vec![b'x'; MAX_EVENT_BYTES / 2 + 1];
         assert_eq!(
             buffer
-                .accept(Some("4"), Some("0"), Some("m1"), &chunk)
+                .accept(Some("4"), Some("0"), Some("m1"), chunk.clone())
                 .expect("a partial event is not an error"),
             None
         );
         let error = buffer
-            .accept(Some("4"), Some("1"), Some("m1"), &chunk)
+            .accept(Some("4"), Some("1"), Some("m1"), chunk)
             .expect_err("past the byte ceiling");
         assert!(error.to_string().contains("exceeds"), "{error}");
         // And the fragments are released rather than held by a peer that will

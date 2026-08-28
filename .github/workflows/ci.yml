@@ -81,6 +81,8 @@ jobs:
         run: bash scripts/check-module-size.sh
       - name: Provider calls go through the request gateway
         run: bash scripts/check-provider-calls.sh
+      - name: Runtime children use the common subprocess boundary
+        run: bash scripts/check-subprocess-boundaries.sh
       - name: Generated catalogs are current
         run: bash scripts/check-catalogs.sh
       # The catalogs, the capability matrix and the release notes are each

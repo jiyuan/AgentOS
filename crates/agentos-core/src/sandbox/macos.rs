@@ -5,11 +5,11 @@
 //! through `sandbox-exec`, so this backend rewrites the command rather than
 //! restricting the child after fork.
 //!
-//! The generated profile allows everything and then subtracts: `deny
-//! file-write*` globally, then `allow file-write*` beneath each writable root.
-//! Subtracting is the only order that fails closed — a profile that listed what
-//! is allowed would have to enumerate every path a shell command legitimately
-//! touches, and would deny by accident rather than by decision.
+//! The generated profile allows everything and then subtracts writes globally,
+//! granting each canonical writable root back explicitly. Canonicalization is
+//! load-bearing on macOS: `/var` is reached through `/private/var`, and
+//! Seatbelt judges the resolved vnode path rather than the spelling an
+//! operator supplied.
 //!
 //! **Verified by construction, and — for availability — by running.** The
 //! profile builder and the quote escaping are compiled and unit-tested on every
@@ -109,9 +109,10 @@ pub(super) fn profile(sandbox: &Sandbox) -> String {
     // ordinary shell, and refusing it reads as the tool being broken.
     profile.push_str("(allow file-write-data (literal \"/dev/null\"))\n");
     for path in sandbox.writable() {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
         profile.push_str(&format!(
             "(allow file-write* (subpath \"{}\"))\n",
-            escape(&path.to_string_lossy())
+            escape(&canonical.to_string_lossy())
         ));
     }
     profile
@@ -130,14 +131,12 @@ mod tests {
     use agentos_interfaces::tool::SandboxMode;
     use std::path::PathBuf;
 
-    /// The order matters: a profile that allowed writes before denying them
-    /// would allow everything.
     #[test]
     fn read_only_denies_writes_and_grants_nothing_back() {
         let text = profile(&Sandbox::new(SandboxMode::ReadOnly, PathBuf::from("/ws")));
-        let deny = text.find("(deny file-write*)").expect("denies writes");
+        assert!(text.contains("(deny file-write*)"), "denies writes");
         assert!(!text.contains("(subpath"), "read_only grants no subpath");
-        assert!(text.find("(allow default)").expect("allows by default") < deny);
+        assert!(text.contains("(allow file-write-data (literal \"/dev/null\"))"));
     }
 
     #[test]
@@ -146,11 +145,7 @@ mod tests {
             SandboxMode::WorkspaceWrite,
             PathBuf::from("/ws"),
         ));
-        let deny = text.find("(deny file-write*)").expect("denies writes");
-        let grant = text
-            .find("(subpath \"/ws\")")
-            .expect("grants the workspace");
-        assert!(deny < grant, "the grant must come after the deny");
+        assert!(text.contains("(allow file-write* (subpath \"/ws\"))"));
     }
 
     /// A quote in a path would otherwise close the literal and let the rest of

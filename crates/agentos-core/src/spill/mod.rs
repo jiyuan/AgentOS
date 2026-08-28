@@ -58,8 +58,9 @@
 use crate::paths::{ContainmentError, RootDir};
 use agentos_proto::{RunId, ToolCallId};
 use std::fmt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -69,6 +70,8 @@ pub enum SpillError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error(transparent)]
+    Containment(#[from] ContainmentError),
 }
 
 /// The scheme every locator carries, so a string that is not one is obvious
@@ -215,17 +218,34 @@ impl Default for ContentLimits<'_> {
 #[derive(Clone, Debug)]
 pub struct SpillStore {
     root: PathBuf,
+    rooted: Arc<OnceLock<Arc<RootDir>>>,
 }
 
 impl SpillStore {
     /// A store rooted at `root`. The directory is created on first write, not
     /// here, so constructing a store never touches the disk.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            rooted: Arc::new(OnceLock::new()),
+        }
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    fn root_dir(&self) -> Result<Arc<RootDir>, SpillError> {
+        if let Some(root) = self.rooted.get() {
+            return Ok(root.clone());
+        }
+        crate::paths::create_private_dir(&self.root).map_err(|err| SpillError::Io {
+            path: err.path().to_path_buf(),
+            source: err.into_io(),
+        })?;
+        let root = Arc::new(RootDir::open(&self.root)?);
+        let _ = self.rooted.set(root.clone());
+        Ok(self.rooted.get().cloned().unwrap_or(root))
     }
 
     /// Persist `content` and return its locator.
@@ -239,13 +259,29 @@ impl SpillStore {
     ) -> Result<SpillRef, SpillError> {
         let run = safe_segment(source.run_id.as_str());
         let artifact = spill_file_name(source);
-        let dir = self.root.join(&run);
-        create_private_dir(&dir).await?;
-        write_private_file(&dir.join(&artifact), content).await?;
+        let relative = Path::new(&run).join(&artifact);
+        let root = self.root_dir()?;
+        let content = content.as_bytes().to_vec();
+        let content_len = content.len() as u64;
+        let write_path = relative.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut file = root.create_new_file(&write_path)?;
+            file.write_all(&content)
+                .and_then(|()| file.sync_all())
+                .map_err(|source| SpillError::Io {
+                    path: root.path().join(&write_path),
+                    source,
+                })
+        })
+        .await
+        .map_err(|err| SpillError::Io {
+            path: self.root.join(&relative),
+            source: std::io::Error::other(format!("spill writer task failed: {err}")),
+        })??;
 
         let locator = SpillLocator::new(run, artifact);
         Ok(SpillRef {
-            bytes: content.len() as u64,
+            bytes: content_len,
             retrieval_hint: Arc::from(format!(
                 "The full output was saved as {locator}. Read it with the `spill_read` tool \
                  (use `offset`/`tail` for a slice) instead of re-running the command."
@@ -266,7 +302,12 @@ impl SpillStore {
     /// caller may have it is the `spill_read` tool's question, and it asks the
     /// transcript.
     pub fn open(&self, locator: &SpillLocator) -> Result<std::fs::File, ContainmentError> {
-        RootDir::open(&self.root)?.open_file(Path::new(locator.run()).join(locator.artifact()))
+        self.root_dir()
+            .map_err(|error| match error {
+                SpillError::Containment(error) => error,
+                SpillError::Io { path, source } => ContainmentError::Root { root: path, source },
+            })?
+            .open_file(Path::new(locator.run()).join(locator.artifact()))
     }
 }
 
@@ -305,53 +346,6 @@ fn spill_file_name(source: &SpillSource<'_>) -> String {
         safe_segment(source.tool_name),
         safe_segment(source.call_id.as_str())
     )
-}
-
-#[cfg(unix)]
-async fn create_private_dir(dir: &Path) -> Result<(), SpillError> {
-    let mut builder = tokio::fs::DirBuilder::new();
-    builder.recursive(true).mode(0o700);
-    builder.create(dir).await.map_err(|source| SpillError::Io {
-        path: dir.to_path_buf(),
-        source,
-    })
-}
-
-#[cfg(not(unix))]
-async fn create_private_dir(dir: &Path) -> Result<(), SpillError> {
-    // No mode bits to set; the parent directory's ACL governs access.
-    tokio::fs::create_dir_all(dir)
-        .await
-        .map_err(|source| SpillError::Io {
-            path: dir.to_path_buf(),
-            source,
-        })
-}
-
-/// Create the file exclusively and write it. `create_new` is `O_EXCL`, so an
-/// existing file *or symlink* at the path is an error rather than a target.
-async fn write_private_file(path: &Path, content: &str) -> Result<(), SpillError> {
-    use tokio::io::AsyncWriteExt;
-
-    let mut options = tokio::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    // `mode` is tokio's own unix-only inherent method; no std extension trait.
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options.open(path).await.map_err(|source| SpillError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    file.write_all(content.as_bytes())
-        .await
-        .map_err(|source| SpillError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    file.flush().await.map_err(|source| SpillError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
 }
 
 #[cfg(test)]
@@ -426,7 +420,7 @@ mod tests {
         // Learn the exact path the store will use, then plant a symlink there
         // pointing at a file we must not clobber.
         let dir = root.join(safe_segment(run.as_str()));
-        create_private_dir(&dir).await.expect("dir is creatable");
+        crate::paths::create_private_dir(&dir).expect("dir is creatable");
         let target = root.join("victim.txt");
         std::fs::write(&target, "original").expect("victim is writable");
         let planted = dir.join(spill_file_name(&spill_source));
@@ -439,7 +433,7 @@ mod tests {
             .save_text(&spill_source, "attacker-controlled")
             .await
             .expect_err("an occupied path must be rejected");
-        assert!(matches!(error, SpillError::Io { .. }));
+        assert!(matches!(error, SpillError::Containment(_)));
         assert_eq!(
             std::fs::read_to_string(&target).expect("victim still reads"),
             "original",

@@ -1,5 +1,6 @@
 use super::common::{default_skills_dir, elapsed_ms, result_metadata, skills_root_for_tests};
-use crate::skills::{validate_skill_dir, SkillStoreError};
+use crate::paths::{ContainmentError, RootDir};
+use crate::skills::{validate_skill, SkillStoreError};
 use agentos_interfaces::tool::{
     SandboxMode, Tool, ToolError, ToolPersistenceScope, ToolSafety, ToolSideEffect, ToolSpec,
 };
@@ -75,12 +76,27 @@ impl Tool for SkillValidateTool {
             "skill_validate invoked"
         );
 
-        let outcome = validate_skill_dir(&skill_dir);
+        let outcome = validate_skill(&root, &parsed.name);
         match outcome {
             Ok(skill) => {
-                let canonical = skill_dir.canonicalize().unwrap_or(skill_dir.clone());
-                let inventory =
-                    bundle_inventory(&skill_dir).unwrap_or_else(|err| vec![format!("{err}")]);
+                let inventory = match bundle_inventory(&root, &parsed.name) {
+                    Ok(inventory) => inventory,
+                    Err(error) => {
+                        let message = format!(
+                            "skill_validate: FAIL — '{}' at {}\n  reason: {}",
+                            parsed.name,
+                            skill_dir.display(),
+                            error
+                        );
+                        let bytes_out = message.len() as u64;
+                        return Ok(ToolResult {
+                            call_id: call.id.clone(),
+                            status: ToolStatus::Failed,
+                            content: Arc::from(message),
+                            metadata: result_metadata(elapsed_ms(start), bytes_out),
+                        });
+                    }
+                };
                 let inventory = inventory
                     .iter()
                     .map(|entry| format!("  - {entry}"))
@@ -91,14 +107,14 @@ impl Tool for SkillValidateTool {
                      bundle_inventory:\n{}\n\
                      note: PASS confirms SKILL.md structure only; ensure the listed bundle files satisfy the requested workflow before final response.",
                     skill.name,
-                    canonical.display(),
+                    skill_dir.display(),
                     skill.description,
                     inventory
                 );
                 tracing::info!(
                     tool = "skill_validate",
                     skill_name = %skill.name,
-                    canonical_path = %canonical.display(),
+                    skill_path = %skill_dir.display(),
                     "skill_validate passed"
                 );
                 let bytes_out = message.len() as u64;
@@ -143,6 +159,12 @@ fn format_validation_failure(
             "The skill directory or SKILL.md does not exist. Use the `file` \
              tool to write the bundle first, then re-run `skill_validate`."
         }
+        SkillStoreError::Containment(
+            ContainmentError::Root { source, .. } | ContainmentError::Io { source, .. },
+        ) if source.kind() == std::io::ErrorKind::NotFound => {
+            "The skill directory or SKILL.md does not exist. Use the `file` \
+             tool to write the bundle first, then re-run `skill_validate`."
+        }
         SkillStoreError::Invalid { message, .. } if message.contains("frontmatter") => {
             "SKILL.md must start with `---\\n` and have a matching `\\n---` \
              closing delimiter, with `name:` and `description:` keys inside. \
@@ -167,6 +189,9 @@ fn format_validation_failure(
         SkillStoreError::Missing(_) | SkillStoreError::Exists(_) => {
             "Unexpected store error during validation."
         }
+        SkillStoreError::Containment(_) => {
+            "The bundle contains a symlink or another path that cannot be safely opened."
+        }
     };
     format!(
         "skill_validate: FAIL — '{}' at {}\n  reason: {}\n  hint: {}",
@@ -177,9 +202,14 @@ fn format_validation_failure(
     )
 }
 
-fn bundle_inventory(skill_dir: &Path) -> Result<Vec<String>, String> {
+const MAX_INVENTORY_DEPTH: usize = 8;
+const MAX_INVENTORY_ENTRIES: usize = 1_024;
+
+fn bundle_inventory(root: &Path, name: &str) -> Result<Vec<String>, String> {
+    let rooted = RootDir::open(root).map_err(|err| format!("bundle root unavailable: {err}"))?;
     let mut entries = Vec::new();
-    collect_bundle_files(skill_dir, skill_dir, &mut entries)?;
+    let skill = Path::new(name);
+    collect_bundle_files(&rooted, skill, skill, 0, &mut entries)?;
     entries.sort();
     if entries.is_empty() {
         entries.push("(no files found)".to_owned());
@@ -187,17 +217,38 @@ fn bundle_inventory(skill_dir: &Path) -> Result<Vec<String>, String> {
     Ok(entries)
 }
 
-fn collect_bundle_files(root: &Path, dir: &Path, entries: &mut Vec<String>) -> Result<(), String> {
-    let read_dir = std::fs::read_dir(dir)
+fn collect_bundle_files(
+    root: &RootDir,
+    skill: &Path,
+    dir: &Path,
+    depth: usize,
+    entries: &mut Vec<String>,
+) -> Result<(), String> {
+    if depth > MAX_INVENTORY_DEPTH {
+        return Err(format!(
+            "bundle inventory exceeds the {MAX_INVENTORY_DEPTH}-directory depth limit"
+        ));
+    }
+    let read_dir = root
+        .read_dir(dir)
         .map_err(|err| format!("bundle inventory unavailable at {}: {err}", dir.display()))?;
     for entry in read_dir {
-        let entry = entry
-            .map_err(|err| format!("bundle inventory read failed at {}: {err}", dir.display()))?;
-        let path = entry.path();
-        if path.is_dir() {
-            collect_bundle_files(root, &path, entries)?;
-        } else if path.is_file() {
-            entries.push(relative_bundle_path(root, &path));
+        if entries.len() >= MAX_INVENTORY_ENTRIES {
+            return Err(format!(
+                "bundle inventory exceeds the {MAX_INVENTORY_ENTRIES}-entry limit"
+            ));
+        }
+        let path = dir.join(&entry.name);
+        if entry.is_symlink {
+            return Err(format!(
+                "bundle inventory refuses symbolic link {}",
+                path.display()
+            ));
+        }
+        if entry.is_dir {
+            collect_bundle_files(root, skill, &path, depth + 1, entries)?;
+        } else {
+            entries.push(relative_bundle_path(skill, &path));
         }
     }
     Ok(())
@@ -269,6 +320,46 @@ mod tests {
         assert!(result.content.contains("  - SKILL.md"));
         assert!(result.content.contains("  - references/schema.md"));
         assert!(result.content.contains("  - scripts/run.py"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bundle_inventory_refuses_symlinks_instead_of_following_cycles() {
+        let guard = SkillsDirGuard::new("skill-validate-cycle");
+        let skill_dir = guard.dir.join("cycle-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::os::unix::fs::symlink(&skill_dir, skill_dir.join("cycle")).unwrap();
+
+        let error = bundle_inventory(&guard.dir, "cycle-skill").expect_err("link is refused");
+        assert!(error.contains("symbolic link"), "{error}");
+    }
+
+    #[test]
+    fn bundle_inventory_has_a_depth_ceiling() {
+        let guard = SkillsDirGuard::new("skill-validate-depth");
+        let skill_dir = guard.dir.join("deep-skill");
+        let mut dir = skill_dir.clone();
+        for depth in 0..=MAX_INVENTORY_DEPTH {
+            dir.push(format!("d{depth}"));
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("leaf.txt"), b"leaf").unwrap();
+
+        let error = bundle_inventory(&guard.dir, "deep-skill").expect_err("depth is bounded");
+        assert!(error.contains("depth limit"), "{error}");
+    }
+
+    #[test]
+    fn bundle_inventory_has_an_entry_ceiling() {
+        let guard = SkillsDirGuard::new("skill-validate-count");
+        let skill_dir = guard.dir.join("wide-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        for index in 0..=MAX_INVENTORY_ENTRIES {
+            std::fs::write(skill_dir.join(format!("entry-{index}")), b"x").unwrap();
+        }
+
+        let error = bundle_inventory(&guard.dir, "wide-skill").expect_err("count is bounded");
+        assert!(error.contains("entry limit"), "{error}");
     }
 
     #[tokio::test]

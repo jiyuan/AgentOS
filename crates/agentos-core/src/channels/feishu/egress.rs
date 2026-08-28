@@ -9,8 +9,9 @@
 //! edit-in-place state a streamed reply is finalized against.
 
 use super::{
-    clamp_feishu_text, feishu_edit_text, feishu_send_text_message, feishu_tenant_token, post_json,
-    reqwest_to_channel_err, CachedTenantToken, FEISHU_EDIT_INTERVAL, FEISHU_TEXT_LIMIT,
+    clamp_feishu_text, feishu_edit_text, feishu_json, feishu_send_text_message,
+    feishu_tenant_token, post_json, reqwest_to_channel_err, CachedTenantToken,
+    FEISHU_EDIT_INTERVAL, FEISHU_TEXT_LIMIT,
 };
 use crate::channels::text::split_text;
 use crate::http::shared_client;
@@ -117,17 +118,15 @@ impl FeishuEgress {
         let form = Form::new()
             .text("image_type", "message")
             .part("image", Part::bytes(bytes).file_name(file_name));
-        let response: Value = shared_client()
+        let response = shared_client()
             .post(self.api_url("im/v1/images"))
             .bearer_auth(token.as_ref())
             .multipart(form)
             .send()
             .await
             .and_then(reqwest::Response::error_for_status)
-            .map_err(reqwest_to_channel_err)?
-            .json()
-            .await
             .map_err(reqwest_to_channel_err)?;
+        let response = feishu_json(response).await?;
         if response.get("code").and_then(Value::as_i64) != Some(0) {
             return Err(ChannelError::Backend(Arc::from(response.to_string())));
         }
@@ -151,17 +150,15 @@ impl FeishuEgress {
             .text("file_type", "stream")
             .text("file_name", name.to_owned())
             .part("file", part);
-        let response: Value = shared_client()
+        let response = shared_client()
             .post(self.api_url("im/v1/files"))
             .bearer_auth(token.as_ref())
             .multipart(form)
             .send()
             .await
             .and_then(reqwest::Response::error_for_status)
-            .map_err(reqwest_to_channel_err)?
-            .json()
-            .await
             .map_err(reqwest_to_channel_err)?;
+        let response = feishu_json(response).await?;
         if response.get("code").and_then(Value::as_i64) != Some(0) {
             return Err(ChannelError::Backend(Arc::from(response.to_string())));
         }

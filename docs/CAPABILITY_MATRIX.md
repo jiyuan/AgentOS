@@ -127,8 +127,8 @@ parsing, streaming assembly, and retry behavior.
 |---|---|---|---|---|---|
 | TUI | Stable | all | — | — | integration |
 | One-shot CLI | Stable | all | — | — | integration |
-| Telegram | **Preview** | all | `[[channels]]`, bot token, an allowlist | Fails closed on identity, with a sender allowlist. The `getUpdates` offset is persisted in the ingress ledger after the update is recorded, and every update carries its `update_id` as the dedupe key. Preview because the transport still shells out to `curl` | unit |
-| Feishu | **Preview** | all | `[[channels]]`, app credentials, an allowlist | Fails closed on identity; fragment reassembly is bounded by count, pending events, and bytes. `event_id` is now the ingress dedupe key, with `message_id` standing in when a payload carries no header id. Preview because the long-connection reconnect path has no end-to-end test | unit |
+| Telegram | **Preview** | all | `[[channels]]`, bot token, an allowlist | Fails closed on identity, with a sender allowlist. The `getUpdates` offset is persisted in the ingress ledger after the update is recorded, and every update carries its `update_id` as the dedupe key. Uses pooled async HTTP with a streamed response cap; preview pending broader transport interoperability coverage | unit |
+| Feishu | **Preview** | all | `[[channels]]`, app credentials, an allowlist | Fails closed on identity; WebSocket frames, protobuf fields, every event shape, fragment reassembly, and API responses are bounded before accumulation. `event_id` is the ingress dedupe key, with `message_id` standing in when a payload carries no header id. Preview because the long-connection reconnect path has no end-to-end test | unit |
 | Attachments | Stable | all | `[limits] attachment_bytes`, `attachments_per_message` | Downloads are streamed and stop at the byte cap; per-message count is bounded and the surplus is reported, not silently dropped. Path components are injectively encoded, so two conversations cannot share a directory | unit |
 
 ## Orchestration and workspace

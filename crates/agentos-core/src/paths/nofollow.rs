@@ -22,6 +22,7 @@ mod imp {
     /// Every `openat` here carries `O_NOFOLLOW` and `O_CLOEXEC`: no component
     /// may be a symlink, and no descriptor leaks into a tool subprocess.
     const BASE_FLAGS: libc::c_int = libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    pub(crate) type DirFd = OwnedFd;
 
     /// Whether the component `name` under `dir` is a symbolic link, given the
     /// error opening it produced.
@@ -152,8 +153,20 @@ mod imp {
         let flags = match mode {
             LeafMode::Read => BASE_FLAGS | libc::O_RDONLY,
             LeafMode::Write => BASE_FLAGS | libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+            LeafMode::Append => BASE_FLAGS | libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
+            LeafMode::CreateNew => BASE_FLAGS | libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
         };
         openat(parent.as_raw_fd(), leaf, flags, 0o600)
+            .and_then(|fd| {
+                // `mode` applies only when `O_CREAT` wins. Tighten an existing
+                // regular file too, so opening it for state never preserves a
+                // permissive mode from an earlier writer.
+                // SAFETY: `fd` is live and owned here.
+                if mode != LeafMode::Read && unsafe { libc::fchmod(fd.as_raw_fd(), 0o600) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(fd)
+            })
             .map(File::from)
             .map_err(|source| {
                 if is_symlink_refusal(parent.as_raw_fd(), leaf, &source) {
@@ -162,6 +175,47 @@ mod imp {
                     LeafFailure::Io(source)
                 }
             })
+    }
+
+    pub(crate) fn rename_leaf_at(
+        parent: &OwnedFd,
+        source: &str,
+        destination: &str,
+    ) -> io::Result<()> {
+        let source = c_name(source)?;
+        let destination = c_name(destination)?;
+        // SAFETY: both names are valid C strings and both directory arguments
+        // are the same live descriptor retained from the no-follow walk.
+        if unsafe {
+            libc::renameat(
+                parent.as_raw_fd(),
+                source.as_ptr(),
+                parent.as_raw_fd(),
+                destination.as_ptr(),
+            )
+        } == 0
+        {
+            return Ok(());
+        }
+        Err(io::Error::last_os_error())
+    }
+
+    pub(crate) fn remove_leaf_at(parent: &OwnedFd, leaf: &str) -> io::Result<()> {
+        let leaf = c_name(leaf)?;
+        // SAFETY: `parent` is live and `leaf` is NUL-terminated.
+        if unsafe { libc::unlinkat(parent.as_raw_fd(), leaf.as_ptr(), 0) } == 0 {
+            return Ok(());
+        }
+        Err(io::Error::last_os_error())
+    }
+
+    pub(crate) fn sync_dir(parent: &OwnedFd) -> io::Result<()> {
+        // SAFETY: `parent` is a live directory descriptor. `fsync` does not
+        // take ownership and reports durability failure through errno.
+        if unsafe { libc::fsync(parent.as_raw_fd()) } == 0 {
+            return Ok(());
+        }
+        Err(io::Error::last_os_error())
     }
 
     /// Set `errno` to zero.
@@ -288,6 +342,7 @@ mod imp {
 
     /// A placeholder descriptor type for platforms with no `openat`.
     pub(crate) struct NoFd;
+    pub(crate) type DirFd = NoFd;
 
     impl RootDir {
         pub(crate) fn descend(
@@ -308,12 +363,28 @@ mod imp {
         Err(LeafFailure::Io(io::Error::from(io::ErrorKind::Unsupported)))
     }
 
+    pub(crate) fn rename_leaf_at(
+        _parent: &NoFd,
+        _source: &str,
+        _destination: &str,
+    ) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
+    pub(crate) fn remove_leaf_at(_parent: &NoFd, _leaf: &str) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
+    pub(crate) fn sync_dir(_parent: &NoFd) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
     pub(crate) fn list_dir(_dir: NoFd) -> io::Result<Vec<DirEntry>> {
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 }
 
 #[cfg(unix)]
-pub(super) use imp::{list_dir, open_leaf_at};
+pub(super) use imp::{list_dir, open_leaf_at, remove_leaf_at, rename_leaf_at, sync_dir, DirFd};
 #[cfg(not(unix))]
-pub(super) use imp::{list_dir, open_leaf_at, NoFd};
+pub(super) use imp::{list_dir, open_leaf_at, remove_leaf_at, rename_leaf_at, sync_dir, DirFd};

@@ -10,8 +10,11 @@
 mod support;
 
 use agentos_core::crons::{CronSchedule, CronStore, CronTask};
-use agentos_core::paths::write_private_atomic;
+use agentos_core::paths::{write_private_atomic, RootDir};
+use agentos_core::task_workspace::TaskWorkspace;
+use agentos_proto::TaskId;
 use agentos_proto::{ChannelId, ConversationId};
+use serde_json::json;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Mutex;
@@ -94,6 +97,82 @@ fn a_replaced_state_file_stays_private_under_a_permissive_umask() {
         0o666,
         "at umask 0 a plain write is world-writable, which is the whole point"
     );
+}
+
+#[test]
+fn rooted_create_append_and_publish_are_private_under_a_permissive_umask() {
+    use std::io::Write;
+
+    let tree = support::temp_tree("rooted-modes");
+    let root = RootDir::open(tree.path()).expect("root opens");
+    under_permissive_umask(|| {
+        root.create_dir_all("private/nested")
+            .expect("directories create");
+        let mut created = root
+            .create_file("private/nested/created.txt")
+            .expect("file creates");
+        created.write_all(b"first").expect("file writes");
+        drop(created);
+        let mut appended = root
+            .append_file("private/nested/created.txt")
+            .expect("file appends");
+        appended.write_all(b"-second").expect("append writes");
+        drop(appended);
+        root.write_file_atomic("private/nested/state.json", b"state")
+            .expect("state publishes");
+    });
+
+    assert_eq!(
+        std::fs::read(tree.path().join("private/nested/created.txt")).expect("readable"),
+        b"first-second"
+    );
+    assert_eq!(mode_of(&tree.path().join("private")), 0o700);
+    assert_eq!(mode_of(&tree.path().join("private/nested")), 0o700);
+    assert_eq!(
+        mode_of(&tree.path().join("private/nested/created.txt")),
+        0o600
+    );
+    assert_eq!(
+        mode_of(&tree.path().join("private/nested/state.json")),
+        0o600
+    );
+}
+
+#[test]
+fn fsync_failure_aborts_state_commit() {
+    // AF-019: the injected parent-fsync failure itself is exercised beside
+    // RootDir's private syscall hook in paths/rooted.rs. This native integration
+    // test covers the other half of the finding: every migrated task/session
+    // artifact retains private modes even when the process umask permits all.
+    let tree = support::temp_tree("af019-task-session-modes");
+    let tasks = tree.path().join("workspace/tasks");
+    let workspace = TaskWorkspace::new(&tasks);
+    let task = TaskId::new("alpha");
+
+    under_permissive_umask(|| {
+        workspace.init_task(&task).expect("task initializes");
+        workspace
+            .append_session_event(&task, "turn-1", &json!({"secret": true}))
+            .expect("session appends");
+    });
+
+    let task_dir = tasks.join("alpha");
+    for dir in [
+        tasks.clone(),
+        task_dir.clone(),
+        task_dir.join("subagents"),
+        task_dir.join("suborchestrators"),
+        task_dir.join("sessions"),
+    ] {
+        assert_eq!(mode_of(&dir), 0o700, "{} must be private", dir.display());
+    }
+    for file in [
+        task_dir.join("task.toml"),
+        task_dir.join("state.toml"),
+        task_dir.join("sessions/turn-1.jsonl"),
+    ] {
+        assert_eq!(mode_of(&file), 0o600, "{} must be private", file.display());
+    }
 }
 
 /// Atomicity, observed rather than argued: a reader racing a replacement sees

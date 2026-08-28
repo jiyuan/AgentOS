@@ -154,13 +154,18 @@ pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), DurableWrit
         });
     }
 
-    // The rename is durable only once the directory entry is. Best effort:
-    // some filesystems refuse to open a directory for this, and on those the
-    // rename's own ordering guarantee is all there is. Failing the write over
-    // it would turn a weaker guarantee into no write at all.
-    if let Ok(dir) = File::open(parent) {
-        let _ = dir.sync_all();
-    }
+    // The rename is durable only once the directory entry is. A failure here
+    // means the new bytes may be visible but their crash durability is unknown,
+    // so success would be a false claim and must not be returned.
+    let dir = File::open(parent).map_err(|source| DurableWriteError::Replace {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    dir.sync_all()
+        .map_err(|source| DurableWriteError::Replace {
+            path: path.to_path_buf(),
+            source,
+        })?;
     Ok(())
 }
 

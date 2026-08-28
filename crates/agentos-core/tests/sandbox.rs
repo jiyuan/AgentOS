@@ -189,6 +189,8 @@ async fn a_read_only_child_can_still_read() {
 /// workspace and nothing outside it.
 #[tokio::test]
 async fn a_workspace_write_child_writes_inside_and_not_outside() {
+    // AF-020: Seatbelt must grant the canonical workspace path back after the
+    // global write denial, while retaining the denial everywhere else.
     enforced_or_fail!("a_workspace_write_child_writes_inside_and_not_outside");
     let workspace = temp_dir("workspace-write");
     // Not another temp dir: `workspace_write` grants the temp dir on purpose,
@@ -366,6 +368,8 @@ async fn the_isolation_worker_runs_under_its_sandbox() {
 /// the tool anyway — is the one outcome nobody asked for.
 #[tokio::test]
 async fn an_unbuildable_sandbox_fails_the_call() {
+    // AF-020: a missing configured root is a setup failure, not a directory
+    // for the runtime to manufacture immediately before granting it.
     enforced_or_fail!("an_unbuildable_sandbox_fails_the_call");
     // Under a root this process cannot write to, so it cannot be created
     // either — a directory that is merely absent is created on demand.

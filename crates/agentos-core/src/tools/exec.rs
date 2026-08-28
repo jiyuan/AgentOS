@@ -55,8 +55,10 @@
 
 use crate::sandbox::Sandbox;
 use crate::tools::child_env;
+use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::PathBuf;
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -138,60 +140,114 @@ pub struct ExecOutput {
     pub truncated: bool,
 }
 
-/// Run a child process to completion, under a deadline.
-pub async fn run(exec: Exec<'_>) -> Result<ExecOutput, ExecError> {
-    let program = exec.program.to_owned();
-    let timeout_ms = exec.timeout.as_millis() as u64;
+/// Spawn-time inputs shared by one-shot tools and long-lived runtime children.
+pub(crate) struct Spawn<'a> {
+    pub program: &'a str,
+    pub args: &'a [String],
+    pub sandbox: &'a Sandbox,
+    pub cwd: Option<PathBuf>,
+    pub environment: &'a BTreeMap<OsString, OsString>,
+}
 
-    // On a platform that sandboxes by wrapping (macOS), this is where the
-    // wrapper takes over as the program being run; elsewhere it is the tool's
-    // own command, restricted below.
-    let (spawned, args) = exec.sandbox.wrap(exec.program, exec.args);
-    let mut command = Command::new(&spawned);
+/// A child and the process group whose lifetime it owns.
+///
+/// Dropping this value kills the whole group. A caller that deliberately wants
+/// descendants to survive a successful direct-child exit must say so via
+/// [`Self::leave_group_running`].
+pub(crate) struct ManagedChild {
+    child: tokio::process::Child,
+    group: Option<ProcessGroup>,
+}
+
+impl ManagedChild {
+    pub(crate) fn take_stdin(&mut self) -> Option<tokio::process::ChildStdin> {
+        self.child.stdin.take()
+    }
+
+    pub(crate) fn take_stdout(&mut self) -> Option<tokio::process::ChildStdout> {
+        self.child.stdout.take()
+    }
+
+    pub(crate) fn take_stderr(&mut self) -> Option<tokio::process::ChildStderr> {
+        self.child.stderr.take()
+    }
+
+    pub(crate) async fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        self.child.wait().await
+    }
+
+    pub(crate) fn leave_group_running(&mut self) {
+        if let Some(group) = self.group.as_mut() {
+            group.leave_running();
+        }
+    }
+
+    pub(crate) fn signal_group(&mut self, signal: libc::c_int) {
+        if let Some(group) = self.group.as_mut() {
+            group.signal(signal);
+        }
+    }
+
+    pub(crate) async fn kill_and_reap(&mut self) {
+        if let Some(group) = self.group.as_mut() {
+            group.terminate();
+        }
+        let _ = self.child.start_kill();
+        let _ = self.child.wait().await;
+    }
+}
+
+/// Build and start one runtime child through the common process boundary.
+pub(crate) fn spawn(spec: Spawn<'_>) -> Result<ManagedChild, ExecError> {
+    let original_program = spec.program.to_owned();
+    let (program, args) = spec.sandbox.wrap(spec.program, spec.args);
+    let mut command = Command::new(&program);
     command
         .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        // Covers the dropped-future path — D1 cancellation — where no code of
-        // ours runs to clean up.
         .kill_on_drop(true);
-    // M4 / `PROC-001`: the child starts from nothing and is given back only
-    // what it needs, so a credential the gateway holds is not one `env` away
-    // from the model.
     command.env_clear();
-    command.envs(child_env::minimal(exec.extra_env));
-    if let Some(cwd) = &exec.cwd {
+    command.envs(spec.environment);
+    if let Some(cwd) = &spec.cwd {
         command.current_dir(cwd);
     }
-    // Its own process group, so the deadline below can end everything the
-    // command started rather than only the command.
     #[cfg(unix)]
     command.process_group(0);
-    // Before the spawn, and fatal if it fails: a tool that asked to be
-    // sandboxed must not run unsandboxed instead.
-    exec.sandbox
+    spec.sandbox
         .harden(&mut command)
         .map_err(|source| ExecError::Sandbox {
-            program: program.clone(),
+            program: original_program.clone(),
             source,
         })?;
-
-    let mut child = command.spawn().map_err(|source| ExecError::Spawn {
-        program: program.clone(),
+    let child = command.spawn().map_err(|source| ExecError::Spawn {
+        program: original_program,
         source,
     })?;
-    // `process_group(0)` makes the child's pid its own pgid, so this is the
-    // handle to everything it goes on to start. Taken before `child` is moved
-    // into the future below, which is the last point it can be read.
-    let mut group = child.id().map(ProcessGroup::new);
+    let group = child.id().map(ProcessGroup::new);
+    Ok(ManagedChild { child, group })
+}
+
+/// Run a child process to completion, under a deadline.
+pub async fn run(exec: Exec<'_>) -> Result<ExecOutput, ExecError> {
+    let program = exec.program.to_owned();
+    let timeout_ms = exec.timeout.as_millis() as u64;
+    let environment = child_env::minimal(exec.extra_env);
+    let mut child = spawn(Spawn {
+        program: exec.program,
+        args: exec.args,
+        sandbox: exec.sandbox,
+        cwd: exec.cwd,
+        environment: &environment,
+    })?;
 
     // Taken up front: `wait` needs the pipes closed or a child that fills one
     // never exits, and holding them past this point would deadlock the join
     // below on a child that writes more than it reads.
-    let stdin = child.stdin.take();
-    let mut stdout = child.stdout.take();
-    let mut stderr = child.stderr.take();
+    let stdin = child.take_stdin();
+    let mut stdout = child.take_stdout();
+    let mut stderr = child.take_stderr();
 
     let payload = exec.stdin.unwrap_or(&[]).to_vec();
     let cap = exec.max_output_bytes;
@@ -227,9 +283,7 @@ pub async fn run(exec: Exec<'_>) -> Result<ExecOutput, ExecError> {
         // The command finished on its own terms. Anything it deliberately
         // left running is its business, so the group is not signalled.
         Ok(Ok(output)) => {
-            if let Some(group) = group.as_mut() {
-                group.leave_running();
-            }
+            child.leave_group_running();
             Ok(output)
         }
         Ok(Err(source)) => Err(ExecError::Io { program, source }),
@@ -238,9 +292,7 @@ pub async fn run(exec: Exec<'_>) -> Result<ExecOutput, ExecError> {
             // now dropped — `kill_on_drop` has already signalled the direct
             // child. This signals the rest of its group, which is where a
             // forked grandchild lives.
-            if let Some(group) = group.as_mut() {
-                group.terminate();
-            }
+            child.signal_group(libc::SIGKILL);
             Err(ExecError::TimedOut {
                 program,
                 timeout_ms,
@@ -276,6 +328,15 @@ impl ProcessGroup {
         self.signal_on_drop = false;
     }
 
+    fn signal(&mut self, signal: libc::c_int) {
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-(self.pgid as i32), signal);
+        }
+        #[cfg(not(unix))]
+        let _ = signal;
+    }
+
     /// End every process in the group, now.
     ///
     /// `SIGKILL` rather than `SIGTERM`: this runs only after a deadline has
@@ -285,13 +346,7 @@ impl ProcessGroup {
     /// stopped waiting.
     fn terminate(&mut self) {
         self.signal_on_drop = false;
-        #[cfg(unix)]
-        // SAFETY: `kill` with a negative pid signals a process group and
-        // touches no memory. A pgid that no longer exists returns `ESRCH`,
-        // which is ignored.
-        unsafe {
-            libc::kill(-(self.pgid as i32), libc::SIGKILL);
-        }
+        self.signal(libc::SIGKILL);
     }
 }
 

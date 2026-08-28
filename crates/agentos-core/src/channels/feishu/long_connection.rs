@@ -35,7 +35,7 @@ impl FeishuLongConnection {
     ) -> Result<Option<(ParsedFeishuEvent, Arc<[u8]>)>, ChannelError> {
         loop {
             let payload = self.socket.read_frame().await?;
-            let frame = FeishuFrame::decode(&payload)
+            let mut frame = FeishuFrame::decode(&payload)
                 .map_err(|err| ChannelError::Backend(Arc::from(err)))?;
             if frame.method == 0 {
                 if header_value(&frame.headers, "type") == Some("ping") {
@@ -53,7 +53,7 @@ impl FeishuLongConnection {
             if frame_type != Some("event") {
                 continue;
             }
-            let payload = self.event_payload(&frame)?;
+            let payload = self.event_payload(&mut frame)?;
             let Some(payload) = payload else {
                 continue;
             };
@@ -80,7 +80,7 @@ impl FeishuLongConnection {
         self.socket.write_frame(token).await
     }
 
-    fn event_payload(&mut self, frame: &FeishuFrame) -> Result<Option<Vec<u8>>, ChannelError> {
+    fn event_payload(&mut self, frame: &mut FeishuFrame) -> Result<Option<Vec<u8>>, ChannelError> {
         if frame.payload.is_empty() {
             return Ok(None);
         }
@@ -88,7 +88,7 @@ impl FeishuLongConnection {
             header_value(&frame.headers, "sum"),
             header_value(&frame.headers, "seq"),
             header_value(&frame.headers, "message_id"),
-            &frame.payload,
+            std::mem::take(&mut frame.payload),
         )
     }
 }

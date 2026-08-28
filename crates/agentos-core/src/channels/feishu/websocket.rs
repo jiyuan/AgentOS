@@ -11,6 +11,7 @@
 //! directly so users see their proxy is being ignored instead of silently
 //! failing closed.
 
+use super::limits::MAX_FRAME_BYTES;
 use agentos_interfaces::ChannelError;
 use futures_util::{SinkExt, StreamExt};
 use std::env;
@@ -19,9 +20,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::Request;
-use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 use tokio_tungstenite::{
-    client_async, client_async_tls, connect_async, MaybeTlsStream, WebSocketStream,
+    client_async_tls_with_config, client_async_with_config, connect_async_with_config,
+    MaybeTlsStream, WebSocketStream,
 };
 use tracing::warn;
 
@@ -47,8 +49,8 @@ impl WebSocketConnection {
     pub(super) async fn read_frame(&mut self) -> Result<Vec<u8>, ChannelError> {
         loop {
             match self.stream.next().await {
-                Some(Ok(Message::Binary(payload))) => return Ok(payload.to_vec()),
-                Some(Ok(Message::Text(text))) => return Ok(text.as_bytes().to_vec()),
+                Some(Ok(Message::Binary(payload))) => return Ok(payload),
+                Some(Ok(Message::Text(text))) => return Ok(text.into_bytes()),
                 Some(Ok(Message::Ping(payload))) => {
                     if let Err(err) = self.stream.send(Message::Pong(payload)).await {
                         return Err(ChannelError::Backend(Arc::from(format!(
@@ -92,11 +94,13 @@ async fn connect_direct(url: &str) -> Result<WsStream, ChannelError> {
             "Feishu WebSocket URL is not a valid request: {err}"
         )))
     })?;
-    let (stream, _response) = connect_async(request).await.map_err(|err| {
-        ChannelError::Backend(Arc::from(format!(
-            "Feishu WebSocket direct connect failed: {err}"
-        )))
-    })?;
+    let (stream, _response) = connect_async_with_config(request, Some(frame_config()), false)
+        .await
+        .map_err(|err| {
+            ChannelError::Backend(Arc::from(format!(
+                "Feishu WebSocket direct connect failed: {err}"
+            )))
+        })?;
     Ok(stream)
 }
 
@@ -160,9 +164,14 @@ async fn connect_via_proxy(proxy: &Proxy, target: &TargetUrl) -> Result<WsStream
                 )))
             })?;
     let (stream, _response) = if target.tls {
-        client_async_tls(request, tunneled).await
+        client_async_tls_with_config(request, tunneled, Some(frame_config()), None).await
     } else {
-        client_async(request, MaybeTlsStream::Plain(tunneled)).await
+        client_async_with_config(
+            request,
+            MaybeTlsStream::Plain(tunneled),
+            Some(frame_config()),
+        )
+        .await
     }
     .map_err(|err| {
         ChannelError::Backend(Arc::from(format!(
@@ -170,6 +179,14 @@ async fn connect_via_proxy(proxy: &Proxy, target: &TargetUrl) -> Result<WsStream
         )))
     })?;
     Ok(stream)
+}
+
+fn frame_config() -> WebSocketConfig {
+    WebSocketConfig {
+        max_message_size: Some(MAX_FRAME_BYTES),
+        max_frame_size: Some(MAX_FRAME_BYTES),
+        ..WebSocketConfig::default()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -335,6 +352,7 @@ fn no_proxy_entry_matches(host: &str, entry: &str) -> bool {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use tokio::net::TcpListener;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -390,6 +408,32 @@ mod tests {
     #[test]
     fn target_url_rejects_non_ws_scheme() {
         assert!(TargetUrl::parse("https://example.com").is_err());
+    }
+
+    #[tokio::test]
+    async fn an_oversized_websocket_frame_is_rejected_by_the_transport() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback binds");
+        let address = listener.local_addr().expect("listener has an address");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("client connects");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("server handshake succeeds");
+            let _ = socket
+                .send(Message::Binary(vec![0; MAX_FRAME_BYTES + 1]))
+                .await;
+        });
+
+        let stream = connect_direct(&format!("ws://{address}/"))
+            .await
+            .expect("client handshake succeeds");
+        let error = WebSocketConnection { stream }
+            .read_frame()
+            .await
+            .expect_err("the frame ceiling fires before a payload reaches channel code");
+        assert!(error.to_string().contains("limit exceeded"), "{error}");
     }
 
     #[test]

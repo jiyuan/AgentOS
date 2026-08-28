@@ -867,3 +867,63 @@
 - **Actual Behavior**: The work was completed locally because the active runtime instructions prohibit spawning Subagents without an explicit user request.
 - **Root Cause**: The repository's mandatory delegation threshold conflicts with the higher-priority runtime consent gate; this recurring conflict remains unresolved.
 - **Suggested Fix**: Amend the repository guideline, with human approval, so automatic delegation thresholds defer explicitly to environments that require user consent for Subagent creation.
+
+## [2026-08-27 22:29] ORCHESTRATION [ESCALATE]
+
+- **Agent**: /root
+- **Task**: Start R3 by implementing FS-002 descriptor-relative rooted-write primitives.
+- **Guideline Violated**: ORCHESTRATION > Subagent Delegation & Creation
+- **Expected Behavior**: Delegate implementation work exceeding the sequential tool-call threshold to a registered or built-in Subagent.
+- **Actual Behavior**: The work was completed locally because the active runtime instructions prohibit spawning Subagents without an explicit user request.
+- **Root Cause**: The repository's mandatory delegation threshold conflicts with the higher-priority runtime consent gate; this recurring conflict remains unresolved.
+- **Suggested Fix**: Amend the repository guideline, with human approval, so automatic delegation thresholds defer explicitly to environments that require user consent for Subagent creation.
+
+## [2026-08-27 23:03] ORCHESTRATION [ESCALATE]
+
+- **Agent**: /root
+- **Task**: Implement FS-003 migration of untrusted filesystem consumers to descriptor-rooted I/O.
+- **Guideline Violated**: ORCHESTRATION > Subagent Delegation & Creation
+- **Expected Behavior**: Delegate implementation work exceeding the sequential tool-call threshold to a registered or built-in Subagent.
+- **Actual Behavior**: The work was completed locally because the active runtime instructions prohibit spawning Subagents without an explicit user request.
+- **Root Cause**: The repository's mandatory delegation threshold conflicts with the higher-priority runtime consent gate; this recurring conflict remains unresolved.
+- **Suggested Fix**: Amend the repository guideline, with human approval, so automatic delegation thresholds defer explicitly to environments that require user consent for Subagent creation.
+
+## [2026-08-27 23:07] CONSISTENCY [RESOLVED]
+
+- **Agent**: /root
+- **Task**: Collect final FS-003 source line references.
+- **Guideline Violated**: Rules for getting work done > Exercise caution when escaping text for exec commands.
+- **Expected Behavior**: Quote a ripgrep pattern containing Markdown backticks so the shell receives it literally.
+- **Actual Behavior**: An unquoted backticked roadmap heading triggered harmless command substitution and printed `command not found`; the remaining read-only search still completed.
+- **Root Cause**: The search pattern was embedded directly in a double-quoted shell command.
+- **Suggested Fix**: Use single quotes around ripgrep patterns containing Markdown backticks; applied to subsequent commands.
+
+## [2026-08-28 00:43] CORRECTNESS [RESOLVED]
+
+- **Agent**: /root
+- **Task**: Correct the macOS Seatbelt `workspace_write` profile for SBX-002.
+- **Guideline Violated**: GUIDELINES > Correctness
+- **Expected Behavior**: Derive the profile change from observed native Seatbelt semantics and prove that the workspace is writable while outside paths remain denied.
+- **Actual Behavior**: The first change assumed a `require-not` deny predicate would grant the workspace, but the native AF-020 test still denied the workspace.
+- **Root Cause**: The initial diagnosis conflated rule precedence with the actual failure, which was the `/var` versus `/private/var` vnode-path alias.
+- **Suggested Fix**: Probe SBPL directly, retain the tested deny-then-allow structure, canonicalize every writable root before emitting it, and keep the native AF-020 matrix blocking; all nine sandbox tests now pass.
+
+## [2026-08-28 00:43] ORCHESTRATION [ESCALATE]
+
+- **Agent**: /root
+- **Task**: Implement PROC-002/SBX-002 common subprocess and native sandbox boundaries.
+- **Guideline Violated**: ORCHESTRATION > Subagent Delegation & Creation
+- **Expected Behavior**: Delegate implementation work exceeding the sequential tool-call threshold to a registered or built-in Subagent.
+- **Actual Behavior**: The work was completed locally because the active runtime instructions prohibit spawning Subagents without an explicit user request.
+- **Root Cause**: The repository's mandatory delegation threshold conflicts with the higher-priority runtime consent gate; this recurring conflict remains unresolved.
+- **Suggested Fix**: Amend the repository guideline, with human approval, so automatic delegation thresholds defer explicitly to environments that require user consent for Subagent creation.
+
+## [2026-08-28 14:32] ORCHESTRATION [ESCALATE]
+
+- **Agent**: /root
+- **Task**: Implement ING-002/NET-002 bounded channel ingress and IPv6 site-local egress policy.
+- **Guideline Violated**: ORCHESTRATION > Subagent Delegation & Creation
+- **Expected Behavior**: Delegate implementation work exceeding the sequential tool-call threshold to a registered or built-in Subagent.
+- **Actual Behavior**: The work was completed locally because the active runtime instructions prohibit spawning Subagents without an explicit user request.
+- **Root Cause**: The repository's mandatory delegation threshold conflicts with the higher-priority runtime consent gate; this recurring conflict remains unresolved.
+- **Suggested Fix**: Amend the repository guideline, with human approval, so automatic delegation thresholds defer explicitly to environments that require user consent for Subagent creation.

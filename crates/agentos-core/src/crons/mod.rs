@@ -7,9 +7,10 @@ use croner::Cron;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -268,6 +269,7 @@ pub struct CronScheduler {
 
 pub struct CronStore {
     root: PathBuf,
+    rooted: OnceLock<crate::paths::RootDir>,
 }
 
 /// A scheduled whole-memory reflection sweep. On each due tick it runs
@@ -417,17 +419,39 @@ impl CronScheduler {
 
 impl CronStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            rooted: OnceLock::new(),
+        }
     }
 
     pub fn root(&self) -> &Path {
         &self.root
     }
 
+    fn root_dir(&self) -> Result<&crate::paths::RootDir, CronError> {
+        if let Some(root) = self.rooted.get() {
+            return Ok(root);
+        }
+        crate::paths::create_private_dir(&self.root)
+            .map_err(|error| storage_error(error.into_io()))?;
+        let opened = crate::paths::RootDir::open(&self.root)
+            .map_err(|error| CronError::Storage(Arc::from(error.to_string())))?;
+        let _ = self.rooted.set(opened);
+        self.rooted
+            .get()
+            .ok_or_else(|| CronError::Storage(Arc::from("cron root initialization failed")))
+    }
+
     pub fn load_scheduler(&self) -> Result<CronScheduler, CronError> {
         let mut tasks = Vec::new();
-        for path in self.cron_files()? {
-            let input = std::fs::read_to_string(&path).map_err(storage_error)?;
+        let root = self.root_dir()?;
+        for relative in self.cron_files()? {
+            let mut input = String::new();
+            root.open_file(&relative)
+                .map_err(|error| CronError::Storage(Arc::from(error.to_string())))?
+                .read_to_string(&mut input)
+                .map_err(storage_error)?;
             tasks.push(toml::from_str(&input).map_err(toml_de_error)?);
         }
         Ok(CronScheduler::new(tasks))
@@ -438,8 +462,10 @@ impl CronStore {
         // Atomic and private (M8 / `GW-001`): a cron task carries the prompt
         // it fires and the conversation it fires into, and a half-written one
         // makes the whole scheduler fail to load rather than just that task.
-        crate::paths::write_private_atomic(&self.task_path(&task.id)?, encoded.as_bytes())
-            .map_err(|err| storage_error(err.into_io()))
+        let relative = PathBuf::from(cron_file_name(&task.id)?);
+        self.root_dir()?
+            .write_file_atomic(&relative, encoded.as_bytes())
+            .map_err(|error| CronError::Storage(Arc::from(error.to_string())))
     }
 
     pub fn save_scheduler(&self, scheduler: &CronScheduler) -> Result<(), CronError> {
@@ -455,16 +481,13 @@ impl CronStore {
     }
 
     fn cron_files(&self) -> Result<Vec<PathBuf>, CronError> {
-        let entries = match std::fs::read_dir(&self.root) {
-            Ok(entries) => entries,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(err) => return Err(storage_error(err)),
-        };
-        let mut files = entries
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(storage_error)?
+        let mut files = self
+            .root_dir()?
+            .read_root_dir()
+            .map_err(|error| CronError::Storage(Arc::from(error.to_string())))?
             .into_iter()
-            .map(|entry| entry.path())
+            .filter(|entry| !entry.is_dir && !entry.is_symlink)
+            .map(|entry| PathBuf::from(entry.name))
             .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
             .collect::<Vec<_>>();
         files.sort();

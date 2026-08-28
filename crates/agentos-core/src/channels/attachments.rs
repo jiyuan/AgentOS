@@ -10,14 +10,14 @@
 //! `workspace/attachments`, matching the layout the runtime sets up.
 
 use crate::config::{DEFAULT_ATTACHMENTS_PER_MESSAGE, DEFAULT_ATTACHMENT_BYTES};
-use crate::paths::path_segment;
+use crate::paths::{path_segment, RootDir};
 use agentos_interfaces::ChannelError;
-use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 pub(crate) struct AttachmentStore {
     root: PathBuf,
+    rooted: Arc<OnceLock<Arc<RootDir>>>,
     channel: String,
     /// `[limits].attachment_bytes` — what one file may cost this machine
     /// (M4 / `ING-001`).
@@ -38,6 +38,7 @@ impl AttachmentStore {
     pub(crate) fn new(root: impl Into<PathBuf>, channel: &str) -> Self {
         Self {
             root: root.into(),
+            rooted: Arc::new(OnceLock::new()),
             channel: channel.to_owned(),
             max_bytes: DEFAULT_ATTACHMENT_BYTES,
             max_per_message: DEFAULT_ATTACHMENTS_PER_MESSAGE,
@@ -52,6 +53,7 @@ impl AttachmentStore {
     /// is otherwise discovered by a bound quietly not applying.
     pub(crate) fn with_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.root = root.into();
+        self.rooted = Arc::new(OnceLock::new());
         self
     }
 
@@ -78,38 +80,53 @@ impl AttachmentStore {
         self.max_per_message
     }
 
-    /// Build the on-disk path an inbound attachment should be written to.
-    /// Creates the parent directory.
-    pub(crate) fn target_path(
+    fn root_dir(&self) -> Result<Arc<RootDir>, ChannelError> {
+        if let Some(root) = self.rooted.get() {
+            return Ok(root.clone());
+        }
+        crate::paths::create_private_dir(&self.root).map_err(|err| {
+            ChannelError::Backend(Arc::from(format!(
+                "create attachment root {} failed: {err}",
+                self.root.display()
+            )))
+        })?;
+        let root = Arc::new(RootDir::open(&self.root).map_err(|err| {
+            ChannelError::Backend(Arc::from(format!(
+                "open attachment root {} failed: {err}",
+                self.root.display()
+            )))
+        })?);
+        let _ = self.rooted.set(root.clone());
+        Ok(self.rooted.get().cloned().unwrap_or(root))
+    }
+
+    fn relative_path(&self, conversation: &str, message_id: &str, name: &str) -> PathBuf {
+        Path::new(&self.channel)
+            .join(sanitize_segment(conversation).as_ref())
+            .join(sanitize_segment(message_id).as_ref())
+            .join(sanitize_filename(name).as_ref())
+    }
+
+    /// Publish a completely downloaded attachment through a descriptor-rooted
+    /// temporary file. The final name is never visible partially written.
+    pub(crate) fn publish(
         &self,
         conversation: &str,
         message_id: &str,
         name: &str,
+        bytes: &[u8],
     ) -> Result<PathBuf, ChannelError> {
-        let safe_conv = sanitize_segment(conversation);
-        let safe_msg = sanitize_segment(message_id);
-        let safe_name = sanitize_filename(name);
-        let mut path = self.root.clone();
-        path.push(&self.channel);
-        path.push(safe_conv.as_ref());
-        path.push(safe_msg.as_ref());
-        // Private (M8 / `GW-001`): the directory names are a conversation id
-        // and a message id, so a listable tree leaks who is talking to the
-        // agent even when the attachments themselves cannot be read.
-        crate::paths::create_private_dir(&path).map_err(|err| {
-            ChannelError::Backend(Arc::from(format!(
-                "create attachment dir {} failed: {err}",
-                path.display()
-            )))
-        })?;
-        path.push(safe_name.as_ref());
-        Ok(path)
+        let relative = self.relative_path(conversation, message_id, name);
+        self.root_dir()?
+            .write_file_atomic(&relative, bytes)
+            .map_err(|err| {
+                ChannelError::Backend(Arc::from(format!(
+                    "publish attachment {} failed: {err}",
+                    self.root.join(&relative).display()
+                )))
+            })?;
+        Ok(self.root.join(relative))
     }
-}
-
-/// Stat a file written by curl and return its size in bytes.
-pub(crate) fn file_size(path: &Path) -> Option<u64> {
-    fs::metadata(path).ok().map(|meta| meta.len())
 }
 
 /// Encode a path segment so user-controlled values can neither escape the
@@ -177,6 +194,7 @@ impl<I: Iterator<Item = char>> TakeWithinBytes for I {}
 mod tests {
     use super::*;
     use std::env;
+    use std::fs;
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -246,9 +264,10 @@ mod tests {
             None => env::remove_var("AGENTOS_HOME"),
         }
 
-        let path = store.target_path("12345", "67", "photo.jpg").unwrap();
+        let path = store.publish("12345", "67", "photo.jpg", b"photo").unwrap();
         assert!(path.ends_with("telegram/12345/67/photo.jpg"));
         assert!(path.parent().unwrap().is_dir());
+        assert_eq!(fs::read(path).unwrap(), b"photo");
         let _ = fs::remove_dir_all(&tmp);
     }
 
@@ -279,5 +298,34 @@ mod tests {
         let store = AttachmentStore::new("/tmp/a", "telegram");
         assert_eq!(store.max_bytes(), DEFAULT_ATTACHMENT_BYTES);
         assert_eq!(store.max_per_message(), DEFAULT_ATTACHMENTS_PER_MESSAGE);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_refuses_a_planted_directory_symlink() {
+        let root = env::temp_dir().join(format!(
+            "agentos-attachment-link-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let outside = root.with_extension("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let canary = outside.join("canary");
+        fs::write(&canary, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("telegram")).unwrap();
+
+        let store = AttachmentStore::new(&root, "telegram");
+        assert!(store
+            .publish("conversation", "message", "x.txt", b"pwned")
+            .is_err());
+        assert_eq!(fs::read(&canary).unwrap(), b"untouched");
+        assert!(!outside.join("conversation/message/x.txt").exists());
+
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&outside).ok();
     }
 }

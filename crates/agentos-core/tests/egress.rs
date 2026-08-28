@@ -18,6 +18,7 @@ use agentos_proto::{ToolCall, ToolCallId, ToolStatus};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use serde_json::value::RawValue;
 use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -245,6 +246,27 @@ async fn an_allowed_destination_still_gets_through() {
     assert_eq!(fetched.status.as_u16(), 200);
     assert_eq!(fetched.body, "hello");
     assert!(!fetched.truncated);
+}
+
+/// AF-038: deprecated IPv6 site-local space is an internal destination both
+/// when written literally and after a hostname resolves to it.
+#[test]
+fn ipv6_site_local_is_refused_by_literal_and_resolution() {
+    let literal = reqwest::Url::parse("http://[fec0::1]/secret").expect("valid literal URL");
+    assert!(
+        agentos_core::egress::check_url(&literal).is_err(),
+        "a literal site-local destination must be refused before DNS"
+    );
+
+    for resolved in [
+        Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 1),
+        Ipv6Addr::new(0xfeff, 0xffff, 0, 0, 0, 0, 0, 1),
+    ] {
+        assert!(
+            agentos_core::egress::check_address(IpAddr::V6(resolved)).is_err(),
+            "the resolver's address policy must drop {resolved}"
+        );
+    }
 }
 
 /// Counts how many times it is asked, and always answers with one address.

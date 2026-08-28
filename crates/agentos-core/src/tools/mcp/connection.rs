@@ -34,6 +34,7 @@ use super::protocol::{
     self, Message, ProtocolError, Request, RequestId, ServerHandshake, ToolPage,
 };
 use crate::sandbox::Sandbox;
+use crate::tools::exec::{self, ManagedChild, Spawn};
 use agentos_interfaces::mcp::McpError;
 use agentos_interfaces::tool::{SandboxMode, ToolSpec};
 use serde_json::Value;
@@ -42,7 +43,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::ChildStdin;
 use tokio::sync::oneshot;
 
 /// The largest single JSON-RPC message this client will read.
@@ -100,7 +101,7 @@ pub struct Connection {
     /// with a structured `method not found` rather than leaving the server
     /// waiting on a reply that will never come.
     stdin: Arc<tokio::sync::Mutex<ChildStdin>>,
-    child: tokio::sync::Mutex<Child>,
+    child: tokio::sync::Mutex<ManagedChild>,
     pending: Pending,
     next_id: AtomicU64,
     stderr: Arc<Mutex<StderrTail>>,
@@ -149,37 +150,22 @@ impl Connection {
         sandbox: &Sandbox,
         timeout: Duration,
     ) -> Result<Self, McpError> {
-        let (program, args) = sandbox.wrap(program, args);
-        let mut command = Command::new(&program);
-        command.args(&args);
-        // M4 / `PROC-001`: an MCP server is third-party code the deployment
-        // chose to run, so it gets the neutral allowlist and nothing else.
-        command.env_clear();
-        command.envs(env);
-        command
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-        // Fail-closed: a mode the kernel cannot enforce is not a mode.
-        sandbox
-            .harden(&mut command)
-            .map_err(|err| failed(format!("MCP server '{program}' cannot be sandboxed: {err}")))?;
-
-        let mut child = command
-            .spawn()
-            .map_err(|err| failed(format!("MCP server '{program}' failed to start: {err}")))?;
+        let mut child = exec::spawn(Spawn {
+            program,
+            args,
+            sandbox,
+            cwd: None,
+            environment: &env,
+        })
+        .map_err(|err| failed(format!("MCP server '{program}' failed to start: {err}")))?;
         let stdin = child
-            .stdin
-            .take()
+            .take_stdin()
             .ok_or_else(|| failed("MCP server stdin unavailable"))?;
         let stdout = child
-            .stdout
-            .take()
+            .take_stdout()
             .ok_or_else(|| failed("MCP server stdout unavailable"))?;
         let stderr = child
-            .stderr
-            .take()
+            .take_stderr()
             .ok_or_else(|| failed("MCP server stderr unavailable"))?;
 
         let pending: Pending = Arc::default();
@@ -406,23 +392,19 @@ impl Connection {
         drop(self.stdin);
         let mut child = self.child.lock().await;
         if wait_briefly(&mut child).await {
+            child.signal_group(libc::SIGKILL);
             return;
         }
         #[cfg(unix)]
-        if let Some(pid) = child.id() {
-            // SAFETY: `kill` with a pid and a signal number. The pid is this
-            // child's and the child has not been reaped, so it is not reused.
-            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-        }
+        child.signal_group(libc::SIGTERM);
         if wait_briefly(&mut child).await {
             return;
         }
-        let _ = child.kill().await;
-        let _ = child.wait().await;
+        child.kill_and_reap().await;
     }
 }
 
-async fn wait_briefly(child: &mut Child) -> bool {
+async fn wait_briefly(child: &mut ManagedChild) -> bool {
     tokio::time::timeout(SHUTDOWN_STEP, child.wait())
         .await
         .is_ok()

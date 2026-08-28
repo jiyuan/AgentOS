@@ -179,6 +179,9 @@ fn is_global_v6(address: Ipv6Addr) -> bool {
         || (first & 0xfe00) == 0xfc00
         // fe80::/10, link local.
         || (first & 0xffc0) == 0xfe80
+        // fec0::/10, deprecated site local. It still names an operator's
+        // internal network when routed and is no more public than unique-local.
+        || (first & 0xffc0) == 0xfec0
         // 2001:db8::/32, documentation.
         || (first == 0x2001 && address.segments()[1] == 0x0db8)
         // 100::/64, discard-only.
@@ -271,6 +274,8 @@ mod tests {
             "224.0.0.1",
             "fc00::1",
             "fe80::1",
+            "fec0::1",
+            "feff::1",
             "::",
             "ff02::1",
         ] {

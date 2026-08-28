@@ -151,12 +151,6 @@ pub(super) fn harden(
         }
     }
     for path in sandbox.writable() {
-        // A rule has to name a path that exists. Creating a directory the
-        // child is about to be granted writes beneath is not an escalation,
-        // and without this a fresh install — where the workspace root has not
-        // been touched yet — would fail every sandboxed tool with a setup
-        // error instead of running it.
-        let _ = std::fs::create_dir_all(path);
         let fd = open_path(path).ok_or_else(|| {
             SandboxError::Setup(format!(
                 "cannot grant writes beneath '{}': it does not exist or cannot be opened",

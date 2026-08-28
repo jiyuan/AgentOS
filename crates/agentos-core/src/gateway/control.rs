@@ -13,7 +13,7 @@
 //! - A pid file left by a process that crashed is indistinguishable from one
 //!   left by a process that is running. The code guessed with `kill -0`, which
 //!   is the same guess.
-//! - `Command::new("kill")` puts the operator's `PATH` between the gateway and
+//! - Spawning `kill` by name puts the operator's `PATH` between the gateway and
 //!   its own lifecycle.
 //!
 //! # What a lock establishes

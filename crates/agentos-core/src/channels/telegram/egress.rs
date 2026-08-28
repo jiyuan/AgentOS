@@ -12,17 +12,17 @@
 //! because the payload behind each button is part of what `send` emits.
 
 use super::{
-    check_send_response, tg_edit_message, TelegramEditState, TELEGRAM_CAPTION_LIMIT,
+    check_send_response, telegram_json, tg_edit_message, TelegramEditState, TELEGRAM_CAPTION_LIMIT,
     TELEGRAM_TEXT_LIMIT,
 };
 use crate::channels::text::split_text;
+use crate::http::shared_client;
 use crate::r#loop::{ACTIONS_KEY, PROMPT_KIND};
 use agentos_interfaces::{ChannelError, Egress};
 use agentos_proto::{Attachment, AttachmentKind, Envelope};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 /// Render `approval_actions` metadata as a Telegram `reply_markup` payload.
@@ -76,51 +76,43 @@ impl TelegramEgress {
     ///
     /// Not chunked: an approval prompt is two lines, and splitting it would
     /// leave the buttons on a fragment.
-    fn send_with_keyboard(
+    async fn send_with_keyboard(
         &self,
         chat_id: &str,
         text: &str,
         keyboard: &str,
     ) -> Result<(), ChannelError> {
-        let text_arg = format!("text={text}");
-        let chat_arg = format!("chat_id={chat_id}");
-        let markup_arg = format!("reply_markup={keyboard}");
-        let output = Command::new("curl")
-            .args(["--silent", "--show-error", "--max-time", "10", "-X", "POST"])
-            .arg(self.api_url("sendMessage"))
-            .args([
-                "-d",
-                &chat_arg,
-                "--data-urlencode",
-                &text_arg,
-                "--data-urlencode",
-                &markup_arg,
+        let response = shared_client()
+            .post(self.api_url("sendMessage"))
+            .form(&[
+                ("chat_id", chat_id),
+                ("text", text),
+                ("reply_markup", keyboard),
             ])
-            .output()
-            .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
-        check_send_response(&output.status, &output.stdout, &output.stderr)
+            .send()
+            .await
+            .map_err(|error| ChannelError::Backend(Arc::from(error.to_string())))?;
+        check_send_response(&telegram_json(response).await?)
     }
 
-    fn send_text(&self, chat_id: &str, text: &str) -> Result<(), ChannelError> {
+    async fn send_text(&self, chat_id: &str, text: &str) -> Result<(), ChannelError> {
         for chunk in split_text(text, TELEGRAM_TEXT_LIMIT) {
-            self.send_text_chunk(chat_id, &chunk)?;
+            self.send_text_chunk(chat_id, &chunk).await?;
         }
         Ok(())
     }
 
-    fn send_text_chunk(&self, chat_id: &str, text: &str) -> Result<(), ChannelError> {
-        let text_arg = format!("text={text}");
-        let chat_arg = format!("chat_id={chat_id}");
-        let output = Command::new("curl")
-            .args(["--silent", "--show-error", "--max-time", "10", "-X", "POST"])
-            .arg(self.api_url("sendMessage"))
-            .args(["-d", &chat_arg, "--data-urlencode", &text_arg])
-            .output()
-            .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
-        check_send_response(&output.status, &output.stdout, &output.stderr)
+    async fn send_text_chunk(&self, chat_id: &str, text: &str) -> Result<(), ChannelError> {
+        let response = shared_client()
+            .post(self.api_url("sendMessage"))
+            .form(&[("chat_id", chat_id), ("text", text)])
+            .send()
+            .await
+            .map_err(|error| ChannelError::Backend(Arc::from(error.to_string())))?;
+        check_send_response(&telegram_json(response).await?)
     }
 
-    fn send_attachment(
+    async fn send_attachment(
         &self,
         chat_id: &str,
         attachment: &Attachment,
@@ -130,23 +122,23 @@ impl TelegramEgress {
             AttachmentKind::Image => ("sendPhoto", "photo"),
             AttachmentKind::Document => ("sendDocument", "document"),
         };
-        let file_form = format!("{field}=@{}", attachment.path.display());
-        let chat_form = format!("chat_id={chat_id}");
-        let mut command = Command::new("curl");
-        command
-            .args(["--silent", "--show-error", "--max-time", "60", "-X", "POST"])
-            .arg(self.api_url(method))
-            .args(["-F", &chat_form, "-F", &file_form]);
+        let mut form = reqwest::multipart::Form::new().text("chat_id", chat_id.to_owned());
+        form = form
+            .file(field.to_owned(), &attachment.path)
+            .await
+            .map_err(|error| ChannelError::Backend(Arc::from(error.to_string())))?;
         if let Some(caption) = caption {
             if !caption.is_empty() {
-                let caption_form = format!("caption={caption}");
-                command.args(["-F", &caption_form]);
+                form = form.text("caption", caption.to_owned());
             }
         }
-        let output = command
-            .output()
-            .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
-        check_send_response(&output.status, &output.stdout, &output.stderr)
+        let response = shared_client()
+            .post(self.api_url(method))
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|error| ChannelError::Backend(Arc::from(error.to_string())))?;
+        check_send_response(&telegram_json(response).await?)
     }
 }
 
@@ -163,7 +155,7 @@ impl Egress for TelegramEgress {
         // keyboard is not locked out.
         if env.metadata.get("kind").and_then(Value::as_str) == Some(PROMPT_KIND) {
             if let Some(keyboard) = inline_keyboard(env.metadata.get(ACTIONS_KEY)) {
-                return self.send_with_keyboard(chat_id, text, &keyboard);
+                return self.send_with_keyboard(chat_id, text, &keyboard).await;
             }
         }
 
@@ -178,7 +170,7 @@ impl Egress for TelegramEgress {
                 true
             } else {
                 // Too long to fit the edited message; deliver as fresh chunks.
-                self.send_text(chat_id, text)?;
+                self.send_text(chat_id, text).await?;
                 true
             }
         } else {
@@ -189,7 +181,7 @@ impl Egress for TelegramEgress {
             if text_finalized {
                 return Ok(());
             }
-            return self.send_text(chat_id, text);
+            return self.send_text(chat_id, text).await;
         }
 
         // Telegram captions are capped at 1024 chars. If the reply text is
@@ -201,12 +193,12 @@ impl Egress for TelegramEgress {
         } else if text.chars().count() <= TELEGRAM_CAPTION_LIMIT {
             Some(text)
         } else {
-            self.send_text(chat_id, text)?;
+            self.send_text(chat_id, text).await?;
             None
         };
         let mut caption = caption;
         for attachment in &env.message.attachments {
-            self.send_attachment(chat_id, attachment, caption)?;
+            self.send_attachment(chat_id, attachment, caption).await?;
             caption = None;
         }
         Ok(())

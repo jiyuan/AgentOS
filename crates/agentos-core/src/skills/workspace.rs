@@ -1,5 +1,6 @@
+use crate::paths::{ContainmentError, RootDir};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
@@ -53,6 +54,8 @@ pub enum SkillStoreError {
     Missing(Arc<str>),
     #[error("skill '{0}' already exists")]
     Exists(Arc<str>),
+    #[error(transparent)]
+    Containment(#[from] ContainmentError),
 }
 
 impl WorkspaceSkillCatalog {
@@ -160,18 +163,19 @@ pub fn create_skill(
         });
     }
 
-    fs::create_dir_all(root).map_err(|source| SkillStoreError::Io {
-        path: root.to_path_buf(),
-        source,
+    crate::paths::create_private_dir(root).map_err(|err| SkillStoreError::Io {
+        path: err.path().to_path_buf(),
+        source: err.into_io(),
     })?;
-    let skill_dir = root.join(creation.name.as_ref());
-    if skill_dir.exists() {
+    let rooted = RootDir::open(root)?;
+    if rooted
+        .read_root_dir()?
+        .iter()
+        .any(|entry| entry.name == creation.name.as_ref())
+    {
         return Err(SkillStoreError::Exists(Arc::clone(&creation.name)));
     }
-    fs::create_dir(&skill_dir).map_err(|source| SkillStoreError::Io {
-        path: skill_dir.clone(),
-        source,
-    })?;
+    rooted.create_dir_all(creation.name.as_ref())?;
 
     for resource in &creation.resources {
         let name = match resource {
@@ -179,10 +183,7 @@ pub fn create_skill(
             SkillResourceKind::References => "references",
             SkillResourceKind::Assets => "assets",
         };
-        fs::create_dir(skill_dir.join(name)).map_err(|source| SkillStoreError::Io {
-            path: skill_dir.join(name),
-            source,
-        })?;
+        rooted.create_dir_all(Path::new(creation.name.as_ref()).join(name))?;
     }
 
     let content = format!(
@@ -191,21 +192,11 @@ pub fn create_skill(
         yaml_scalar(&creation.description),
         default_skill_body(&creation.name).trim_end()
     );
-    let skill_file = skill_dir.join(SKILL_FILE);
-    fs::write(&skill_file, &content).map_err(|source| SkillStoreError::Io {
-        path: skill_file.clone(),
-        source,
-    })?;
-    verify_written(&skill_file, content.len())?;
+    let relative_skill_file = Path::new(creation.name.as_ref()).join(SKILL_FILE);
+    rooted.write_file_atomic(&relative_skill_file, content.as_bytes())?;
+    verify_written(&rooted, &relative_skill_file, content.len())?;
 
-    let mut skill = validate_skill_dir(&skill_dir)?;
-    // Canonicalise the returned path so callers (the CLI / human-facing
-    // tooling) report an absolute, symlink-resolved location rather than
-    // whatever relative path `skill_dir` was constructed from.
-    if let Ok(canonical) = skill_dir.canonicalize() {
-        skill.path = canonical;
-    }
-    Ok(skill)
+    validate_skill(root, creation.name.as_ref())
 }
 
 /// Stat a freshly-written file and confirm it exists with the expected size.
@@ -213,15 +204,22 @@ pub fn create_skill(
 /// failure mode: a NFS/overlay/permissions oddity that swallows the write
 /// without surfacing an `io::Error` from `fs::write`. We'd rather fail loud
 /// here than leave the LLM telling the user a lie.
-fn verify_written(path: &Path, expected_bytes: usize) -> Result<(), SkillStoreError> {
-    let metadata = fs::metadata(path).map_err(|source| SkillStoreError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
+fn verify_written(
+    root: &RootDir,
+    path: &Path,
+    expected_bytes: usize,
+) -> Result<(), SkillStoreError> {
+    let metadata = root
+        .open_file(path)?
+        .metadata()
+        .map_err(|source| SkillStoreError::Io {
+            path: root.path().join(path),
+            source,
+        })?;
     let actual = metadata.len() as usize;
     if actual != expected_bytes {
         return Err(SkillStoreError::Invalid {
-            path: path.to_path_buf(),
+            path: root.path().join(path),
             message: format!(
                 "post-write verification failed: expected {expected_bytes} bytes, found {actual}"
             ),
@@ -248,11 +246,32 @@ fn default_skill_body(name: &str) -> String {
 }
 
 pub fn validate_skill_dir(path: &Path) -> Result<WorkspaceSkill, SkillStoreError> {
-    let skill_file = path.join(SKILL_FILE);
-    let content = fs::read_to_string(&skill_file).map_err(|source| SkillStoreError::Io {
-        path: skill_file.clone(),
-        source,
+    let root = path.parent().unwrap_or_else(|| Path::new("."));
+    let folder = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    validate_skill(root, folder)
+}
+
+/// Validate one named skill through a retained descriptor for its configured
+/// store. `name` is one component, never a path.
+pub fn validate_skill(root: &Path, name: &str) -> Result<WorkspaceSkill, SkillStoreError> {
+    validate_skill_name(name).map_err(|message| SkillStoreError::Invalid {
+        path: root.join(name),
+        message,
     })?;
+    let rooted = RootDir::open(root)?;
+    let relative = Path::new(name).join(SKILL_FILE);
+    let skill_file = root.join(&relative);
+    let mut content = String::new();
+    rooted
+        .open_file(&relative)?
+        .read_to_string(&mut content)
+        .map_err(|source| SkillStoreError::Io {
+            path: skill_file.clone(),
+            source,
+        })?;
     let (frontmatter, instructions) =
         split_skill_markdown(&content).map_err(|message| SkillStoreError::Invalid {
             path: skill_file.clone(),
@@ -263,15 +282,11 @@ pub fn validate_skill_dir(path: &Path) -> Result<WorkspaceSkill, SkillStoreError
             path: skill_file.clone(),
             message,
         })?;
-    let folder = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default();
-    if metadata.name.as_ref() != folder {
+    if metadata.name.as_ref() != name {
         return Err(SkillStoreError::Invalid {
             path: skill_file,
             message: format!(
-                "skill folder '{folder}' must match frontmatter name '{}'",
+                "skill folder '{name}' must match frontmatter name '{}'",
                 metadata.name
             ),
         });
@@ -285,33 +300,31 @@ pub fn validate_skill_dir(path: &Path) -> Result<WorkspaceSkill, SkillStoreError
     Ok(WorkspaceSkill {
         name: metadata.name,
         description: metadata.description,
-        path: path.to_path_buf(),
+        path: root.join(name),
         instructions: Arc::from(instructions.trim().to_owned()),
     })
 }
 
 fn discover_skills(root: &Path) -> Result<BTreeMap<Arc<str>, WorkspaceSkill>, SkillStoreError> {
-    let entries = match fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-        Err(source) => {
-            return Err(SkillStoreError::Io {
-                path: root.to_path_buf(),
-                source,
-            })
+    let rooted = match RootDir::open(root) {
+        Ok(rooted) => rooted,
+        Err(ContainmentError::Root { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Ok(BTreeMap::new())
         }
+        Err(error) => return Err(error.into()),
     };
     let mut skills = BTreeMap::new();
-    for entry in entries {
-        let entry = entry.map_err(|source| SkillStoreError::Io {
-            path: root.to_path_buf(),
-            source,
-        })?;
-        let path = entry.path();
-        if !path.is_dir() {
+    for entry in rooted.read_root_dir()? {
+        if !entry.is_dir || entry.is_symlink {
             continue;
         }
-        let skill = validate_skill_dir(&path)?;
+        validate_skill_name(&entry.name).map_err(|message| SkillStoreError::Invalid {
+            path: root.join(&entry.name),
+            message,
+        })?;
+        let skill = validate_skill(root, &entry.name)?;
         skills.insert(Arc::clone(&skill.name), skill);
     }
     Ok(skills)

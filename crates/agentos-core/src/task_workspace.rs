@@ -1,13 +1,13 @@
-use crate::paths::{path_segment, PathSegmentError};
+use crate::paths::{path_segment, ContainmentError, PathSegmentError, RootDir};
 use agentos_interfaces::orchestrator::{MemoryFragment, OrchestratorTemplate};
 use agentos_proto::TaskId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::fs::File;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::runtime::Handle;
@@ -48,6 +48,8 @@ pub enum TaskWorkspaceError {
     /// the task directory at all.
     #[error(transparent)]
     UnusableName(#[from] PathSegmentError),
+    #[error(transparent)]
+    Containment(#[from] ContainmentError),
 }
 
 /// Bound on the in-flight queue between `append_session_event` and the
@@ -58,11 +60,15 @@ const SESSION_QUEUE_CAPACITY: usize = 256;
 #[derive(Clone, Debug)]
 pub struct TaskWorkspace {
     root: PathBuf,
+    boundary: PathBuf,
+    tasks_prefix: Arc<str>,
+    rooted: Arc<OnceLock<Arc<RootDir>>>,
     writer: Arc<StdMutex<Option<Arc<SessionWriter>>>>,
 }
 
 #[derive(Debug)]
 struct SessionWriter {
+    root: Arc<RootDir>,
     sender: mpsc::Sender<SessionWrite>,
     _flusher: JoinHandle<()>,
 }
@@ -102,13 +108,48 @@ pub struct SubAgentWorkspaceConfig {
 
 impl TaskWorkspace {
     pub fn new(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        let boundary = root
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let tasks_prefix: Arc<str> = Arc::from(
+            root.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("tasks"),
+        );
         Self {
-            root: root.into(),
+            root,
+            boundary,
+            tasks_prefix,
+            rooted: Arc::new(OnceLock::new()),
             writer: Arc::new(StdMutex::new(None)),
         }
     }
 
-    fn writer(&self) -> Option<Arc<SessionWriter>> {
+    fn root_dir(&self) -> Result<Arc<RootDir>, TaskWorkspaceError> {
+        if let Some(root) = self.rooted.get() {
+            return Ok(root.clone());
+        }
+        crate::paths::create_private_dir(&self.boundary).map_err(|err| TaskWorkspaceError::Io {
+            path: err.path().to_path_buf(),
+            source: err.into_io(),
+        })?;
+        let root = Arc::new(RootDir::open(&self.boundary)?);
+        let _ = self.rooted.set(root.clone());
+        Ok(self.rooted.get().cloned().unwrap_or(root))
+    }
+
+    fn relative_task_dir(&self, task_id: &TaskId) -> Result<PathBuf, TaskWorkspaceError> {
+        let name = path_segment("task id", task_id.as_str())?;
+        if matches!(name, "main" | "min") {
+            return Ok(PathBuf::from(name));
+        }
+        Ok(Path::new(self.tasks_prefix.as_ref()).join(name))
+    }
+
+    fn writer(&self) -> Result<Option<Arc<SessionWriter>>, TaskWorkspaceError> {
         // A poisoned guard still holds a structurally valid Option<Arc<_>>
         // (assignment happens after construction completes), so recover
         // instead of propagating a panic into every session write.
@@ -117,17 +158,21 @@ impl TaskWorkspace {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(writer) = guard.as_ref() {
-            return Some(writer.clone());
+            return Ok(Some(writer.clone()));
         }
-        let handle = Handle::try_current().ok()?;
+        let Some(handle) = Handle::try_current().ok() else {
+            return Ok(None);
+        };
+        let root = self.root_dir()?;
         let (sender, receiver) = mpsc::channel::<SessionWrite>(SESSION_QUEUE_CAPACITY);
-        let flusher = handle.spawn(session_flusher(receiver));
+        let flusher = handle.spawn(session_flusher(root.clone(), receiver));
         let writer = Arc::new(SessionWriter {
+            root,
             sender,
             _flusher: flusher,
         });
         *guard = Some(writer.clone());
-        Some(writer)
+        Ok(Some(writer))
     }
 
     pub fn root(&self) -> &Path {
@@ -141,24 +186,21 @@ impl TaskWorkspace {
     /// `task.toml`, and the `subagents`, `suborchestrators` and `sessions`
     /// subtrees in one place.
     pub fn task_dir(&self, task_id: &TaskId) -> Result<PathBuf, TaskWorkspaceError> {
-        let name = path_segment("task id", task_id.as_str())?;
-        if matches!(name, "main" | "min") {
-            return Ok(self.root.parent().unwrap_or_else(|| self.root()).join(name));
-        }
-        Ok(self.root.join(name))
+        Ok(self.boundary.join(self.relative_task_dir(task_id)?))
     }
 
     pub fn init_task(&self, task_id: &TaskId) -> Result<(), TaskWorkspaceError> {
-        let dir = self.task_dir(task_id)?;
-        create_dir_all(&dir)?;
-        create_dir_all(&dir.join("subagents"))?;
-        create_dir_all(&dir.join("suborchestrators"))?;
-        create_dir_all(&dir.join("sessions"))?;
+        let root = self.root_dir()?;
+        let dir = self.relative_task_dir(task_id)?;
+        root.create_dir_all(dir.join("subagents"))?;
+        root.create_dir_all(dir.join("suborchestrators"))?;
+        root.create_dir_all(dir.join("sessions"))?;
 
         let metadata_path = dir.join("task.toml");
-        if !metadata_path.exists() {
+        if !rooted_exists(&root, &metadata_path)? {
             let now = timestamp();
             write_toml(
+                &root,
                 &metadata_path,
                 &TaskMetadata {
                     task_id: task_id.clone(),
@@ -171,20 +213,36 @@ impl TaskWorkspace {
         }
 
         let state_path = dir.join("state.toml");
-        if !state_path.exists() {
-            write_toml(&state_path, &TaskState::default())?;
+        if !rooted_exists(&root, &state_path)? {
+            write_toml(&root, &state_path, &TaskState::default())?;
         }
         Ok(())
     }
 
     pub fn load_state(&self, task_id: &TaskId) -> Result<Option<TaskState>, TaskWorkspaceError> {
-        let path = self.task_dir(task_id)?.join("state.toml");
-        match fs::read_to_string(&path) {
-            Ok(input) => toml::from_str(&input)
-                .map(Some)
-                .map_err(|source| TaskWorkspaceError::TomlDe { path, source }),
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(source) => Err(TaskWorkspaceError::Io { path, source }),
+        let root = self.root_dir()?;
+        let path = self.relative_task_dir(task_id)?.join("state.toml");
+        match root.open_file(&path) {
+            Ok(mut file) => {
+                let mut input = String::new();
+                file.read_to_string(&mut input)
+                    .map_err(|source| TaskWorkspaceError::Io {
+                        path: self.boundary.join(&path),
+                        source,
+                    })?;
+                toml::from_str(&input)
+                    .map(Some)
+                    .map_err(|source| TaskWorkspaceError::TomlDe {
+                        path: self.boundary.join(path),
+                        source,
+                    })
+            }
+            Err(ContainmentError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(None)
+            }
+            Err(source) => Err(source.into()),
         }
     }
 
@@ -193,7 +251,12 @@ impl TaskWorkspace {
         task_id: &TaskId,
         state: &TaskState,
     ) -> Result<(), TaskWorkspaceError> {
-        write_toml(&self.task_dir(task_id)?.join("state.toml"), state)
+        let root = self.root_dir()?;
+        write_toml(
+            &root,
+            &self.relative_task_dir(task_id)?.join("state.toml"),
+            state,
+        )
     }
 
     pub fn create_subagent_config(
@@ -202,16 +265,19 @@ impl TaskWorkspace {
         name: &str,
         config: &SubAgentWorkspaceConfig,
     ) -> Result<(), TaskWorkspaceError> {
+        let root = self.root_dir()?;
         let dir = self
-            .task_dir(task_id)?
+            .relative_task_dir(task_id)?
             .join("subagents")
             .join(path_segment("sub-agent name", name)?);
-        create_dir_all(&dir)?;
+        root.create_dir_all(&dir)?;
         let path = dir.join("config.toml");
-        if path.exists() {
-            return Err(TaskWorkspaceError::ImmutableConfig { path });
+        if rooted_exists(&root, &path)? {
+            return Err(TaskWorkspaceError::ImmutableConfig {
+                path: self.boundary.join(path),
+            });
         }
-        write_toml(&path, config)
+        write_toml(&root, &path, config)
     }
 
     pub fn write_suborchestrator_graph(
@@ -219,15 +285,16 @@ impl TaskWorkspace {
         task_id: &TaskId,
         template: &OrchestratorTemplate,
     ) -> Result<(), TaskWorkspaceError> {
+        let root = self.root_dir()?;
         let dir = self
-            .task_dir(task_id)?
+            .relative_task_dir(task_id)?
             .join("suborchestrators")
             .join(path_segment(
                 "orchestrator template name",
                 template.name.as_ref(),
             )?);
-        create_dir_all(&dir)?;
-        write_toml(&dir.join("graph.toml"), template)
+        root.create_dir_all(&dir)?;
+        write_toml(&root, &dir.join("graph.toml"), template)
     }
 
     pub fn append_session_event(
@@ -240,16 +307,16 @@ impl TaskWorkspace {
         // `../../x` cannot become a legitimate-looking `x.jsonl` somewhere
         // else.
         let path = self
-            .task_dir(task_id)?
+            .relative_task_dir(task_id)?
             .join("sessions")
             .join(format!("{}.jsonl", path_segment("session id", session_id)?));
         let encoded = serde_json::to_string(event).map_err(|source| TaskWorkspaceError::Json {
-            path: path.clone(),
+            path: self.boundary.join(&path),
             source,
         })?;
         let line = format!("{encoded}\n");
 
-        if let Some(writer) = self.writer() {
+        if let Some(writer) = self.writer()? {
             match writer.sender.try_send(SessionWrite {
                 path: path.clone(),
                 line,
@@ -260,19 +327,20 @@ impl TaskWorkspace {
                     // Backpressure or flusher gone — preserve durability via
                     // a synchronous direct write rather than dropping the
                     // event.
-                    return write_session_line_sync(&write.path, &write.line);
+                    return write_session_line_sync(&writer.root, &write.path, &write.line);
                 }
             }
         }
 
-        write_session_line_sync(&path, &line)
+        let root = self.root_dir()?;
+        write_session_line_sync(&root, &path, &line)
     }
 }
 
-async fn session_flusher(mut rx: mpsc::Receiver<SessionWrite>) {
+async fn session_flusher(root: Arc<RootDir>, mut rx: mpsc::Receiver<SessionWrite>) {
     let mut files: HashMap<PathBuf, File> = HashMap::new();
     while let Some(write) = rx.recv().await {
-        match cached_file(&mut files, &write.path) {
+        match cached_file(&root, &mut files, &write.path) {
             Ok(file) => {
                 if let Err(err) = file.write_all(write.line.as_bytes()) {
                     tracing::warn!(
@@ -295,49 +363,43 @@ async fn session_flusher(mut rx: mpsc::Receiver<SessionWrite>) {
 }
 
 fn cached_file<'a>(
+    root: &RootDir,
     cache: &'a mut HashMap<PathBuf, File>,
     path: &Path,
-) -> std::io::Result<&'a mut File> {
+) -> Result<&'a mut File, ContainmentError> {
     if !cache.contains_key(path) {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let file = root.append_file(path)?;
         cache.insert(path.to_path_buf(), file);
     }
     Ok(cache.get_mut(path).expect("file just inserted into cache"))
 }
 
-fn write_session_line_sync(path: &Path, line: &str) -> Result<(), TaskWorkspaceError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| TaskWorkspaceError::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|source| TaskWorkspaceError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
+fn write_session_line_sync(
+    root: &RootDir,
+    path: &Path,
+    line: &str,
+) -> Result<(), TaskWorkspaceError> {
+    let mut file = root.append_file(path)?;
     file.write_all(line.as_bytes())
         .map_err(|source| TaskWorkspaceError::Io {
-            path: path.to_path_buf(),
+            path: root.path().join(path),
             source,
         })
 }
 
-fn create_dir_all(path: &Path) -> Result<(), TaskWorkspaceError> {
-    fs::create_dir_all(path).map_err(|source| TaskWorkspaceError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
+fn rooted_exists(root: &RootDir, path: &Path) -> Result<bool, TaskWorkspaceError> {
+    match root.open_file(path) {
+        Ok(_) => Ok(true),
+        Err(ContainmentError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Ok(false)
+        }
+        Err(source) => Err(source.into()),
+    }
 }
 
-fn write_toml<T>(path: &Path, value: &T) -> Result<(), TaskWorkspaceError>
+fn write_toml<T>(root: &RootDir, path: &Path, value: &T) -> Result<(), TaskWorkspaceError>
 where
     T: Serialize,
 {
@@ -345,12 +407,8 @@ where
         path: path.to_path_buf(),
         source,
     })?;
-    crate::paths::write_private_atomic(path, encoded.as_bytes()).map_err(|err| {
-        TaskWorkspaceError::Io {
-            path: err.path().to_path_buf(),
-            source: err.into_io(),
-        }
-    })
+    root.write_file_atomic(path, encoded.as_bytes())?;
+    Ok(())
 }
 
 fn timestamp() -> String {
@@ -364,6 +422,7 @@ fn timestamp() -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);

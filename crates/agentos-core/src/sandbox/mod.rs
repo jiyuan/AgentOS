@@ -167,6 +167,18 @@ impl Sandbox {
         if !self.mode.is_sandboxed() {
             return Ok(());
         }
+        // Writable grants name operator-configured boundaries. Manufacturing a
+        // missing one here turns a typo into authority over a path that did
+        // not exist when the deployment was reviewed. Both native backends
+        // therefore validate before spawn and fail closed.
+        for path in &self.writable {
+            if !path.is_dir() {
+                return Err(SandboxError::Setup(format!(
+                    "cannot grant writes beneath '{}': it does not exist or is not a directory",
+                    path.display()
+                )));
+            }
+        }
         #[cfg(target_os = "linux")]
         {
             return linux::harden(self, command);

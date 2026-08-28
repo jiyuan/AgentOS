@@ -1,4 +1,4 @@
-use crate::channels::attachments::{file_size, AttachmentStore};
+use crate::channels::attachments::AttachmentStore;
 use crate::http::shared_client;
 use agentos_interfaces::{
     Channel, ChannelError, Egress, InboundEvent, IngressReceipt, StreamEgress,
@@ -8,16 +8,15 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::fs;
-use tokio::io::AsyncWriteExt;
 use tracing::debug;
 
 mod egress;
 mod event;
 mod fragments;
+mod limits;
 mod long_connection;
 mod proto;
 mod websocket;
@@ -25,6 +24,7 @@ mod websocket;
 use crate::channels::admission::{env_flag, AdmissionPolicy};
 use egress::FeishuEgress;
 use event::{feishu_allowed_source_ids_from_env, AttachmentDescriptor};
+use limits::MAX_HTTP_RESPONSE_BYTES;
 use long_connection::{FeishuEndpoint, FeishuLongConnection};
 
 const DEFAULT_API_BASE: &str = "https://open.feishu.cn/open-apis";
@@ -170,8 +170,7 @@ impl FeishuChannel {
         message_id: &str,
         key: &str,
         kind: &str,
-        target: &Path,
-    ) -> Result<(), ChannelError> {
+    ) -> Result<Vec<u8>, ChannelError> {
         let token = self.tenant_access_token().await?;
         let url = format!(
             "{}?type={kind}",
@@ -191,26 +190,17 @@ impl FeishuChannel {
         // out-of-memory kill for the gateway and every conversation on it.
         let max_bytes = self.attachments.max_bytes();
         let mut written: u64 = 0;
-        let mut file = fs::File::create(target)
-            .await
-            .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
+        let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(reqwest_to_channel_err)? {
             written += chunk.len() as u64;
             if written > max_bytes {
-                drop(file);
-                let _ = fs::remove_file(target).await;
                 return Err(ChannelError::Backend(Arc::from(format!(
                     "Feishu attachment exceeds the {max_bytes}-byte limit"
                 ))));
             }
-            file.write_all(&chunk)
-                .await
-                .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
+            bytes.extend_from_slice(&chunk);
         }
-        file.flush()
-            .await
-            .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
-        Ok(())
+        Ok(bytes)
     }
 
     async fn download_attachments(
@@ -230,16 +220,15 @@ impl FeishuChannel {
         }
         let mut out = Vec::with_capacity(accepted);
         for desc in descriptors.iter().take(accepted) {
-            let target = self
-                .attachments
-                .target_path(conversation, message_id, &desc.name)?;
             let kind = match desc.kind {
                 AttachmentKind::Image => "image",
                 AttachmentKind::Document => "file",
             };
-            self.download_resource(message_id, &desc.key, kind, &target)
-                .await?;
-            let size = file_size(&target);
+            let bytes = self.download_resource(message_id, &desc.key, kind).await?;
+            let size = Some(bytes.len() as u64);
+            let target = self
+                .attachments
+                .publish(conversation, message_id, &desc.name, &bytes)?;
             out.push(Attachment {
                 kind: desc.kind.clone(),
                 name: Arc::from(desc.name.as_str()),
@@ -257,17 +246,15 @@ impl FeishuChannel {
             "AppID": self.app_id.as_ref(),
             "AppSecret": self.app_secret.as_ref(),
         });
-        let response: Value = shared_client()
+        let response = shared_client()
             .post(self.platform_url("callback/ws/endpoint"))
             .header("locale", "zh")
             .json(&body)
             .send()
             .await
             .and_then(reqwest::Response::error_for_status)
-            .map_err(reqwest_to_channel_err)?
-            .json()
-            .await
             .map_err(reqwest_to_channel_err)?;
+        let response = feishu_json(response).await?;
         if response.get("code").and_then(Value::as_i64) != Some(0) {
             return Err(ChannelError::Backend(Arc::from(response.to_string())));
         }
@@ -523,17 +510,15 @@ pub(super) async fn feishu_edit_text(
     let content = json!({ "text": text }).to_string();
     let body = json!({ "msg_type": "text", "content": content });
     let url = format!("{api_base}/im/v1/messages/{message_id}");
-    let response: Value = shared_client()
+    let response = shared_client()
         .put(url)
         .bearer_auth(token)
         .json(&body)
         .send()
         .await
         .and_then(reqwest::Response::error_for_status)
-        .map_err(reqwest_to_channel_err)?
-        .json()
-        .await
         .map_err(reqwest_to_channel_err)?;
+    let response = feishu_json(response).await?;
     if response.get("code").and_then(Value::as_i64) == Some(0) {
         Ok(())
     } else {
@@ -560,14 +545,16 @@ pub(super) async fn post_json(
     if let Some(token) = bearer {
         request = request.bearer_auth(token);
     }
-    request
+    let response = request
         .send()
         .await
         .and_then(reqwest::Response::error_for_status)
-        .map_err(reqwest_to_channel_err)?
-        .json()
-        .await
-        .map_err(reqwest_to_channel_err)
+        .map_err(reqwest_to_channel_err)?;
+    feishu_json(response).await
+}
+
+async fn feishu_json(response: reqwest::Response) -> Result<Value, ChannelError> {
+    crate::channels::bounded_response::json(response, "Feishu", MAX_HTTP_RESPONSE_BYTES).await
 }
 
 /// Whether a long-connection read error is just the server recycling the

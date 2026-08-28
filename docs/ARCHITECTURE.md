@@ -443,10 +443,10 @@ telemetry, and silently never sent.
   transcript, made the locator authorize nothing (anything that could read one
   path could read any path), and left a spill root outside the workspace
   unreadable, since `file` is contained to the workspace. Retrieval is now the
-  `spill_read` tool: it resolves against the configured store through
-  `paths::RootDir`, and refuses a locator the calling run's own transcript does
-  not cite. That last check is the authorization — the model may re-read what
-  it was told about and nothing else — and it spans turns for free, because a
+  `spill_read` tool: it resolves against the configured store through a
+  retained `paths::RootDir`, and refuses a locator the calling run's own
+  transcript does not cite. That last check is the authorization — the model
+  may re-read what it was told about and nothing else — and it spans turns for free, because a
   conversation's transcript does.
 - **Elision.** Under pressure, the middle of an already-recorded tool result is
   replaced by a marker citing its locator. Free, deterministic, and a view
@@ -680,27 +680,52 @@ AgentOS uses nine independent safety rings:
 5. **Filesystem containment.** A model-supplied path never reaches the
    filesystem as a string. `crates/agentos-core/src/paths/RootDir` holds a
    descriptor for the root and walks to the target with `openat(O_NOFOLLOW)`,
-   one component at a time, then acts on the descriptor it arrived at. A
-   symlink anywhere on the path is refused rather than resolved — including
-   one whose target is inside the root, because deciding that safely means
-   re-resolving, which is the race this replaces. Identifiers that become a
-   path component (task ids, sub-agent names, orchestrator template names,
-   session ids) are validated as single names by `paths::path_segment` and
-   rejected if they are not; they are never rewritten, because whoever chose
-   the name will use it again to find what was written under it.
+   one component at a time, then acts on the descriptor it arrived at. Reads,
+   private directory/file creation, append, temporary cleanup, and atomic
+   publication all stay directory-relative; publication uses `renameat` and
+   returns success only after both file data and the retained parent directory
+   have been `fsync`ed. Created directories and files are `0700` and `0600`
+   even under a permissive umask. A symlink anywhere on the path is refused
+   rather than resolved — including one whose target is inside the root,
+   because deciding that safely means re-resolving, which is the race this
+   replaces. Identifiers that become a path component (task ids, sub-agent
+   names, orchestrator template names, session ids) are validated as single
+   names by `paths::path_segment` and rejected if they are not; they are never
+   rewritten, because whoever chose the name will use it again to find what
+   was written under it. Task/session state retains one descriptor at the
+   common task-layout root, including the special `main` and `min` siblings;
+   attachment stores publish bounded downloads atomically beneath a retained
+   attachment root; skill validation accepts one lowercase hyphen-case name
+   and inventories through no-follow directory descriptors with depth and
+   entry ceilings. Spill and cron stores use the same rooted create/read/write
+   surface. Runtime-selected paused-run paths and operator-selected trace roots
+   remain trusted path APIs and were not reclassified as model input.
 
 6. **Subprocess environment and lifetime.** Every child the runtime spawns —
-   the isolation worker, a `shell` command, a stdio MCP server — starts from
-   `env_clear` and is given back a named allowlist
+   the isolation worker, a `shell` command, a stdio MCP server — is constructed
+   by `tools::exec::spawn`, starts from `env_clear`, and is given back a named allowlist
    (`crates/agentos-core/src/tools/child_env.rs`): `PATH`, `HOME`, `TMPDIR`,
    the locale, proxy settings, and `AGENTOS_HOME`. No provider or channel
    credential is inherited, so a tool the model drives cannot read the keys
    the gateway holds. `[isolation].env_passthrough` names anything else a
    deployment needs, by name and never by value. Each child is spawned into
-   its own process group; a deadline or a cancellation signals the *group*, so
-   a shell that forks does not leave a grandchild behind. A command that exits
-   cleanly is left alone, because something it started on purpose is its
-   business.
+   its own process group. The managed child owns that group: deadline,
+   cancellation, drop, and MCP shutdown signal the group and reap the direct
+   child, so a forked grandchild cannot survive an abandoned operation. A
+   one-shot command that exits cleanly is deliberately allowed to leave a
+   daemon it intentionally started. `scripts/check-subprocess-boundaries.sh`
+   rejects direct runtime `Command::new` calls outside the boundary and the two
+   documented bootstrap/probe exceptions. Telegram uses the pooled async HTTP
+   client instead of spawning `curl`, with bounded response and attachment
+   accumulation.
+
+   Native sandbox setup is part of the same spawn. Linux installs Landlock in
+   `pre_exec`; macOS wraps the exact child in Seatbelt. `workspace_write`
+   validates that every granted root already exists, rather than manufacturing
+   authority for a missing configured path. Seatbelt profiles canonicalize
+   roots before granting them, which is required for macOS aliases such as
+   `/var` resolving to `/private/var`. Unsupported or unbuildable backends fail
+   the call before spawn.
 
 7. **Tool egress.** A URL the model chose is fetched through
    `crates/agentos-core/src/egress/`, never through the shared client. The
@@ -708,8 +733,9 @@ AgentOS uses nine independent safety rings:
    hostname is not a destination, `localtest.me` resolves to `127.0.0.1`, and
    filtering after resolution and before the connection means there is no
    second lookup for a rebinding attack to win. Everything that is not
-   globally routable unicast is refused, plus the cloud metadata addresses,
-   which are globally routable and are the highest-value SSRF target there is.
+   globally routable unicast is refused, including deprecated IPv6 site-local
+   `fec0::/10`, plus the cloud metadata addresses, which are globally routable
+   and are the highest-value SSRF target there is.
    A literal-address URL and every redirect hop are checked separately,
    because neither reaches DNS. The ambient HTTP proxy is deliberately off for
    this client: a proxy resolves the destination itself, so every request
@@ -727,14 +753,20 @@ AgentOS uses nine independent safety rings:
    choose how much memory this process spends. Feishu's fragment reassembly
    (`channels/feishu/fragments.rs`) took `sum` straight from a frame header
    into `vec![None; sum]`, which a peer could turn into an allocation failure
-   before the event was parsed, let alone admitted; it now has ceilings on
-   fragments per event, on partially-received events held at once, and on the
-   reassembled total. Attachment downloads stream to
-   `[limits].attachment_bytes` and abandon what exceeds it, because the size a
-   channel reports is the sender's claim rather than a limit the sender is
-   held to, and `[limits].attachments_per_message` bounds how many downloads
-   one message can cause. Provider response bodies are read to a ceiling
-   rather than buffered whole.
+   before the event was parsed, let alone admitted. Tungstenite now rejects a
+   frame or message beyond the named transport ceiling before returning it;
+   protobuf-declared lengths and retained headers are bounded before cloning;
+   and the same event-byte ceiling applies to unfragmented, missing/malformed
+   metadata, and fragmented paths. Reassembly also has ceilings on fragments
+   per event and partially-received events held at once. Telegram and Feishu
+   JSON API responses share one streaming accumulator that checks declared and
+   observed bytes before extending its buffer. Attachment downloads stream to
+   `[limits].attachment_bytes`, checking every received chunk before extending
+   the bounded buffer, then publish once through a rooted temporary file,
+   because the size a channel reports is the sender's claim rather than a limit
+   the sender is held to. `[limits].attachments_per_message` bounds how many
+   downloads one message can cause. Provider response bodies are read to a
+   ceiling rather than buffered whole.
 
 9. **Durable safety events.** Every decision the rings above make appends a
    row to `safety_events` through `crates/agentos-core/src/audit/`: approval
