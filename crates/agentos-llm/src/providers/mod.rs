@@ -7,19 +7,57 @@ pub(crate) mod reply;
 pub(crate) mod stream;
 
 use crate::LlmError;
+use agentos_interfaces::tool::ToolSpec;
 use agentos_proto::{Message, TOKEN_USAGE_METADATA_KEY};
 use bytes::Bytes;
 use rand::Rng;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::env;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::time::sleep;
+
+/// One tool as an OpenAI *chat completions* function object.
+///
+/// Shared by every provider speaking that dialect (DeepSeek, Ollama). The
+/// OpenAI Responses API takes a flatter shape and keeps its own builder in
+/// `openai::responses`; the two used to be same-named private copies in three
+/// files, two identical and one not, which is a rename away from a provider
+/// silently sending the wrong schema.
+pub(crate) fn chat_completion_tool_schema(spec: &ToolSpec) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": spec.name.as_ref(),
+            "description": spec.description.as_ref(),
+            "parameters": spec.input_schema,
+        }
+    })
+}
+
+/// A tool result whose originating tool call is not in this request, rendered
+/// as a user turn.
+///
+/// Chat-completions and Responses both reject a tool message with no matching
+/// call id — which is what an elided or compacted transcript produces — so the
+/// observation rides as ordinary user content instead of being dropped.
+pub(crate) fn orphan_tool_message_as_user(message: &Message) -> Value {
+    let kind = message
+        .metadata
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("tool_result");
+    let content = format!(
+        "Internal AgentOS observation ({kind}):\n{}",
+        message.content.as_ref()
+    );
+    json!({ "role": "user", "content": content })
+}
 
 #[derive(Debug)]
 pub(crate) struct JsonHttpResponse {

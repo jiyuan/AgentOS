@@ -127,10 +127,6 @@ impl StepFailure {
         &self.error
     }
 
-    pub fn into_error(self) -> RunError {
-        self.error
-    }
-
     /// The state to persist and the error to report.
     pub fn into_parts(self) -> (RunState, RunError) {
         (*self.state, self.error)

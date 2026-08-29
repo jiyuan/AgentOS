@@ -6,7 +6,7 @@ pub mod mcp;
 mod memory;
 mod registry;
 
-pub(crate) use builtin::{safe_workspace_path, skills_dir, workspace_root};
+pub(crate) use builtin::{failed_result, safe_workspace_path, skills_dir, workspace_root};
 pub use builtin::{
     CronCreatorTool, CronListTool, CronRemoveTool, FileTool, HttpTool, JobKillTool, JobOutputTool,
     JobStatusTool, ShellTool, SkillValidateTool, SpillReadTool, DEFAULT_DIRECTORY_LIST_ENTRIES,

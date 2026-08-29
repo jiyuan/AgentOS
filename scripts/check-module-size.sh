@@ -15,11 +15,19 @@ limit=800
 # Keep this POSIX-ish instead of using associative arrays so the script works on
 # the older Bash shipped by default on macOS.
 # Per PLAN.md A6, only entry-point binaries may stay allowlisted.
-is_allowlisted() {
+#
+# An allowlist that only warns is not a boundary: the gateway entry point grew
+# by 237 lines across R2-R5 while this gate stayed green, which is precisely
+# what the roadmap's "do not further grow the entry-point files" rule forbids.
+# Each allowlisted file therefore carries a recorded budget and is ratcheted
+# *both* ways -- exceeding it fails, and dropping below it fails too, asking for
+# the number to come down. A budget that is only ever an upper bound drifts back
+# up; one that has to be edited to move stays honest.
+allowlisted_budget() {
   case "$1" in
-    crates/agentos-cli/src/main.rs) return 0 ;;
-    crates/agentos-cli/src/bin/agentos-gateway/main.rs) return 0 ;;
-    *) return 1 ;;
+    crates/agentos-cli/src/main.rs) echo 917 ;;
+    crates/agentos-cli/src/bin/agentos-gateway/main.rs) echo 1952 ;;
+    *) echo "" ;;
   esac
 }
 
@@ -71,8 +79,19 @@ while IFS= read -r -d "" file; do
     continue
   fi
 
-  if is_allowlisted "$rel"; then
-    echo "warn: $rel is $effective LOC (allowlisted; budget $limit)"
+  budget="$(allowlisted_budget "$rel")"
+  if [[ -n "$budget" ]]; then
+    if (( effective > budget )); then
+      echo "error: $rel is $effective LOC, above its recorded budget of $budget."
+      echo "       This file is already over the $limit ceiling; put new code in a new module."
+      violations=$((violations + 1))
+    elif (( effective < budget )); then
+      echo "error: $rel is $effective LOC, below its recorded budget of $budget."
+      echo "       Lower the budget in allowlisted_budget() to $effective to keep the ratchet tight."
+      violations=$((violations + 1))
+    else
+      echo "warn: $rel is $effective LOC (allowlisted at its budget; ceiling $limit)"
+    fi
     continue
   fi
 

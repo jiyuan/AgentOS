@@ -31,7 +31,28 @@ use std::time::Duration;
 macro_rules! enforced_or_fail {
     ($test:literal) => {
         match availability() {
-            agentos_core::sandbox::Availability::Enforced(mechanism) => mechanism,
+            agentos_core::sandbox::Availability::Enforced(mechanism) => {
+                // `AF-020` is a claim about *Seatbelt* semantics, and the
+                // coverage table records it as `native-macos`. Naming the
+                // expected backend per platform is what keeps that honest: a
+                // macOS run that somehow enforced through anything else would
+                // pass every assertion below while proving nothing about the
+                // mechanism the finding is about.
+                let expected = if cfg!(target_os = "macos") {
+                    "seatbelt"
+                } else if cfg!(target_os = "linux") {
+                    "landlock"
+                } else {
+                    mechanism
+                };
+                assert_eq!(
+                    mechanism, expected,
+                    "{} ran under '{mechanism}', but this platform's sandbox \
+                     contract is written against '{expected}'",
+                    $test
+                );
+                mechanism
+            }
             agentos_core::sandbox::Availability::Unavailable(reason) => {
                 if !cfg!(any(target_os = "linux", target_os = "macos")) {
                     eprintln!("skipping {}: {reason}", $test);

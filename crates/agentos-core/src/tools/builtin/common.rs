@@ -12,6 +12,7 @@
 //!    RAII guards. Production code never sets these — `cron_root_for_tests`
 //!    and `skills_root_for_tests` short-circuit to `None` outside `cfg(test)`.
 
+use agentos_proto::{ToolCall, ToolResult, ToolStatus};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -107,6 +108,19 @@ pub(super) fn default_cron_dir() -> PathBuf {
 /// joined with `workspace/skills`.
 pub(super) fn default_skills_dir() -> PathBuf {
     workspace_root().join("workspace").join("skills")
+}
+
+/// A tool result the model should read and correct, not an error that ends the
+/// run: an unknown job id, a spill locator this run never cited, a registry
+/// refusal. Carries no metadata — a caller with fields to attach (an egress
+/// refusal, a timeout, a tripped guardrail) builds the result itself.
+pub(crate) fn failed_result(call: &ToolCall, message: &str) -> ToolResult {
+    ToolResult {
+        call_id: call.id.clone(),
+        status: ToolStatus::Failed,
+        content: Arc::from(message),
+        metadata: BTreeMap::new(),
+    }
 }
 
 #[cfg(test)]

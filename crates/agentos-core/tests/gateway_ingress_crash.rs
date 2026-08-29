@@ -23,37 +23,62 @@ fn envelope(channel: &str, event_id: i64, content: &str) -> Envelope {
     }
 }
 
-/// AF-002: Feishu cannot ACK an event before its replay payload commits.
+/// The transport half — that the shipped receive loop emits the ACK only after
+/// this commit — is pinned on the loop itself by `agentos-gateway/ingress.rs`'s
+/// `transport_ack_follows_durable_admission_on_the_receive_path`: an ordering
+/// asserted by calling a ledger in the right order proves only that the test
+/// knows the order.
+///
+/// AF-002: Feishu cannot ACK an event before its replay payload commits. This
+/// test owns the ledger half — the row and checkpoint commit first, carry the
+/// whole envelope, and stay invisible to the dispatcher until the ACK lands.
 #[test]
 fn feishu_ack_follows_durable_ingress_commit() {
     let store = Arc::new(SqliteStore::open_in_memory().expect("store opens"));
     let ledger = IngressLedger::new(store);
     let input = envelope("feishu", 41, "hello");
-    let mut acknowledged = false;
-    assert!(!acknowledged, "the transport starts unacknowledged");
 
     assert_eq!(
         ledger
-            .admit_with_checkpoint(&input, None)
+            .admit_with_checkpoint(&input, Some("42"))
             .expect("durable admission succeeds"),
         Admission::Fresh
     );
-    assert!(ledger
-        .claim_next(&input.channel_id)
-        .expect("queue reads before ACK")
-        .is_none());
+    assert_eq!(
+        ledger
+            .unsettled(&input.channel_id)
+            .expect("unsettled rows read")
+            .len(),
+        1,
+        "the replay payload must be durable before any acknowledgement"
+    );
+    assert_eq!(
+        ledger
+            .cursor(&input.channel_id)
+            .expect("cursor reads")
+            .as_deref(),
+        Some("42"),
+        "the checkpoint commits atomically with the envelope"
+    );
+    assert!(
+        ledger
+            .claim_next(&input.channel_id)
+            .expect("queue reads before ACK")
+            .is_none(),
+        "an unacknowledged event must not be routable"
+    );
+
     ledger
         .mark_acknowledged(&input.channel_id, "41")
         .expect("ACK state commits");
-    assert!(ledger
+    let claimed = ledger
         .claim_next(&input.channel_id)
         .expect("queue reads")
-        .is_some());
-    acknowledged = true;
-
-    assert!(
-        acknowledged,
-        "ACK is emitted only after a replayable row exists"
+        .expect("an acknowledged event is dispatchable");
+    assert_eq!(claimed.event_id.as_ref(), "41");
+    assert_eq!(
+        claimed.envelope, input,
+        "the durable row must replay the exact envelope that was admitted"
     );
 }
 
@@ -84,6 +109,12 @@ fn telegram_cursor_never_advances_past_unrecoverable_input() {
 }
 
 /// AF-004: a failed SQLite admission permits neither ACK nor execution.
+///
+/// The executable half is here — a failed admission leaves no row, no cursor,
+/// and nothing the dispatcher can claim. That no transport acknowledgement is
+/// emitted either is a property of the shipped receive loop, pinned by
+/// `agentos-gateway/ingress.rs`'s
+/// `ledger_failure_on_the_receive_path_acknowledges_and_runs_nothing`.
 #[test]
 fn ledger_failure_prevents_ack_and_execution() {
     let tree = support::temp_tree("gw002-ledger-failure");
@@ -98,17 +129,28 @@ fn ledger_failure_prevents_ack_and_execution() {
         .expect("failure trigger installs");
     let ledger = IngressLedger::new(store);
     let input = envelope("telegram", 7, "do not run");
-    let acknowledged = false;
-    let executed = false;
 
     assert!(ledger.admit_with_checkpoint(&input, Some("8")).is_err());
-    assert!(!acknowledged);
-    assert!(!executed);
+    assert!(
+        ledger
+            .unsettled(&input.channel_id)
+            .expect("unsettled rows still read")
+            .is_empty(),
+        "a failed admission must leave no accepted row behind"
+    );
+    assert!(
+        ledger
+            .claim_next(&input.channel_id)
+            .expect("queue still reads")
+            .is_none(),
+        "unadmitted input must never become executable"
+    );
     assert_eq!(
         ledger
             .cursor(&input.channel_id)
             .expect("cursor query still works"),
-        None
+        None,
+        "a failed admission must not move the transport checkpoint"
     );
 }
 

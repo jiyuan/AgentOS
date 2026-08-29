@@ -1,6 +1,7 @@
 //! Immediate provider-attempt trace records.
 
-use super::{write_trace_record, RunnerError};
+use super::trace_records::write_trace_record;
+use super::RunnerError;
 use agentos_proto::{RequestAttempt, RunId};
 use serde_json::json;
 use std::fs::OpenOptions;

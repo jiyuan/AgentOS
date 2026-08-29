@@ -84,6 +84,15 @@ pub(crate) fn vector_json(vector: &[f32]) -> String {
     format!("[{}]", values.join(","))
 }
 
+/// The vector to store for `record`: a caller-supplied embedding when the
+/// metadata carries one, else the offline hash embedding of its searchable
+/// text. Both vector backends decide this identically, and a backend that
+/// drifted from the other would index the same record two different ways.
+pub(crate) fn record_embedding(record: &Record, dimensions: usize) -> Vec<f32> {
+    metadata_embedding(record)
+        .unwrap_or_else(|| hash_embedding(&searchable_record_text(record), dimensions))
+}
+
 pub(crate) fn metadata_embedding(record: &Record) -> Option<Vec<f32>> {
     record
         .metadata

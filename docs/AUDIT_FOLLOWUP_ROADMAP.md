@@ -2,7 +2,15 @@
 
 Drafted: 2026-08-23
 
-Status: **R0 implemented; R1 underway with `ID-003`, `AUTH-003`, `AUTH-004`, `AUTH-005`, and `AUD-002` complete; R2 complete with `GW-002`, `GW-003`, `GW-004`, `GW-005`, `STATE-002`, `MAINT-002`, and `CTRL-002` complete; R3 complete with `FS-002`, `FS-003`, `PROC-002`, `SBX-002`, `ING-002`, and `NET-002` complete; R4 complete with `MCP-002`, `MCP-003`, and `MCP-004` complete; R5 complete with `REQ-002`, `OUT-001`, and `AUD-003` complete**
+Status: **R0–R6 implemented; all 28 slices and all 40 coverage rows complete.**
+Per-slice status lines below carry the detail, and every slice's evidence is the
+named regression artifact in its coverage row, which
+`scripts/check-audit-regressions.sh` resolves on every CI run.
+
+The header used to say "R1 underway" while the table marked every R1 row
+complete, and omitted R6 entirely while its three rows were complete — a prose
+summary maintained separately from the register it summarises will drift, so it
+now states the register's totals rather than restating each slice.
 
 Baseline: branch `docs/audit-remediation-plan`, commit `d4b2e94`
 
@@ -14,9 +22,15 @@ runtime behavior, migration rehearsals, and exit gates below.
 
 ## Audit verdict and release posture
 
-The implementation is **not ready for sign-off**. Useful controls exist, but
-several are incomplete at the point where the security or durability property
-must actually hold:
+### Opening verdict (2026-08-23)
+
+This was the position when the roadmap was drafted, kept as the historical
+record of what the work had to close. Every item below is now addressed; see the
+coverage table for the regression that holds each one down.
+
+At that point the implementation was **not ready for sign-off**. Useful controls
+existed, but several were incomplete at the point where the security or
+durability property must actually hold:
 
 - persistent child identity can collide across parent agents and channels;
 - transport acknowledgement, durable ingress, replay, steering, and settlement
@@ -35,7 +49,18 @@ coverage table remains open. The final release candidate also closes every P2
 listed here; deferral requires a new accepted ADR that states the residual risk,
 owner, expiry, and compensating control.
 
-## Current verification baseline
+### Current posture
+
+All 40 coverage rows are complete and every row's named regression resolves.
+What that does *not* yet amount to is a sign-off: the rows marked
+`native-macos` and `native-linux+macos` are only evidence once the macOS job has
+run them, per delivery rule 7, and the release gate below still has to pass end
+to end from a clean checkout. Treat the register as closed and the release
+decision as outstanding until those two things are true.
+
+## Verification baseline
+
+### At audit time (2026-08-23)
 
 The audit established this starting point:
 
@@ -53,6 +78,18 @@ The audit established this starting point:
 - Timing-sensitive: the exact gateway lifecycle test passes outside the managed
   sandbox but exposes a startup window between publishing the control lock and
   installing the shutdown handler.
+
+### Now, on Linux
+
+Every item above is resolved. `cargo fmt --all -- --check`,
+`cargo check --workspace --locked --all-targets`,
+`cargo clippy --workspace --all-targets --locked -- -D warnings`, and
+`cargo test --workspace --locked` pass, as do the audit-regression, baseline,
+import-boundary, module-size, provider-call, subprocess-boundary, catalog,
+release-surface, release-locking, dependency, and gateway-crash-matrix gates.
+The sandbox suite runs enforced under Landlock and now asserts that mechanism by
+name, so the matching Seatbelt claim has to come from the macOS runner rather
+than from this one.
 
 ## Delivery rules
 
@@ -114,6 +151,7 @@ finding-to-test register.
 ### `BASE-001` — Restore the blocking local gate
 
 - Priority: P1.
+- Status: Complete; see this slice's coverage rows for its regressions.
 - Files: `crates/agentos-core/src/channels/admission.rs`, CI only if the local
   and required commands differ.
 - Deliver:
@@ -128,6 +166,7 @@ finding-to-test register.
 ### `CFG-002` — Remove implicit cron mutation authority
 
 - Priority: P1.
+- Status: Complete; see this slice's coverage rows for its regressions.
 - Files: `workspace/agent.toml`,
   `crates/agentos-core/src/runtime/tools_config.rs`,
   `crates/agentos-core/tests/shipped_config_policy.rs`.
@@ -148,6 +187,7 @@ finding-to-test register.
 ### `TEST-002` — Ratchet the audit finding register
 
 - Priority: P1.
+- Status: Complete; see this slice's coverage rows for its regressions.
 - Files: focused unit/integration tests named by R1–R6; this document's coverage
   table.
 - Deliver:
@@ -169,6 +209,7 @@ incomplete principal, incomplete plan, ambiguous ticket, or unscoped grant.
 ### `ID-003` — Collision-free subagent principals
 
 - Priority: P0.
+- Status: Complete; see this slice's coverage rows for its regressions.
 - Files: `crates/agentos-core/src/subagents/branch.rs`,
   `crates/agentos-core/src/subagents/mod.rs`, principal persistence/migration
   code, and session/memory integration tests.
@@ -198,6 +239,7 @@ incomplete principal, incomplete plan, ambiguous ticket, or unscoped grant.
 ### `AUTH-005` — Authorize an immutable, complete plan
 
 - Priority: P1.
+- Status: Complete; see this slice's coverage rows for its regressions.
 - Files: `crates/agentos-core/src/loop/authorization.rs`, loop plan/act modules,
   `crates/agentos-core/tests/loop_transitions.rs`.
 - Deliver:
@@ -246,6 +288,7 @@ incomplete principal, incomplete plan, ambiguous ticket, or unscoped grant.
 ### `AUTH-004` — Principal-bound delegation grants
 
 - Priority: P1.
+- Status: Complete; see this slice's coverage rows for its regressions.
 - Files: `crates/agentos-core/src/approve/mod.rs`, subagent config/runtime/loop
   modules, narrowing property tests, and safety-event tests.
 - Deliver:
@@ -267,6 +310,7 @@ incomplete principal, incomplete plan, ambiguous ticket, or unscoped grant.
 ### `AUD-002` — Make required safety evidence a first-class result
 
 - Priority: P1.
+- Status: Complete; see this slice's coverage rows for its regressions.
 - Files: safety journal API, loop/runner audit helpers, approval/delegation,
   policy/guardrail/sandbox/cancellation paths, and database failpoint tests.
 - Deliver:
@@ -305,6 +349,7 @@ Implementation order inside the phase is `GW-002 → GW-003/GW-004 → STATE-002
 ### `GW-002` — Make durable admission the transport checkpoint
 
 - Priority: P0.
+- Status: Complete; see this slice's coverage rows for its regressions.
 - Files: `crates/agentos-interfaces/src/channel.rs`, channel adapters,
   `crates/agentos-core/src/gateway/ingress.rs`, gateway main, SQLite migration,
   and channel pipeline fixtures.
@@ -341,6 +386,7 @@ Implementation order inside the phase is `GW-002 → GW-003/GW-004 → STATE-002
 ### `GW-003` — Preserve complete envelope identity through steering
 
 - Priority: P1.
+- Status: Complete; see this slice's coverage rows for its regressions.
 - Depends on: `GW-002`.
 - Files: `crates/agentos-core/src/gateway/inbox.rs`, gateway shard/router code,
   and steering/admission tests.
@@ -364,6 +410,7 @@ Implementation order inside the phase is `GW-002 → GW-003/GW-004 → STATE-002
 ### `GW-004` — Model delivery and settlement as durable states
 
 - Priority: P1.
+- Status: Complete; see this slice's coverage rows for its regressions.
 - Depends on: `GW-002`.
 - Files: ingress schema/API, gateway shard/egress path, runner task-session code,
   and crash/egress tests.
@@ -418,6 +465,7 @@ Implementation order inside the phase is `GW-002 → GW-003/GW-004 → STATE-002
 ### `GW-005` — Establish one process-wide runtime authority
 
 - Priority: P1.
+- Status: Complete; see this slice's coverage rows for its regressions.
 - Files: gateway main/shard/supervisor, runtime construction, and multi-channel
   lifecycle/pipeline tests.
 - Deliver:
@@ -435,6 +483,7 @@ Implementation order inside the phase is `GW-002 → GW-003/GW-004 → STATE-002
 ### `MAINT-002` — Drive maintenance independently of traffic
 
 - Priority: P1.
+- Status: Complete; see this slice's coverage rows for its regressions.
 - Depends on: `GW-005`.
 - Files: core gateway maintenance, gateway supervisor, retention/reflection/cron
   leases, and deterministic-clock tests.
@@ -771,6 +820,7 @@ claim, not yet a claim that Rust binaries or archives are bit-for-bit reproducib
 ### `REL-003` — Make install and upgrade non-destructive
 
 - Priority: P1.
+- Status: Complete; see this slice's coverage rows for its regressions.
 - Files: `scripts/install-agentos.sh`, release archive rehearsal, installer docs.
 - Deliver:
   - separate immutable distribution assets from the mutable operator workspace;
@@ -788,6 +838,7 @@ claim, not yet a claim that Rust binaries or archives are bit-for-bit reproducib
 ### `REL-004` — Lock release dependency and tool resolution
 
 - Priority: P2, release blocking.
+- Status: Complete; see this slice's coverage rows for its regressions.
 - Files: `scripts/package-release.sh`, `scripts/install-agentos.sh`,
   `scripts/check-catalogs.sh`, remaining scripted Cargo invocations, CI toolchain
   setup, and an exact `rust-toolchain.toml`.
@@ -808,6 +859,7 @@ claim, not yet a claim that Rust binaries or archives are bit-for-bit reproducib
 ### `CI-003` — Promote the corrective matrix to one required check
 
 - Priority: P1.
+- Status: Complete; see this slice's coverage rows for its regressions.
 - Depends on: all previous slices.
 - Files: `.github/workflows/ci.yml`, `.github/workflows/nightly.yml`, test/release
   scripts, capability matrix, observability and release notes.
@@ -843,9 +895,9 @@ ID sequence, and complete-row artifact resolution.
 | ID | Finding | Priority | Corrective slice | Acceptance evidence | Regression artifact | Execution | Status |
 |---|---|---:|---|---|---|---|---|
 | `AF-001` | Child session namespace omits parent channel/agent/policy | P0 | `ID-003` | Cross-channel, cross-agent, cross-policy fork/memory isolation | `crates/agentos-core/tests/subagent_identity.rs::colliding_legacy_sources_do_not_share_transcript_or_memory` | `portable` | Complete |
-| `AF-002` | Feishu ACK precedes durable ingress | P0 | `GW-002` | ACK-order crash fixture | `crates/agentos-core/tests/gateway_ingress_crash.rs::feishu_ack_follows_durable_ingress_commit` | `native-linux+macos` | Complete |
+| `AF-002` | Feishu ACK precedes durable ingress | P0 | `GW-002` | ACK-order crash fixture, plus the shipped receive loop observed at its acknowledgement | `crates/agentos-core/tests/gateway_ingress_crash.rs::feishu_ack_follows_durable_ingress_commit`, `crates/agentos-cli/src/bin/agentos-gateway/ingress.rs::transport_ack_follows_durable_admission_on_the_receive_path` | `native-linux+macos` | Complete |
 | `AF-003` | Telegram checkpoint advances without recoverable replay | P0 | `GW-002` | Cursor/restart/replay fixture | `crates/agentos-core/tests/gateway_ingress_crash.rs::telegram_cursor_never_advances_past_unrecoverable_input` | `native-linux+macos` | Complete |
-| `AF-004` | Ingress ledger error logs and continues | P0 | `GW-002` | SQLite failpoint proves no ACK or execution | `crates/agentos-core/tests/gateway_ingress_crash.rs::ledger_failure_prevents_ack_and_execution` | `portable` | Complete |
+| `AF-004` | Ingress ledger error logs and continues | P0 | `GW-002` | SQLite failpoint proves no ACK or execution, on the ledger and on the shipped receive loop | `crates/agentos-core/tests/gateway_ingress_crash.rs::ledger_failure_prevents_ack_and_execution`, `crates/agentos-cli/src/bin/agentos-gateway/ingress.rs::ledger_failure_on_the_receive_path_acknowledges_and_runs_nothing` | `portable` | Complete |
 | `AF-005` | ACKed rows can strand until restart; `/stop` bypasses admission | P0 | `GW-002` | Live dispatcher, saturation, and `/stop` ordering | `crates/agentos-core/tests/gateway_ingress_crash.rs::live_dispatcher_drains_acked_rows_and_stop_obeys_admission` | `native-linux+macos` | Complete |
 | `AF-006` | Legacy unsettled rows lack replay payload behind an advanced cursor | P0 | `GW-002` | Pre-roadmap migration quarantine fixture | `crates/agentos-core/tests/gateway_ingress_crash.rs::legacy_unsettled_rows_are_quarantined_before_cursor_advance` | `portable` | Complete |
 | `AF-007` | Steering/requeue loses envelope metadata and ingress ID | P1 | `GW-003` | Multi-sender steering/displacement | `crates/agentos-core/tests/gateway_steering.rs::displaced_envelope_preserves_principal_and_ingress_id` | `portable` | Complete |

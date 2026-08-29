@@ -1,3 +1,4 @@
+use super::failed_result;
 use super::McpTool;
 use crate::jobs::{JobId, JobRegistry, JobSnapshot, JobSpec, JobState};
 use crate::memory::{conversation_id_from_context, conversation_principal_from_context};
@@ -478,12 +479,7 @@ impl ToolRegistry {
             ))),
             Ok(None) => Some(Ok(promoted_result(call, &id, deadline))),
             // The job vanished mid-wait, which only disposal does.
-            Err(error) => Some(Ok(ToolResult {
-                call_id: call.id.clone(),
-                status: ToolStatus::Failed,
-                content: Arc::from(error.to_string()),
-                metadata: BTreeMap::new(),
-            })),
+            Err(error) => Some(Ok(failed_result(call, &error.to_string()))),
         }
     }
 }

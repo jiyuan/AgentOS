@@ -314,12 +314,16 @@ pub(super) fn report_unsettled(
 mod tests {
     use super::*;
     use agentos_core::memory::SqliteStore;
-    use agentos_interfaces::ChannelError;
+    use agentos_interfaces::{ChannelError, InboundEvent, IngressReceipt};
     use agentos_proto::{ConversationId, Message, MessageRole, INGRESS_ID_KEY};
     use async_trait::async_trait;
+    use rusqlite::Connection;
     use serde_json::Value;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, VecDeque};
+    use std::path::PathBuf;
     use std::sync::Mutex;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio_util::sync::CancellationToken;
 
     struct RecordingEgress {
         fail: bool,
@@ -418,5 +422,198 @@ mod tests {
             .claim_next(&refused.channel_id)
             .expect("queue reads")
             .is_none());
+    }
+
+    /// What the durable ledger already held when the transport was acknowledged.
+    #[derive(Debug)]
+    struct AckObservation {
+        durable: Vec<String>,
+        cursor: Option<String>,
+    }
+
+    struct SilentEgress;
+
+    #[async_trait]
+    impl Egress for SilentEgress {
+        async fn send(&self, _envelope: Envelope) -> Result<(), ChannelError> {
+            Ok(())
+        }
+    }
+
+    /// A transport that hands out fixed events and records, at each ACK, what
+    /// the ledger had already committed.
+    ///
+    /// These two tests drive [`receive`] itself rather than sequencing an
+    /// `IngressLedger` by hand. The `persist -> ACK -> route` order is a
+    /// property of this loop, so a test that calls the ledger in the right
+    /// order proves only that the test knows the order; reversing the two
+    /// statements in `receive` has to be what fails.
+    struct OrderProbe {
+        pending: VecDeque<InboundEvent>,
+        store: Arc<SqliteStore>,
+        shutdown: gateway::ProcessShutdown,
+        observed: Arc<Mutex<Vec<AckObservation>>>,
+    }
+
+    #[async_trait]
+    impl Channel for OrderProbe {
+        fn id(&self) -> ChannelId {
+            ChannelId::new("telegram")
+        }
+
+        async fn receive(&mut self) -> Option<InboundEvent> {
+            match self.pending.pop_front() {
+                Some(event) => Some(event),
+                // Nothing further to admit: end the loop the way a drain does.
+                None => {
+                    self.shutdown.begin();
+                    None
+                }
+            }
+        }
+
+        async fn acknowledge(&mut self, _receipt: IngressReceipt) -> Result<(), ChannelError> {
+            let ledger = IngressLedger::new(Arc::clone(&self.store));
+            let channel = self.id();
+            let durable = ledger
+                .unsettled(&channel)
+                .expect("the ledger is readable at acknowledgement")
+                .into_iter()
+                .map(|event| event.event_id.to_string())
+                .collect();
+            let cursor = ledger
+                .cursor(&channel)
+                .expect("the cursor is readable at acknowledgement")
+                .map(|value| value.to_string());
+            self.observed
+                .lock()
+                .expect("observation lock is not poisoned")
+                .push(AckObservation { durable, cursor });
+            Ok(())
+        }
+
+        fn egress(&self) -> Arc<dyn Egress> {
+            Arc::new(SilentEgress)
+        }
+    }
+
+    fn service_home(name: &str) -> (ServiceConfig, PathBuf) {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("the clock is after the Unix epoch")
+            .as_nanos();
+        let home = std::env::temp_dir().join(format!("agentos-{name}-{nonce}"));
+        std::fs::create_dir_all(home.join("logs")).expect("the gateway home is creatable");
+        (ServiceConfig::from_home(home.clone()), home)
+    }
+
+    fn probe(
+        store: &Arc<SqliteStore>,
+        observed: &Arc<Mutex<Vec<AckObservation>>>,
+        inbound: &Envelope,
+        checkpoint: &str,
+    ) -> OrderProbe {
+        let receipt =
+            IngressReceipt::new(Some(Arc::from(checkpoint)), None).expect("the receipt fits");
+        OrderProbe {
+            pending: VecDeque::from(vec![InboundEvent::new(inbound.clone(), receipt)]),
+            store: Arc::clone(store),
+            shutdown: gateway::ProcessShutdown::new(
+                CancellationToken::new(),
+                Duration::from_secs(5),
+            ),
+            observed: Arc::clone(observed),
+        }
+    }
+
+    /// AF-002: the shipped receive loop commits a replayable envelope and its
+    /// event-bound checkpoint before it acknowledges the transport.
+    #[tokio::test]
+    async fn transport_ack_follows_durable_admission_on_the_receive_path() {
+        let (config, home) = service_home("af002-receive-order");
+        let store = Arc::new(SqliteStore::open_in_memory().expect("the store opens"));
+        let ledger = IngressLedger::new(Arc::clone(&store));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let inbound = input("event-42");
+
+        let mut channel = probe(&store, &observed, &inbound, "43");
+        let shutdown = channel.shutdown.clone();
+        let gate = tokio::sync::Mutex::new(());
+        receive(&config, &mut channel, "Telegram", &ledger, &gate, &shutdown)
+            .await
+            .expect("the receive loop drains cleanly");
+
+        {
+            let observations = observed.lock().expect("observation lock is not poisoned");
+            assert_eq!(observations.len(), 1, "the event is acknowledged once");
+            assert_eq!(
+                observations[0].durable,
+                vec!["event-42".to_owned()],
+                "the transport was acknowledged before its replay payload committed"
+            );
+            assert_eq!(
+                observations[0].cursor.as_deref(),
+                Some("43"),
+                "the checkpoint must commit with the envelope, not after the ACK"
+            );
+        }
+
+        // Routing is downstream of the acknowledgement: the dispatcher replays
+        // the exact envelope, which it could not claim before the ACK state.
+        let claimed = ledger
+            .claim_next(&inbound.channel_id)
+            .expect("queue reads")
+            .expect("the acknowledged event is dispatchable");
+        assert_eq!(claimed.envelope, inbound);
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// AF-004: a ledger write failure on that same path acknowledges nothing,
+    /// moves no cursor, and leaves nothing executable.
+    #[tokio::test]
+    async fn ledger_failure_on_the_receive_path_acknowledges_and_runs_nothing() {
+        let (config, home) = service_home("af004-receive-failclosed");
+        let database = home.join("ingress.sqlite");
+        let store = Arc::new(SqliteStore::open(&database).expect("the store opens"));
+        Connection::open(&database)
+            .expect("a raw connection opens")
+            .execute_batch(
+                "CREATE TRIGGER inject_ingress_failure BEFORE INSERT ON ingress_events \
+                 BEGIN SELECT RAISE(FAIL, 'injected ingress failure'); END;",
+            )
+            .expect("the failure trigger installs");
+        let ledger = IngressLedger::new(Arc::clone(&store));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let inbound = input("event-7");
+
+        let mut channel = probe(&store, &observed, &inbound, "8");
+        let shutdown = channel.shutdown.clone();
+        let gate = tokio::sync::Mutex::new(());
+        let failure = receive(&config, &mut channel, "Telegram", &ledger, &gate, &shutdown)
+            .await
+            .expect_err("a failed admission must stop the receive loop");
+        assert!(failure.contains("admission failed closed"), "{failure}");
+
+        assert!(
+            observed
+                .lock()
+                .expect("observation lock is not poisoned")
+                .is_empty(),
+            "the transport was acknowledged despite a failed durable admission"
+        );
+        assert!(
+            ledger
+                .claim_next(&inbound.channel_id)
+                .expect("queue reads")
+                .is_none(),
+            "unadmitted input must never become executable"
+        );
+        assert_eq!(
+            ledger.cursor(&inbound.channel_id).expect("cursor reads"),
+            None
+        );
+
+        std::fs::remove_dir_all(&home).ok();
     }
 }

@@ -32,6 +32,7 @@
 //! still cannot name anything outside the store, and a symlink planted between
 //! the write and the read is refused rather than followed.
 
+use super::common::failed_result;
 use crate::spill::{SpillLocator, SpillStore, SPILL_LOCATOR_KEY};
 use agentos_interfaces::orchestrator::RunContext;
 use agentos_interfaces::tool::{
@@ -155,7 +156,7 @@ impl Tool for SpillReadTool {
             .map_err(|err| ToolError::Failed(err.to_string().into()))?;
 
         let Some(locator) = SpillLocator::parse(&parsed.locator) else {
-            return Ok(refused(
+            return Ok(failed_result(
                 call,
                 "that is not a spill locator. Use the `spill:` value a truncated tool result \
                  cited, exactly as written.",
@@ -165,7 +166,7 @@ impl Tool for SpillReadTool {
             // Deliberately the same answer as "no such artifact". A model that
             // could tell a real locator it may not read from an invented one
             // would have an oracle over what other runs produced.
-            return Ok(refused(
+            return Ok(failed_result(
                 call,
                 "no such spilled output in this conversation. A locator can only be read \
                  back in the conversation whose transcript cites it.",
@@ -180,7 +181,7 @@ impl Tool for SpillReadTool {
                     error = %err,
                     "a cited spill artifact could not be opened"
                 );
-                return Ok(refused(
+                return Ok(failed_result(
                     call,
                     "that spilled output is no longer available; it may have been swept by \
                      the retention policy.",
@@ -225,16 +226,6 @@ fn cited_in_transcript(ctx: &RunContext<'_>, locator: &SpillLocator) -> bool {
 
 /// A refusal the model can read and act on, rather than an error that would
 /// surface as a failed tool call. Reading back the wrong locator is an
-/// ordinary mistake, not a fault.
-fn refused(call: &ToolCall, message: &str) -> ToolResult {
-    ToolResult {
-        call_id: call.id.clone(),
-        status: ToolStatus::Failed,
-        content: Arc::from(message),
-        metadata: BTreeMap::new(),
-    }
-}
-
 /// Read a bounded window, reporting the artifact's real size so the model can
 /// ask for the next one.
 fn read_slice(

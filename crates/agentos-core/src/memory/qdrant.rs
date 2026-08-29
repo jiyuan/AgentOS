@@ -1,6 +1,5 @@
 use super::hybrid::{
-    hash_embedding, memory_backend_error, metadata_embedding, searchable_record_text,
-    SemanticIndex, SemanticSearchHit,
+    hash_embedding, memory_backend_error, record_embedding, SemanticIndex, SemanticSearchHit,
 };
 use super::MemoryError;
 use crate::http::shared_client;
@@ -104,15 +103,6 @@ impl QdrantSemanticIndex {
         hash_embedding(query, self.config.vector_dimensions)
     }
 
-    fn record_vector(&self, record: &Record) -> Vec<f32> {
-        metadata_embedding(record).unwrap_or_else(|| {
-            hash_embedding(
-                &searchable_record_text(record),
-                self.config.vector_dimensions,
-            )
-        })
-    }
-
     fn upsert_vector_value(&self, vector: Vec<f32>) -> Value {
         if let Some(vector_name) = &self.config.vector_name {
             let mut vectors = serde_json::Map::new();
@@ -154,7 +144,7 @@ impl QdrantSemanticIndex {
         Ok(json!({
             "points": [{
                 "id": qdrant_point_id(record_id),
-                "vector": self.upsert_vector_value(self.record_vector(record)),
+                "vector": self.upsert_vector_value(record_embedding(record, self.config.vector_dimensions)),
                 "payload": {
                     "record_id": record_id.as_str(),
                     "namespace": record.namespace.as_str(),

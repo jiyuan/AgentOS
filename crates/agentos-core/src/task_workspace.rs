@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -217,46 +217,6 @@ impl TaskWorkspace {
             write_toml(&root, &state_path, &TaskState::default())?;
         }
         Ok(())
-    }
-
-    pub fn load_state(&self, task_id: &TaskId) -> Result<Option<TaskState>, TaskWorkspaceError> {
-        let root = self.root_dir()?;
-        let path = self.relative_task_dir(task_id)?.join("state.toml");
-        match root.open_file(&path) {
-            Ok(mut file) => {
-                let mut input = String::new();
-                file.read_to_string(&mut input)
-                    .map_err(|source| TaskWorkspaceError::Io {
-                        path: self.boundary.join(&path),
-                        source,
-                    })?;
-                toml::from_str(&input)
-                    .map(Some)
-                    .map_err(|source| TaskWorkspaceError::TomlDe {
-                        path: self.boundary.join(path),
-                        source,
-                    })
-            }
-            Err(ContainmentError::Io { source, .. })
-                if source.kind() == std::io::ErrorKind::NotFound =>
-            {
-                Ok(None)
-            }
-            Err(source) => Err(source.into()),
-        }
-    }
-
-    pub fn save_state(
-        &self,
-        task_id: &TaskId,
-        state: &TaskState,
-    ) -> Result<(), TaskWorkspaceError> {
-        let root = self.root_dir()?;
-        write_toml(
-            &root,
-            &self.relative_task_dir(task_id)?.join("state.toml"),
-            state,
-        )
     }
 
     pub fn create_subagent_config(

@@ -1,9 +1,11 @@
 //! Library surface shared by the agentos-cli binaries (TUI + gateway).
 //!
-//! Currently exposes the slash-command parser and renderers so the TUI and the
+//! Exposes the slash-command parser and renderers so the TUI and the
 //! Telegram/Feishu gateway can speak the same `/help`, `/skills`, `/crons`,
-//! `/tools`, `/memory`, `/orchestrator`, `/model`, `/clear` vocabulary.
+//! `/tools`, `/memory`, `/orchestrator`, `/model`, `/clear` vocabulary, and the
+//! provider-error wording so both report the same failure the same way.
 
+pub mod provider_error;
 pub mod slash;
 
 use agentos_interfaces::SemanticIndex;

@@ -20,8 +20,10 @@ dependencies = [
  "async-trait",
  "getrandom 0.3.4",
  "libc",
+ "rusqlite",
  "serde_json",
  "tokio",
+ "tokio-util",
  "toml",
  "tracing-subscriber",
 ]

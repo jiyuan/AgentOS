@@ -21,3 +21,8 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 libc = "0.2"
+# The gateway's admission ordering (`AF-002`, `AF-004`) is tested against a real
+# ledger: rusqlite installs the write failpoint, tokio-util builds the process
+# cancellation root the receive loop selects on.
+rusqlite.workspace = true
+tokio-util.workspace = true

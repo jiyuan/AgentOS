@@ -1,3 +1,4 @@
+use super::{chat_completion_tool_schema, orphan_tool_message_as_user};
 use crate::providers::content::append_descriptors;
 use crate::providers::reply::record_reply_outcome;
 use crate::providers::stream::openai_compatible_stream;
@@ -41,7 +42,10 @@ pub async fn complete(
     });
     if !tools.is_empty() {
         // DeepSeek follows OpenAI's Chat Completions shape for function tools.
-        payload["tools"] = json!(tools.iter().map(tool_to_function).collect::<Vec<_>>());
+        payload["tools"] = json!(tools
+            .iter()
+            .map(chat_completion_tool_schema)
+            .collect::<Vec<_>>());
     }
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let headers = [
@@ -149,7 +153,10 @@ pub async fn complete_stream(
         "stream_options": { "include_usage": true },
     });
     if !tools.is_empty() {
-        payload["tools"] = json!(tools.iter().map(tool_to_function).collect::<Vec<_>>());
+        payload["tools"] = json!(tools
+            .iter()
+            .map(chat_completion_tool_schema)
+            .collect::<Vec<_>>());
     }
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let headers = [
@@ -202,17 +209,6 @@ fn assistant_message_from_value(message: &Value) -> Message {
         tool_call_id: None,
         metadata,
     }
-}
-
-fn tool_to_function(spec: &ToolSpec) -> Value {
-    json!({
-        "type": "function",
-        "function": {
-            "name": spec.name.as_ref(),
-            "description": spec.description.as_ref(),
-            "parameters": spec.input_schema,
-        }
-    })
 }
 
 fn parse_tool_calls(message: &Value) -> Vec<ToolCall> {
@@ -344,19 +340,6 @@ fn serialize_messages(messages: &[Message]) -> Vec<Value> {
         }
     }
     serialized
-}
-
-fn orphan_tool_message_as_user(message: &Message) -> Value {
-    let kind = message
-        .metadata
-        .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or("tool_result");
-    let content = format!(
-        "Internal AgentOS observation ({kind}):\n{}",
-        message.content.as_ref()
-    );
-    json!({ "role": "user", "content": content })
 }
 
 fn is_reasoning_content_passback_error(error: &Value) -> bool {

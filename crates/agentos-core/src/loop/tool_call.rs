@@ -17,6 +17,7 @@ use super::telemetry::field_key;
 use super::{ensure_guardrail_passed, LoopDeps, RunError};
 use crate::audit::{ArgumentDigest, SafetyEvent, SafetyEventKind, SafetyOutcome};
 use crate::spill::{SpillRef, SpillSource};
+use crate::tools::failed_result;
 use crate::tools::ToolRegistryError;
 use crate::trace;
 use agentos_interfaces::guardrail::GuardrailOutcome;
@@ -175,12 +176,7 @@ pub(super) async fn execute_tool(
         }
         match called {
             Ok(result) => result,
-            Err(ToolRegistryError::Tool(tool_err)) => ToolResult {
-                call_id: call.id.clone(),
-                status: ToolStatus::Failed,
-                content: Arc::from(tool_err.to_string()),
-                metadata: BTreeMap::new(),
-            },
+            Err(ToolRegistryError::Tool(tool_err)) => failed_result(&call, &tool_err.to_string()),
             Err(other) => {
                 // A tool that declared a sandbox mode the runtime cannot
                 // enforce is refused rather than run unsandboxed (M4 /

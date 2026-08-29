@@ -1,6 +1,6 @@
 use super::hybrid::{
-    hash_embedding, memory_backend_error, metadata_embedding, searchable_record_text,
-    stable_hash_u64, vector_json, SemanticIndex, SemanticSearchHit,
+    hash_embedding, memory_backend_error, record_embedding, stable_hash_u64, vector_json,
+    SemanticIndex, SemanticSearchHit,
 };
 use super::{memory_sqlite_error, MemoryError, SqliteStore};
 use agentos_interfaces::memory::Record;
@@ -66,15 +66,6 @@ impl SqliteVecSemanticIndex {
         Ok(())
     }
 
-    fn vector_for_record(&self, record: &Record) -> Vec<f32> {
-        metadata_embedding(record).unwrap_or_else(|| {
-            hash_embedding(
-                &searchable_record_text(record),
-                self.config.vector_dimensions,
-            )
-        })
-    }
-
     fn query_vector(&self, query: &str) -> Vec<f32> {
         hash_embedding(query, self.config.vector_dimensions)
     }
@@ -89,7 +80,7 @@ impl SemanticIndex for SqliteVecSemanticIndex {
             ));
         };
         let row_id = vector_row_id(record_id);
-        let vector = vector_json(&self.vector_for_record(record));
+        let vector = vector_json(&record_embedding(record, self.config.vector_dimensions));
         let conn = self.store.memory_conn()?;
         conn.execute(
             &format!("DELETE FROM {} WHERE rowid = ?1", self.config.table),

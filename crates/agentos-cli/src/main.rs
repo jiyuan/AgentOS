@@ -1,3 +1,4 @@
+use agentos_cli::provider_error::user_facing_error_message;
 use agentos_cli::slash::{self, Parsed, SessionUsage, SlashCommand, SlashContext};
 use agentos_core::channels::{feishu::FeishuChannel, telegram::TelegramChannel};
 use agentos_core::crons::{CronSchedule, CronStore, CronTask};
@@ -674,38 +675,6 @@ where
         }
     }
     Ok(())
-}
-
-fn user_facing_error_message(error: &str) -> String {
-    if error.contains("insufficient_quota") {
-        let mut message = "AgentOS reached OpenAI, but OpenAI returned insufficient_quota for the configured API project or organization. Check OpenAI Platform billing, project budget, org usage limits, and prepaid API credits.".to_owned();
-        if let Some(request_id) = extract_openai_request_id(error) {
-            message.push_str("\nOpenAI request id: ");
-            message.push_str(&request_id);
-        }
-        return message;
-    }
-
-    let mut message =
-        "AgentOS could not complete this request. See the gateway log for details.".to_owned();
-    if let Some(request_id) = extract_openai_request_id(error) {
-        message.push_str("\nOpenAI request id: ");
-        message.push_str(&request_id);
-    }
-    message
-}
-
-fn extract_openai_request_id(error: &str) -> Option<String> {
-    let (_, rest) = error.split_once("x-request-id=")?;
-    let request_id = rest
-        .split(|ch: char| ch == ',' || ch == ';' || ch.is_whitespace())
-        .next()?
-        .trim();
-    if request_id.is_empty() {
-        None
-    } else {
-        Some(request_id.to_owned())
-    }
 }
 
 fn print_trace(state: &agentos_interfaces::RunState) {

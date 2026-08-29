@@ -30,6 +30,7 @@
 //! [`Tool::call_with_context`] — is refused outright: there is no safe default
 //! owner, and inventing one would be a way across the fence.
 
+use super::common::failed_result;
 use crate::jobs::{JobError, JobId, JobRegistry, JobSnapshot};
 use crate::memory::{conversation_id_from_context, conversation_principal_from_context};
 use agentos_interfaces::orchestrator::RunContext;
@@ -182,7 +183,7 @@ impl Tool for JobOutputTool {
     ) -> Result<ToolResult, ToolError> {
         let (conversation, parsed) = owner_and_args(ctx, args)?;
         let Some(id) = parsed.job_id else {
-            return Ok(failed_text(call, "job_output needs a job_id"));
+            return Ok(failed_result(call, "job_output needs a job_id"));
         };
         let id = JobId::parse(&id);
         let offset = parsed.offset.unwrap_or(0);
@@ -237,7 +238,7 @@ impl Tool for JobKillTool {
     ) -> Result<ToolResult, ToolError> {
         let (conversation, parsed) = owner_and_args(ctx, args)?;
         let Some(id) = parsed.job_id else {
-            return Ok(failed_text(call, "job_kill needs a job_id"));
+            return Ok(failed_result(call, "job_kill needs a job_id"));
         };
         let id = JobId::parse(&id);
         match self.jobs.kill(&conversation, &id) {
@@ -309,14 +310,5 @@ fn ok(call: &ToolCall, content: String, metadata: BTreeMap<Arc<str>, Value>) -> 
 /// something the model should read and correct, not something that should end
 /// the run.
 fn failed(call: &ToolCall, error: &JobError) -> ToolResult {
-    failed_text(call, &error.to_string())
-}
-
-fn failed_text(call: &ToolCall, message: &str) -> ToolResult {
-    ToolResult {
-        call_id: call.id.clone(),
-        status: ToolStatus::Failed,
-        content: Arc::from(message),
-        metadata: BTreeMap::new(),
-    }
+    failed_result(call, &error.to_string())
 }

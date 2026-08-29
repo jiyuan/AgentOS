@@ -11,6 +11,7 @@
 //! so it survives `RunState` serialization, pause/resume, and sub-agent
 //! transcripts exactly as the messages it annotates do.
 
+use super::super::orphan_tool_message_as_user;
 use super::{
     api_error, endpoint_and_headers, events, post_sse_with_param_fixes, post_with_param_fixes,
 };
@@ -197,19 +198,6 @@ fn serialize_input(messages: &[Message], carried: BTreeSet<String>) -> Vec<Value
 /// A tool result with no call to pair with — a sub-agent result, or a resumed
 /// transcript whose assistant turn was dropped. Sending it as a tool output
 /// would be rejected, so it becomes labelled user context instead.
-fn orphan_tool_message_as_user(message: &Message) -> Value {
-    let kind = message
-        .metadata
-        .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or("tool_result");
-    let content = format!(
-        "Internal AgentOS observation ({kind}):\n{}",
-        message.content.as_ref()
-    );
-    json!({ "role": "user", "content": content })
-}
-
 /// One non-tool turn as an input message. Plain text rides as a bare string;
 /// only user turns get structured content parts, since `input_image` and
 /// `input_file` are rejected on assistant and system items.

@@ -1,3 +1,4 @@
+use super::chat_completion_tool_schema;
 use crate::providers::content::append_descriptors;
 use crate::providers::{
     attach_token_usage, log_token_usage, post_json, raw_args_from_json_value, ProviderError,
@@ -23,7 +24,10 @@ pub async fn complete(
     if !tools.is_empty() {
         // Ollama's tools support is model-dependent. Pass them through;
         // models that don't support tools simply ignore the field.
-        payload["tools"] = json!(tools.iter().map(tool_to_function).collect::<Vec<_>>());
+        payload["tools"] = json!(tools
+            .iter()
+            .map(chat_completion_tool_schema)
+            .collect::<Vec<_>>());
     }
     let response = post_json(
         "llm",
@@ -58,17 +62,6 @@ pub async fn complete(
         attach_token_usage(&mut message, usage);
     }
     Ok(message)
-}
-
-fn tool_to_function(spec: &ToolSpec) -> Value {
-    json!({
-        "type": "function",
-        "function": {
-            "name": spec.name.as_ref(),
-            "description": spec.description.as_ref(),
-            "parameters": spec.input_schema,
-        }
-    })
 }
 
 fn parse_tool_calls(message: &Value) -> Vec<ToolCall> {
