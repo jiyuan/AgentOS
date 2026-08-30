@@ -3,14 +3,13 @@
 //! Two flavours live here:
 //!
 //! 1. **Production helpers**: `workspace_root`, `safe_workspace_path`,
-//!    `elapsed_ms`, `result_metadata`, `default_cron_dir`, `default_skills_dir`.
+//!    `elapsed_ms`, `result_metadata`, `cron_dir`, `skills_dir`.
 //!    All path helpers derive from `AGENTOS_HOME` via
 //!    `agentos_interfaces::agentos_home(None)`. The runtime pins `AGENTOS_HOME`
 //!    once at startup; the fallbacks here are only for standalone tool use.
 //!
-//! 2. **Test plumbing**: `TEST_CRON_DIR`, `TEST_SKILLS_DIR`, and the matching
-//!    RAII guards. Production code never sets these — `cron_root_for_tests`
-//!    and `skills_root_for_tests` short-circuit to `None` outside `cfg(test)`.
+//! 2. **Test plumbing**: `TEST_CRON_DIR`, `TEST_SKILLS_DIR`, and matching RAII
+//!    guards. The overrides are compiled only into unit-test builds.
 
 use agentos_proto::{ToolCall, ToolResult, ToolStatus};
 use serde_json::Value;
@@ -31,10 +30,25 @@ pub(crate) fn workspace_root() -> PathBuf {
 /// directory. Honors the thread-local test override; otherwise derives from
 /// `AGENTOS_HOME` joined with `workspace/skills`.
 pub(crate) fn skills_dir() -> PathBuf {
-    if let Some(dir) = skills_root_for_tests() {
-        return dir;
+    #[cfg(test)]
+    {
+        if let Some(dir) = TEST_SKILLS_DIR.with(|cell| cell.borrow().clone()) {
+            return dir;
+        }
     }
     workspace_root().join("workspace").join("skills")
+}
+
+/// Resolve the on-disk root for cron task files. Derived from `AGENTOS_HOME`
+/// joined with `workspace/crons`.
+pub(super) fn cron_dir() -> PathBuf {
+    #[cfg(test)]
+    {
+        if let Some(dir) = TEST_CRON_DIR.with(|cell| cell.borrow().clone()) {
+            return dir;
+        }
+    }
+    workspace_root().join("workspace").join("crons")
 }
 
 /// Validate that `requested` stays inside `root`. Reject:
@@ -98,18 +112,6 @@ pub(super) fn result_metadata(duration_ms: u64, bytes_out: u64) -> BTreeMap<Arc<
     metadata
 }
 
-/// Resolve the on-disk root for cron task files. Derived from `AGENTOS_HOME`
-/// joined with `workspace/crons`.
-pub(super) fn default_cron_dir() -> PathBuf {
-    workspace_root().join("workspace").join("crons")
-}
-
-/// Resolve the on-disk root for workspace skills. Derived from `AGENTOS_HOME`
-/// joined with `workspace/skills`.
-pub(super) fn default_skills_dir() -> PathBuf {
-    workspace_root().join("workspace").join("skills")
-}
-
 /// A tool result the model should read and correct, not an error that ends the
 /// run: an unknown job id, a spill locator this run never cited, a registry
 /// refusal. Carries no metadata — a caller with fields to attach (an egress
@@ -127,26 +129,6 @@ pub(crate) fn failed_result(call: &ToolCall, message: &str) -> ToolResult {
 thread_local! {
     pub(super) static TEST_CRON_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
     pub(super) static TEST_SKILLS_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(test)]
-pub(super) fn cron_root_for_tests() -> Option<PathBuf> {
-    TEST_CRON_DIR.with(|cell| cell.borrow().clone())
-}
-
-#[cfg(not(test))]
-pub(super) fn cron_root_for_tests() -> Option<PathBuf> {
-    None
-}
-
-#[cfg(test)]
-pub(super) fn skills_root_for_tests() -> Option<PathBuf> {
-    TEST_SKILLS_DIR.with(|cell| cell.borrow().clone())
-}
-
-#[cfg(not(test))]
-pub(super) fn skills_root_for_tests() -> Option<PathBuf> {
-    None
 }
 
 #[cfg(test)]

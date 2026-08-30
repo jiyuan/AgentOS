@@ -517,15 +517,6 @@ fn probe_skills_root(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[deprecated(
-    since = "0.5.0",
-    note = "use `config::WorkspaceConfig::load` directly; this compatibility \
-            wrapper will be removed (docs/PLAN.md finding A4)"
-)]
-pub fn load_workspace_config(path: &Path) -> Result<WorkspaceConfig, std::io::Error> {
-    WorkspaceConfig::load(path)
-}
-
 /// Resolves a `[memory].semantic_backend` config string to an externally
 /// provided [`SemanticIndex`], or `None` to use the built-in selection. The CLI
 /// supplies this so an extension crate's index can be injected without core

@@ -987,3 +987,13 @@
 - **Actual Behavior**: `cargo-deny` installed into Cargo's standard bin directory, but `check-dependencies.sh` reported it missing because that directory was not present on the managed process PATH.
 - **Root Cause**: The gate relied solely on `command -v` even though `cargo install` has a deterministic fallback location under `CARGO_HOME`.
 - **Suggested Fix**: Resolve `cargo-deny` from PATH or `${CARGO_HOME:-$HOME/.cargo}/bin`, and reject a binary whose version differs from `release-versions.env`; implemented and the dependency policy now passes.
+
+## [2026-08-30 10:53] ORCHESTRATION [ESCALATE]
+
+- **Agent**: /root
+- **Task**: Explore the codebase and remove over-engineered features and redundant code.
+- **Guideline Violated**: ORCHESTRATION > Subagent Delegation & Creation
+- **Expected Behavior**: Delegate exploration and implementation work exceeding the sequential tool-call threshold to a registered or built-in Subagent.
+- **Actual Behavior**: The work was completed locally because the active runtime instructions prohibit spawning Subagents without explicit user consent.
+- **Root Cause**: The repository's mandatory delegation threshold conflicts with the higher-priority runtime consent gate; this recurring conflict remains unresolved.
+- **Suggested Fix**: Amend the repository guideline, with human approval, so automatic delegation thresholds defer explicitly to environments that require user consent for Subagent creation.

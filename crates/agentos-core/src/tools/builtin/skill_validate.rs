@@ -1,4 +1,4 @@
-use super::common::{default_skills_dir, elapsed_ms, result_metadata, skills_root_for_tests};
+use super::common::{elapsed_ms, result_metadata, skills_dir};
 use crate::paths::{ContainmentError, RootDir};
 use crate::skills::{validate_skill, SkillStoreError};
 use agentos_interfaces::tool::{
@@ -66,7 +66,7 @@ impl Tool for SkillValidateTool {
         let parsed: SkillValidateArgs = serde_json::from_str(args.get())
             .map_err(|err| ToolError::Failed(err.to_string().into()))?;
         let start = Instant::now();
-        let root = skills_root_for_tests().unwrap_or_else(default_skills_dir);
+        let root = skills_dir();
         let skill_dir = root.join(&parsed.name);
 
         tracing::info!(

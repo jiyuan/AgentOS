@@ -1,4 +1,4 @@
-use super::common::{cron_root_for_tests, default_cron_dir, elapsed_ms, result_metadata};
+use super::common::{cron_dir, elapsed_ms, result_metadata};
 use crate::crons::{CronSchedule, CronStore, CronTask};
 use agentos_interfaces::tool::{
     SandboxMode, Tool, ToolError, ToolPersistenceScope, ToolSafety, ToolSideEffect, ToolSpec,
@@ -126,7 +126,7 @@ impl Tool for CronCreatorTool {
             .previous_fire_unix(now)
             .map_err(|err| ToolError::Failed(Arc::from(err.to_string())))?;
 
-        let store = CronStore::new(cron_root_for_tests().unwrap_or_else(default_cron_dir));
+        let store = CronStore::new(cron_dir());
         store
             .save_task(&task)
             .map_err(|err| ToolError::Failed(Arc::from(err.to_string())))?;
@@ -188,7 +188,7 @@ impl Tool for CronListTool {
         let _parsed: CronListArgs = serde_json::from_str(args.get())
             .map_err(|err| ToolError::Failed(err.to_string().into()))?;
         let start = Instant::now();
-        let store = CronStore::new(cron_root_for_tests().unwrap_or_else(default_cron_dir));
+        let store = CronStore::new(cron_dir());
         let scheduler = store
             .load_scheduler()
             .map_err(|err| ToolError::Failed(Arc::from(err.to_string())))?;
@@ -269,7 +269,7 @@ impl Tool for CronRemoveTool {
         let parsed: CronRemoveArgs = serde_json::from_str(args.get())
             .map_err(|err| ToolError::Failed(err.to_string().into()))?;
         let start = Instant::now();
-        let store = CronStore::new(cron_root_for_tests().unwrap_or_else(default_cron_dir));
+        let store = CronStore::new(cron_dir());
         let path = store
             .task_path(&parsed.id)
             .map_err(|err| ToolError::Failed(Arc::from(err.to_string())))?;

@@ -131,15 +131,15 @@ Violations of the no-`unwrap()`/no-panic rule on live paths:
 Effort: S. Verify: grep shows no `expect(`/`unwrap(` outside tests/benches in
 `agentos-core` and `agentos-llm` src; full test suite passes.
 
-### 2.3 Close A4: a single workspace-config loader — **done 2026-06-11** (wrapper deletion pending one release)
+### 2.3 Close A4: a single workspace-config loader — **done 2026-08-30**
 
-`runtime::load_workspace_config()` is a compatibility wrapper around the
-canonical `WorkspaceConfig::load()`, with the deprecation decision pending.
-Decide now: add an equivalence test for both paths on a fixture config, mark
-the wrapper `#[deprecated]` for one release, then delete it.
+`runtime::load_workspace_config()` was deprecated in v0.5.0 after all in-tree
+callers moved to the canonical `WorkspaceConfig::load()`. The compatibility
+wrapper and its equivalence-only tests were deleted after the deprecation
+window; the config range and unknown-key tests remain.
 
 Files: `crates/agentos-core/src/runtime/`, `PLAN.md` A4.
-Effort: S–M. Verify: equivalence test; workspace compiles after removal.
+Effort: S–M. Verify: config loader tests and workspace compile after removal.
 
 ### 2.4 Module-size allowlist audit — **done 2026-06-11 (pulled into Phase 1)**
 
@@ -402,9 +402,9 @@ Every item is closed; per-item outcome notes live in the sections above. The
 and 4.3 landed without touching the public `Llm` trait. Open follow-ups
 carried out of this roadmap:
 
-- Delete the deprecated `runtime::load_workspace_config()` wrapper after one
-  release (Phase 2.3 note; equivalence tests are the gate). Still present at
-  `runtime/mod.rs`, still covered by `tests/config_loader.rs`.
+- ~~Delete the deprecated `runtime::load_workspace_config()` wrapper after one
+  release.~~ **Resolved 2026-08-30:** the wrapper and equivalence-only tests
+  were removed; config validation coverage remains in `tests/config_loader.rs`.
 - ~~Making the loop future `Send` (or formally adopting thread-per-core)~~ —
   **resolved** by [`TRANSFER_ROADMAP.md`](TRANSFER_ROADMAP.md) G1: thread-per-core
   is now the deliberate scaling model, and `gateway/shard.rs` is the concurrency

@@ -178,25 +178,19 @@ Current behavior:
 
 - `WorkspaceConfig::load()` parses the main TOML, resolves paths, loads
   `subagents/*.toml` and `suborchs/*.toml`, and validates the effective config.
-- `runtime::load_workspace_config()` is a compatibility wrapper around
-  `WorkspaceConfig::load()`.
 
-Why this matters:
+Why this mattered:
 
 - Callers using the public-looking loader get a different runtime model than
   `AgentRuntime::build`.
 - Tests can pass against one loader while production uses another.
 
-Resolution (2026-06-11, roadmap Phase 2.3):
+Resolution (completed 2026-08-30, roadmap Phase 2.3):
 
-- `runtime::load_workspace_config()` is now `#[deprecated]` and delegates to
-  `WorkspaceConfig::load()`. All in-tree call sites (runtime build, gateway
-  binary) use the canonical loader directly.
-- `crates/agentos-core/tests/config_loader.rs` asserts both loaders produce
-  identical configs for the repository `workspace/agent.toml` (covering
-  subagents/suborchs sibling-file loading), a minimal fixture, and the
-  missing-file default path.
-- Remaining step: delete the deprecated wrapper after one release.
+- All in-tree callers moved to `WorkspaceConfig::load()`, and the former
+  `runtime::load_workspace_config()` wrapper was deprecated in v0.5.0.
+- The wrapper and its equivalence-only tests were deleted after the deprecation
+  window. Range and unknown-key coverage remains in `config_loader.rs`.
 
 ### A5. Required Regression Tests Are Missing Or Stale
 
